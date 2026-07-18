@@ -4,7 +4,7 @@ use super::capture::{
 };
 use super::diagnostics::{dataset_runtime_diagnostics_json, local_dataset_source_diagnostics_json};
 use super::*;
-use std::{fs, path::PathBuf};
+use std::{collections::VecDeque, fs, path::PathBuf};
 
 use mirante4d_dataset_runtime::{DatasetRuntimeConfig, DatasetRuntimeDiagnostics};
 
@@ -28,6 +28,135 @@ fn runtime_idle_wait_includes_async_camera_demand_planning_and_install() {
     assert!(!automation_runtime_is_idle(true, false, false));
     assert!(!automation_runtime_is_idle(false, true, false));
     assert!(!automation_runtime_is_idle(false, false, true));
+}
+
+#[test]
+fn active_view_gpu_timing_wait_requires_exact_execution_and_interval_completion() {
+    use crate::native_presentation::ProductGpuExecutionTiming;
+
+    let identity = ProductGpuExecutionIdentity {
+        execution_id: 17,
+        target: mirante4d_render_api::PresentationToken::new(3).unwrap(),
+        renderer_frame: mirante4d_render_api::FrameIdentity::new(11),
+        display_generation: 7,
+        pass_kind: RenderPassKind::Volume,
+    };
+    let facts = ActiveViewGpuExecutionFacts {
+        identity,
+        target: identity.target,
+        renderer_frame: identity.renderer_frame,
+        display_generation: identity.display_generation,
+        pass_kind: identity.pass_kind,
+        timing_complete: true,
+    };
+    let sample = PresentedFrameIntervalSample {
+        sequence: 1,
+        panel: PanelId::ThreeD,
+        frame: identity.renderer_frame,
+        interval_ns: Some(1),
+        cpu_planning_ns: Some(1),
+        cpu_queue_submit_ns: Some(1),
+        gpu_execution: Some(identity),
+        gpu_timing: Some(ProductGpuExecutionTiming {
+            batch_gpu_envelope_ns: Some(5),
+            payload_copy_ns: None,
+            render_pass_ns: Some(4),
+        }),
+    };
+    let exact = VecDeque::from([sample]);
+
+    assert_eq!(
+        exact_completed_gpu_timing_identity(
+            7,
+            PanelId::ThreeD,
+            RenderPassKind::Volume,
+            Some(facts),
+            &exact,
+        ),
+        Some(identity)
+    );
+
+    let mut pending_execution = facts;
+    pending_execution.timing_complete = false;
+    assert!(
+        exact_completed_gpu_timing_identity(
+            7,
+            PanelId::ThreeD,
+            RenderPassKind::Volume,
+            Some(pending_execution),
+            &exact,
+        )
+        .is_none()
+    );
+    assert!(
+        exact_completed_gpu_timing_identity(
+            7,
+            PanelId::ThreeD,
+            RenderPassKind::Volume,
+            Some(facts),
+            &VecDeque::new(),
+        )
+        .is_none()
+    );
+
+    let mut interval_only = exact;
+    interval_only[0].gpu_timing = None;
+    assert!(
+        exact_completed_gpu_timing_identity(
+            7,
+            PanelId::ThreeD,
+            RenderPassKind::Volume,
+            Some(facts),
+            &interval_only,
+        )
+        .is_none()
+    );
+    assert!(
+        exact_completed_gpu_timing_identity(
+            8,
+            PanelId::ThreeD,
+            RenderPassKind::Volume,
+            Some(facts),
+            &VecDeque::from([sample]),
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn active_view_gpu_timing_await_is_strict_and_bounded() {
+    let raw = json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "gpu-timing-await",
+        "gpu_timing": true,
+        "commands": [{
+            "command": "await_active_view_gpu_timing",
+            "target": "three_d",
+            "pass_kind": "volume",
+            "timeout_ms": 5_000,
+        }, { "command": "quit" }],
+    });
+    let script: ProductAutomationScript = serde_json::from_value(raw.clone()).unwrap();
+    script.validate().unwrap();
+    assert!(matches!(
+        &script.commands[0],
+        ProductAutomationCommand::AwaitActiveViewGpuTiming {
+            target: ProductAutomationGpuTarget::ThreeD,
+            pass_kind: ProductAutomationGpuPassKind::Volume,
+            timeout_ms: 5_000,
+        }
+    ));
+
+    let mut extra = raw.clone();
+    extra["commands"][0]["condition"] = json!("runtime_idle");
+    assert!(serde_json::from_value::<ProductAutomationScript>(extra).is_err());
+
+    let mut unbounded = raw;
+    unbounded["commands"][0]["timeout_ms"] = json!(MAX_GPU_TIMING_AWAIT_TIMEOUT_MS + 1);
+    let unbounded: ProductAutomationScript = serde_json::from_value(unbounded).unwrap();
+    assert!(unbounded.validate().is_err());
 }
 
 #[test]

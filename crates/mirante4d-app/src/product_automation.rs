@@ -34,7 +34,7 @@ use mirante4d_domain::{
 };
 use mirante4d_import_pipeline::{ImportReceipt, ImportStatistics, TiffSource};
 use mirante4d_project_model::{LayerViewState, ProjectRevisionId};
-use mirante4d_render_api::{PresentationViewport, RenderExtent, VolumePickQuery};
+use mirante4d_render_api::{PresentationViewport, RenderExtent, RenderPassKind, VolumePickQuery};
 use mirante4d_storage::ScientificPublicationTransferEvidence;
 use mirante4d_ui_egui::{ViewerPickPurpose, ViewerPickRequest};
 use rustix::time::{ClockId, clock_gettime};
@@ -43,8 +43,11 @@ use serde_json::{Value, json};
 
 use crate::{
     DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
-    MiranteWorkbenchApp, application_view, import_worker_service::ImportWorkerTimingOrigin,
-    set_render_viewport, viewer_layout::PanelId,
+    MiranteWorkbenchApp, application_view,
+    import_worker_service::ImportWorkerTimingOrigin,
+    native_presentation::{PresentedFrameIntervalSample, ProductGpuExecutionIdentity},
+    set_render_viewport,
+    viewer_layout::PanelId,
 };
 
 mod capture;
@@ -106,6 +109,87 @@ fn product_presentation(
         .get(&panel)?
         .presented
         .as_ref()
+}
+
+#[derive(Clone, Copy)]
+struct ActiveViewGpuExecutionFacts {
+    identity: ProductGpuExecutionIdentity,
+    target: mirante4d_render_api::PresentationToken,
+    renderer_frame: mirante4d_render_api::FrameIdentity,
+    display_generation: u64,
+    pass_kind: RenderPassKind,
+    timing_complete: bool,
+}
+
+fn exact_completed_gpu_timing_identity(
+    current_generation: u64,
+    expected_panel: PanelId,
+    expected_pass_kind: RenderPassKind,
+    execution: Option<ActiveViewGpuExecutionFacts>,
+    intervals: &std::collections::VecDeque<PresentedFrameIntervalSample>,
+) -> Option<ProductGpuExecutionIdentity> {
+    let execution = execution?;
+    let identity = execution.identity;
+    if identity.execution_id == 0
+        || identity.target.get() == 0
+        || identity.target != execution.target
+        || identity.renderer_frame != execution.renderer_frame
+        || identity.display_generation != execution.display_generation
+        || identity.pass_kind != execution.pass_kind
+        || execution.display_generation != current_generation
+        || execution.pass_kind != expected_pass_kind
+        || !execution.timing_complete
+    {
+        return None;
+    }
+    intervals
+        .iter()
+        .rev()
+        .any(|sample| {
+            sample.panel == expected_panel
+                && sample.gpu_execution == Some(identity)
+                && sample.gpu_timing.is_some()
+        })
+        .then_some(identity)
+}
+
+fn active_view_gpu_timing_identity(
+    app: &MiranteWorkbenchApp,
+    target: ProductAutomationGpuTarget,
+    pass_kind: ProductAutomationGpuPassKind,
+) -> Option<ProductGpuExecutionIdentity> {
+    let expected_panel = PanelId::from(target);
+    let expected_pass_kind = match pass_kind {
+        ProductAutomationGpuPassKind::Plane => RenderPassKind::Plane,
+        ProductAutomationGpuPassKind::Volume => RenderPassKind::Volume,
+    };
+    let product = app.native_presentation.product_gpu.as_ref()?;
+    let execution = product
+        .targets
+        .get(&expected_panel)
+        .and_then(|target| target.last_execution_timing)
+        .and_then(|execution| {
+            execution
+                .gpu_ticket
+                .map(ProductGpuExecutionIdentity::from_ticket)
+                .map(|identity| ActiveViewGpuExecutionFacts {
+                    identity,
+                    target: execution.target,
+                    renderer_frame: execution.frame,
+                    display_generation: execution.display_generation,
+                    pass_kind: execution.pass_kind,
+                    timing_complete: execution.gpu.is_some(),
+                })
+        });
+    exact_completed_gpu_timing_identity(
+        app.render_coordination
+            .display_generation()
+            .input_generation,
+        expected_panel,
+        expected_pass_kind,
+        execution,
+        product.presented_frame_interval_samples(),
+    )
 }
 
 fn product_presentations_ready(
@@ -1903,6 +1987,70 @@ impl ProductAutomationController {
                     command_started.elapsed(),
                     details,
                 );
+                // A GPU timing result is current only for the UI callback in
+                // which it was observed. Normal rendering and timestamp
+                // polling run before automation on the next callback and may
+                // replace it with a newer pending execution. Qualification
+                // scripts therefore publish the statically adjacent
+                // diagnostic checkpoint now, without yielding back to the
+                // product between readiness and evidence capture.
+                if matches!(
+                    &command,
+                    ProductAutomationCommand::AwaitActiveViewGpuTiming { .. }
+                ) && let Some(next_command @ ProductAutomationCommand::SampleDiagnostics { .. }) =
+                    self.script.commands.get(command_index + 1).cloned()
+                {
+                    let next_index = command_index + 1;
+                    let next_started = Instant::now();
+                    let next_result = self.execute_command(app, ctx, &next_command);
+                    if let Err(error) = self.observe_and_enforce_hard_safety_limits(app) {
+                        let reason =
+                            if let Some(cancellation) = self.cancel_active_dataset_switch(app) {
+                                format!("{error}; dataset_switch_cancellation={cancellation}")
+                            } else {
+                                error
+                            };
+                        return self.record_fatal_command_failure(
+                            next_index,
+                            next_command.name(),
+                            next_started.elapsed(),
+                            reason,
+                        );
+                    }
+                    return match next_result {
+                        Ok(CommandProgress::Done(details)) => {
+                            self.record_successful_command(
+                                next_index,
+                                next_command.name(),
+                                next_started.elapsed(),
+                                details,
+                            );
+                            AutomationStatus::Continue
+                        }
+                        Ok(CommandProgress::Waiting | CommandProgress::PassiveWaiting(_)) => self
+                            .record_fatal_command_failure(
+                                next_index,
+                                next_command.name(),
+                                next_started.elapsed(),
+                                "GPU timing checkpoint diagnostic unexpectedly waited".to_owned(),
+                            ),
+                        Err(reason) => {
+                            let reason = if let Some(cancellation) =
+                                self.cancel_active_dataset_switch(app)
+                            {
+                                format!("{reason}; dataset_switch_cancellation={cancellation}")
+                            } else {
+                                reason
+                            };
+                            self.record_fatal_command_failure(
+                                next_index,
+                                next_command.name(),
+                                next_started.elapsed(),
+                                reason,
+                            )
+                        }
+                    };
+                }
                 AutomationStatus::Continue
             }
             Ok(CommandProgress::Waiting) => AutomationStatus::Waiting {
@@ -2841,6 +2989,42 @@ impl ProductAutomationController {
                     })
                 }
             }
+            ProductAutomationCommand::AwaitActiveViewGpuTiming {
+                target,
+                pass_kind,
+                timeout_ms,
+            } => {
+                let qualification_started = Instant::now();
+                let started = *self.active_wait_started.get_or_insert_with(Instant::now);
+                let result = if let Some(identity) =
+                    active_view_gpu_timing_identity(app, *target, *pass_kind)
+                {
+                    Ok(CommandProgress::Done(json!({
+                        "target": target.name(),
+                        "pass_kind": pass_kind.name(),
+                        "execution_id": identity.execution_id,
+                        "renderer_target": identity.target.get(),
+                        "display_generation": identity.display_generation,
+                        "renderer_frame": identity.renderer_frame.get(),
+                        "exact_presented_interval_timing_complete": true,
+                        "waited_ms": duration_ms(started.elapsed()),
+                    })))
+                } else if started.elapsed() >= Duration::from_millis(*timeout_ms) {
+                    Err(format!(
+                        "timed out after {timeout_ms} ms waiting for exact {} {} GPU timing",
+                        target.name(),
+                        pass_kind.name(),
+                    ))
+                } else {
+                    Ok(CommandProgress::Waiting)
+                };
+                self.qualification_only_ui_overhead_ns =
+                    self.qualification_only_ui_overhead_ns.saturating_add(
+                        u64::try_from(qualification_started.elapsed().as_nanos())
+                            .unwrap_or(u64::MAX),
+                    );
+                result
+            }
             ProductAutomationCommand::ObserveGateBatch {
                 batch_id,
                 phase_id,
@@ -3679,7 +3863,10 @@ impl ProductAutomationController {
                 let diagnostics = self.diagnostics_json(app);
                 self.diagnostics.push(diagnostics.clone());
                 self.qualification_only_ui_overhead_ns =
-                    u64::try_from(qualification_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    self.qualification_only_ui_overhead_ns.saturating_add(
+                        u64::try_from(qualification_started.elapsed().as_nanos())
+                            .unwrap_or(u64::MAX),
+                    );
                 Ok(CommandProgress::Done(diagnostics))
             }
             ProductAutomationCommand::SampleDiagnostics { label } => {
@@ -3842,7 +4029,10 @@ impl ProductAutomationController {
                 });
                 self.diagnostics.push(sample.clone());
                 self.qualification_only_ui_overhead_ns =
-                    u64::try_from(qualification_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    self.qualification_only_ui_overhead_ns.saturating_add(
+                        u64::try_from(qualification_started.elapsed().as_nanos())
+                            .unwrap_or(u64::MAX),
+                    );
                 Ok(CommandProgress::Done(sample))
             }
             ProductAutomationCommand::CaptureScreenshot { name } => {
@@ -4557,6 +4747,7 @@ impl ProductAutomationController {
                 "name": snapshot.catalog().label(),
                 "layer_count": snapshot.catalog().len(),
                 "active_logical_layer": view.active_layer().ordinal(),
+                "current_time_index": view.timepoint().get(),
                 "active_layer_label": active_layer.label(),
                 "active_layer_dtype": format!("{:?}", active_layer.dtype()),
                 "active_layer_shape": {
@@ -4567,6 +4758,10 @@ impl ProductAutomationController {
                 },
                 "active_scale_count": active_layer.scales().len(),
                 "timepoint_count": active_layer.shape().t(),
+            },
+            "application_state": {
+                "currentness_generation": snapshot.currentness().get(),
+                "currentness_derivation": "ApplicationSnapshot_currentness_generation",
             },
             "render": {
                 "active_render_mode": format!("{:?}", view.layer(view.active_layer()).expect("active layer").render_state().mode()),
@@ -5841,12 +6036,12 @@ fn display_coordination_diagnostics_json(
             ),
         },
         "active_ui_update_duration": {
-            "ownership": "eframe_App_ui_callback_when_input_or_loading_work_is_active_minus_exact_sequential_qualification_diagnostic_interval",
-            "excludes": "compositor_present_and_vsync_outside_callback_and_sample_diagnostics_or_copy_diagnostics_evidence_production",
+            "ownership": "eframe_App_ui_callback_when_input_or_loading_work_is_active_minus_exact_sequential_qualification_diagnostic_or_timing_await_interval",
+            "excludes": "compositor_present_and_vsync_outside_callback_and_sample_diagnostics_copy_diagnostics_or_await_active_view_gpu_timing_evidence_production",
             "claim_bearing_2ms_gate": true,
             "settled_event_driven_idle_updates_included": false,
             "qualification_only_automation_overhead_excluded": true,
-            "qualification_only_automation_commands_excluded": ["sample_diagnostics", "copy_diagnostics"],
+            "qualification_only_automation_commands_excluded": ["sample_diagnostics", "copy_diagnostics", "await_active_view_gpu_timing"],
             "subtraction_method": "saturating_subtract_exact_monotonic_elapsed_interval_from_enclosing_ui_callback",
             "samples": timing_samples_json(
                 app.render_coordination.active_ui_update_duration_samples(),

@@ -16,6 +16,7 @@ pub(super) const MAX_INPUT_SEQUENCE_SAMPLES: u32 = 4_096;
 pub(super) const MAX_INPUT_SEQUENCE_DURATION_MS: u64 = 120_000;
 pub(super) const MAX_GATE_BATCH_OBSERVATIONS: usize = 64;
 pub(super) const MAX_GATE_DEADLINE_AFTER_ORIGIN_NS: u64 = 7_200_000_000_000;
+pub(super) const MAX_GPU_TIMING_AWAIT_TIMEOUT_MS: u64 = 30_000;
 const MAX_GATE_ID_BYTES: usize = 128;
 const MAX_GATE_BATCH_ID_BYTES: usize = 128;
 const MAX_GATE_PHASE_ID_BYTES: usize = 128;
@@ -482,6 +483,13 @@ pub(super) enum ProductAutomationCommand {
         condition: ProductAutomationWaitCondition,
         timeout_ms: u64,
     },
+    /// Qualification-only nonblocking wait for the exact current target's
+    /// asynchronous timestamp result and its presented-interval binding.
+    AwaitActiveViewGpuTiming {
+        target: ProductAutomationGpuTarget,
+        pass_kind: ProductAutomationGpuPassKind,
+        timeout_ms: u64,
+    },
     ObserveGateBatch {
         batch_id: String,
         phase_id: String,
@@ -684,6 +692,7 @@ impl ProductAutomationCommand {
             Self::CancelImport => "cancel_import",
             Self::WaitForImportedOpenReady { .. } => "wait_for_imported_open_ready",
             Self::WaitFor { .. } => "wait_for",
+            Self::AwaitActiveViewGpuTiming { .. } => "await_active_view_gpu_timing",
             Self::ObserveGateBatch { .. } => "observe_gate_batch",
             Self::SetViewportSize { .. } => "set_viewport_size",
             Self::SetMappedClientPixels { .. } => "set_mapped_client_pixels",
@@ -887,6 +896,13 @@ impl ProductAutomationCommand {
             && let Err(error) = validate_diagnostic_sample_label(label)
         {
             return Err(error);
+        }
+        if let Self::AwaitActiveViewGpuTiming { timeout_ms, .. } = self
+            && !(1..=MAX_GPU_TIMING_AWAIT_TIMEOUT_MS).contains(timeout_ms)
+        {
+            anyhow::bail!(
+                "await_active_view_gpu_timing timeout_ms must be in 1..={MAX_GPU_TIMING_AWAIT_TIMEOUT_MS}"
+            );
         }
         if let Self::ObserveGateBatch {
             batch_id,
@@ -1252,6 +1268,53 @@ pub(super) enum ProductAutomationPanelId {
     Xy,
     Xz,
     Yz,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProductAutomationGpuTarget {
+    ThreeD,
+    Xy,
+    Xz,
+    Yz,
+}
+
+impl From<ProductAutomationGpuTarget> for PanelId {
+    fn from(value: ProductAutomationGpuTarget) -> Self {
+        match value {
+            ProductAutomationGpuTarget::ThreeD => Self::ThreeD,
+            ProductAutomationGpuTarget::Xy => Self::Xy,
+            ProductAutomationGpuTarget::Xz => Self::Xz,
+            ProductAutomationGpuTarget::Yz => Self::Yz,
+        }
+    }
+}
+
+impl ProductAutomationGpuTarget {
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::ThreeD => "three_d",
+            Self::Xy => "xy",
+            Self::Xz => "xz",
+            Self::Yz => "yz",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProductAutomationGpuPassKind {
+    Plane,
+    Volume,
+}
+
+impl ProductAutomationGpuPassKind {
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::Plane => "plane",
+            Self::Volume => "volume",
+        }
+    }
 }
 
 impl From<ProductAutomationPanelId> for PanelId {

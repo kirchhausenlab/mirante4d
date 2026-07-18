@@ -996,6 +996,17 @@ closeout grace, with the IP import wall counted once; there is no caller-
 authored timeout. This three-sample population is development evidence under
 the existing progression rule and cannot establish a performance claim.
 
+Every GPU-gated phase resolves its concurrent acceptance checkpoint before
+the end diagnostic, then uses one five-second-bounded nonblocking
+active-target timing await. That await accepts only the exact current
+execution ticket after both its renderer timing and matching presented-
+interval timing are complete. It drives normal asynchronous polling and never
+uses a fixed sleep or synchronous device wait. Its declared ceiling is counted
+in the role watchdog; normal completion is ordinarily the next UI tick. On
+success, readiness and publication of the adjacent end diagnostic are atomic
+within that UI callback, before normal rendering can install a newer pending
+execution ticket.
+
 Automatic full-package source verification is not a generic viewer-startup
 prerequisite. RZ, ZB, RO, ST, NO, VM, and IP cancel the normal automatic
 verifier through its real reducer operation and require an inactive,
@@ -1152,6 +1163,13 @@ path has a measured negligible cost. Keep both classes small and asynchronous:
 - peak accounted queues, handles, CPU bytes, upload bytes, and GPU bytes; and
 - durable project/view commits during each interaction gesture.
 
+The canonical gesture-end authority is the application snapshot currentness
+generation, which exists for both provisional unbound viewing and bound
+projects. Project revision and undo/history counters corroborate that authority
+only while a project is bound. An unbound diagnostic reports those
+project-only fields as explicit nulls; it does not fabricate a project
+revision for provisional viewing.
+
 Per-ray/sample diagnostics are temporary unless they can remain without
 material synchronization or perturbation. Instrumentation overhead is
 measured.
@@ -1195,9 +1213,12 @@ require:
   preparation, or cancellation churn after a bounded containment/signature
   check proves that the installed envelope still covers the view;
 - zero UI wait for demand preparation;
-- zero durable revision or undo/history entry per raw wheel/drag sample;
-- exactly one durable commit at gesture end whose camera equals the final
-  transient camera; and
+- zero finalized application/view currentness commit per raw wheel/drag
+  sample, and, when a project is bound, zero project revision or undo/history
+  entry per raw sample;
+- exactly one finalized application/view commit at gesture end whose camera
+  equals the final transient camera, corroborated by exactly one project
+  revision and history entry only when a project is bound; and
 - after any complete current-camera fallback exists, no incomplete
   data-bearing frame becomes current under any preview or target label.
 

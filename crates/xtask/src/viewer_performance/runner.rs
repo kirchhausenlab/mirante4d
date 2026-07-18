@@ -49,6 +49,7 @@ const MAX_NONIMPORT_STATIC_WAIT_NS: u64 = 35_000_000_000;
 const PROCESS_STARTUP_ADMISSION_GRACE_NS: u64 = 30_000_000_000;
 const PROCESS_CLOSEOUT_GRACE_NS: u64 = 10_000_000_000;
 const SOURCE_VERIFICATION_QUIESCENCE_TIMEOUT_MS: u64 = 5_000;
+const GPU_TIMING_AWAIT_TIMEOUT_MS: u64 = 5_000;
 const CONFORMANCE_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTEMPT_ROOT_PLACEHOLDER: &str = "${ATTEMPT_ROOT}";
 const WORKLOAD_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -3690,7 +3691,10 @@ fn validate_automation_template(
             .flat_map(|bootstrap| &bootstrap.commands),
     ) {
         if command.get("timeout_ms").is_some()
-            && command.get("command").and_then(Value::as_str) != Some("wait_for")
+            && !matches!(
+                command.get("command").and_then(Value::as_str),
+                Some("wait_for" | "await_active_view_gpu_timing")
+            )
         {
             bail!(
                 "viewer scenario {id} contains a timeout-bearing command outside the accounted fatal wait surface"
@@ -3703,6 +3707,13 @@ fn validate_automation_template(
     }
     if !instrumented && (script.gpu_timing || script.diagnostic_counters) {
         bail!("viewer instrumentation controls must disable timing and diagnostic counters")
+    }
+    if !instrumented
+        && script.commands.iter().any(|command| {
+            command.get("command").and_then(Value::as_str) == Some("await_active_view_gpu_timing")
+        })
+    {
+        bail!("instrumentation controls cannot await disabled GPU timing")
     }
     let command_labels = diagnostic_labels(&script.commands)?;
     let mut labels = Vec::new();
@@ -3916,6 +3927,9 @@ fn validate_product_gate_schedule(
     profile: &ViewerQualificationProfile,
     oracle: &OracleScenario,
 ) -> anyhow::Result<RoleScheduleBound> {
+    if script.diagnostic_counters {
+        validate_gpu_timing_await_schedule(scenario, script, oracle)?;
+    }
     let batches = expected_product_gate_batches(&script.commands)?;
     let expected_phase_ids = expected_product_gate_phase_ids(id);
     if batches.len() != expected_phase_ids.len() {
@@ -3980,12 +3994,19 @@ fn validate_product_gate_schedule(
                 .start_diagnostic_label
                 .as_deref()
                 .and_then(|label| diagnostic_command_index(&script.commands, label));
+            let end = diagnostic_command_index(&script.commands, &phase.end_diagnostic_label)
+                .context("phase end checkpoint is unavailable while validating gate schedule")?;
             match (checkpoint_kind, start) {
                 (PhaseCheckpointKind::Setup, Some(start)) if batch.command_index >= start => {
                     bail!("viewer scenario {id} setup gate batch is not before its phase start")
                 }
                 (PhaseCheckpointKind::Checkpoint, Some(start)) if batch.command_index <= start => {
                     bail!("viewer scenario {id} checkpoint gate batch is not after its phase start")
+                }
+                (PhaseCheckpointKind::Checkpoint, _) if batch.command_index >= end => {
+                    bail!(
+                        "viewer scenario {id} checkpoint gate batch must resolve before its phase end diagnostic"
+                    )
                 }
                 _ => {}
             }
@@ -4081,6 +4102,67 @@ fn validate_product_gate_schedule(
     }
     validate_fatal_wait_deadlines(id, &script.commands, profile)?;
     role_schedule_bound(id, script, profile, oracle)
+}
+
+fn validate_gpu_timing_await_schedule(
+    scenario: &ScriptScenario,
+    script: &AutomationScriptTemplate,
+    oracle: &OracleScenario,
+) -> anyhow::Result<()> {
+    let expected_count = oracle
+        .phases
+        .iter()
+        .filter(|phase| phase.gpu_gate.is_some())
+        .count();
+    let observed_count = script
+        .commands
+        .iter()
+        .filter(|command| {
+            command.get("command").and_then(Value::as_str) == Some("await_active_view_gpu_timing")
+        })
+        .count();
+    if observed_count != expected_count {
+        bail!("viewer GPU timing await count differs from the GPU-gated phase count")
+    }
+    for (script_phase, oracle_phase) in scenario.phases.iter().zip(&oracle.phases) {
+        let Some(gpu_gate) = oracle_phase.gpu_gate else {
+            continue;
+        };
+        let end = diagnostic_command_index(&script.commands, &script_phase.end_diagnostic_label)
+            .context("GPU-gated phase end diagnostic is unavailable")?;
+        let command = end
+            .checked_sub(1)
+            .and_then(|index| script.commands.get(index))
+            .context("GPU-gated phase lacks its pre-diagnostic timing await")?;
+        let object = command
+            .as_object()
+            .context("GPU timing await command must be an object")?;
+        if object.keys().map(String::as_str).collect::<BTreeSet<_>>()
+            != BTreeSet::from(["command", "target", "pass_kind", "timeout_ms"])
+            || object.get("command").and_then(Value::as_str) != Some("await_active_view_gpu_timing")
+        {
+            bail!(
+                "every GPU-gated phase must await exact active-view timing immediately before its end diagnostic"
+            )
+        }
+        let expected_target = match oracle_phase.phase_state.active_view {
+            ViewerPanel::ThreeD => "three_d",
+            ViewerPanel::Xy => "xy",
+            ViewerPanel::Xz => "xz",
+            ViewerPanel::Yz => "yz",
+        };
+        let expected_pass_kind = match gpu_gate {
+            GpuGate::Plane => "plane",
+            GpuGate::Mip | GpuGate::Dvr | GpuGate::Iso => "volume",
+        };
+        if object.get("target").and_then(Value::as_str) != Some(expected_target)
+            || object.get("pass_kind").and_then(Value::as_str) != Some(expected_pass_kind)
+            || object.get("timeout_ms").and_then(Value::as_u64) != Some(GPU_TIMING_AWAIT_TIMEOUT_MS)
+        {
+            bail!("GPU timing await differs from its exact phase target, pass, or timeout")
+        }
+    }
+    Ok(())
 }
 
 fn validate_fc_source_verification_isolation_order(
@@ -4268,7 +4350,7 @@ fn role_schedule_bound(
     let mut action_duration_bound_ns = 0_u64;
     for command in &script.commands {
         let name = command.get("command").and_then(Value::as_str);
-        if name == Some("wait_for") {
+        if matches!(name, Some("wait_for" | "await_active_view_gpu_timing")) {
             let timeout_ns = command
                 .get("timeout_ms")
                 .and_then(Value::as_u64)
@@ -4475,7 +4557,7 @@ fn normalized_semantic_script(script: &AutomationScriptTemplate) -> Value {
         .filter(|command| {
             !matches!(
                 command.get("command").and_then(Value::as_str),
-                Some("sample_diagnostics" | "copy_diagnostics")
+                Some("sample_diagnostics" | "copy_diagnostics" | "await_active_view_gpu_timing")
             )
         })
         .cloned()
@@ -8600,10 +8682,11 @@ fn validate_phase_script_binding(
     {
         reasons.insert("phase_layout_script_binding_mismatch".to_owned());
     }
-    if latest("set_time_index")
+    let scripted_time_index = latest("set_time_index")
         .and_then(|(_, command)| command.get("time_index"))
-        .and_then(Value::as_u64)
-        != Some(u64::from(expected.time_index))
+        .and_then(Value::as_u64);
+    if scripted_time_index.is_some() && scripted_time_index != Some(u64::from(expected.time_index))
+        || scripted_time_index.is_none() && expected.time_index != 0
     {
         reasons.insert("phase_time_index_script_binding_mismatch".to_owned());
     }
@@ -8663,6 +8746,14 @@ fn validate_phase_state_facts(
     contract: &NumericalContract,
     reasons: &mut BTreeSet<String>,
 ) {
+    let time_index = diagnostics
+        .pointer("/dataset/current_time_index")
+        .and_then(Value::as_u64);
+    if time_index.is_none() {
+        reasons.insert("phase_time_index_fact_missing".to_owned());
+    } else if time_index != Some(u64::from(expected.time_index)) {
+        reasons.insert("product_gate_phase_time_index_mismatch".to_owned());
+    }
     let camera = diagnostics.get("camera");
     let canonical_source = camera
         .and_then(|value| value.get("canonical_source"))
@@ -9044,7 +9135,11 @@ fn validate_interaction_metrics(
             != Some(true)
             || update
                 .and_then(|update| update.get("qualification_only_automation_commands_excluded"))
-                != Some(&json!(["sample_diagnostics", "copy_diagnostics"]))
+                != Some(&json!([
+                    "sample_diagnostics",
+                    "copy_diagnostics",
+                    "await_active_view_gpu_timing"
+                ]))
             || update
                 .and_then(|update| update.get("subtraction_method"))
                 .and_then(Value::as_str)
@@ -9592,7 +9687,8 @@ fn validate_observed_exact_resource_union<'a>(
     }
     let canonical_entries = union
         .and_then(|union| union.get("canonical_entries_sha256"))
-        .and_then(Value::as_str);
+        .and_then(Value::as_str)
+        .filter(|digest| require_sha256(digest, "observed exact resource union").is_ok());
     if canonical_entries.is_none() {
         reasons.insert(format!(
             "exact_cross_scope_{position}_union_canonical_entries_sha256_mismatch_or_missing"
@@ -9635,7 +9731,7 @@ fn validate_unique_work(
     expected: &UniqueWorkExpectation,
     reasons: &mut BTreeSet<String>,
 ) {
-    validate_observed_exact_resource_union(
+    let start_union = validate_observed_exact_resource_union(
         start_checkpoint,
         start_label,
         "start",
@@ -9667,26 +9763,35 @@ fn validate_unique_work(
     // derivation.  A missing or different value makes the evidence
     // unauthoritative rather than proving a product regression.
     for (field, value) in [
-        ("previous_label", start_label),
+        ("previous_label", Some(start_label)),
         (
             "previous_union_sha256",
-            expected.start_union.canonical_entries_sha256.as_str(),
+            start_union
+                .and_then(|union| union.get("canonical_entries_sha256"))
+                .and_then(Value::as_str)
+                .filter(|digest| {
+                    require_sha256(digest, "observed start exact resource union").is_ok()
+                }),
         ),
-        ("current_label", end_label),
+        ("current_label", Some(end_label)),
         (
             "current_union_sha256",
-            expected.target_union.canonical_entries_sha256.as_str(),
+            end_union
+                .and_then(|union| union.get("canonical_entries_sha256"))
+                .and_then(Value::as_str)
+                .filter(|digest| {
+                    require_sha256(digest, "observed target exact resource union").is_ok()
+                }),
         ),
         (
             "partition_derivation",
-            "sorted_DatasetResourceKey_payload_descriptor_three_way_merge",
+            Some("sorted_DatasetResourceKey_payload_descriptor_three_way_merge"),
         ),
     ] {
-        if delta
+        let observed = delta
             .and_then(|delta| delta.get(field))
-            .and_then(Value::as_str)
-            != Some(value)
-        {
+            .and_then(Value::as_str);
+        if value.is_none() || observed != value {
             reasons.insert(format!(
                 "exact_resource_union_delta_{field}_mismatch_or_missing"
             ));
@@ -10486,38 +10591,105 @@ fn validate_sequence_commit_events(
             reasons.insert("phase_durable_gesture_commit_counter_missing".to_owned());
         }
     }
-    for (counter, pointer) in [
-        (
-            "durable_project_revision",
-            "/project_state/revision_high_water_sequence",
-        ),
-        (
-            "undo_history_entry",
-            "/project_state/history_entry_high_water_sequence",
-        ),
-    ] {
-        let start = start_diagnostics.pointer(pointer).and_then(Value::as_u64);
-        let end = end_diagnostics.pointer(pointer).and_then(Value::as_u64);
-        match (start, end) {
-            (Some(start), Some(end)) if end < start => {
-                reasons.insert(format!("phase_{counter}_counter_regressed"));
-            }
-            (Some(start), Some(end)) if end - start == expected_phase_commits => {}
-            (Some(_), Some(_)) => {
-                reasons.insert(format!("product_gate_phase_{counter}_delta_mismatch"));
-            }
-            _ => {
-                reasons.insert(format!("phase_{counter}_counter_missing"));
-            }
+    let start_currentness = start_diagnostics
+        .pointer("/application_state/currentness_generation")
+        .and_then(Value::as_u64);
+    let end_currentness = end_diagnostics
+        .pointer("/application_state/currentness_generation")
+        .and_then(Value::as_u64);
+    match (start_currentness, end_currentness) {
+        (Some(start), Some(end)) if end < start => {
+            reasons.insert("phase_application_currentness_counter_regressed".to_owned());
+        }
+        (Some(start), Some(end)) if end - start == expected_phase_commits => {}
+        (Some(_), Some(_)) => {
+            reasons.insert("product_gate_phase_application_currentness_delta_mismatch".to_owned());
+        }
+        _ => {
+            reasons.insert("phase_application_currentness_counter_missing".to_owned());
         }
     }
     for diagnostics in [start_diagnostics, end_diagnostics] {
         if diagnostics
-            .pointer("/project_state/history_entry_high_water_derivation")
+            .pointer("/application_state/currentness_derivation")
             .and_then(Value::as_str)
-            != Some("one_BoundWorkspace_history_push_per_allocated_durable_revision")
+            != Some("ApplicationSnapshot_currentness_generation")
         {
-            reasons.insert("phase_undo_history_authority_missing".to_owned());
+            reasons.insert("phase_application_currentness_authority_missing".to_owned());
+        }
+    }
+
+    let start_bound = start_diagnostics
+        .pointer("/project_state/bound")
+        .and_then(Value::as_bool);
+    let end_bound = end_diagnostics
+        .pointer("/project_state/bound")
+        .and_then(Value::as_bool);
+    match (start_bound, end_bound) {
+        (Some(true), Some(true)) => {
+            for (counter, pointer) in [
+                (
+                    "durable_project_revision",
+                    "/project_state/revision_high_water_sequence",
+                ),
+                (
+                    "undo_history_entry",
+                    "/project_state/history_entry_high_water_sequence",
+                ),
+            ] {
+                let start = start_diagnostics.pointer(pointer).and_then(Value::as_u64);
+                let end = end_diagnostics.pointer(pointer).and_then(Value::as_u64);
+                match (start, end) {
+                    (Some(start), Some(end)) if end < start => {
+                        reasons.insert(format!("phase_{counter}_counter_regressed"));
+                    }
+                    (Some(start), Some(end)) if end - start == expected_phase_commits => {}
+                    (Some(_), Some(_)) => {
+                        reasons.insert(format!("product_gate_phase_{counter}_delta_mismatch"));
+                    }
+                    _ => {
+                        reasons.insert(format!("phase_{counter}_counter_missing"));
+                    }
+                }
+            }
+            for diagnostics in [start_diagnostics, end_diagnostics] {
+                if diagnostics
+                    .pointer("/project_state/history_entry_high_water_derivation")
+                    .and_then(Value::as_str)
+                    != Some("one_BoundWorkspace_history_push_per_allocated_durable_revision")
+                {
+                    reasons.insert("phase_undo_history_authority_missing".to_owned());
+                }
+            }
+        }
+        (Some(false), Some(false)) => {
+            for diagnostics in [start_diagnostics, end_diagnostics] {
+                let project_state = diagnostics.get("project_state");
+                if [
+                    "current_revision",
+                    "saved_revision",
+                    "revision_high_water_sequence",
+                    "retained_history_entries",
+                    "history_entry_high_water_sequence",
+                ]
+                .into_iter()
+                .any(|field| {
+                    !project_state
+                        .and_then(|project_state| project_state.get(field))
+                        .is_some_and(Value::is_null)
+                }) {
+                    reasons.insert(
+                        "phase_unbound_project_revision_or_history_fact_not_explicit_null"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        (Some(_), Some(_)) => {
+            reasons.insert("phase_project_binding_changed".to_owned());
+        }
+        _ => {
+            reasons.insert("phase_project_binding_fact_missing".to_owned());
         }
     }
     let Some(events) = report.get("events").and_then(Value::as_array) else {
@@ -10943,6 +11115,7 @@ fn is_known_product_gate_reason(reason: &str) -> bool {
             | "product_gate_canonical_cross_section_schema_or_layout_mismatch"
             | "product_gate_canonical_active_view_mismatch"
             | "product_gate_canonical_cross_section_geometry_outside_contract"
+            | "product_gate_phase_time_index_mismatch"
             | "product_gate_current_presentation_generation_mismatch"
             | "product_gate_current_complete_fidelity_false"
             | "product_gate_target_or_displayed_scale_mismatch"
@@ -10957,6 +11130,7 @@ fn is_known_product_gate_reason(reason: &str) -> bool {
             | "product_gate_nonresident_target_resident_target_intersection_mismatch"
             | "product_gate_nonresident_target_nonresident_target_difference_mismatch"
             | "product_gate_phase_durable_gesture_commit_delta_mismatch"
+            | "product_gate_phase_application_currentness_delta_mismatch"
             | "product_gate_phase_durable_project_revision_delta_mismatch"
             | "product_gate_phase_undo_history_entry_delta_mismatch"
             | "product_gate_gesture_sequence_durable_commit_or_sample_delta_mismatch"
@@ -12338,16 +12512,22 @@ mod tests {
                     "samples": 120,
                     "scroll_y_points": -120.0,
                 }),
+                json!({
+                    "command": "await_active_view_gpu_timing",
+                    "target": "three_d",
+                    "pass_kind": "volume",
+                    "timeout_ms": GPU_TIMING_AWAIT_TIMEOUT_MS,
+                }),
             ],
         );
         let schedule = role_schedule_bound("RZ", &script, &profile(), &ip_oracle_scenario())
             .expect("the bounded schedule must be derivable");
-        assert_eq!(schedule.prerequisite_wait_bound_ns, 5_000_000_000);
+        assert_eq!(schedule.prerequisite_wait_bound_ns, 10_000_000_000);
         assert_eq!(schedule.action_duration_bound_ns, 2_000_000_000);
-        assert_eq!(schedule.static_wait_bound_ns, 5_000_000_000);
+        assert_eq!(schedule.static_wait_bound_ns, 10_000_000_000);
         assert_eq!(
             schedule.derived_process_timeout_ns,
-            5_000_000_000
+            10_000_000_000
                 + 2_000_000_000
                 + PROCESS_STARTUP_ADMISSION_GRACE_NS
                 + PROCESS_CLOSEOUT_GRACE_NS
@@ -14293,7 +14473,7 @@ mod tests {
                     "claim_bearing_2ms_gate": true,
                     "qualification_only_automation_overhead_excluded": true,
                     "qualification_only_automation_commands_excluded": [
-                        "sample_diagnostics", "copy_diagnostics"
+                        "sample_diagnostics", "copy_diagnostics", "await_active_view_gpu_timing"
                     ],
                     "subtraction_method": "saturating_subtract_exact_monotonic_elapsed_interval_from_enclosing_ui_callback",
                     "samples": timing_ring(0, &[]),
@@ -14313,7 +14493,7 @@ mod tests {
                     "claim_bearing_2ms_gate": true,
                     "qualification_only_automation_overhead_excluded": true,
                     "qualification_only_automation_commands_excluded": [
-                        "sample_diagnostics", "copy_diagnostics"
+                        "sample_diagnostics", "copy_diagnostics", "await_active_view_gpu_timing"
                     ],
                     "subtraction_method": "saturating_subtract_exact_monotonic_elapsed_interval_from_enclosing_ui_callback",
                     "samples": timing_ring(1, &[2_000_000]),
@@ -14409,6 +14589,51 @@ mod tests {
             &mut reasons,
         );
         assert!(reasons.contains("per_target_gpu_execution_fact_missing_for_current_generation"));
+    }
+
+    #[test]
+    fn gpu_timing_await_is_exactly_before_every_gpu_gated_phase_endpoint() {
+        let commands = vec![
+            json!({ "command": "sample_diagnostics", "label": "start" }),
+            json!({ "command": "camera_zoom_sequence", "samples": 3 }),
+            json!({
+                "command": "await_active_view_gpu_timing",
+                "target": "xy",
+                "pass_kind": "volume",
+                "timeout_ms": GPU_TIMING_AWAIT_TIMEOUT_MS,
+            }),
+            json!({ "command": "sample_diagnostics", "label": "end" }),
+            json!({ "command": "quit" }),
+        ];
+        let scenario = ScriptScenario {
+            id: "RZ".to_owned(),
+            phases: vec![ScriptPhase {
+                name: "resident_3d_zoom".to_owned(),
+                start_diagnostic_label: Some("start".to_owned()),
+                end_diagnostic_label: "end".to_owned(),
+            }],
+            instrumented_script: template(true, commands),
+            instrumentation_control_script: None,
+            cleanup: AttemptCleanup::default(),
+        };
+        let oracle = OracleScenario {
+            id: "RZ".to_owned(),
+            phases: vec![resident_oracle_phase()],
+        };
+        validate_gpu_timing_await_schedule(&scenario, &scenario.instrumented_script, &oracle)
+            .unwrap();
+
+        let mut late = scenario.instrumented_script.clone();
+        late.commands.swap(2, 3);
+        assert!(validate_gpu_timing_await_schedule(&scenario, &late, &oracle).is_err());
+
+        let mut missing = scenario.instrumented_script.clone();
+        missing.commands.remove(2);
+        assert!(validate_gpu_timing_await_schedule(&scenario, &missing, &oracle).is_err());
+
+        let mut wrong_pass = scenario.instrumented_script.clone();
+        wrong_pass.commands[2]["pass_kind"] = json!("plane");
+        assert!(validate_gpu_timing_await_schedule(&scenario, &wrong_pass, &oracle).is_err());
     }
 
     #[test]
@@ -14541,6 +14766,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         json!({
+            "dataset": { "current_time_index": state.time_index },
             "render": { "projection": state.camera.projection.report_label() },
             "camera": {
                 "projection": state.camera.projection.report_label(),
@@ -14580,10 +14806,12 @@ mod tests {
         validate_phase_state_facts(&diagnostics, &state, &numerical_contract(), &mut reasons);
         assert!(reasons.is_empty());
 
+        diagnostics["dataset"]["current_time_index"] = json!(1);
         diagnostics["camera"]["target_world"][0] = json!(0.01);
         diagnostics["cross_section"]["panels"][0]["canonical_plane_geometry"]["source"] =
             json!("derived_copy");
         validate_phase_state_facts(&diagnostics, &state, &numerical_contract(), &mut reasons);
+        assert!(reasons.contains("product_gate_phase_time_index_mismatch"));
         assert!(reasons.contains("product_gate_canonical_camera_geometry_outside_contract"));
         assert!(reasons.contains("canonical_xy_plane_geometry_missing_or_outside_contract"));
     }
@@ -14615,6 +14843,17 @@ mod tests {
         }}});
         let mut reasons = BTreeSet::new();
         validate_phase_script_binding(&report, &template, &phase, &state, &mut reasons);
+        assert!(reasons.is_empty());
+
+        let mut canonical_zero_default = template.clone();
+        canonical_zero_default.commands.remove(3);
+        validate_phase_script_binding(
+            &report,
+            &canonical_zero_default,
+            &phase,
+            &state,
+            &mut reasons,
+        );
         assert!(reasons.is_empty());
 
         template.commands[3]["time_index"] = json!(1);
@@ -14989,8 +15228,80 @@ mod tests {
         validate_unique_work(&start, &end, "start", "end", None, &expected, &mut reasons);
         assert!(reasons.is_empty());
 
+        let mut different_oracle_unions = expected.clone();
+        different_oracle_unions.start_union.canonical_entries_sha256 = "33".repeat(32);
+        different_oracle_unions
+            .target_union
+            .canonical_entries_sha256 = "44".repeat(32);
+        reasons.clear();
+        validate_unique_work(
+            &start,
+            &end,
+            "start",
+            "end",
+            None,
+            &different_oracle_unions,
+            &mut reasons,
+        );
+        assert!(reasons.contains(
+            "product_gate_exact_cross_scope_start_union_canonical_entries_sha256_mismatch"
+        ));
+        assert!(reasons.contains(
+            "product_gate_exact_cross_scope_target_union_canonical_entries_sha256_mismatch"
+        ));
+        assert!(
+            !reasons
+                .contains("exact_resource_union_delta_previous_union_sha256_mismatch_or_missing")
+        );
+        assert!(
+            !reasons
+                .contains("exact_resource_union_delta_current_union_sha256_mismatch_or_missing")
+        );
+
+        let mut misbound_delta = end.clone();
+        misbound_delta["resource_accounting"]["exact_cross_scope_union"]["delta_from_previous_label"]
+            ["current_union_sha256"] = json!("55".repeat(32));
+        reasons.clear();
+        validate_unique_work(
+            &start,
+            &misbound_delta,
+            "start",
+            "end",
+            None,
+            &expected,
+            &mut reasons,
+        );
+        assert!(
+            reasons.contains("exact_resource_union_delta_current_union_sha256_mismatch_or_missing")
+        );
+
+        let mut malformed_start = start.clone();
+        malformed_start["resource_accounting"]["exact_cross_scope_union"]["canonical_entries_sha256"] =
+            json!("not-a-sha256");
+        let mut malformed_bound_end = end.clone();
+        malformed_bound_end["resource_accounting"]["exact_cross_scope_union"]["delta_from_previous_label"]
+            ["previous_union_sha256"] = json!("not-a-sha256");
+        reasons.clear();
+        validate_unique_work(
+            &malformed_start,
+            &malformed_bound_end,
+            "start",
+            "end",
+            None,
+            &expected,
+            &mut reasons,
+        );
+        assert!(reasons.contains(
+            "exact_cross_scope_start_union_canonical_entries_sha256_mismatch_or_missing"
+        ));
+        assert!(
+            reasons
+                .contains("exact_resource_union_delta_previous_union_sha256_mismatch_or_missing")
+        );
+
         end["diagnostics"]["dataset_source_io"]["reader"]["physical_encoded_bytes_read"] =
             json!(12);
+        reasons.clear();
         validate_unique_work(&start, &end, "start", "end", None, &expected, &mut reasons);
         assert!(reasons.contains("unique_work_physical_encoded_bytes_read_delta_outside_oracle"));
 
@@ -15158,7 +15469,12 @@ mod tests {
         }] });
         let start_diagnostics = json!({
             "render": { "display_coordination": { "durable_gesture_commits": 4 } },
+            "application_state": {
+                "currentness_generation": 20,
+                "currentness_derivation": "ApplicationSnapshot_currentness_generation",
+            },
             "project_state": {
+                "bound": true,
                 "revision_high_water_sequence": 10,
                 "retained_history_entries": 7,
                 "history_entry_high_water_sequence": 10,
@@ -15167,7 +15483,12 @@ mod tests {
         });
         let end_diagnostics = json!({
             "render": { "display_coordination": { "durable_gesture_commits": 5 } },
+            "application_state": {
+                "currentness_generation": 21,
+                "currentness_derivation": "ApplicationSnapshot_currentness_generation",
+            },
             "project_state": {
+                "bound": true,
                 "revision_high_water_sequence": 11,
                 "retained_history_entries": 8,
                 "history_entry_high_water_sequence": 11,
@@ -15185,6 +15506,63 @@ mod tests {
             &mut reasons,
         );
         assert!(reasons.is_empty());
+
+        let unbound_start = json!({
+            "render": { "display_coordination": { "durable_gesture_commits": 4 } },
+            "application_state": {
+                "currentness_generation": 20,
+                "currentness_derivation": "ApplicationSnapshot_currentness_generation",
+            },
+            "project_state": {
+                "bound": false,
+                "current_revision": null,
+                "saved_revision": null,
+                "revision_high_water_sequence": null,
+                "retained_history_entries": null,
+                "history_entry_high_water_sequence": null,
+            },
+        });
+        let unbound_end = json!({
+            "render": { "display_coordination": { "durable_gesture_commits": 5 } },
+            "application_state": {
+                "currentness_generation": 21,
+                "currentness_derivation": "ApplicationSnapshot_currentness_generation",
+            },
+            "project_state": {
+                "bound": false,
+                "current_revision": null,
+                "saved_revision": null,
+                "revision_high_water_sequence": null,
+                "retained_history_entries": null,
+                "history_entry_high_water_sequence": null,
+            },
+        });
+        reasons.clear();
+        validate_sequence_commit_events(
+            &report,
+            &template,
+            &phase,
+            &unbound_start,
+            &unbound_end,
+            1,
+            &mut reasons,
+        );
+        assert!(reasons.is_empty());
+
+        let mut invalid_unbound = unbound_end;
+        invalid_unbound["project_state"]["revision_high_water_sequence"] = json!(1);
+        validate_sequence_commit_events(
+            &report,
+            &template,
+            &phase,
+            &unbound_start,
+            &invalid_unbound,
+            1,
+            &mut reasons,
+        );
+        assert!(
+            reasons.contains("phase_unbound_project_revision_or_history_fact_not_explicit_null")
+        );
 
         report["events"][0]["details"]["observed_counter_delta"]["durable_gesture_commits"] =
             json!(0);
