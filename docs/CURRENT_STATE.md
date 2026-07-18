@@ -199,7 +199,7 @@ See [testing](TESTING.md) for commands and claim language.
 The renderer, demand, scheduling, storage-read, capability-restoration, and
 small-tool implementation described above remains the current product
 baseline in the worktree. The complete PR profile passes all 11 policy phases,
-all 8 Rust phases, and 1,230 selected tests on the current dirty worktree. The
+all 8 Rust phases, and 1,246 selected tests on the current dirty worktree. The
 current ignored trusted-Vulkan inventory contains nine renderer cases; its
 exact result will be recorded again on the clean EP-00 baseline revision. Both
 native-window viewer scenarios previously passed.

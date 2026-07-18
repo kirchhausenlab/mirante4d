@@ -491,6 +491,38 @@
     "package_ratio_gates_are_candidate_admission_not_universal_format_guarantees": true,
     "checkpoint_batch_payload_is_separate_from_resident_header_and_read_windows": true
   },
+  "source_currentness_contract": {
+    "source_inventory_scheme": "mirante4d-t5-source-inventory-1",
+    "metadata_generation_scheme": "mirante4d-ep01-metadata-generation-v1",
+    "maximum_entries_per_input": 4096,
+    "stream_buffer_bytes": 65536,
+    "source_input_roles": [
+      "0:representative_package",
+      "1:supporting_temporal_package",
+      "2:import_source"
+    ],
+    "capture_order": [
+      "0:before:representative_package",
+      "1:before:supporting_temporal_package",
+      "2:before:import_source",
+      "3:after:representative_package",
+      "4:after:supporting_temporal_package",
+      "5:after:import_source"
+    ],
+    "capture_boundary_rule": "open_all_three_bound_input_roots_and_complete_capture_ordinals0_through2_after_raw_binding_validation_and_before_any_candidate_build_validation_trace_replay_runtime_GPU_or_import_work_then_complete_both_candidates_every_independent_validation_every_replay_and_IP_work_join_all_workers_close_every_source_handle_and_only_then_recapture_ordinals3_through5_before_source_inventory_sidecar_or_candidate_artifact_closure",
+    "open_and_stream_rule": "resolve_each_bound_root_from_a_held_parent_descriptor_with_openat2_RESOLVE_BENEATH_RESOLVE_NO_SYMLINKS_RESOLVE_NO_MAGICLINKS_open_root_and_descendants_read_only_nofollow_require_regular_file_or_directory_reject_symlink_special_empty_or_more_than4096_traversed_entries_sort_raw_relative_name_bytes_stream_file_contents_in65536_byte_chunks_poll_cancellation_before_each_open_and_after_each_chunk_and_compare_descriptor_and_named_metadata_before_open_after_open_and_after_read",
+    "content_inventory_rule": "use_the_existing_mirante4d_t5_source_inventory_1_domain_then_for_each_regular_file_in_sorted_raw_relative_name_byte_order_hash_name_length_u64_le_name_bytes_file_length_u64_le_and_complete_file_bytes_regular_files_and_source_bytes_are_checked_u64_counts",
+    "metadata_generation_rule": "SHA256_exact_ASCII_mirante4d-ep01-metadata-generation-v1_then_00_root_kind_u8_then_for_root_and_every_descendant_in_sorted_raw_relative_name_byte_order_name_length_u64_le_name_bytes_entry_kind_u8_device_u64_le_inode_u64_le_mode_u32_le_links_u64_le_owner_u32_le_group_u32_le_device_type_u64_le_length_u64_le_modified_seconds_i64_le_modified_nanoseconds_i64_le_changed_seconds_i64_le_changed_nanoseconds_i64_le_and_reject_any_metadata_change_during_capture",
+    "input_binding_rule": "before_and_after_package_inputs_must_each_pass_the_strict_reader_filesystem_closure_and_root_manifest_identity_bound_by_the_workload_and_before_and_after_import_source_content_inventory_regular_files_source_bytes_and_reviewed_source_fingerprint_must_exactly_match_the_bound_workload_import_source_facts",
+    "comparison_rule": "for_each_input_ordinal_compare_before_and_after_root_kind_regular_files_source_bytes_content_inventory_SHA256_metadata_generation_SHA256_manifest_root_SHA256_and_reviewed_source_fingerprint_SHA256_for_exact_equality_any_missing_extra_reordered_or_unequal_fact_is_a_currentness_failure",
+    "source_preservation_commitment_rule": "SHA256_exact_ASCII_mirante4d-ep01-source-preservation-v1_then_00_private_commitment_nonce_raw32_selection_authority_raw32_qualification_profile_contract_raw32_workload_bundle_raw32_script_bundle_raw32_then_each_of_the_six_capture_rows_in_capture_ordinal_order_as_capture_ordinal_u8_phase_tag_u8_input_ordinal_u8_input_role_tag_u8_root_kind_u8_regular_files_u64_le_source_bytes_u64_le_content_inventory_raw32_metadata_generation_raw32_manifest_root_raw32_or32_zero_reviewed_source_fingerprint_raw32_or32_zero",
+    "candidate_package_inventory_rule": "independent_validator_captures_each_closed_candidate_package_immediately_before_and_after_strict_validation_using_the_same_content_and_metadata_generation_algorithms_pre_and_post_facts_must_match_each_other_the_top_level_manifest_root_package_bytes_and_physical_objects_and_the_global_source_inventory_sidecar_SHA256_must_match_the_raw_receipt_binding",
+    "candidate_package_commitment_rule": "SHA256_exact_ASCII_mirante4d-ep01-candidate-package-currentness-v1_then_00_private_commitment_nonce_raw32_selection_authority_raw32_candidate_edge_u32_le_package_role_tag_u8_phase_tag_u8_manifest_root_raw32_regular_files_u64_le_package_bytes_u64_le_content_inventory_raw32_metadata_generation_raw32",
+    "raw_receipt_closure_rule": "the_private_source_inventory_sidecar_is_a_fixed_sibling_of_the_raw_receipt_and_its_selection_authority_qualification_profile_contract_workload_bundle_and_script_bundle_SHA256_values_exactly_match_raw_bindings_its_exact_bytes_hash_to_raw_bindings_source_inventory_sidecar_SHA256_its_recomputed_nonce_blinded_commitment_equals_raw_bindings_and_public_revision_source_preservation_commitment_SHA256_each_build_import_and_package_validation_artifact_repeats_the_sidecar_SHA256_all_artifact_hashes_close_through_the12_entry_manifest_and_the_raw_receipt_closes_through_external_raw_receipt_SHA256",
+    "privacy_rule": "the_source_inventory_sidecar_raw_digests_counts_bytes_metadata_generation_facts_manifest_and_reviewed_source_bindings_and_sidecar_SHA256_remain_external_private_only_the_nonce_blinded_source_preservation_commitment_may_enter_the_public_revision_projection_or_sanitized_receipt_and_no_source_path_or_raw_relative_name_is_serialized_even_privately",
+    "source_access_is_read_only": true,
+    "mismatch_allows_selection_receipt": false
+  },
   "checkpoint_contract": {
     "peak_regular_files": 6,
     "regular_file_roles": [
@@ -612,6 +644,18 @@
       "min_storage_buffer_offset_alignment"
     ],
     "adapter_limit_evidence_rule": "runtime_artifact_adapter_limits_contains_exactly_the_listed_native_wgpu_limit_values_queried_from_the_bound_adapter_and_the_validator_rejects_any_required_binding_count_or_size_above_them_capacity_uses_adapter_limits_max_buffer_size_and_max_storage_buffer_binding_size",
+    "timestamp_period_source_rule": "timestamp_period_f32_bits_is_the_exact_lowercase_hex_encoding_of_the_u32_IEEE754_bits_returned_by_wgpu_Queue_get_timestamp_period_on_the_device_queue_created_from_the_bound_adapter_queried_once_after_device_creation_and_before_any_timestamp_interval_no_profile_environment_or_caller_value_may_supply_or_replace_it_and_both_candidates_must_use_the_same_bound_adapter_query_result",
+    "timestamp_period_bits_rule": "decode_the_eight_lowercase_hex_digits_as_one_big_endian_textual_u32_bit_pattern_then_f32_from_bits_require_sign_bit_zero_value_not_positive_or_negative_zero_exponent_not255_and_value_strictly_greater_than_zero_positive_subnormal_values_are_valid_negative_finite_negative_zero_positive_or_negative_infinity_and_every_quiet_or_signaling_NaN_are_rejected",
+    "timestamp_tick_conversion_rule": "derive_the_period_without_host_floating_arithmetic_for_exponent_E_zero_significand_is_fraction_F_and_binary_shift_is_minus149_for_E_1_through254_significand_is2_pow23_plusF_and_binary_shift_is_E_minus150_delta_is_checked_end_tick_minus_start_tick_and_product_is_checked_u128_delta_times_significand_if_shift_is_nonnegative_reject_shift_at_least64_or_product_greater_than_u64_max_shift_right_shift_else_result_is_product_shift_left_shift_if_shift_is_negative_letK_equal_checked_negation_ifK_at_least128_result_is0_else_denominator_is_u128_1_shift_left_K_quotient_and_remainder_are_exact_product_divmod_denominator_compare_checked_remainder_times2_to_denominator_increment_quotient_only_when_greater_or_when_equal_and_quotient_is_odd_then_require_result_fit_u64_this_is_round_to_nearest_integer_nanosecond_ties_to_even_and_any_tick_underflow_checked_u128_failure_shift_failure_u64_overflow_or_noncanonical_recomputation_is_rejected",
+    "runtime_state_binding_rule": "state_binding_SHA256_equals_SHA256_exact_ASCII_mirante4d-ep01-runtime-state-binding-v1_then_00_qualification_profile_contract_raw32_selection_authority_raw32_workload_bundle_raw32_script_bundle_raw32_oracle_bundle_raw32_projection_input_sidecar_raw32_candidate_edge_u32_le_package_role_tag_u8_trace_family_tag_u8_state_ordinal_u64_le_protocol_sample_ordinal_u64_le_within_state_observation_ordinal_u64_le_display_batch_generation_u64_le_pass_kind_tag_u8_target_view_ordinal_u32_le_renderer_variant_ordinal_u32_le_canonical_invocation_record_length_u64_le_canonical_invocation_record_bytes_the_record_is_independently_recomputed_from_the_exact_workload_script_oracle_projection_state_and_contains_the_current_generation_target_view_pass_and_complete_timing_scope",
+    "runtime_execution_binding_rule": "each_execution_binding_SHA256_equals_SHA256_exact_ASCII_mirante4d-ep01-runtime-execution-binding-v1_then_00_state_binding_raw32_ticket_domain_tag_u8_execution_ticket_u64_le_execution_role_tag_u8_GPU_start_ticks_u64_le_GPU_end_ticks_u64_le_input_or_interval_start_monotonic_ns_u64_le_presentation_or_interval_end_monotonic_ns_u64_le_absent_GPU_or_monotonic_pair_is_encoded_as_two_u64_zeros_the_independent_validator_recomputes_every_binding_and_rejects_ticket_state_pass_target_role_or_raw_endpoint_transplant",
+    "timestamp_derived_sample_paths": [
+      "absolute_gates.maximum_plane_gpu_ns",
+      "absolute_gates.maximum_mip_gpu_ns",
+      "absolute_gates.maximum_dvr_gpu_ns",
+      "absolute_gates.maximum_iso_gpu_ns"
+    ],
+    "timestamp_control_subtraction_rule": "each_runtime_sample_for_an_exact_timestamp_derived_gate_path_has_one_nonnull_timestamp_control_pair_bound_to_the_same_state_with_two_distinct_contiguous_execution_tickets_and_declared_execution_order_convert_measured_and_control_tick_deltas_independently_by_the_exact_period_rule_sample_numerator_is_checked_max_measured_ns_minus_control_ns_or_zero_denominator1_and_every_other_runtime_sample_has_timestamp_control_pair_null_diagnostic_aggregate_rows_are_recomputed_from_diagnostic_variants_instead",
     "runtime_sample_allowed_paths": [
       "every_gate_observation_contract_registry_authority_path_whose_primitive_source_mapping_allows_runtime_gpu",
       "diagnostics.pipeline_compile_startup_ns",
@@ -619,9 +663,40 @@
       "diagnostics.variant_direct_kernel_gpu_ns",
       "diagnostics.variant_end_to_end_ns"
     ],
-    "runtime_sample_population_rule": "runtime_samples_are_sorted_strictly_by_metric_path_UTF8_bytes_then_exact_primitive_tie_key_and_contain_no_duplicates_or_extras_for_gate_paths_there_is_a_bijection_with_every_primitive_observation_source_commitment_of_kind_runtime_gpu_and_the_sample_tie_key_numerator_denominator_unit_and_source_pointer_must_match_exactly_non_gate_rows_are_exactly_six_pipeline_compile_startup_rows_six_shader_memory_rows_and_one_direct_kernel_plus_one_end_to_end_row_for_each_unique_bound_renderer_variant_the_independent_validator_recomputes_the_expected_population_from_the_workload_script_oracle_projection_sidecar_embedded_pipeline_manifest_and_gate_observations_streams_until_expected_count_plus1_and_rejects_missing_or_extra_rows",
+    "runtime_sample_population_rule": "runtime_samples_are_sorted_strictly_by_metric_path_UTF8_bytes_then_exact_primitive_tie_key_and_contain_no_duplicates_or_extras_for_gate_paths_there_is_a_bijection_with_every_primitive_observation_source_commitment_of_kind_runtime_gpu_and_the_sample_tie_key_numerator_denominator_unit_source_pointer_and_required_timestamp_control_pair_must_match_exactly_non_gate_rows_are_exactly_six_pipeline_compile_startup_rows_six_shader_memory_rows_and_one_direct_kernel_plus_one_end_to_end_aggregate_row_for_each_unique_bound_renderer_variant_instrumentation_overhead_pairs_are_sorted_by_exact_tie_key_with_contiguous_pair_and_execution_ticket_ordinals_and_biject_every_bound_control_pair_the_independent_validator_recomputes_all_expected_populations_from_the_workload_script_oracle_projection_sidecar_embedded_pipeline_manifest_and_gate_observations_streams_each_array_until_expected_count_plus1_and_rejects_missing_extra_duplicate_or_reordered_rows",
     "runtime_variant_identity_rule": "bound_renderer_variant_is_pipeline_tag0_plane_1_MIP_2_DVR_or3_ISO_then_dtype_tag0_u8_1_u16_2_f32_then_sampling_tag0_nearest_1_smooth_linear_then_validity_tag0_all_valid_1_mixed_2_all_invalid_then_positive_layer_count_u32_enumerate_every_renderer_invocation_in_the_exact_ordered_workload_plus_the_fixed_exact64_layer_general_fallback_verification_invocations_require_each_dtype_sampling_validity_and_every_observed_common_plane_or_volume_layer_count_to_appear_sort_and_deduplicate_by_that_typed_tuple_and_assign_variant_ordinal_contiguously_from_zero",
-    "runtime_non_gate_diagnostic_rule": "pipeline_rows_use_sentinel_tie_package_role_tag255_trace_family_tag255_state_ordinal_pipeline_tag_protocol_sample_ordinal_u64_max_within_state0_variant_rows_use_the_same_sentinels_with_state_ordinal_variant_ordinal_pipeline_compile_startup_unit_is_exactly_nanoseconds_and_numerator_is_monotonic_nanoseconds_from_pipeline_create_entry_through_first_completed_warm_execution_in_its_fresh_isolated_subprocess_denominator1_shader_memory_unit_is_exactly_bytes_and_numerator_is_maximum_of_zero_and_peak_process_RSS_minus_quiescent_precreate_RSS_bytes_during_that_same_subprocess_denominator1_each_variant_uses100_paired_trials_in25_ABBA_blocks_after_warmup_with_identical_resident_inputs_and_validated_GPU_intervals_both_variant_path_units_are_exactly_nanoseconds_direct_kernel_numerator_is_selected_direct_nearest_rank_p95_GPU_nanoseconds_denominator_is_mixed_fallback_p95_and_must_be_strictly_less_end_to_end_numerator_is_selected_direct_nearest_rank_p95_input_to_complete_presentation_nanoseconds_denominator_is_mixed_fallback_p95_and_must_be_less_than_or_equal_any_missing_invalid_or_nonconforming_variant_diagnostic_invalidates_candidate_execution_before_a_selection_receipt_pipeline_startup_and_shader_memory_are_recorded_without_a_selection_threshold",
+    "runtime_variant_state_rule": "for_each_variant_choose_the_lexicographically_first_bound_renderer_invocation_by_package_role_tag_trace_family_tag_state_ordinal_protocol_sample_ordinal_within_state_observation_ordinal_commit_the_complete_canonical_invocation_state_bytes_and_use_that_exact_fully_resident_input_for_every_warmup_and_measured_execution_of_both_arms",
+    "runtime_diagnostic_protocol": {
+      "maximum_variants": 256,
+      "maximum_canonical_variant_bytes": 98304,
+      "warmup_abba_blocks_per_variant": 1,
+      "warmup_pairs_per_variant": 4,
+      "measured_abba_blocks_per_variant": 25,
+      "pairs_per_abba_block": 4,
+      "measured_pairs_per_variant": 100,
+      "observations_per_arm_per_variant": 100,
+      "executions_per_pair": 2,
+      "execution_tickets_per_variant": 208,
+      "first_arm_order_within_block": [
+        "selected_direct",
+        "mixed_fallback",
+        "mixed_fallback",
+        "selected_direct"
+      ],
+      "p95_population_size": 100,
+      "p95_nearest_rank_one_based": 95,
+      "p95_zero_based_sorted_index": 94,
+      "aggregate_metric_paths": [
+        "diagnostics.variant_direct_kernel_gpu_ns",
+        "diagnostics.variant_end_to_end_ns"
+      ],
+      "execution_ticket_domain": "diagnostic_variant_execution_ticket_domain_is_typed_and_disjoint_from_instrumentation_overhead_execution_tickets",
+      "row_order_rule": "diagnostic_variants_are_sorted_by_contiguous_variant_ordinal_matching_the_exact_variant_tuple_each_warmup_or_measured_array_is_in_contiguous_pair_ordinal_order_block_ordinal_equals_pair_ordinal_div4_pair_ordinal_within_block_equals_pair_ordinal_mod4_first_arm_follows_selected_direct_mixed_fallback_mixed_fallback_selected_direct_and_second_arm_is_the_other_arm_diagnostic_execution_ticket_equals_checked_variant_ordinal_times208_plus_local_ticket_with_warmup_local_tickets0_through7_then_measured8_through207_in_actual_execution_order",
+      "population_rule": "each_pair_contains_exactly_one_selected_direct_and_one_mixed_fallback_execution_with_raw_GPU_start_end_ticks_and_raw_input_start_presentation_complete_monotonic_nanoseconds_warmup_has_exactly4_pairs_and_is_never_in_a_metric_population_measured_has_exactly100_pairs_so_the_four_populations_selected_GPU_fallback_GPU_selected_end_to_end_and_fallback_end_to_end_each_have_exactly100_values_no_retry_repeat_drop_timeout_filter_outlier_rejection_or_substitute_execution_is_allowed",
+      "p95_rule": "for_each_of_the_four_measured_populations_derive_GPU_nanoseconds_only_with_the_exact_timestamp_period_rational_rule_and_end_to_end_nanoseconds_by_checked_presentation_complete_minus_input_start_sort_by_derived_nanoseconds_then_measured_pair_ordinal_take_zero_based_index94_selected_direct_GPU_p95_and_mixed_fallback_GPU_p95_must_exactly_equal_the_direct_kernel_aggregate_sample_numerator_and_denominator_selected_direct_end_to_end_p95_and_mixed_fallback_end_to_end_p95_must_exactly_equal_the_end_to_end_aggregate_sample_numerator_and_denominator_direct_GPU_must_be_strictly_less_and_direct_end_to_end_must_be_less_than_or_equal",
+      "failure_rule": "any_missing_extra_duplicate_reordered_noncontiguous_mismatched_state_or_ticket_nonpositive_raw_interval_invalid_timestamp_conversion_overflow_or_aggregate_disagreement_invalidates_the_candidate_before_any_selection_receipt"
+    },
+    "runtime_non_gate_diagnostic_rule": "pipeline_rows_use_sentinel_tie_package_role_tag255_trace_family_tag255_state_ordinal_pipeline_tag_protocol_sample_ordinal_u64_max_within_state0_variant_aggregate_rows_use_the_same_sentinels_with_state_ordinal_variant_ordinal_pipeline_compile_startup_unit_is_nanoseconds_from_monotonic_pipeline_create_entry_through_first_completed_warm_execution_in_its_fresh_isolated_subprocess_denominator1_shader_memory_unit_is_bytes_and_numerator_is_maximum_zero_or_peak_process_RSS_minus_quiescent_precreate_RSS_during_that_subprocess_denominator1_variant_aggregate_rows_are_only_the_independently_recomputed_p95_ratios_defined_by_runtime_diagnostic_protocol_pipeline_startup_and_shader_memory_have_no_selection_threshold",
     "capacity_rule": "allocate_one_unconditional_shared_four_byte_zero_dummy_buffer_live_page_cap_equals_positive_qualification_profile_resources_max_queued_requests_and_must_be_at_most_u32_max_minus1_page_record_capacity_equals_live_page_cap_directory_capacity_is_the_unique_smallest_power_of_two_at_least_checked_two_times_live_page_cap_and_must_be_at_most_two_pow31_persistent_nonpayload_bytes_equals_exact_allocated_directory_capacity_times32_plus_page_capacity_times64_plus_bound_harness_frame_hot_pick_bytes_plus_exactly4_dummy_bytes_resource_ceiling_equals_floor_qualification_max_gpu_resident_bytes_times8000_div10000_arena_available_equals_floor_to_multiple_of4_of_checked_resource_ceiling_minus_persistent_nonpayload_bytes_segment_limit_equals_floor_to_multiple_of4_of_minimum_adapter_max_buffer_size_adapter_max_storage_buffer_binding_size_and4294967292_total_arena_bytes_equals_minimum_arena_available_and_checked_four_times_segment_limit_segment_count_equals_unique_ceiling_total_arena_bytes_divsegment_limit_in_one_through4_for_segments_zero_through_count_minus2_bytes_equals_segment_limit_last_segment_bytes_equals_total_arena_bytes_minus_checked_segment_count_minus1_times_segment_limit_and_must_be_1_through_segment_limit_all_are_preallocated_and_every_unused_binding_reuses_the_one_dummy_buffer_any_underflow_zero_capacity_or_overlimit_fails_candidate",
     "directory_slot_fields": [
       "0:runtime_generation_id_u32",
@@ -682,6 +757,7 @@
     "validation_resource_contract": {
       "maximum_candidate_artifact_bytes": 67108864,
       "maximum_projection_input_sidecar_bytes": 67108864,
+      "maximum_source_inventory_sidecar_bytes": 67108864,
       "maximum_raw_receipt_bytes": 67108864,
       "maximum_public_projection_bytes": 67108864,
       "maximum_sanitized_receipt_bytes": 67108864,
@@ -690,10 +766,13 @@
       "maximum_schema_document_bytes": 1048576,
       "maximum_variable_array_items": 262144,
       "maximum_layout_fields_per_binding": 256,
+      "maximum_diagnostic_variants": 256,
+      "maximum_canonical_diagnostic_variant_bytes": 98304,
+      "maximum_instrumentation_overhead_pairs": 8192,
       "maximum_ascii_bytes": 512,
       "file_admission_rule": "before_hash_or_parse_resolve_from_the_already_opened_canonical_parent_with_no_symlink_traversal_open_nofollow_require_exactly_one_regular_file_read_metadata_from_the_open_descriptor_reject_size_above_the_role_limit_and_stream_at_most_limit_plus1_bytes_without_preallocating_from_untrusted_size",
       "stream_validation_rule": "hash_and_strict_schema_validate_incrementally_with_bounded_buffers_poll_cancellation_before_open_after_each65536_input_bytes_and_after_each_array_item_never_materialize_a_variable_population_and_abort_immediately_on_limit_schema_hash_population_or_canonical_encoding_failure",
-      "population_limit_rule": "projection_records_runtime_samples_and_primitive_observations_equal_their_independently_recomputed_protocol_populations_layout_fields_equal_the_embedded_manifest_population_each_validator_stops_at_expected_count_plus1_and_all_arrays_must_also_respect_their_schema_maxItems_and_enclosing_67108864_byte_limit"
+      "population_limit_rule": "projection_records_runtime_samples_instrumentation_overhead_pairs_diagnostic_variants_and_primitive_observations_equal_their_independently_recomputed_protocol_populations_source_inventory_captures_equal_exactly6_layout_fields_equal_the_embedded_manifest_population_each_validator_stops_at_expected_count_plus1_before_writing_or_allocating_fails_if_expected_variants_exceed256_instrumentation_pairs_exceed8192_or_one_canonical_variant_exceeds98304_bytes_and_all_arrays_must_also_respect_their_schema_maxItems_and_enclosing_67108864_byte_limit"
     },
     "raw_receipt_fields": [
       "schema",
@@ -733,10 +812,10 @@
     "gate_reason_codes": [
       "EP01-Gnnn-comparison-failed"
     ],
-    "completion_rule": "both_candidates_must_complete_two_packages_all_eight_ordered_and_unique_traces_all_74_valid_observations_and_rows_and_all_12_closed_artifacts_before_either_candidate_pass_or_selection_is_computed_any_invalid_observation_permits_only_failure_receipt",
+    "completion_rule": "the_global_six_capture_source_inventory_sidecar_then_both_candidates_two_packages_all_eight_ordered_and_unique_traces_all_74_valid_observations_and_rows_and_all_12_closed_artifacts_must_complete_and_close_before_either_candidate_pass_or_selection_is_computed_any_source_or_candidate_package_currentness_mismatch_or_invalid_observation_permits_only_failure_receipt",
     "private_commitment_nonce_rule": "generate_exactly32_bytes_from_the_operating_system_cryptographic_random_source_immediately_at_harness_process_start_before_repository_or_external_binding_validation_require_success_and_reject_all_zero_encode_as_64_lowercase_hex_use_one_nonce_for_the_whole_run_and_both_candidates_write_it_only_to_raw_bindings_or_the_private_failure_evidence_envelope_never_to_any_public_projection_sanitized_receipt_or_failure_receipt_and_never_reuse_it_for_another_run_the_nonce_blinds_public_commitments_but_does_not_enter_trace_identity_or_candidate_selection_arithmetic",
     "selection_recompute_rule": "candidate_pass_is_all_74_rows_passed_selection_is_32_if_32_pass_else_64_if_64_pass_else_null_and_any_other_value_rejects",
-    "closure_rule": "construct_and_sync_12_artifacts_then_both_raw_candidates_then_the_public_projection_and_its_hash_then_raw_receipt_and_its_hash_then_sanitized_receipt_artifact_manifest_excludes_raw_receipt_public_projection_sanitized_receipt_and_failure_receipt_independent_validator_recomputes_packages_artifacts_traces_observations_rows_candidate_pass_selection_projection_and_every_hash_link",
+    "closure_rule": "complete_the_global_source_currentness_sandwich_construct_and_sync_the_private_source_inventory_sidecar_then_construct_and_sync_12_artifacts_then_both_raw_candidates_then_the_public_projection_and_its_hash_then_raw_receipt_and_its_hash_then_sanitized_receipt_artifact_manifest_excludes_source_inventory_sidecar_raw_receipt_public_projection_sanitized_receipt_and_failure_receipt_independent_validator_recomputes_source_and_candidate_package_currentness_timestamp_and_diagnostic_populations_packages_artifacts_traces_observations_rows_candidate_pass_selection_projection_and_every_hash_link",
     "incomplete_rule": "interruption_abort_missing_observation_or_candidate_failure_to_execute_may_preserve_external_partial_artifacts_and_emit_only_failure_receipt_never_a_raw_or_sanitized_selection_receipt",
     "sanitized_fields": [
       "repository_revision_clean_tree_selection_authority_sha256_and_qualification_binding_verified",
@@ -744,6 +823,7 @@
       "trace_family_tag_name_and_ordered_unique_digests_without_counts",
       "gate_ordinal_id_path_comparator_unit_limit_pass_reason_and_raw_row_commitment_without_operands",
       "external_raw_candidate_sha256_and_candidate_pass",
+      "nonce_blinded_source_preservation_commitment",
       "selection",
       "external_raw_receipt_sha256"
     ],
@@ -761,6 +841,10 @@
       "geometry_shard_coordinates_or_unpublished_source_metadata",
       "projection_input_sidecar_digest_or_values",
       "private_commitment_nonce_256",
+      "source_inventory_sidecar_digest_or_raw_capture_facts",
+      "candidate_package_currentness_raw_facts_or_commitments",
+      "raw_diagnostic_trial_or_timestamp_control_pair_rows",
+      "raw_instrumentation_control_pair_rows",
       "raw_failure_details"
     ],
     "receipt_schema_grammar": {
@@ -866,7 +950,9 @@
           "workload_bundle_sha256:sha256",
           "script_bundle_sha256:sha256",
           "oracle_bundle_sha256:sha256",
-          "projection_input_sidecar_sha256:sha256"
+          "projection_input_sidecar_sha256:sha256",
+          "source_inventory_sidecar_sha256:sha256",
+          "source_preservation_commitment_sha256:sha256"
         ],
         "raw_package": [
           "role_tag:u8",
@@ -929,7 +1015,8 @@
           "repository_revision:git_oid",
           "clean_tree:const<true>",
           "selection_authority_sha256:sha256",
-          "qualification_binding_verified:const<true>"
+          "qualification_binding_verified:const<true>",
+          "source_preservation_commitment_sha256:sha256"
         ],
         "public_trace": [
           "family_tag:u8",
@@ -1020,30 +1107,45 @@
       "failure_projection_rule": "failure_receipt_revision_repository_revision_clean_tree_and_selection_authority_stage_candidate_edge_package_role_gate_id_and_reason_code_must_exactly_equal_the_private_envelope_fields_external_failure_evidence_SHA256_must_equal_the_domain_separated_blinded_envelope_hash_and_selection_must_be_null",
       "privacy_rule": "envelope_and_nonce_remain_external_private_only_the_domain_separated_external_failure_evidence_sha256_is_serialized_in_the_public_failure_receipt"
     },
+    "source_inventory_schema_binding": {
+      "payload_schema": "mirante4d-viewer-performance-ep01-source-inventory-evidence-1",
+      "schema_path": "verification/schemas/viewer-performance-ep01-source-inventory.schema.json",
+      "schema_sha256": "6ef32dcbd502dad6cca504876e7ffdbdc1438b85741dd4ac73ec100b98310249",
+      "common_schema_path": "verification/schemas/viewer-performance-ep01-common.schema.json",
+      "common_schema_sha256": "0ec35918eed8268bac28cef45e598e48583ca2761f40489fcd4d010569bbe09f",
+      "canonical_encoding": "restricted_JCS",
+      "unknown_or_missing_fields_rejected": true,
+      "private_source_inventory_relative_path": "source-inventory.jcs",
+      "locator_and_publication_rule": "inside_the_private_evidence_bundle_resolve_the_fixed_source_inventory_jcs_sibling_against_the_held_canonical_parent_descriptor_without_symlink_traversal_create_exactly_once_with_O_WRONLY_O_CREAT_O_EXCL_O_CLOEXEC_O_NOFOLLOW_mode0600_require_open_descriptor_fstat_regular_file_nlink_exactly1_and_permission_bits_exactly0600_write_complete_canonical_bytes_file_sync_close_then_parent_directory_sync_before_raw_receipt_publication_before_initial_hash_parse_or_any_retained_audit_reopen_open_read_only_nofollow_from_the_same_held_parent_require_regular_nlink1_mode0600_and_the_same_device_inode_size_and_metadata_generation_before_and_after_the_bounded_read_reject_any_currentness_change_retain_immutably_for_audit_and_never_copy_the_private_sibling_when_copying_the_public_sanitized_receipt",
+      "capture_order_rule": "captures_are_exactly_ordinals0_through5_mapping_before_inputs0_1_2_then_after_inputs0_1_2_with_roles_representative_package_supporting_temporal_package_import_source_phase_tags0_0_0_1_1_1",
+      "comparison_rule": "independent_validator_recomputes_each_capture_from_the_held_read_only_root_and_bound_authorities_requires_positive_regular_file_and_byte_counts_exact_package_or_import_bindings_and_exact_equality_of_every_before_after_fact_for_each_input",
+      "raw_receipt_closure_rule": "exact_sidecar_SHA256_and_recomputed_source_preservation_commitment_match_raw_bindings_the_commitment_matches_public_revision_and_build_import_plus_package_validation_artifacts_repeat_the_sidecar_SHA256",
+      "privacy_rule": "sidecar_and_its_SHA256_remain_external_private_only_the_nonce_blinded_source_preservation_commitment_is_public"
+    },
     "artifact_schema_bindings": [
       {
         "logical_role_tag": 0,
         "logical_role": "package_validation",
         "payload_schema": "mirante4d-viewer-performance-ep01-package-validation-evidence-1",
         "schema_path": "verification/schemas/viewer-performance-ep01-package-validation.schema.json",
-        "schema_sha256": "662e4ce29633ccb6291ccf1772d673f795eeff57e0fdc77cb1b95dabb2076bad",
+        "schema_sha256": "712a43e554b1050e1c71f1f50f014920be02e2732e0fedf75eeb9766f663ed4b",
         "canonical_encoding": "restricted_JCS",
         "unknown_or_missing_fields_rejected": true,
         "artifact_cardinality": 4,
         "package_role_rule": "required_exactly_role_tag0_then1_within_each_candidate",
-        "payload_array_order_rule": "candidate_edge32_then64_and_within_candidate_package_role_representative_then_supporting_temporal_storage_facts_and_checks_are_schema_field_order_independent"
+        "payload_array_order_rule": "candidate_edge32_then64_and_within_candidate_package_role_representative_then_supporting_temporal_each_payload_source_inventory_sidecar_SHA256_matches_raw_bindings_and_package_currentness_pre_post_facts_commitments_are_validator_recomputed_storage_facts_and_checks_are_schema_field_order_independent"
       },
       {
         "logical_role_tag": 1,
         "logical_role": "build_import_accounting",
         "payload_schema": "mirante4d-viewer-performance-ep01-build-import-evidence-1",
         "schema_path": "verification/schemas/viewer-performance-ep01-build-import.schema.json",
-        "schema_sha256": "11fc75e9a8ee024d8f3cfdd41d57619e0631f5e3c0f92af39316c87e22a61889",
+        "schema_sha256": "cd44a45dcc6b67aca87013bd2c25c60b311243375d7f3dfd46715eb1a0e6da26",
         "canonical_encoding": "restricted_JCS",
         "unknown_or_missing_fields_rejected": true,
         "artifact_cardinality": 2,
         "package_role_rule": "artifact_manifest_package_role_null_payload_roles_exactly_role_tag0_then1",
-        "payload_array_order_rule": "candidate_edge32_then64_and_each_payload_roles_representative_then_supporting_temporal"
+        "payload_array_order_rule": "candidate_edge32_then64_and_each_payload_roles_representative_then_supporting_temporal_with_source_inventory_sidecar_SHA256_matching_raw_bindings"
       },
       {
         "logical_role_tag": 2,
@@ -1062,12 +1164,12 @@
         "logical_role": "runtime_gpu",
         "payload_schema": "mirante4d-viewer-performance-ep01-runtime-gpu-evidence-1",
         "schema_path": "verification/schemas/viewer-performance-ep01-runtime-gpu.schema.json",
-        "schema_sha256": "07a272fdc3ba0ce59f58cf4ed202aa694e6d33040dd57a5c2279f7a8ee7526f3",
+        "schema_sha256": "70dcb1054530f4499dd7d3d63ad8d1e2af8415a8004a233e68efc7d378c26d1b",
         "canonical_encoding": "restricted_JCS",
         "unknown_or_missing_fields_rejected": true,
         "artifact_cardinality": 2,
         "package_role_rule": "artifact_manifest_package_role_null",
-        "payload_array_order_rule": "candidate_edge32_then64_shader_modules_exactly_pipeline_tag0_plane_1_mip_2_dvr_3_iso_4_mixed_5_pick_layout_bindings_exactly_group0_binding0_group0_binding1_group2_binding0_group2_binding1_each_fields_field_ordinal_from0_segment_bytes_segment_index_order_and_samples_metric_path_then_tie_key"
+        "payload_array_order_rule": "candidate_edge32_then64_shader_modules_exactly_pipeline_tag0_plane_1_mip_2_dvr_3_iso_4_mixed_5_pick_layout_bindings_exactly_group0_binding0_group0_binding1_group2_binding0_group2_binding1_each_fields_field_ordinal_from0_segment_bytes_segment_index_order_instrumentation_pairs_tie_key_order_diagnostic_variants_variant_ordinal_order_and_samples_metric_path_then_tie_key"
       },
       {
         "logical_role_tag": 4,
@@ -1086,11 +1188,17 @@
       "external_raw_gate_sha256": "SHA256_exact_ASCII_mirante4d-ep01-raw-gate-v2_then_00_private_commitment_nonce_raw32_selection_authority_raw32_candidate_edge_u32_le_gate_ordinal_u32_le_exact_canonical_raw_gate_bytes",
       "external_raw_candidate_sha256": "SHA256_exact_ASCII_mirante4d-ep01-raw-candidate-v2_then_00_private_commitment_nonce_raw32_selection_authority_raw32_candidate_edge_u32_le_exact_canonical_raw_candidate_bytes",
       "external_failure_evidence_sha256": "SHA256_exact_ASCII_mirante4d-ep01-private-failure-v1_then_00_private_commitment_nonce_raw32_exact_canonical_private_failure_evidence_envelope_bytes",
+      "source_preservation_commitment_sha256": "exactly_source_currentness_contract.source_preservation_commitment_rule",
       "sanitized_projection_sha256": "plain_SHA256_of_exact_canonical_public_projection_bytes",
       "external_raw_receipt_sha256": "plain_SHA256_of_exact_canonical_raw_receipt_bytes",
       "artifact_sha256": "plain_SHA256_of_exact_artifact_bytes",
       "construction_order": [
         "generate_private_commitment_nonce_at_process_start",
+        "complete_source_inventory_before_captures_0_through_2",
+        "complete_both_candidates_all_validation_replay_import_and_joined_read_only_source_work",
+        "complete_source_inventory_after_captures_3_through_5",
+        "compute_nonce_blinded_source_preservation_commitment",
+        "construct_close_and_sync_private_source_inventory_sidecar",
         "close_and_sync_all_12_artifacts",
         "construct_both_raw_candidates_and_each_raw_gate_commitment",
         "compute_both_external_raw_candidate_sha256_values",
@@ -1109,6 +1217,7 @@
         "emit_no_raw_selection_or_sanitized_selection_receipt"
       ],
       "artifact_manifest_excludes": [
+        "source_inventory_sidecar",
         "raw_receipt",
         "public_projection",
         "sanitized_receipt",
@@ -1123,6 +1232,7 @@
       "clean_tree",
       "selection_authority_sha256",
       "qualification_binding_verified",
+      "source_preservation_commitment_sha256",
       "candidate_edge",
       "trace_family_tag_and_name",
       "ordered_and_unique_trace_digests",
@@ -1146,6 +1256,10 @@
       "geometry_or_shard_facts",
       "projection_input_sidecar_digest_or_values",
       "private_commitment_nonce_256",
+      "source_inventory_sidecar_digest_or_raw_capture_facts",
+      "candidate_package_currentness_raw_facts_or_commitments",
+      "raw_diagnostic_trial_or_timestamp_control_pair_rows",
+      "raw_instrumentation_control_pair_rows",
       "raw_failure_details"
     ],
     "public_receipt_serializes_private_geometry": false,
@@ -1254,7 +1368,14 @@
       "per_bound_pair_numerator": "instrumented_ns_gt_control_ns_question_instrumented_ns_minus_control_ns_else_0",
       "per_bound_pair_denominator": "control_ns",
       "control_must_be_positive": true,
-      "aggregation": "greatest_ratio_then_primitive_observation_tie_key"
+      "aggregation": "greatest_ratio_then_primitive_observation_tie_key",
+      "maximum_raw_pairs": 8192,
+      "raw_pair_population_rule": "runtime_GPU_artifact_contains_exactly_one_raw_pair_for_every_bound_instrumentation_control_pair_recomputed_from_the_workload_and_script_no_missing_extra_retry_drop_filter_or_substitute_pair_allowed",
+      "raw_pair_order_rule": "sort_strictly_by_primitive_observation_tie_key_assign_pair_ordinal_contiguously_from_zero_and_assign_two_distinct_contiguous_execution_tickets_in_actual_declared_instrumented_then_control_or_control_then_instrumented_order",
+      "execution_ticket_domain": "instrumentation_overhead_execution_ticket_domain_is_typed_and_disjoint_from_diagnostic_variant_execution_tickets",
+      "raw_pair_arithmetic_rule": "derive_instrumented_ns_and_control_ns_by_checked_monotonic_end_minus_start_require_both_positive_primitive_numerator_is_checked_instrumented_ns_minus_control_ns_when_instrumented_is_greater_else0_denominator_is_exact_control_ns_and_EP01_G025_selects_the_greatest_exact_ratio_then_tie_key_without_rounded_intermediate",
+      "raw_pair_source_rule": "each_pair_state_binding_SHA256_and_tie_key_must_bit_match_the_bound_control_protocol_state_and_the_G025_primitive_source_pointer_must_address_that_exact_runtime_GPU_raw_pair",
+      "invalid_pair_allows_selection_receipt": false
     },
     "invalid_observation_behavior": {
       "selection_receipt_allowed": false,

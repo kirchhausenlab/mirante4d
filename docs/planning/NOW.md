@@ -44,7 +44,7 @@ when a read-only audit found that the EP-01 selection authority did not yet
 freeze byte-exact candidate identity, package, checkpoint, ordered-trace,
 GPU-lookup, gate-operand, and receipt contracts. Its partial evidence is
 preserved as interrupted evidence and is not reused. The version-3 authority
-and its eight hash-bound evidence schemas are now strict, bounded, and
+and its nine hash-bound evidence schemas are now strict, bounded, and
 internally validated. The immediate next action is to land that correction and
 its rotated opaque profile authority as one clean immutable revision, bind the
 private profile to that exact revision, and rerun the complete predecessor

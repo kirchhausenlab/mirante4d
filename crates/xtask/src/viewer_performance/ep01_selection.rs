@@ -14,6 +14,9 @@ const FAILURE_EVIDENCE_SCHEMA_BYTES: &[u8] = include_bytes!(
 const PROJECTION_INPUT_SCHEMA_BYTES: &[u8] = include_bytes!(
     "../../../../verification/schemas/viewer-performance-ep01-projection-input.schema.json"
 );
+const SOURCE_INVENTORY_SCHEMA_BYTES: &[u8] = include_bytes!(
+    "../../../../verification/schemas/viewer-performance-ep01-source-inventory.schema.json"
+);
 const PACKAGE_VALIDATION_SCHEMA_BYTES: &[u8] = include_bytes!(
     "../../../../verification/schemas/viewer-performance-ep01-package-validation.schema.json"
 );
@@ -31,9 +34,9 @@ const GATE_OBSERVATION_SCHEMA_BYTES: &[u8] = include_bytes!(
 const AUTHORITY_SCHEMA: &str = "mirante4d-viewer-performance-ep01-selection-authority";
 const AUTHORITY_SCHEMA_VERSION: u64 = 3;
 const COMMITTED_AUTHORITY_SHA256: &str =
-    "788dc8881ce53f768c8837bccadbbb7ce653d30aec1b6abf928e481a6055d1d9";
+    "bcba48d78e0e522527136e90fa54ef28fb513feb8154d5ea1157ec9ab8ee4314";
 const COMMITTED_AUTHORITY_SEMANTIC_SHA256: &str =
-    "95618ab0d195c8a22b2e4270dcdd9a40d8f1e0cd8006f815efa8bbfffb5cdb96";
+    "7d2f2906650e7c81d02be5e447d9c345f836d0ab1b5df0c80b0227319face9b7";
 
 const GEOMETRY_AUTHORITIES: [&str; 4] = [
     "mirante4d-viewer-performance-workload-bundle-4",
@@ -234,6 +237,38 @@ const RUNTIME_SAMPLE_ALLOWED_PATHS: [&str; 5] = [
     "diagnostics.variant_direct_kernel_gpu_ns",
     "diagnostics.variant_end_to_end_ns",
 ];
+const TIMESTAMP_DERIVED_SAMPLE_PATHS: [&str; 4] = [
+    "absolute_gates.maximum_plane_gpu_ns",
+    "absolute_gates.maximum_mip_gpu_ns",
+    "absolute_gates.maximum_dvr_gpu_ns",
+    "absolute_gates.maximum_iso_gpu_ns",
+];
+const DIAGNOSTIC_FIRST_ARM_ORDER: [&str; 4] = [
+    "selected_direct",
+    "mixed_fallback",
+    "mixed_fallback",
+    "selected_direct",
+];
+const DIAGNOSTIC_AGGREGATE_METRIC_PATHS: [&str; 2] = [
+    "diagnostics.variant_direct_kernel_gpu_ns",
+    "diagnostics.variant_end_to_end_ns",
+];
+const SOURCE_INPUT_ROLES: [&str; 3] = [
+    "0:representative_package",
+    "1:supporting_temporal_package",
+    "2:import_source",
+];
+const SOURCE_CAPTURE_ORDER: [&str; 6] = [
+    "0:before:representative_package",
+    "1:before:supporting_temporal_package",
+    "2:before:import_source",
+    "3:after:representative_package",
+    "4:after:supporting_temporal_package",
+    "5:after:import_source",
+];
+const SOURCE_INVENTORY_LOCATOR_RULE: &str = "inside_the_private_evidence_bundle_resolve_the_fixed_source_inventory_jcs_sibling_against_the_held_canonical_parent_descriptor_without_symlink_traversal_create_exactly_once_with_O_WRONLY_O_CREAT_O_EXCL_O_CLOEXEC_O_NOFOLLOW_mode0600_require_open_descriptor_fstat_regular_file_nlink_exactly1_and_permission_bits_exactly0600_write_complete_canonical_bytes_file_sync_close_then_parent_directory_sync_before_raw_receipt_publication_before_initial_hash_parse_or_any_retained_audit_reopen_open_read_only_nofollow_from_the_same_held_parent_require_regular_nlink1_mode0600_and_the_same_device_inode_size_and_metadata_generation_before_and_after_the_bounded_read_reject_any_currentness_change_retain_immutably_for_audit_and_never_copy_the_private_sibling_when_copying_the_public_sanitized_receipt";
+const POSITIVE_FINITE_F32_BITS_PATTERN: &str =
+    "^(?!(?:00000000|7f[89a-f][0-9a-f]{5})$)[0-7][0-9a-f]{7}(?![\\s\\S])";
 const COMMON_SCHEMA_ID: &str = "viewer-performance-ep01-common.schema.json";
 const COMMON_SCHEMA_PATH: &str = "verification/schemas/viewer-performance-ep01-common.schema.json";
 const FAILURE_EVIDENCE_SCHEMA_ID: &str =
@@ -243,6 +278,10 @@ const FAILURE_EVIDENCE_SCHEMA_PATH: &str =
 const PROJECTION_INPUT_SCHEMA_ID: &str = "mirante4d-viewer-performance-ep01-projection-input-1";
 const PROJECTION_INPUT_SCHEMA_PATH: &str =
     "verification/schemas/viewer-performance-ep01-projection-input.schema.json";
+const SOURCE_INVENTORY_SCHEMA_ID: &str =
+    "mirante4d-viewer-performance-ep01-source-inventory-evidence-1";
+const SOURCE_INVENTORY_SCHEMA_PATH: &str =
+    "verification/schemas/viewer-performance-ep01-source-inventory.schema.json";
 const SCHEMA_DOCUMENT_ENCODING: &str = "UTF8_JSON_Schema_2020-12_without_BOM";
 const ARTIFACT_INSTANCE_ENCODING: &str = "restricted_JCS";
 const PRIMITIVE_SOURCE_KIND_TAGS: [&str; 4] = [
@@ -469,6 +508,7 @@ struct SelectionAuthority {
     pyramid_contract: PyramidContract,
     compound_shard_contract: CompoundShardContract,
     accounting_contract: AccountingContract,
+    source_currentness_contract: SourceCurrentnessContract,
     checkpoint_contract: CheckpointContract,
     runtime_gpu_contract: RuntimeGpuContract,
     evidence_contract: EvidenceContract,
@@ -706,6 +746,30 @@ struct AccountingContract {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+struct SourceCurrentnessContract {
+    source_inventory_scheme: String,
+    metadata_generation_scheme: String,
+    maximum_entries_per_input: u64,
+    stream_buffer_bytes: u64,
+    source_input_roles: Vec<String>,
+    capture_order: Vec<String>,
+    capture_boundary_rule: String,
+    open_and_stream_rule: String,
+    content_inventory_rule: String,
+    metadata_generation_rule: String,
+    input_binding_rule: String,
+    comparison_rule: String,
+    source_preservation_commitment_rule: String,
+    candidate_package_inventory_rule: String,
+    candidate_package_commitment_rule: String,
+    raw_receipt_closure_rule: String,
+    privacy_rule: String,
+    source_access_is_read_only: bool,
+    mismatch_allows_selection_receipt: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct CheckpointContract {
     peak_regular_files: u64,
     regular_file_roles: Vec<String>,
@@ -749,9 +813,18 @@ struct RuntimeGpuContract {
     layout_binding_evidence_rule: String,
     adapter_limit_evidence_fields: Vec<String>,
     adapter_limit_evidence_rule: String,
+    timestamp_period_source_rule: String,
+    timestamp_period_bits_rule: String,
+    timestamp_tick_conversion_rule: String,
+    runtime_state_binding_rule: String,
+    runtime_execution_binding_rule: String,
+    timestamp_derived_sample_paths: Vec<String>,
+    timestamp_control_subtraction_rule: String,
     runtime_sample_allowed_paths: Vec<String>,
     runtime_sample_population_rule: String,
     runtime_variant_identity_rule: String,
+    runtime_variant_state_rule: String,
+    runtime_diagnostic_protocol: RuntimeDiagnosticProtocol,
     runtime_non_gate_diagnostic_rule: String,
     capacity_rule: String,
     directory_slot_fields: Vec<String>,
@@ -774,6 +847,31 @@ struct RuntimeGpuContract {
     coordinated_frame_scope: String,
     maximum_staging_bytes_formula: String,
     all_invalid_payload_slot_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RuntimeDiagnosticProtocol {
+    maximum_variants: u64,
+    maximum_canonical_variant_bytes: u64,
+    warmup_abba_blocks_per_variant: u64,
+    warmup_pairs_per_variant: u64,
+    measured_abba_blocks_per_variant: u64,
+    pairs_per_abba_block: u64,
+    measured_pairs_per_variant: u64,
+    observations_per_arm_per_variant: u64,
+    executions_per_pair: u64,
+    execution_tickets_per_variant: u64,
+    first_arm_order_within_block: Vec<String>,
+    p95_population_size: u64,
+    p95_nearest_rank_one_based: u64,
+    p95_zero_based_sorted_index: u64,
+    aggregate_metric_paths: Vec<String>,
+    execution_ticket_domain: String,
+    row_order_rule: String,
+    population_rule: String,
+    p95_rule: String,
+    failure_rule: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -802,6 +900,7 @@ struct EvidenceContract {
     artifact_role_contracts: Vec<String>,
     artifact_common_schema_binding: ArtifactCommonSchemaBinding,
     failure_evidence_schema_binding: FailureEvidenceSchemaBinding,
+    source_inventory_schema_binding: SourceInventorySchemaBinding,
     artifact_schema_bindings: Vec<ArtifactSchemaBinding>,
     receipt_hash_contract: ReceiptHashContract,
     public_projection_allowlist: Vec<String>,
@@ -815,6 +914,7 @@ struct EvidenceContract {
 struct ValidationResourceContract {
     maximum_candidate_artifact_bytes: u64,
     maximum_projection_input_sidecar_bytes: u64,
+    maximum_source_inventory_sidecar_bytes: u64,
     maximum_raw_receipt_bytes: u64,
     maximum_public_projection_bytes: u64,
     maximum_sanitized_receipt_bytes: u64,
@@ -823,6 +923,9 @@ struct ValidationResourceContract {
     maximum_schema_document_bytes: u64,
     maximum_variable_array_items: u64,
     maximum_layout_fields_per_binding: u64,
+    maximum_diagnostic_variants: u64,
+    maximum_canonical_diagnostic_variant_bytes: u64,
+    maximum_instrumentation_overhead_pairs: u64,
     maximum_ascii_bytes: u64,
     file_admission_rule: String,
     stream_validation_rule: String,
@@ -854,6 +957,24 @@ struct FailureEvidenceSchemaBinding {
     record_order_rule: String,
     bounded_failure_evidence_rule: String,
     failure_projection_rule: String,
+    privacy_rule: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SourceInventorySchemaBinding {
+    payload_schema: String,
+    schema_path: String,
+    schema_sha256: String,
+    common_schema_path: String,
+    common_schema_sha256: String,
+    canonical_encoding: String,
+    unknown_or_missing_fields_rejected: bool,
+    private_source_inventory_relative_path: String,
+    locator_and_publication_rule: String,
+    capture_order_rule: String,
+    comparison_rule: String,
+    raw_receipt_closure_rule: String,
     privacy_rule: String,
 }
 
@@ -951,6 +1072,7 @@ struct ReceiptHashContract {
     external_raw_gate_sha256: String,
     external_raw_candidate_sha256: String,
     external_failure_evidence_sha256: String,
+    source_preservation_commitment_sha256: String,
     sanitized_projection_sha256: String,
     external_raw_receipt_sha256: String,
     artifact_sha256: String,
@@ -1039,6 +1161,13 @@ struct InstrumentationOverheadOperand {
     per_bound_pair_denominator: String,
     control_must_be_positive: bool,
     aggregation: String,
+    maximum_raw_pairs: u64,
+    raw_pair_population_rule: String,
+    raw_pair_order_rule: String,
+    execution_ticket_domain: String,
+    raw_pair_arithmetic_rule: String,
+    raw_pair_source_rule: String,
+    invalid_pair_allows_selection_receipt: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1411,6 +1540,76 @@ fn schema_uses_exact_common_ref(value: &serde_json::Value) -> bool {
     }
 }
 
+fn parse_positive_finite_timestamp_period_bits(encoded: &str) -> anyhow::Result<u32> {
+    if encoded.len() != 8
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("timestamp period bits must be exactly eight lowercase hexadecimal digits")
+    }
+    let bits =
+        u32::from_str_radix(encoded, 16).context("timestamp period bits are not a valid u32")?;
+    let value = f32::from_bits(bits);
+    if !value.is_finite() || value <= 0.0 {
+        bail!("timestamp period must decode to a finite strictly positive IEEE-754 f32")
+    }
+    Ok(bits)
+}
+
+fn timestamp_ticks_to_nanoseconds(
+    encoded_period_bits: &str,
+    start_ticks: u64,
+    end_ticks: u64,
+) -> anyhow::Result<u64> {
+    let bits = parse_positive_finite_timestamp_period_bits(encoded_period_bits)?;
+    let exponent = (bits >> 23) & 0xff;
+    let fraction = bits & 0x7f_ffff;
+    let (significand, binary_shift) = if exponent == 0 {
+        (u128::from(fraction), -149_i32)
+    } else {
+        (
+            u128::from((1_u32 << 23) | fraction),
+            i32::try_from(exponent).expect("u8 exponent fits i32") - 150,
+        )
+    };
+    let delta = end_ticks
+        .checked_sub(start_ticks)
+        .context("timestamp interval tick counter moved backwards")?;
+    let product = u128::from(delta)
+        .checked_mul(significand)
+        .context("timestamp interval exact rational product overflowed u128")?;
+
+    if binary_shift >= 0 {
+        let shift = u32::try_from(binary_shift).expect("nonnegative i32 fits u32");
+        if shift >= 64 || product > u128::from(u64::MAX >> shift) {
+            bail!("timestamp interval nanoseconds exceed u64")
+        }
+        return u64::try_from(product << shift)
+            .context("timestamp interval nanoseconds do not fit u64");
+    }
+
+    let denominator_shift = binary_shift
+        .checked_neg()
+        .and_then(|shift| u32::try_from(shift).ok())
+        .context("timestamp interval denominator shift is invalid")?;
+    if denominator_shift >= 128 {
+        return Ok(0);
+    }
+    let denominator = 1_u128 << denominator_shift;
+    let quotient = product / denominator;
+    let remainder = product % denominator;
+    let doubled_remainder = remainder
+        .checked_mul(2)
+        .context("timestamp interval rounding remainder overflowed u128")?;
+    let round_up =
+        doubled_remainder > denominator || (doubled_remainder == denominator && quotient & 1 == 1);
+    let rounded = quotient
+        .checked_add(u128::from(round_up))
+        .context("timestamp interval rounded value overflowed u128")?;
+    u64::try_from(rounded).context("timestamp interval nanoseconds do not fit u64")
+}
+
 fn validate_embedded_schema(
     bytes: &[u8],
     expected_schema_id: &str,
@@ -1433,12 +1632,140 @@ fn validate_embedded_schema(
     {
         bail!("EP-01 instance schema name or shared common-schema reference is incoherent")
     }
+    if expected_schema_id == "viewer-performance-ep01-runtime-gpu.schema.json"
+        && (schema
+            .pointer("/$defs/positive_finite_f32_bits/pattern")
+            .and_then(serde_json::Value::as_str)
+            != Some(POSITIVE_FINITE_F32_BITS_PATTERN)
+            || parse_positive_finite_timestamp_period_bits("3f800000").is_err()
+            || parse_positive_finite_timestamp_period_bits("00000001").is_err()
+            || parse_positive_finite_timestamp_period_bits("00000000").is_ok()
+            || parse_positive_finite_timestamp_period_bits("80000000").is_ok()
+            || parse_positive_finite_timestamp_period_bits("7f800000").is_ok()
+            || parse_positive_finite_timestamp_period_bits("7fc00000").is_ok()
+            || timestamp_ticks_to_nanoseconds("3f800000", 7, 10).ok() != Some(3)
+            || timestamp_ticks_to_nanoseconds("3f000000", 0, 1).ok() != Some(0)
+            || timestamp_ticks_to_nanoseconds("3f000000", 0, 3).ok() != Some(2))
+    {
+        bail!(
+            "EP-01 runtime schema does not enforce a positive finite timestamp-period bit pattern"
+        )
+    }
+    let required_contains = |pointer: &str, field: &str| {
+        schema
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(field)))
+    };
+    if expected_schema_id == "viewer-performance-ep01-runtime-gpu.schema.json"
+        && (schema
+            .pointer("/properties/diagnostic_variants/maxItems")
+            .and_then(serde_json::Value::as_u64)
+            != Some(256)
+            || schema
+                .pointer("/properties/instrumentation_overhead_pairs/maxItems")
+                .and_then(serde_json::Value::as_u64)
+                != Some(8_192)
+            || schema
+                .pointer("/$defs/diagnostic_variant/properties/warmup_pairs/minItems")
+                .and_then(serde_json::Value::as_u64)
+                != Some(4)
+            || schema
+                .pointer("/$defs/diagnostic_variant/properties/warmup_pairs/maxItems")
+                .and_then(serde_json::Value::as_u64)
+                != Some(4)
+            || schema
+                .pointer("/$defs/diagnostic_variant/properties/measured_pairs/minItems")
+                .and_then(serde_json::Value::as_u64)
+                != Some(100)
+            || schema
+                .pointer("/$defs/diagnostic_variant/properties/measured_pairs/maxItems")
+                .and_then(serde_json::Value::as_u64)
+                != Some(100)
+            || !required_contains("/$defs/sample/required", "timestamp_control_pair")
+            || !required_contains(
+                "/$defs/diagnostic_execution/required",
+                "execution_binding_sha256",
+            ))
+    {
+        bail!("EP-01 runtime schema does not freeze its bounded raw timing populations")
+    }
+    if expected_schema_id == "viewer-performance-ep01-build-import.schema.json"
+        && (!required_contains("/required", "source_inventory_sidecar_sha256")
+            || required_contains("/required", "source_unchanged"))
+    {
+        bail!("EP-01 build/import schema retained assertion-only source currentness")
+    }
+    if expected_schema_id == "viewer-performance-ep01-package-validation.schema.json"
+        && (!required_contains("/required", "source_inventory_sidecar_sha256")
+            || !required_contains("/$defs/checks/required", "package_currentness")
+            || !required_contains(
+                "/$defs/pre_package_inventory/required",
+                "metadata_generation_sha256",
+            )
+            || !required_contains(
+                "/$defs/post_package_inventory/required",
+                "metadata_generation_sha256",
+            ))
+    {
+        bail!("EP-01 package-validation schema lacks independently recomputable currentness")
+    }
+    if expected_schema_id == "viewer-performance-ep01-source-inventory.schema.json" {
+        let expected_capture_identity = [
+            (0, 0, 0, "representative_package"),
+            (1, 0, 1, "supporting_temporal_package"),
+            (2, 0, 2, "import_source"),
+            (3, 1, 0, "representative_package"),
+            (4, 1, 1, "supporting_temporal_package"),
+            (5, 1, 2, "import_source"),
+        ];
+        let captures_are_exact = expected_capture_identity.iter().enumerate().all(
+            |(index, (capture, phase, input, role))| {
+                let prefix = format!("/properties/captures/prefixItems/{index}/allOf/1/properties");
+                schema
+                    .pointer(&format!("{prefix}/capture_ordinal/const"))
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(*capture)
+                    && schema
+                        .pointer(&format!("{prefix}/phase_tag/const"))
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(*phase)
+                    && schema
+                        .pointer(&format!("{prefix}/input_ordinal/const"))
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(*input)
+                    && schema
+                        .pointer(&format!("{prefix}/input_role/const"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(*role)
+            },
+        );
+        if schema
+            .pointer("/properties/captures/minItems")
+            .and_then(serde_json::Value::as_u64)
+            != Some(6)
+            || schema
+                .pointer("/properties/captures/maxItems")
+                .and_then(serde_json::Value::as_u64)
+                != Some(6)
+            || schema
+                .pointer("/properties/captures/items")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            || !required_contains("/required", "qualification_profile_contract_sha256")
+            || !required_contains("/required", "script_bundle_sha256")
+            || !captures_are_exact
+        {
+            bail!("EP-01 source-inventory schema does not freeze its six-capture sandwich")
+        }
+    }
     Ok(Sha256Hasher::digest(bytes).to_string())
 }
 
 struct EmbeddedSchemaHashes {
     common: String,
     projection_input: String,
+    source_inventory: String,
     failure_evidence: String,
     artifacts: Vec<String>,
 }
@@ -1452,6 +1779,11 @@ fn embedded_schema_hashes() -> anyhow::Result<&'static EmbeddedSchemaHashes> {
                 PROJECTION_INPUT_SCHEMA_BYTES,
                 "viewer-performance-ep01-projection-input.schema.json",
                 Some(PROJECTION_INPUT_SCHEMA_ID),
+            )?;
+            let source_inventory = validate_embedded_schema(
+                SOURCE_INVENTORY_SCHEMA_BYTES,
+                "viewer-performance-ep01-source-inventory.schema.json",
+                Some(SOURCE_INVENTORY_SCHEMA_ID),
             )?;
             let failure_evidence = validate_embedded_schema(
                 FAILURE_EVIDENCE_SCHEMA_BYTES,
@@ -1471,6 +1803,7 @@ fn embedded_schema_hashes() -> anyhow::Result<&'static EmbeddedSchemaHashes> {
             Ok(EmbeddedSchemaHashes {
                 common,
                 projection_input,
+                source_inventory,
                 failure_evidence,
                 artifacts,
             })
@@ -1489,6 +1822,7 @@ fn validate_clarification_contracts(authority: &SelectionAuthority) -> anyhow::R
     let pyramid = &authority.pyramid_contract;
     let format = &authority.compound_shard_contract;
     let accounting = &authority.accounting_contract;
+    let source = &authority.source_currentness_contract;
     let checkpoint = &authority.checkpoint_contract;
     let runtime = &authority.runtime_gpu_contract;
     let evidence = &authority.evidence_contract;
@@ -1600,6 +1934,30 @@ fn validate_clarification_contracts(authority: &SelectionAuthority) -> anyhow::R
     {
         bail!("EP-01 accounting contract changed admission or checkpoint byte semantics")
     }
+    if source.source_inventory_scheme != "mirante4d-t5-source-inventory-1"
+        || source.metadata_generation_scheme != "mirante4d-ep01-metadata-generation-v1"
+        || source.maximum_entries_per_input != 4_096
+        || source.stream_buffer_bytes != 65_536
+        || source.source_input_roles != SOURCE_INPUT_ROLES
+        || source.capture_order != SOURCE_CAPTURE_ORDER
+        || source.capture_boundary_rule.is_empty()
+        || source.open_and_stream_rule.is_empty()
+        || source.content_inventory_rule.is_empty()
+        || source.metadata_generation_rule.is_empty()
+        || source.input_binding_rule.is_empty()
+        || source.comparison_rule.is_empty()
+        || !source.source_preservation_commitment_rule.contains(
+            "qualification_profile_contract_raw32_workload_bundle_raw32_script_bundle_raw32",
+        )
+        || source.candidate_package_inventory_rule.is_empty()
+        || source.candidate_package_commitment_rule.is_empty()
+        || source.raw_receipt_closure_rule.is_empty()
+        || source.privacy_rule.is_empty()
+        || !source.source_access_is_read_only
+        || source.mismatch_allows_selection_receipt
+    {
+        bail!("EP-01 source and candidate-package currentness contract is incomplete")
+    }
     if checkpoint.peak_regular_files != 6
         || checkpoint.regular_file_roles != CHECKPOINT_FILE_ROLES
         || checkpoint.canonical_source_file_names != CANONICAL_SOURCE_FILE_NAMES
@@ -1612,15 +1970,68 @@ fn validate_clarification_contracts(authority: &SelectionAuthority) -> anyhow::R
     {
         bail!("EP-01 ordinal checkpoint contract is incomplete or exceeds its file gate")
     }
+    let diagnostic = &runtime.runtime_diagnostic_protocol;
+    let diagnostic_warmup_pairs = diagnostic
+        .warmup_abba_blocks_per_variant
+        .checked_mul(diagnostic.pairs_per_abba_block);
+    let diagnostic_measured_pairs = diagnostic
+        .measured_abba_blocks_per_variant
+        .checked_mul(diagnostic.pairs_per_abba_block);
+    let diagnostic_execution_tickets = diagnostic
+        .warmup_pairs_per_variant
+        .checked_add(diagnostic.measured_pairs_per_variant)
+        .and_then(|pairs| pairs.checked_mul(diagnostic.executions_per_pair));
+    let maximum_diagnostic_bytes = diagnostic
+        .maximum_variants
+        .checked_mul(diagnostic.maximum_canonical_variant_bytes);
     if runtime.directory_slot_fields != GPU_DIRECTORY_SLOT_FIELDS
         || runtime.page_record_fields != GPU_PAGE_RECORD_FIELDS
         || runtime.adapter_limit_evidence_fields != GPU_ADAPTER_LIMIT_EVIDENCE_FIELDS
+        || runtime.timestamp_period_source_rule.is_empty()
+        || runtime.timestamp_period_bits_rule.is_empty()
+        || runtime.timestamp_tick_conversion_rule.is_empty()
+        || runtime.runtime_state_binding_rule.is_empty()
+        || runtime.runtime_execution_binding_rule.is_empty()
+        || runtime.timestamp_derived_sample_paths != TIMESTAMP_DERIVED_SAMPLE_PATHS
+        || runtime.timestamp_control_subtraction_rule.is_empty()
         || runtime.runtime_sample_allowed_paths != RUNTIME_SAMPLE_ALLOWED_PATHS
         || runtime.runtime_sample_population_rule.is_empty()
         || runtime.runtime_variant_identity_rule.is_empty()
         || runtime.runtime_non_gate_diagnostic_rule.is_empty()
         || runtime.binding_groups.len() != 3
         || runtime.all_invalid_payload_slot_bytes != 0
+        || diagnostic.maximum_variants != 256
+        || diagnostic.maximum_canonical_variant_bytes != 98_304
+        || diagnostic.warmup_abba_blocks_per_variant != 1
+        || diagnostic.warmup_pairs_per_variant != 4
+        || diagnostic.measured_abba_blocks_per_variant != 25
+        || diagnostic.pairs_per_abba_block != 4
+        || diagnostic.measured_pairs_per_variant != 100
+        || diagnostic.observations_per_arm_per_variant != 100
+        || diagnostic.executions_per_pair != 2
+        || diagnostic.execution_tickets_per_variant != 208
+        || diagnostic.first_arm_order_within_block != DIAGNOSTIC_FIRST_ARM_ORDER
+        || diagnostic.p95_population_size != 100
+        || diagnostic.p95_nearest_rank_one_based != 95
+        || diagnostic.p95_zero_based_sorted_index != 94
+        || diagnostic.aggregate_metric_paths != DIAGNOSTIC_AGGREGATE_METRIC_PATHS
+        || diagnostic.execution_ticket_domain.is_empty()
+        || diagnostic.row_order_rule.is_empty()
+        || diagnostic.population_rule.is_empty()
+        || diagnostic.p95_rule.is_empty()
+        || diagnostic.failure_rule.is_empty()
+        || diagnostic_warmup_pairs != Some(diagnostic.warmup_pairs_per_variant)
+        || diagnostic_measured_pairs != Some(diagnostic.measured_pairs_per_variant)
+        || diagnostic.measured_pairs_per_variant != diagnostic.observations_per_arm_per_variant
+        || diagnostic_execution_tickets != Some(diagnostic.execution_tickets_per_variant)
+        || diagnostic.p95_nearest_rank_one_based.checked_sub(1)
+            != Some(diagnostic.p95_zero_based_sorted_index)
+        || maximum_diagnostic_bytes.is_none_or(|bytes| {
+            bytes
+                > evidence
+                    .validation_resource_contract
+                    .maximum_candidate_artifact_bytes
+        })
         || runtime.directory_slot_fields.len() * size_of::<u32>()
             != usize::try_from(authority.gates.gpu.maximum_directory_slot_bytes)
                 .context("EP-01 directory-slot gate does not fit usize")?
@@ -1631,10 +2042,11 @@ fn validate_clarification_contracts(authority: &SelectionAuthority) -> anyhow::R
         bail!("EP-01 GPU directory, page-record, or binding contract is incoherent")
     }
     let resources = &evidence.validation_resource_contract;
-    let embedded_schemas: [&[u8]; 8] = [
+    let embedded_schemas: [&[u8]; 9] = [
         COMMON_SCHEMA_BYTES,
         FAILURE_EVIDENCE_SCHEMA_BYTES,
         PROJECTION_INPUT_SCHEMA_BYTES,
+        SOURCE_INVENTORY_SCHEMA_BYTES,
         PACKAGE_VALIDATION_SCHEMA_BYTES,
         BUILD_IMPORT_SCHEMA_BYTES,
         TRACE_SCHEMA_BYTES,
@@ -1643,6 +2055,7 @@ fn validate_clarification_contracts(authority: &SelectionAuthority) -> anyhow::R
     ];
     if resources.maximum_candidate_artifact_bytes != 64 * 1024 * 1024
         || resources.maximum_projection_input_sidecar_bytes != 64 * 1024 * 1024
+        || resources.maximum_source_inventory_sidecar_bytes != 64 * 1024 * 1024
         || resources.maximum_raw_receipt_bytes != 64 * 1024 * 1024
         || resources.maximum_public_projection_bytes != 64 * 1024 * 1024
         || resources.maximum_sanitized_receipt_bytes != 64 * 1024 * 1024
@@ -1651,6 +2064,16 @@ fn validate_clarification_contracts(authority: &SelectionAuthority) -> anyhow::R
         || resources.maximum_schema_document_bytes != 1024 * 1024
         || resources.maximum_variable_array_items != 262_144
         || resources.maximum_layout_fields_per_binding != 256
+        || resources.maximum_diagnostic_variants != 256
+        || resources.maximum_canonical_diagnostic_variant_bytes != 98_304
+        || resources.maximum_instrumentation_overhead_pairs != 8_192
+        || resources.maximum_diagnostic_variants != diagnostic.maximum_variants
+        || resources.maximum_canonical_diagnostic_variant_bytes
+            != diagnostic.maximum_canonical_variant_bytes
+        || resources.maximum_instrumentation_overhead_pairs
+            != observations
+                .instrumentation_overhead_operand
+                .maximum_raw_pairs
         || resources.maximum_ascii_bytes != 512
         || embedded_schemas
             .iter()
@@ -1671,8 +2094,8 @@ fn validate_clarification_contracts(authority: &SelectionAuthority) -> anyhow::R
         || evidence.candidate_receipt_fields.len() != 6
         || evidence.gate_row_fields.len() != 10
         || evidence.gate_reason_codes.len() != 1
-        || evidence.sanitized_fields.len() != 7
-        || evidence.forbidden_sanitized_fields.len() != 14
+        || evidence.sanitized_fields.len() != 8
+        || evidence.forbidden_sanitized_fields.len() != 18
         || !evidence
             .forbidden_sanitized_fields
             .iter()
@@ -1689,6 +2112,18 @@ fn validate_clarification_contracts(authority: &SelectionAuthority) -> anyhow::R
             .forbidden_sanitized_fields
             .iter()
             .any(|field| field == "private_commitment_nonce_256")
+        || !evidence
+            .sanitized_fields
+            .iter()
+            .any(|field| field == "nonce_blinded_source_preservation_commitment")
+        || !evidence
+            .forbidden_sanitized_fields
+            .iter()
+            .any(|field| field == "source_inventory_sidecar_digest_or_raw_capture_facts")
+        || !evidence
+            .forbidden_sanitized_fields
+            .iter()
+            .any(|field| field == "raw_diagnostic_trial_or_timestamp_control_pair_rows")
     {
         bail!("EP-01 evidence privacy contract permits private geometry or lineage")
     }
@@ -1723,6 +2158,24 @@ fn validate_clarification_contracts(authority: &SelectionAuthority) -> anyhow::R
         || failure_binding.privacy_rule.is_empty()
     {
         bail!("EP-01 private failure-evidence schema binding is incomplete or stale")
+    }
+    let source_inventory_schema_sha256 = schema_hashes.source_inventory.as_str();
+    let source_binding = &evidence.source_inventory_schema_binding;
+    if source_binding.payload_schema != SOURCE_INVENTORY_SCHEMA_ID
+        || source_binding.schema_path != SOURCE_INVENTORY_SCHEMA_PATH
+        || source_binding.schema_sha256 != source_inventory_schema_sha256
+        || source_binding.common_schema_path != COMMON_SCHEMA_PATH
+        || source_binding.common_schema_sha256 != common_schema_sha256
+        || source_binding.canonical_encoding != ARTIFACT_INSTANCE_ENCODING
+        || !source_binding.unknown_or_missing_fields_rejected
+        || source_binding.private_source_inventory_relative_path != "source-inventory.jcs"
+        || source_binding.locator_and_publication_rule != SOURCE_INVENTORY_LOCATOR_RULE
+        || source_binding.capture_order_rule.is_empty()
+        || source_binding.comparison_rule.is_empty()
+        || source_binding.raw_receipt_closure_rule.is_empty()
+        || source_binding.privacy_rule.is_empty()
+    {
+        bail!("EP-01 private source-inventory schema binding is incomplete or stale")
     }
     if evidence.artifact_schema_bindings.len() != ARTIFACT_SCHEMA_EXPECTATIONS.len() {
         bail!("EP-01 artifact schema binding count differs from the five artifact roles")
@@ -1779,14 +2232,14 @@ fn validate_clarification_contracts(authority: &SelectionAuthority) -> anyhow::R
         || enums.failure_reason.len() != 8
         || objects.raw_revision.len() != 6
         || grammar.scalar_types.bytes32 != "exactly_32_raw_bytes_encoded_as_64_lowercase_hex"
-        || objects.raw_bindings.len() != 8
+        || objects.raw_bindings.len() != 10
         || objects.raw_package.len() != 6
         || objects.raw_trace.len() != 8
         || objects.raw_gate.len() != 10
         || objects.raw_candidate.len() != 6
         || objects.artifact.len() != 8
         || objects.raw_receipt.len() != 7
-        || objects.public_revision.len() != 4
+        || objects.public_revision.len() != 5
         || objects.public_trace.len() != 4
         || objects.public_gate.len() != 9
         || objects.public_candidate.len() != 5
@@ -1833,7 +2286,11 @@ fn validate_clarification_contracts(authority: &SelectionAuthority) -> anyhow::R
         || evidence.artifact_role_contracts.len() != 5
         || artifact_cardinalities.len() != 5
         || artifact_cardinalities.iter().sum::<u64>() != 12
-        || evidence.receipt_hash_contract.construction_order.len() != 9
+        || evidence
+            .receipt_hash_contract
+            .source_preservation_commitment_sha256
+            != "exactly_source_currentness_contract.source_preservation_commitment_rule"
+        || evidence.receipt_hash_contract.construction_order.len() != 14
         || evidence
             .receipt_hash_contract
             .failure_construction_order
@@ -1843,15 +2300,15 @@ fn validate_clarification_contracts(authority: &SelectionAuthority) -> anyhow::R
             .receipt_hash_contract
             .artifact_manifest_excludes
             .len()
-            != 5
+            != 6
         || evidence
             .receipt_hash_contract
             .standalone_public_projection_file_allowed
         || !evidence
             .receipt_hash_contract
             .failure_receipt_mutually_exclusive_with_selection_receipts
-        || evidence.public_projection_allowlist.len() != 12
-        || evidence.public_projection_forbidden.len() != 14
+        || evidence.public_projection_allowlist.len() != 13
+        || evidence.public_projection_forbidden.len() != 18
         || !evidence
             .public_projection_forbidden
             .iter()
@@ -1868,6 +2325,14 @@ fn validate_clarification_contracts(authority: &SelectionAuthority) -> anyhow::R
             .public_projection_forbidden
             .iter()
             .any(|field| field == "private_commitment_nonce_256")
+        || !evidence
+            .public_projection_allowlist
+            .iter()
+            .any(|field| field == "source_preservation_commitment_sha256")
+        || !evidence
+            .public_projection_forbidden
+            .iter()
+            .any(|field| field == "source_inventory_sidecar_digest_or_raw_capture_facts")
     {
         bail!("EP-01 receipt schema dictionary, hash closure, or privacy projection is incomplete")
     }
@@ -1918,6 +2383,37 @@ fn validate_clarification_contracts(authority: &SelectionAuthority) -> anyhow::R
         || !observations
             .instrumentation_overhead_operand
             .control_must_be_positive
+        || observations
+            .instrumentation_overhead_operand
+            .maximum_raw_pairs
+            != 8_192
+        || observations
+            .instrumentation_overhead_operand
+            .raw_pair_population_rule
+            .is_empty()
+        || observations
+            .instrumentation_overhead_operand
+            .raw_pair_order_rule
+            .is_empty()
+        || observations
+            .instrumentation_overhead_operand
+            .execution_ticket_domain
+            .is_empty()
+        || observations
+            .instrumentation_overhead_operand
+            .execution_ticket_domain
+            == diagnostic.execution_ticket_domain
+        || observations
+            .instrumentation_overhead_operand
+            .raw_pair_arithmetic_rule
+            .is_empty()
+        || observations
+            .instrumentation_overhead_operand
+            .raw_pair_source_rule
+            .is_empty()
+        || observations
+            .instrumentation_overhead_operand
+            .invalid_pair_allows_selection_receipt
         || observations
             .invalid_observation_behavior
             .selection_receipt_allowed
@@ -2328,7 +2824,7 @@ mod tests {
         assert_eq!(grammar.enums.package_role, CANDIDATE_PACKAGE_ROLES);
         assert_eq!(grammar.enums.trace_family, REQUIRED_TRACE_FAMILIES);
         assert_eq!(grammar.enums.unit, OBSERVATION_UNITS);
-        assert_eq!(grammar.objects.raw_bindings.len(), 8);
+        assert_eq!(grammar.objects.raw_bindings.len(), 10);
         assert_eq!(grammar.objects.raw_candidate.len(), 6);
         assert_eq!(grammar.objects.raw_gate.len(), 10);
         assert_eq!(grammar.objects.raw_receipt.len(), 7);
@@ -2366,7 +2862,7 @@ mod tests {
             );
             assert!(binding.unknown_or_missing_fields_rejected);
         }
-        assert_eq!(evidence.receipt_hash_contract.construction_order.len(), 9);
+        assert_eq!(evidence.receipt_hash_contract.construction_order.len(), 14);
         assert_eq!(
             evidence
                 .receipt_hash_contract
@@ -2374,8 +2870,8 @@ mod tests {
                 .len(),
             6
         );
-        assert_eq!(evidence.public_projection_allowlist.len(), 12);
-        assert_eq!(evidence.public_projection_forbidden.len(), 14);
+        assert_eq!(evidence.public_projection_allowlist.len(), 13);
+        assert_eq!(evidence.public_projection_forbidden.len(), 18);
         assert_eq!(
             evidence
                 .validation_resource_contract
@@ -2500,6 +2996,7 @@ mod tests {
     fn checkpoint_and_gpu_layouts_match_their_exact_byte_contracts() {
         let authority: SelectionAuthority = serde_json::from_slice(AUTHORITY_BYTES).unwrap();
         let checkpoint = &authority.checkpoint_contract;
+        let source = &authority.source_currentness_contract;
         assert_eq!(checkpoint.peak_regular_files, 6);
         assert_eq!(checkpoint.regular_file_roles.len(), 6);
         assert_eq!(
@@ -2511,6 +3008,10 @@ mod tests {
         assert_eq!(checkpoint.header_fields.len(), 31);
         assert_eq!(checkpoint.record_fields.len(), 5);
         assert_eq!(checkpoint.commit_slot_fields.len(), 7);
+        assert_eq!(source.source_input_roles, SOURCE_INPUT_ROLES);
+        assert_eq!(source.capture_order, SOURCE_CAPTURE_ORDER);
+        assert!(source.source_access_is_read_only);
+        assert!(!source.mismatch_allows_selection_receipt);
         assert_eq!(2 * 128, 256);
         assert_eq!(
             authority.runtime_gpu_contract.directory_slot_fields.len() * 4,
@@ -2523,6 +3024,124 @@ mod tests {
         assert_eq!(
             authority.runtime_gpu_contract.adapter_limit_evidence_fields,
             GPU_ADAPTER_LIMIT_EVIDENCE_FIELDS
+        );
+        assert_eq!(
+            authority
+                .runtime_gpu_contract
+                .timestamp_derived_sample_paths,
+            TIMESTAMP_DERIVED_SAMPLE_PATHS
+        );
+        let diagnostic = &authority.runtime_gpu_contract.runtime_diagnostic_protocol;
+        assert_eq!(
+            diagnostic.first_arm_order_within_block,
+            DIAGNOSTIC_FIRST_ARM_ORDER
+        );
+        assert_eq!(diagnostic.measured_abba_blocks_per_variant, 25);
+        assert_eq!(diagnostic.measured_pairs_per_variant, 100);
+        assert_eq!(diagnostic.observations_per_arm_per_variant, 100);
+        assert_eq!(diagnostic.p95_zero_based_sorted_index, 94);
+        assert_eq!(diagnostic.maximum_variants, 256);
+        assert!(
+            diagnostic.maximum_variants * diagnostic.maximum_canonical_variant_bytes
+                < authority
+                    .evidence_contract
+                    .validation_resource_contract
+                    .maximum_candidate_artifact_bytes
+        );
+        assert_eq!(
+            authority
+                .evidence_contract
+                .source_inventory_schema_binding
+                .schema_sha256,
+            Sha256Hasher::digest(SOURCE_INVENTORY_SCHEMA_BYTES).to_string()
+        );
+
+        assert_eq!(
+            parse_positive_finite_timestamp_period_bits("00000001").unwrap(),
+            1
+        );
+        assert_eq!(
+            parse_positive_finite_timestamp_period_bits("3f800000").unwrap(),
+            1.0_f32.to_bits()
+        );
+        for invalid in [
+            "00000000", "80000000", "80000001", "bf800000", "7f800000", "ff800000", "7f800001",
+            "7fc00000", "7fffffff", "ffc00000", "3F800000",
+        ] {
+            assert!(
+                parse_positive_finite_timestamp_period_bits(invalid).is_err(),
+                "accepted invalid timestamp period bits {invalid}"
+            );
+        }
+        assert_eq!(timestamp_ticks_to_nanoseconds("3f000000", 0, 1).unwrap(), 0);
+        assert_eq!(timestamp_ticks_to_nanoseconds("3f000000", 0, 3).unwrap(), 2);
+        assert_eq!(
+            timestamp_ticks_to_nanoseconds("3f800000", 7, 10).unwrap(),
+            3
+        );
+        assert!(timestamp_ticks_to_nanoseconds("3f800000", 2, 1).is_err());
+        assert!(timestamp_ticks_to_nanoseconds("7f7fffff", 0, 1).is_err());
+
+        let mut weak_runtime_schema: serde_json::Value =
+            serde_json::from_slice(RUNTIME_GPU_SCHEMA_BYTES).unwrap();
+        weak_runtime_schema["$defs"]["positive_finite_f32_bits"]["pattern"] =
+            serde_json::Value::String("^[0-9a-f]{8}$".to_owned());
+        assert!(
+            validate_embedded_schema(
+                &serde_json::to_vec(&weak_runtime_schema).unwrap(),
+                "viewer-performance-ep01-runtime-gpu.schema.json",
+                Some("mirante4d-viewer-performance-ep01-runtime-gpu-evidence-1"),
+            )
+            .is_err()
+        );
+
+        let mut reordered_source_schema: serde_json::Value =
+            serde_json::from_slice(SOURCE_INVENTORY_SCHEMA_BYTES).unwrap();
+        reordered_source_schema["properties"]["captures"]["prefixItems"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        assert!(
+            validate_embedded_schema(
+                &serde_json::to_vec(&reordered_source_schema).unwrap(),
+                "viewer-performance-ep01-source-inventory.schema.json",
+                Some(SOURCE_INVENTORY_SCHEMA_ID),
+            )
+            .is_err()
+        );
+
+        let mut assertion_only_build_schema: serde_json::Value =
+            serde_json::from_slice(BUILD_IMPORT_SCHEMA_BYTES).unwrap();
+        let required = assertion_only_build_schema["required"]
+            .as_array_mut()
+            .unwrap();
+        let currentness = required
+            .iter_mut()
+            .find(|value| value.as_str() == Some("source_inventory_sidecar_sha256"))
+            .unwrap();
+        *currentness = serde_json::Value::String("source_unchanged".to_owned());
+        assert!(
+            validate_embedded_schema(
+                &serde_json::to_vec(&assertion_only_build_schema).unwrap(),
+                "viewer-performance-ep01-build-import.schema.json",
+                Some("mirante4d-viewer-performance-ep01-build-import-evidence-1"),
+            )
+            .is_err()
+        );
+
+        let mut weak_package_schema: serde_json::Value =
+            serde_json::from_slice(PACKAGE_VALIDATION_SCHEMA_BYTES).unwrap();
+        weak_package_schema["$defs"]["pre_package_inventory"]["required"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|value| value.as_str() != Some("metadata_generation_sha256"));
+        assert!(
+            validate_embedded_schema(
+                &serde_json::to_vec(&weak_package_schema).unwrap(),
+                "viewer-performance-ep01-package-validation.schema.json",
+                Some("mirante4d-viewer-performance-ep01-package-validation-evidence-1"),
+            )
+            .is_err()
         );
         assert_eq!(
             authority.gates.checkpoint.header_bytes

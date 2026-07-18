@@ -10,7 +10,7 @@
     "candidate_edge",
     "roles",
     "checkpoint_contract",
-    "source_unchanged",
+    "source_inventory_sidecar_sha256",
     "candidate_complete"
   ],
   "properties": {
@@ -34,8 +34,8 @@
     "checkpoint_contract": {
       "$ref": "#/$defs/checkpoint_contract"
     },
-    "source_unchanged": {
-      "const": true
+    "source_inventory_sidecar_sha256": {
+      "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
     },
     "candidate_complete": {
       "const": true

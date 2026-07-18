@@ -15,6 +15,8 @@
     "adapter",
     "capacity",
     "pipeline_counters",
+    "instrumentation_overhead_pairs",
+    "diagnostic_variants",
     "samples",
     "resource_ledger_closed"
   ],
@@ -58,6 +60,22 @@
     },
     "pipeline_counters": {
       "$ref": "#/$defs/pipeline_counters"
+    },
+    "instrumentation_overhead_pairs": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8192,
+      "items": {
+        "$ref": "#/$defs/instrumentation_overhead_pair"
+      }
+    },
+    "diagnostic_variants": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": {
+        "$ref": "#/$defs/diagnostic_variant"
+      }
     },
     "samples": {
       "type": "array",
@@ -231,10 +249,13 @@
           "$ref": "#/$defs/adapter_limits"
         },
         "timestamp_period_f32_bits": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{8}(?![\\s\\S])"
+          "$ref": "#/$defs/positive_finite_f32_bits"
         }
       }
+    },
+    "positive_finite_f32_bits": {
+      "type": "string",
+      "pattern": "^(?!(?:00000000|7f[89a-f][0-9a-f]{5})$)[0-7][0-9a-f]{7}(?![\\s\\S])"
     },
     "adapter_limits": {
       "type": "object",
@@ -367,6 +388,327 @@
         }
       }
     },
+    "instrumentation_overhead_pair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pair_ordinal",
+        "tie_key",
+        "state_binding_sha256",
+        "execution_order",
+        "first_execution_ticket",
+        "second_execution_ticket",
+        "first_execution_binding_sha256",
+        "second_execution_binding_sha256",
+        "instrumented_start_monotonic_ns",
+        "instrumented_end_monotonic_ns",
+        "control_start_monotonic_ns",
+        "control_end_monotonic_ns"
+      ],
+      "properties": {
+        "pair_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "tie_key": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/tie_key"
+        },
+        "state_binding_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "execution_order": {
+          "enum": [
+            "instrumented_then_control",
+            "control_then_instrumented"
+          ]
+        },
+        "first_execution_ticket": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "second_execution_ticket": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "first_execution_binding_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "second_execution_binding_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "instrumented_start_monotonic_ns": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "instrumented_end_monotonic_ns": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "control_start_monotonic_ns": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "control_end_monotonic_ns": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        }
+      }
+    },
+    "diagnostic_variant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "variant_ordinal",
+        "pipeline_tag",
+        "dtype_tag",
+        "sampling_tag",
+        "validity_tag",
+        "layer_count",
+        "state_binding",
+        "warmup_pairs",
+        "measured_pairs"
+      ],
+      "properties": {
+        "variant_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "pipeline_tag": {
+          "enum": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        "dtype_tag": {
+          "enum": [
+            0,
+            1,
+            2
+          ]
+        },
+        "sampling_tag": {
+          "enum": [
+            0,
+            1
+          ]
+        },
+        "validity_tag": {
+          "enum": [
+            0,
+            1,
+            2
+          ]
+        },
+        "layer_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "state_binding": {
+          "$ref": "#/$defs/diagnostic_state_binding"
+        },
+        "warmup_pairs": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/diagnostic_pair"
+          }
+        },
+        "measured_pairs": {
+          "type": "array",
+          "minItems": 100,
+          "maxItems": 100,
+          "items": {
+            "$ref": "#/$defs/diagnostic_pair"
+          }
+        }
+      }
+    },
+    "diagnostic_state_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package_role_tag",
+        "trace_family_tag",
+        "state_ordinal",
+        "protocol_sample_ordinal",
+        "within_state_observation_ordinal",
+        "state_binding_sha256"
+      ],
+      "properties": {
+        "package_role_tag": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u8"
+        },
+        "trace_family_tag": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u8"
+        },
+        "state_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "protocol_sample_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "within_state_observation_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "state_binding_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        }
+      }
+    },
+    "diagnostic_pair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "block_ordinal",
+        "pair_ordinal_within_block",
+        "pair_ordinal",
+        "first_execution",
+        "second_execution"
+      ],
+      "properties": {
+        "block_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "pair_ordinal_within_block": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "pair_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "first_execution": {
+          "$ref": "#/$defs/diagnostic_execution"
+        },
+        "second_execution": {
+          "$ref": "#/$defs/diagnostic_execution"
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "first_execution": {
+              "properties": {
+                "arm": {
+                  "const": "selected_direct"
+                }
+              }
+            },
+            "second_execution": {
+              "properties": {
+                "arm": {
+                  "const": "mixed_fallback"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "first_execution": {
+              "properties": {
+                "arm": {
+                  "const": "mixed_fallback"
+                }
+              }
+            },
+            "second_execution": {
+              "properties": {
+                "arm": {
+                  "const": "selected_direct"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "diagnostic_execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "arm",
+        "execution_ticket",
+        "execution_binding_sha256",
+        "gpu_start_timestamp_ticks",
+        "gpu_end_timestamp_ticks",
+        "input_start_monotonic_ns",
+        "presentation_complete_monotonic_ns"
+      ],
+      "properties": {
+        "arm": {
+          "enum": [
+            "selected_direct",
+            "mixed_fallback"
+          ]
+        },
+        "execution_ticket": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "execution_binding_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "gpu_start_timestamp_ticks": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "gpu_end_timestamp_ticks": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "input_start_monotonic_ns": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "presentation_complete_monotonic_ns": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        }
+      }
+    },
+    "timestamp_control_pair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state_binding_sha256",
+        "execution_order",
+        "measured_execution_ticket",
+        "control_execution_ticket",
+        "measured_execution_binding_sha256",
+        "control_execution_binding_sha256",
+        "measured_start_ticks",
+        "measured_end_ticks",
+        "control_start_ticks",
+        "control_end_ticks"
+      ],
+      "properties": {
+        "state_binding_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "execution_order": {
+          "enum": [
+            "measured_then_control",
+            "control_then_measured"
+          ]
+        },
+        "measured_execution_ticket": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "control_execution_ticket": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "measured_execution_binding_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "control_execution_binding_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "measured_start_ticks": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "measured_end_ticks": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "control_start_ticks": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "control_end_ticks": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        }
+      }
+    },
     "sample": {
       "type": "object",
       "additionalProperties": false,
@@ -376,6 +718,7 @@
         "tie_key",
         "numerator",
         "denominator",
+        "timestamp_control_pair",
         "validated"
       ],
       "properties": {
@@ -393,6 +736,16 @@
         },
         "denominator": {
           "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u128d"
+        },
+        "timestamp_control_pair": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/timestamp_control_pair"
+            }
+          ]
         },
         "validated": {
           "const": true

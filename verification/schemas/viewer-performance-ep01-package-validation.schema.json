@@ -17,6 +17,7 @@
     "representation_recipe_id",
     "candidate_geometry_sha256",
     "candidate_content_generation_sha256",
+    "source_inventory_sidecar_sha256",
     "storage_profile",
     "facts",
     "checks"
@@ -56,6 +57,9 @@
       "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
     },
     "candidate_content_generation_sha256": {
+      "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+    },
+    "source_inventory_sidecar_sha256": {
       "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
     },
     "storage_profile": {
@@ -192,7 +196,123 @@
           "const": true
         },
         "package_currentness": {
-          "const": true
+          "$ref": "#/$defs/package_currentness"
+        }
+      }
+    },
+    "package_currentness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pre_validation",
+        "post_validation"
+      ],
+      "properties": {
+        "pre_validation": {
+          "$ref": "#/$defs/pre_package_inventory"
+        },
+        "post_validation": {
+          "$ref": "#/$defs/post_package_inventory"
+        }
+      }
+    },
+    "pre_package_inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase_tag",
+        "regular_files",
+        "package_bytes",
+        "content_inventory_sha256",
+        "metadata_generation_sha256",
+        "commitment_sha256"
+      ],
+      "properties": {
+        "phase_tag": {
+          "const": 0
+        },
+        "regular_files": {
+          "allOf": [
+            {
+              "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+            },
+            {
+              "not": {
+                "const": "0"
+              }
+            }
+          ]
+        },
+        "package_bytes": {
+          "allOf": [
+            {
+              "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+            },
+            {
+              "not": {
+                "const": "0"
+              }
+            }
+          ]
+        },
+        "content_inventory_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "metadata_generation_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "commitment_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        }
+      }
+    },
+    "post_package_inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase_tag",
+        "regular_files",
+        "package_bytes",
+        "content_inventory_sha256",
+        "metadata_generation_sha256",
+        "commitment_sha256"
+      ],
+      "properties": {
+        "phase_tag": {
+          "const": 1
+        },
+        "regular_files": {
+          "allOf": [
+            {
+              "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+            },
+            {
+              "not": {
+                "const": "0"
+              }
+            }
+          ]
+        },
+        "package_bytes": {
+          "allOf": [
+            {
+              "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+            },
+            {
+              "not": {
+                "const": "0"
+              }
+            }
+          ]
+        },
+        "content_inventory_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "metadata_generation_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "commitment_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
         }
       }
     }
