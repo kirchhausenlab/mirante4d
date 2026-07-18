@@ -32,13 +32,18 @@ use crate::host::{
 use crate::process::cargo_command;
 
 const WORKLOAD_SCHEMA: &str = "mirante4d-viewer-performance-workload-bundle-4";
-const SCRIPT_BUNDLE_SCHEMA: &str = "mirante4d-viewer-performance-script-bundle-3";
+const SCRIPT_BUNDLE_SCHEMA: &str = "mirante4d-viewer-performance-script-bundle-4";
 const ORACLE_SCHEMA: &str = "mirante4d-viewer-performance-oracle-bundle-3";
-const RAW_REPORT_SCHEMA: &str = "mirante4d-viewer-performance-raw-private-report-1";
-const RECEIPT_SCHEMA: &str = "mirante4d-viewer-performance-development-receipt-1";
+const RAW_REPORT_SCHEMA: &str = "mirante4d-viewer-performance-raw-private-report-2";
+const RECEIPT_SCHEMA: &str = "mirante4d-viewer-performance-development-receipt-2";
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-const AUTOMATION_SCHEMA_VERSION: u64 = 3;
+const AUTOMATION_SCHEMA_VERSION: u64 = 4;
+const PRODUCT_GATE_OBSERVATION_SCHEMA: &str = "mirante4d-product-gate-observation-1";
+const IMPORTED_OPEN_READY_CONDITION: &str = "imported_open_ready";
+const PRODUCT_GATE_ID_MAX_BYTES: usize = 128;
+const PRODUCT_GATE_CONDITION_MAX_BYTES: usize = 128;
+const PRODUCT_GATE_TIMEOUT_MAX_MS: u64 = 7_200_000;
 const ATTEMPT_ROOT_PLACEHOLDER: &str = "${ATTEMPT_ROOT}";
 const WORKLOAD_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const SCRIPT_BUNDLE_MAX_BYTES: u64 = 32 * 1024 * 1024;
@@ -242,8 +247,7 @@ struct AutomationScriptTemplate {
     diagnostic_counters: bool,
     #[serde(default)]
     startup_bootstrap: Option<AutomationStartupBootstrap>,
-    #[serde(default)]
-    limits: AutomationLimits,
+    hard_safety_limits: AutomationHardSafetyLimits,
     commands: Vec<Value>,
 }
 
@@ -257,7 +261,7 @@ struct AutomationStartupBootstrap {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
-struct AutomationLimits {
+struct AutomationHardSafetyLimits {
     max_cpu_total_bytes: Option<u64>,
     max_cpu_decoded_residency_bytes: Option<u64>,
     max_cpu_upload_staging_bytes: Option<u64>,
@@ -1128,7 +1132,52 @@ struct RoleEvidence {
     source_inventory_after: Option<super::source_inventory::InventoryFacts>,
     cleanup_manifest_sha256: Option<String>,
     cleanup_completed: bool,
+    product_gate_outcomes: Vec<ProductGateOutcome>,
     reasons: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProductGateOutcome {
+    command_index: usize,
+    gate_id: String,
+    condition: String,
+    outcome: ProductGateStatus,
+    condition_met: bool,
+    timed_out: bool,
+    timeout_ms: u64,
+    waited_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProductGateStatus {
+    Passed,
+    Failed,
+}
+
+impl ProductGateStatus {
+    const fn report_label(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PopulationEvidence {
+    expected_sample_records: usize,
+    observed_sample_records: usize,
+    expected_role_attempts: usize,
+    observed_role_attempts: usize,
+    completed_role_reports: usize,
+    expected_phase_evaluations: usize,
+    observed_phase_evaluations: usize,
+    expected_product_gate_observations: usize,
+    observed_product_gate_observations: usize,
+    sample_identities_exact: bool,
+    role_identities_exact: bool,
+    phase_identities_exact: bool,
+    product_gate_bijections_exact: bool,
 }
 
 #[derive(Debug)]
@@ -1269,6 +1318,8 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
     } else {
         all_reasons.insert("qualification_binding_mismatch".to_owned());
     }
+    let population =
+        validate_attempt_population(&profile.profile, &scripts.value, &samples, &mut all_reasons);
 
     let repository_end = repository_identity();
     if !repository_identity_unchanged_and_clean(&repository, &repository_end)
@@ -1296,6 +1347,7 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
         &binding_reason_codes,
         conformance.as_ref(),
         &samples,
+        population,
         &all_reasons,
         &repository,
         &repository_end,
@@ -1312,6 +1364,8 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
         &app_binary_sha256,
         &raw_sha256,
         conformance.as_ref(),
+        &samples,
+        population,
         &all_reasons,
     );
     println!(
@@ -1319,8 +1373,14 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
         serde_json::to_string_pretty(&receipt)
             .context("failed to encode viewer development receipt")?
     );
-    if !all_reasons.is_empty() {
-        bail!("viewer performance development run failed; inspect the private raw report")
+    require_valid_evidence(&all_reasons)
+}
+
+fn require_valid_evidence(reasons: &BTreeSet<String>) -> anyhow::Result<()> {
+    if has_integrity_reasons(reasons) {
+        bail!(
+            "viewer performance evidence is invalid or incomplete; inspect the private raw report"
+        )
     }
     Ok(())
 }
@@ -1532,6 +1592,7 @@ fn validate_bundles(
         .expect("exact scenario coverage includes IP");
     let import_source = sole_ip_source_path(&ip_script.instrumented_script.commands)?;
     validate_import_source_path(import_source, repository_root)?;
+    let mut product_gate_ids = BTreeSet::new();
     for id in REQUIRED_SCENARIOS {
         let workload_scenario = workload_map
             .get(id)
@@ -1544,6 +1605,13 @@ fn validate_bundles(
             .expect("exact scenario coverage was checked");
         validate_workload_scenario(id, workload_scenario)?;
         validate_script_scenario(id, script_scenario, profile)?;
+        for (_, gate) in
+            expected_product_gate_commands(&script_scenario.instrumented_script.commands)?
+        {
+            if !product_gate_ids.insert(gate.gate_id) {
+                bail!("viewer product gate IDs must be unique across all scenarios")
+            }
+        }
         validate_oracle_scenario(id, oracle_scenario)?;
         let workload_phases = workload_scenario
             .phases
@@ -1581,8 +1649,8 @@ fn validate_bundles(
         }
         if id == "VV" {
             let commands = &script_scenario.instrumented_script.commands;
-            let verification_wait = verification_completion_wait_index(commands)
-                .expect("VV required-action validation found the measured completion wait");
+            let verification_wait = verification_completion_observation_index(commands)
+                .expect("VV required-action validation found the measured completion observation");
             for (script_phase, oracle_phase) in
                 script_scenario.phases.iter().zip(&oracle_scenario.phases)
             {
@@ -1917,7 +1985,8 @@ fn validate_script_scenario(
     }
 
     validate_automation_template(id, &scenario.instrumented_script, true, labels.as_slice())?;
-    validate_script_limits(&scenario.instrumented_script.limits, profile)?;
+    validate_product_gate_inventory(id, &scenario.instrumented_script.commands)?;
+    validate_hard_safety_limits(&scenario.instrumented_script.hard_safety_limits, profile)?;
     validate_required_action_surface(
         id,
         scenario,
@@ -1929,7 +1998,8 @@ fn validate_script_scenario(
         .as_ref()
         .context("every viewer scenario requires an instrumentation-control script")?;
     validate_automation_template(id, control, false, &[])?;
-    validate_script_limits(&control.limits, profile)?;
+    validate_product_gate_inventory(id, &control.commands)?;
+    validate_hard_safety_limits(&control.hard_safety_limits, profile)?;
     if normalized_semantic_script(&scenario.instrumented_script)
         != normalized_semantic_script(control)
     {
@@ -2173,20 +2243,25 @@ fn validate_ip_action_contract(scenario: &ScriptScenario) -> anyhow::Result<()> 
     )?;
     let open_ready = sole_command_index(
         commands,
-        "wait_for_imported_open_ready",
+        "observe_imported_open_ready",
         "IP imported open-ready assertion",
     )?;
+    if commands.iter().any(|command| {
+        command.get("command").and_then(Value::as_str) == Some("wait_for_imported_open_ready")
+    }) {
+        bail!("IP must not retain the legacy fatal imported open-ready wait")
+    }
     let import_idle = commands
         .iter()
         .enumerate()
         .filter_map(|(index, command)| {
-            (command.get("command").and_then(Value::as_str) == Some("wait_for")
+            (command.get("command").and_then(Value::as_str) == Some("observe_gate")
                 && command.get("condition").and_then(Value::as_str) == Some("import_idle"))
             .then_some(index)
         })
         .collect::<Vec<_>>();
     let [import_idle] = import_idle.as_slice() else {
-        bail!("IP import-idle assertion must appear exactly once")
+        bail!("IP typed import-idle observation must appear exactly once")
     };
     if !(start_checkpoint < begin_setup
         && begin_setup < start_import
@@ -2456,8 +2531,8 @@ fn validate_required_action_surface(
                         == Some("request_source_verification")
                 })
                 .expect("required VV verification request exists");
-            let completion_wait = verification_completion_wait_index(commands)
-                .context("VV must wait for verification completion after its measured request")?;
+            let completion_wait = verification_completion_observation_index(commands)
+                .context("VV must observe verification completion after its measured request")?;
             let first_start = scenario
                 .phases
                 .first()
@@ -2473,11 +2548,11 @@ fn validate_required_action_surface(
         "IP" => {
             require("begin_tiff_import_setup")?;
             require("start_reviewed_import")?;
-            require("wait_for_imported_open_ready")?;
+            require("observe_imported_open_ready")?;
             validate_ip_action_contract(scenario)?;
             for (command_name, path_field) in [
                 ("begin_tiff_import_setup", "output_parent"),
-                ("wait_for_imported_open_ready", "path"),
+                ("observe_imported_open_ready", "path"),
             ] {
                 if !commands.iter().any(|command| {
                     command.get("command").and_then(Value::as_str) == Some(command_name)
@@ -2518,20 +2593,31 @@ fn template_has_extent(script: &AutomationScriptTemplate, extent: super::PixelEx
         })
 }
 
-fn validate_script_limits(
-    limits: &AutomationLimits,
+fn validate_hard_safety_limits(
+    limits: &AutomationHardSafetyLimits,
     profile: &ViewerQualificationProfile,
 ) -> anyhow::Result<()> {
-    if limits.max_cpu_total_bytes != Some(profile.resources.max_cpu_total_bytes)
-        || limits.max_cpu_decoded_residency_bytes
-            != Some(profile.resources.max_cpu_decoded_residency_bytes)
-        || limits.max_cpu_upload_staging_bytes
-            != Some(profile.resources.max_cpu_upload_staging_bytes)
-        || limits.max_runtime_queued_requests != Some(profile.resources.max_queued_requests)
-    {
-        bail!("viewer automation limits must bind the qualification CPU and queue authorities")
+    if *limits != expected_hard_safety_limits(profile)? {
+        bail!("viewer automation hard safety limits differ from the exact profile-derived caps")
     }
     Ok(())
+}
+
+fn expected_hard_safety_limits(
+    profile: &ViewerQualificationProfile,
+) -> anyhow::Result<AutomationHardSafetyLimits> {
+    let max_runtime_queued_requests = profile
+        .resources
+        .max_queued_requests
+        .checked_mul(2)
+        .context("viewer hard runtime queue cap overflows u64")?;
+    Ok(AutomationHardSafetyLimits {
+        max_cpu_total_bytes: Some(profile.resources.max_cpu_total_bytes),
+        max_cpu_decoded_residency_bytes: Some(profile.resources.max_cpu_total_bytes),
+        max_cpu_upload_staging_bytes: Some(profile.resources.max_cpu_total_bytes),
+        max_runtime_queued_requests: Some(max_runtime_queued_requests),
+        ..AutomationHardSafetyLimits::default()
+    })
 }
 
 fn validate_oracle_scenario(id: &str, scenario: &OracleScenario) -> anyhow::Result<()> {
@@ -3413,6 +3499,7 @@ fn validate_automation_template(
     if script.commands.is_empty() || script.commands.len() > 16_384 {
         bail!("viewer scenario {id} script command count is outside 1..=16384")
     }
+    let product_gates = expected_product_gate_commands(&script.commands)?;
     if instrumented && (!script.gpu_timing || !script.diagnostic_counters) {
         bail!("viewer instrumented scripts must enable GPU timing and diagnostic counters")
     }
@@ -3444,9 +3531,106 @@ fn validate_automation_template(
     {
         bail!("viewer scenario {id} script must end with the normal quit command")
     }
+    let final_quit_index = script.commands.len() - 1;
+    if product_gates
+        .iter()
+        .any(|(command_index, _)| *command_index >= final_quit_index)
+    {
+        bail!("viewer scenario {id} product gates must precede the mandatory final quit")
+    }
     let value = serde_json::to_value(script)?;
     validate_placeholder_strings(&value)?;
     Ok(())
+}
+
+fn validate_product_gate_inventory(id: &str, commands: &[Value]) -> anyhow::Result<()> {
+    let expected_acceptance = expected_acceptance_condition_multiset(id);
+    let expected_fatal = expected_fatal_wait_condition_multiset(id);
+    let gates = expected_product_gate_commands(commands)?;
+    let observed_acceptance =
+        gates
+            .iter()
+            .fold(BTreeMap::<&str, usize>::new(), |mut counts, (_, gate)| {
+                *counts.entry(gate.condition).or_default() += 1;
+                counts
+            });
+    if observed_acceptance != expected_acceptance {
+        bail!("viewer scenario {id} has an incomplete or extra v4 product-gate inventory")
+    }
+    for (ordinal, (_, gate)) in gates.iter().enumerate() {
+        let expected_id = format!("{id}.acceptance.{ordinal:03}.{}", gate.condition);
+        if gate.gate_id != expected_id {
+            bail!("viewer scenario {id} product-gate IDs differ from the frozen ordered identity")
+        }
+    }
+
+    let mut observed_fatal = BTreeMap::<&str, usize>::new();
+    for command in commands {
+        if command.get("command").and_then(Value::as_str) == Some("wait_for") {
+            let condition = command
+                .get("condition")
+                .and_then(Value::as_str)
+                .context("fatal wait_for command condition is unavailable")?;
+            *observed_fatal.entry(condition).or_default() += 1;
+        }
+    }
+    if observed_fatal != expected_fatal {
+        bail!(
+            "viewer scenario {id} generic fatal-wait inventory differs from the frozen v4 contract"
+        )
+    }
+    Ok(())
+}
+
+fn expected_acceptance_condition_multiset(id: &str) -> BTreeMap<&'static str, usize> {
+    let entries: &[(&str, usize)] = match id {
+        "RZ" => &[("coordinated_presentation_settled", 4), ("runtime_idle", 4)],
+        "ZB" => &[("coordinated_presentation_settled", 6), ("runtime_idle", 6)],
+        "RO" => &[("coordinated_presentation_settled", 4), ("runtime_idle", 4)],
+        "ST" | "NO" => &[("coordinated_presentation_settled", 2), ("runtime_idle", 2)],
+        "FC" => &[
+            ("first_frame", 1),
+            ("frame_freshness_current", 1),
+            ("coordinated_presentation_settled", 2),
+            ("runtime_idle", 2),
+        ],
+        "VM" => &[("coordinated_presentation_settled", 8), ("runtime_idle", 8)],
+        "PT" => &[("coordinated_presentation_settled", 3), ("runtime_idle", 3)],
+        "VV" => &[
+            ("coordinated_presentation_settled", 3),
+            ("runtime_idle", 3),
+            ("source_verification_verified", 1),
+        ],
+        "IP" => &[
+            ("import_idle", 1),
+            ("runtime_idle", 1),
+            (IMPORTED_OPEN_READY_CONDITION, 1),
+        ],
+        _ => &[],
+    };
+    entries.iter().copied().collect()
+}
+
+fn expected_fatal_wait_condition_multiset(id: &str) -> BTreeMap<&'static str, usize> {
+    let entries: &[(&str, usize)] = match id {
+        "RZ" | "ZB" | "RO" | "ST" | "NO" | "FC" | "VM" => {
+            &[("window_ready", 1), ("source_verification_verified", 1)]
+        }
+        "PT" => &[("window_ready", 1), ("source_verification_verified", 2)],
+        "VV" => &[
+            ("window_ready", 1),
+            ("source_verification_verified", 1),
+            ("source_verification_required", 1),
+        ],
+        "IP" => &[
+            ("window_ready", 1),
+            ("source_verification_verified", 1),
+            ("runtime_idle", 1),
+            ("import_review_ready", 1),
+        ],
+        _ => &[],
+    };
+    entries.iter().copied().collect()
 }
 
 fn validate_startup_bootstrap(bootstrap: &AutomationStartupBootstrap) -> anyhow::Result<()> {
@@ -3599,7 +3783,7 @@ fn normalized_semantic_script(script: &AutomationScriptTemplate) -> Value {
         "schema_version": script.schema_version,
         "scenario": script.scenario,
         "startup_bootstrap": script.startup_bootstrap,
-        "limits": script.limits,
+        "hard_safety_limits": script.hard_safety_limits,
         "commands": commands,
     })
 }
@@ -3900,6 +4084,214 @@ fn execute_samples(
     samples
 }
 
+fn validate_attempt_population(
+    profile: &ViewerQualificationProfile,
+    scripts: &ScriptBundle,
+    samples: &[SampleEvidence],
+    reasons: &mut BTreeSet<String>,
+) -> PopulationEvidence {
+    let development_samples = usize::try_from(profile.protocol.development_samples)
+        .expect("the bounded development sample count fits usize");
+    let script_map = scripts
+        .scenarios
+        .iter()
+        .map(|scenario| (scenario.id.as_str(), scenario))
+        .collect::<BTreeMap<_, _>>();
+    let expected_sample_records = development_samples
+        .checked_mul(REQUIRED_SCENARIOS.len())
+        .expect("the bounded sample population fits usize");
+    let expected_role_attempts = expected_sample_records
+        .checked_mul(2)
+        .expect("the bounded role population fits usize");
+    let phases_per_sample = REQUIRED_SCENARIOS
+        .iter()
+        .map(|id| {
+            script_map
+                .get(id)
+                .expect("script coverage was validated")
+                .phases
+                .len()
+        })
+        .sum::<usize>();
+    let expected_phase_evaluations = development_samples
+        .checked_mul(phases_per_sample)
+        .expect("the bounded phase population fits usize");
+    let gates_per_sample = REQUIRED_SCENARIOS
+        .iter()
+        .map(|id| {
+            let scenario = script_map.get(id).expect("script coverage was validated");
+            expected_product_gate_commands(&scenario.instrumented_script.commands)
+                .expect("script product gates were validated")
+                .len()
+                + expected_product_gate_commands(
+                    &scenario
+                        .instrumentation_control_script
+                        .as_ref()
+                        .expect("instrumentation controls were validated")
+                        .commands,
+                )
+                .expect("control product gates were validated")
+                .len()
+        })
+        .sum::<usize>();
+    let expected_product_gate_observations = development_samples
+        .checked_mul(gates_per_sample)
+        .expect("the bounded product-gate population fits usize");
+
+    let expected_keys = (1..=profile.protocol.development_samples)
+        .flat_map(|sample_index| {
+            REQUIRED_SCENARIOS
+                .into_iter()
+                .map(move |scenario| (sample_index, scenario))
+        })
+        .collect::<BTreeSet<_>>();
+    let observed_keys = samples
+        .iter()
+        .map(|sample| (sample.sample_index, sample.scenario.as_str()))
+        .collect::<BTreeSet<_>>();
+    if samples.len() != expected_sample_records {
+        reasons.insert("sample_population_cardinality_mismatch".to_owned());
+    }
+    let sample_identities_exact =
+        observed_keys == expected_keys && observed_keys.len() == samples.len();
+    if !sample_identities_exact {
+        reasons.insert("sample_population_identity_mismatch".to_owned());
+    }
+
+    let mut observed_role_attempts = 0_usize;
+    let mut completed_role_reports = 0_usize;
+    let mut observed_phase_evaluations = 0_usize;
+    let mut observed_product_gate_observations = 0_usize;
+    let mut role_identities_exact = true;
+    let mut phase_identities_exact = true;
+    let mut product_gate_bijections_exact = true;
+    for sample in samples {
+        observed_role_attempts = observed_role_attempts.saturating_add(1);
+        completed_role_reports = completed_role_reports.saturating_add(usize::from(
+            sample.instrumented.automation_report_sha256.is_some(),
+        ));
+        observed_product_gate_observations = observed_product_gate_observations
+            .saturating_add(sample.instrumented.product_gate_outcomes.len());
+        if sample.instrumented.role != AttemptRole::Instrumented {
+            role_identities_exact = false;
+            reasons.insert("role_attempt_identity_mismatch".to_owned());
+        }
+        match &sample.control {
+            Some(control) => {
+                observed_role_attempts = observed_role_attempts.saturating_add(1);
+                completed_role_reports = completed_role_reports
+                    .saturating_add(usize::from(control.automation_report_sha256.is_some()));
+                observed_product_gate_observations = observed_product_gate_observations
+                    .saturating_add(control.product_gate_outcomes.len());
+                if control.role != AttemptRole::InstrumentationControl {
+                    role_identities_exact = false;
+                    reasons.insert("role_attempt_identity_mismatch".to_owned());
+                }
+            }
+            None => {
+                role_identities_exact = false;
+                reasons.insert("instrumentation_control_missing".to_owned());
+            }
+        }
+        observed_phase_evaluations = observed_phase_evaluations.saturating_add(sample.phases.len());
+        match script_map.get(sample.scenario.as_str()) {
+            Some(scenario) => {
+                if !sample
+                    .phases
+                    .iter()
+                    .map(|phase| phase.name.as_str())
+                    .eq(scenario.phases.iter().map(|phase| phase.name.as_str()))
+                {
+                    phase_identities_exact = false;
+                    reasons.insert("phase_evaluation_identity_mismatch".to_owned());
+                }
+                if !product_gate_outcomes_match_template(
+                    &sample.instrumented.product_gate_outcomes,
+                    &scenario.instrumented_script,
+                ) || sample.control.as_ref().is_none_or(|control| {
+                    scenario
+                        .instrumentation_control_script
+                        .as_ref()
+                        .is_none_or(|template| {
+                            !product_gate_outcomes_match_template(
+                                &control.product_gate_outcomes,
+                                template,
+                            )
+                        })
+                }) {
+                    product_gate_bijections_exact = false;
+                    reasons.insert("product_gate_observation_identity_mismatch".to_owned());
+                }
+            }
+            _ => {
+                phase_identities_exact = false;
+                product_gate_bijections_exact = false;
+                reasons.insert("phase_evaluation_identity_mismatch".to_owned());
+                reasons.insert("product_gate_observation_identity_mismatch".to_owned());
+            }
+        }
+    }
+    if observed_role_attempts != expected_role_attempts {
+        reasons.insert("role_attempt_population_cardinality_mismatch".to_owned());
+    }
+    if completed_role_reports != expected_role_attempts {
+        reasons.insert("completed_role_report_population_mismatch".to_owned());
+    }
+    if observed_phase_evaluations != expected_phase_evaluations {
+        reasons.insert("phase_evaluation_population_mismatch".to_owned());
+    }
+    if observed_product_gate_observations != expected_product_gate_observations {
+        reasons.insert("product_gate_observation_population_mismatch".to_owned());
+    }
+    PopulationEvidence {
+        expected_sample_records,
+        observed_sample_records: samples.len(),
+        expected_role_attempts,
+        observed_role_attempts,
+        completed_role_reports,
+        expected_phase_evaluations,
+        observed_phase_evaluations,
+        expected_product_gate_observations,
+        observed_product_gate_observations,
+        sample_identities_exact,
+        role_identities_exact,
+        phase_identities_exact,
+        product_gate_bijections_exact,
+    }
+}
+
+fn product_gate_outcomes_match_template(
+    outcomes: &[ProductGateOutcome],
+    template: &AutomationScriptTemplate,
+) -> bool {
+    let Ok(expected) = expected_product_gate_commands(&template.commands) else {
+        return false;
+    };
+    outcomes.len() == expected.len()
+        && outcomes
+            .iter()
+            .zip(expected)
+            .all(|(outcome, (command_index, command))| {
+                outcome.command_index == command_index
+                    && outcome.gate_id == command.gate_id
+                    && outcome.condition == command.condition
+                    && outcome.timeout_ms == command.timeout_ms
+                    && product_gate_outcome_is_coherent(outcome)
+            })
+}
+
+fn product_gate_outcome_is_coherent(outcome: &ProductGateOutcome) -> bool {
+    let Some(timeout_ns) = outcome.timeout_ms.checked_mul(1_000_000) else {
+        return false;
+    };
+    match outcome.outcome {
+        ProductGateStatus::Passed => {
+            outcome.condition_met && !outcome.timed_out && outcome.waited_ns < timeout_ns
+        }
+        ProductGateStatus::Failed => outcome.timed_out && outcome.waited_ns >= timeout_ns,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_sample(
     args: &RunArgs,
@@ -3969,9 +4361,12 @@ fn execute_sample(
         && let Some(control) = control.as_mut()
     {
         match control.automation_report.as_ref() {
-            Some(report) => {
-                validate_import_workflow_gate(report, import_gate, &mut control.reasons)
-            }
+            Some(report) => validate_import_workflow_gate(
+                report,
+                import_gate,
+                imported_open_ready_outcome(&control.product_gate_outcomes),
+                &mut control.reasons,
+            ),
             None => {
                 control
                     .reasons
@@ -4111,6 +4506,7 @@ fn missing_control_evidence(result_root: &Path, sample_index: u32, scenario: &st
         source_inventory_after: None,
         cleanup_manifest_sha256: None,
         cleanup_completed: false,
+        product_gate_outcomes: Vec::new(),
         reasons: BTreeSet::from(["instrumentation_control_missing".to_owned()]),
     }
 }
@@ -4166,6 +4562,7 @@ fn execute_role(
                 source_inventory_after: None,
                 cleanup_manifest_sha256: None,
                 cleanup_completed: false,
+                product_gate_outcomes: Vec::new(),
                 reasons: BTreeSet::from(["attempt_setup_failed".to_owned()]),
             };
         }
@@ -4195,6 +4592,7 @@ fn execute_role(
                     source_inventory_after: None,
                     cleanup_manifest_sha256: None,
                     cleanup_completed: false,
+                    product_gate_outcomes: Vec::new(),
                     reasons: BTreeSet::from(
                         ["import_source_inventory_preflight_failed".to_owned()],
                     ),
@@ -4241,6 +4639,7 @@ fn execute_role(
     }
     let mut app_wall_time_ns = None;
     let mut process_cpu_time_ns = None;
+    let mut product_gate_outcomes = Vec::new();
     if let Some(report) = &automation_report {
         validate_basic_automation_report(
             report,
@@ -4249,6 +4648,7 @@ fn execute_role(
             template,
             profile,
             role,
+            &mut product_gate_outcomes,
             &mut reasons,
         );
         app_wall_time_ns = duration_ms_to_ns(report.get("duration_ms"));
@@ -4288,7 +4688,10 @@ fn execute_role(
         });
     let mut cleanup_manifest_sha256 = None;
     let mut cleanup_completed = false;
-    if reasons.is_empty() && scenario.cleanup.enabled {
+    // Cleanup is part of collecting the import manifest evidence.  An
+    // authoritative product-gate failure must still reach it; only integrity
+    // failures make the attempt unsafe to use as evidence.
+    if !has_integrity_reasons(&reasons) && scenario.cleanup.enabled {
         match cleanup_attempt_package(&role_root, &scenario.cleanup) {
             Ok(digest) => {
                 cleanup_manifest_sha256 = Some(digest);
@@ -4313,6 +4716,7 @@ fn execute_role(
         source_inventory_after,
         cleanup_manifest_sha256,
         cleanup_completed,
+        product_gate_outcomes,
         reasons,
     }
 }
@@ -4482,6 +4886,7 @@ fn validate_basic_automation_report(
     template: &AutomationScriptTemplate,
     profile: &ViewerQualificationProfile,
     role: AttemptRole,
+    product_gate_outcomes: &mut Vec<ProductGateOutcome>,
     reasons: &mut BTreeSet<String>,
 ) {
     if report.get("schema").and_then(Value::as_str) != Some(AUTOMATION_REPORT_SCHEMA)
@@ -4493,6 +4898,12 @@ fn validate_basic_automation_report(
         || !report.get("failure_reason").is_some_and(Value::is_null)
     {
         reasons.insert("automation_report_failed".to_owned());
+    }
+    match product_gate_outcomes_from_report(report, template) {
+        Ok(outcomes) => product_gate_outcomes.extend(outcomes),
+        Err(_) => {
+            reasons.insert("product_gate_observation_event_set_invalid".to_owned());
+        }
     }
     validate_app_build_provenance(report, profile, reasons);
     validate_device_and_presentation_contract(report, profile, reasons);
@@ -4529,6 +4940,9 @@ fn validate_basic_automation_report(
             != u64::try_from(template.commands.len()).ok()
     {
         reasons.insert("automation_report_script_mismatch".to_owned());
+    }
+    if !automation_report_hard_safety_limits_match(report, template) {
+        reasons.insert("automation_report_hard_safety_limits_mismatch".to_owned());
     }
     validate_startup_bootstrap_report(report, template, reasons);
     validate_resource_policy(report, profile, reasons);
@@ -4592,6 +5006,261 @@ fn validate_basic_automation_report(
             reasons.insert("removed_gpu_timing_alias_present".to_owned());
         }
     }
+}
+
+fn automation_report_hard_safety_limits_match(
+    report: &Value,
+    template: &AutomationScriptTemplate,
+) -> bool {
+    report.get("limits").is_none()
+        && serde_json::to_value(template.hard_safety_limits)
+            .ok()
+            .as_ref()
+            == report.get("hard_safety_limits")
+}
+
+fn product_gate_outcomes_from_report(
+    report: &Value,
+    template: &AutomationScriptTemplate,
+) -> anyhow::Result<Vec<ProductGateOutcome>> {
+    let expected = expected_product_gate_commands(&template.commands)?;
+    let events = report
+        .get("events")
+        .and_then(Value::as_array)
+        .context("automation product-gate events are unavailable")?;
+    let observed = events
+        .iter()
+        .filter(|event| {
+            event
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(is_product_gate_observation_command)
+        })
+        .collect::<Vec<_>>();
+    if observed.len() != expected.len() {
+        bail!("automation product-gate event cardinality differs from the script")
+    }
+
+    let mut outcomes = Vec::with_capacity(expected.len());
+    for ((expected_index, expected_command), event) in expected.iter().zip(observed) {
+        let event_object = event
+            .as_object()
+            .context("automation product-gate event must be an object")?;
+        if event_object
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            != BTreeSet::from([
+                "command_index",
+                "command",
+                "status",
+                "event_epoch_ms",
+                "duration_ms",
+                "details",
+            ])
+            || event
+                .get("event_epoch_ms")
+                .and_then(Value::as_u64)
+                .is_none()
+            || !event
+                .get("duration_ms")
+                .and_then(Value::as_f64)
+                .is_some_and(|duration| duration.is_finite() && duration >= 0.0)
+        {
+            bail!("automation product-gate event has an invalid exact outer shape")
+        }
+        if event.get("command_index").and_then(Value::as_u64) != u64::try_from(*expected_index).ok()
+            || event.get("command").and_then(Value::as_str) != Some(expected_command.command)
+            || event.get("status").and_then(Value::as_str) != Some("passed")
+        {
+            bail!("automation product-gate event identity or order is invalid")
+        }
+        let details = event
+            .get("details")
+            .and_then(Value::as_object)
+            .context("automation product-gate event details are unavailable")?;
+        let expected_fields = BTreeSet::from([
+            "schema",
+            "gate_id",
+            "condition",
+            "outcome",
+            "condition_met",
+            "timed_out",
+            "timeout_ms",
+            "waited_ns",
+        ]);
+        if details.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_fields {
+            bail!("automation product-gate event details have the wrong exact field set")
+        }
+        let gate_id = details
+            .get("gate_id")
+            .and_then(Value::as_str)
+            .context("automation product-gate event gate ID is unavailable")?;
+        let condition = details
+            .get("condition")
+            .and_then(Value::as_str)
+            .context("automation product-gate event condition is unavailable")?;
+        let timeout_ms = details
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .context("automation product-gate event timeout is unavailable")?;
+        if details.get("schema").and_then(Value::as_str) != Some(PRODUCT_GATE_OBSERVATION_SCHEMA)
+            || gate_id != expected_command.gate_id
+            || condition != expected_command.condition
+            || timeout_ms != expected_command.timeout_ms
+        {
+            bail!("automation product-gate event differs from its bound command")
+        }
+        validate_product_gate_id(gate_id)?;
+        validate_product_gate_condition(condition)?;
+
+        let outcome = match details.get("outcome").and_then(Value::as_str) {
+            Some("passed") => ProductGateStatus::Passed,
+            Some("failed") => ProductGateStatus::Failed,
+            _ => bail!("automation product-gate event outcome is invalid"),
+        };
+        let condition_met = details
+            .get("condition_met")
+            .and_then(Value::as_bool)
+            .context("automation product-gate event condition result is unavailable")?;
+        let timed_out = details
+            .get("timed_out")
+            .and_then(Value::as_bool)
+            .context("automation product-gate event timeout result is unavailable")?;
+        let waited_ns = details
+            .get("waited_ns")
+            .and_then(Value::as_u64)
+            .context("automation product-gate event wait duration is unavailable")?;
+        let timeout_ns = timeout_ms
+            .checked_mul(1_000_000)
+            .context("automation product-gate timeout overflows nanoseconds")?;
+        match outcome {
+            ProductGateStatus::Passed if condition_met && !timed_out && waited_ns < timeout_ns => {}
+            ProductGateStatus::Failed if timed_out => {
+                if waited_ns < timeout_ns {
+                    bail!("failed automation product-gate event ended before its timeout")
+                }
+            }
+            _ => bail!("automation product-gate outcome flags are incoherent"),
+        }
+        outcomes.push(ProductGateOutcome {
+            command_index: *expected_index,
+            gate_id: gate_id.to_owned(),
+            condition: condition.to_owned(),
+            outcome,
+            condition_met,
+            timed_out,
+            timeout_ms,
+            waited_ns,
+        });
+    }
+    Ok(outcomes)
+}
+
+#[derive(Clone, Copy)]
+struct ExpectedProductGateCommand<'a> {
+    command: &'a str,
+    gate_id: &'a str,
+    condition: &'a str,
+    timeout_ms: u64,
+}
+
+fn is_product_gate_observation_command(command: &str) -> bool {
+    matches!(command, "observe_gate" | "observe_imported_open_ready")
+}
+
+fn expected_product_gate_commands(
+    commands: &[Value],
+) -> anyhow::Result<Vec<(usize, ExpectedProductGateCommand<'_>)>> {
+    let mut expected = Vec::new();
+    let mut gate_ids = BTreeSet::new();
+    for (index, command) in commands.iter().enumerate() {
+        let Some(command_name) = command.get("command").and_then(Value::as_str) else {
+            continue;
+        };
+        if !is_product_gate_observation_command(command_name) {
+            continue;
+        }
+        let object = command
+            .as_object()
+            .context("product-gate observation command must be a JSON object")?;
+        let fields = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        let condition = match command_name {
+            "observe_gate" => {
+                if fields != BTreeSet::from(["command", "gate_id", "condition", "timeout_ms"]) {
+                    bail!("observe_gate command has the wrong exact field set")
+                }
+                object
+                    .get("condition")
+                    .and_then(Value::as_str)
+                    .context("observe_gate command condition is unavailable")?
+            }
+            "observe_imported_open_ready" => {
+                if fields != BTreeSet::from(["command", "gate_id", "path", "timeout_ms"]) {
+                    bail!("observe_imported_open_ready command has the wrong exact field set")
+                }
+                object
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.is_empty())
+                    .context("observe_imported_open_ready command path is unavailable")?;
+                IMPORTED_OPEN_READY_CONDITION
+            }
+            _ => unreachable!("product-gate observation command names are closed"),
+        };
+        let gate_id = object
+            .get("gate_id")
+            .and_then(Value::as_str)
+            .context("product-gate observation command gate ID is unavailable")?;
+        validate_product_gate_id(gate_id)?;
+        if !gate_ids.insert(gate_id) {
+            bail!("product-gate observation command gate IDs must be unique within one script")
+        }
+        validate_product_gate_condition(condition)?;
+        let timeout_ms = object
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .filter(|timeout| *timeout > 0 && *timeout <= PRODUCT_GATE_TIMEOUT_MAX_MS)
+            .context("product-gate observation command timeout is outside its fixed bound")?;
+        expected.push((
+            index,
+            ExpectedProductGateCommand {
+                command: command_name,
+                gate_id,
+                condition,
+                timeout_ms,
+            },
+        ));
+    }
+    Ok(expected)
+}
+
+fn validate_product_gate_id(value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value.len() > PRODUCT_GATE_ID_MAX_BYTES
+        || !value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        bail!("product gate ID is not a bounded path-free identifier")
+    }
+    Ok(())
+}
+
+fn validate_product_gate_condition(value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value.len() > PRODUCT_GATE_CONDITION_MAX_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        bail!("product gate condition is not a bounded snake-case identifier")
+    }
+    Ok(())
 }
 
 fn validate_device_and_presentation_contract(
@@ -5124,6 +5793,7 @@ fn evaluate_phases(
                 &script.instrumented_script,
                 report,
                 &checkpoints,
+                imported_open_ready_outcome(&instrumented.product_gate_outcomes),
             )
         })
         .collect()
@@ -5146,6 +5816,7 @@ fn checkpoint_map(report: &Value) -> anyhow::Result<BTreeMap<&str, &Value>> {
     Ok(checkpoints)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_phase(
     profile: &ViewerQualificationProfile,
     numerical_contract: &NumericalContract,
@@ -5154,6 +5825,7 @@ fn evaluate_phase(
     template: &AutomationScriptTemplate,
     report: &Value,
     checkpoints: &BTreeMap<&str, &Value>,
+    imported_open_ready_outcome: Option<ProductGateStatus>,
 ) -> PhaseEvaluation {
     let mut reasons = BTreeSet::new();
     let end = checkpoints
@@ -5208,13 +5880,15 @@ fn evaluate_phase(
     if oracle.require_current_complete {
         validate_current_complete(end_diagnostics, &mut reasons);
     }
-    if oracle.require_coordinated_layout_complete
-        && end_diagnostics
+    if oracle.require_coordinated_layout_complete {
+        let coordinated = end_diagnostics
             .pointer("/render/display_coordination/coordinated_visible_layout_current_complete")
-            .and_then(Value::as_bool)
-            != Some(true)
-    {
-        reasons.insert("coordinated_layout_complete_fact_missing_or_false".to_owned());
+            .and_then(Value::as_bool);
+        if coordinated.is_none() {
+            reasons.insert("coordinated_layout_complete_fact_missing_or_false".to_owned());
+        } else if coordinated != Some(true) {
+            reasons.insert("product_gate_coordinated_layout_complete_false".to_owned());
+        }
     }
     if let Some(scale) = oracle.expected_scale_level {
         validate_scale(end_diagnostics, scale, &mut reasons);
@@ -5352,7 +6026,7 @@ fn evaluate_phase(
         }
     }
     if let Some(gate) = &oracle.import_gate {
-        validate_import_workflow_gate(report, gate, &mut reasons);
+        validate_import_workflow_gate(report, gate, imported_open_ready_outcome, &mut reasons);
     }
     PhaseEvaluation {
         name: oracle.name.clone(),
@@ -5369,11 +6043,80 @@ struct ImportClockEvidence {
     primary_cpu_time_ns: u64,
 }
 
+const IMPORT_INSPECTION_CLOCK_FIELDS: &[&str] = &[
+    "start_boundary",
+    "end_boundary",
+    "wall_clock",
+    "cpu_clock",
+    "started_at_epoch_ms",
+    "start_command_at_epoch_ms",
+    "wall_time_ns",
+    "process_cpu_time_ns",
+    "excluded_from_primary_clock",
+    "human_review_interval_included_when_present",
+];
+const IMPORT_PRIMARY_CLOCK_FIELDS: &[&str] = &[
+    "start_boundary",
+    "end_boundary",
+    "clock",
+    "started_at_epoch_ms",
+    "open_ready_at_epoch_ms",
+    "wall_time_ns",
+    "process_cpu_time_ns",
+    "inspection_and_human_review_excluded",
+    "published_capability_transfer_and_runtime_open_included",
+];
+const IMPORT_PUBLICATION_TO_OPEN_READY_CLOCK_FIELDS: &[&str] = &[
+    "start_boundary",
+    "end_boundary",
+    "wall_clock",
+    "cpu_clock",
+    "published_at_epoch_ms",
+    "open_ready_at_epoch_ms",
+    "wall_time_ns",
+    "process_cpu_time_ns",
+    "included_in_primary_clock",
+    "transfer_mode",
+    "publication_currentness_execution",
+    "source_verification_started_runs",
+    "source_verification_progress_updates",
+    "source_verification_cancelled_runs",
+    "source_verification_failed_runs",
+    "source_verification_successes",
+];
+const IMPORT_PUBLICATION_CURRENTNESS_EXECUTION_FIELDS: &[&str] = &[
+    "contract_id",
+    "expected_snapshot_object_reads",
+    "first_inventory_object_reads",
+    "observed_snapshot_object_reads",
+    "second_inventory_object_reads",
+    "observed_total_object_reads",
+    "observed_codec_decode_calls",
+];
+
+fn import_object_has_exact_non_null_fields(value: Option<&Value>, fields: &[&str]) -> bool {
+    value.and_then(Value::as_object).is_some_and(|object| {
+        object.len() == fields.len()
+            && fields
+                .iter()
+                .all(|field| object.get(*field).is_some_and(|value| !value.is_null()))
+    })
+}
+
 fn validate_import_workflow_gate(
     report: &Value,
     gate: &ImportGate,
+    imported_open_ready_outcome: Option<ProductGateStatus>,
     reasons: &mut BTreeSet<String>,
 ) {
+    let require_open_ready = match imported_open_ready_outcome {
+        Some(ProductGateStatus::Passed) => true,
+        Some(ProductGateStatus::Failed) => false,
+        None => {
+            reasons.insert("imported_open_ready_observation_missing".to_owned());
+            true
+        }
+    };
     let Some(workflow) = report
         .get("import_workflow_evidence")
         .filter(|value| value.is_object())
@@ -5382,16 +6125,37 @@ fn validate_import_workflow_gate(
         return;
     };
     let expected = &gate.expected;
-    if import_u64(workflow, "successful_runs") != Some(expected.successful_runs)
-        || import_u64(workflow, "published_events") != Some(expected.published_events)
-        || import_u64(workflow, "failed_runs") != Some(expected.failed_runs)
-        || import_u64(workflow, "cancelled_runs") != Some(expected.cancelled_runs)
-        || import_u64(workflow, "maximum_resumed_work_units") != Some(expected.resumed_work_units)
-        || workflow
+    let run_facts = (
+        import_u64(workflow, "successful_runs"),
+        import_u64(workflow, "published_events"),
+        import_u64(workflow, "failed_runs"),
+        import_u64(workflow, "cancelled_runs"),
+        import_u64(workflow, "maximum_resumed_work_units"),
+        workflow
             .get("fabricated_global_percentage_or_eta_observed")
-            .and_then(Value::as_bool)
-            != Some(false)
+            .and_then(Value::as_bool),
+    );
+    if let (
+        Some(successful),
+        Some(published),
+        Some(failed),
+        Some(cancelled),
+        Some(resumed),
+        Some(fabricated),
+    ) = run_facts
     {
+        if successful != expected.successful_runs
+            || published != expected.published_events
+            || failed != expected.failed_runs
+            || cancelled != expected.cancelled_runs
+            || resumed != expected.resumed_work_units
+            || fabricated
+        {
+            reasons.insert(
+                "product_gate_import_workflow_run_counts_or_progress_claim_mismatch".to_owned(),
+            );
+        }
+    } else {
         reasons.insert("import_workflow_run_counts_or_progress_claim_mismatch".to_owned());
     }
 
@@ -5426,16 +6190,28 @@ fn validate_import_workflow_gate(
                     .is_some_and(|completed| completed >= minimum)
             })
     });
-    if worker_stages.as_ref() != Some(&expected_worker)
-        || projected_stages.as_ref() != Some(&expected_projected)
-        || !progress_matches
-        || import_u64(workflow, "progress_updates")
-            .is_none_or(|updates| updates < expected.minimum_progress_updates)
+    let progress_updates = import_u64(workflow, "progress_updates");
+    if worker_stages.is_none()
+        || projected_stages.is_none()
+        || progress.is_none()
+        || progress_updates.is_none()
     {
         reasons.insert("import_required_stage_or_progress_evidence_mismatch".to_owned());
+    } else if worker_stages.as_ref() != Some(&expected_worker)
+        || projected_stages.as_ref() != Some(&expected_projected)
+        || !progress_matches
+        || progress_updates.is_some_and(|updates| updates < expected.minimum_progress_updates)
+    {
+        reasons.insert("product_gate_import_required_stage_or_progress_mismatch".to_owned());
     }
 
-    let clocks = validate_import_clock_evidence(workflow, &gate.limits, reasons);
+    let clocks = if require_open_ready {
+        validate_import_clock_evidence(workflow, &gate.limits, reasons)
+    } else {
+        validate_import_inspection_clock_evidence(workflow, reasons);
+        validate_failed_import_open_ready_evidence_shape(workflow, reasons);
+        None
+    };
     validate_import_publication_currentness(workflow, &gate.publication_currentness, reasons);
     let Some(receipt) = workflow
         .get("last_successful_receipt")
@@ -5444,7 +6220,90 @@ fn validate_import_workflow_gate(
         reasons.insert("import_successful_receipt_missing".to_owned());
         return;
     };
-    validate_import_receipt(report, workflow, receipt, gate, clocks, reasons);
+    validate_import_receipt(
+        report,
+        workflow,
+        receipt,
+        gate,
+        clocks,
+        require_open_ready,
+        reasons,
+    );
+}
+
+fn validate_failed_import_open_ready_evidence_shape(
+    workflow: &Value,
+    reasons: &mut BTreeSet<String>,
+) {
+    let publication = workflow
+        .get("publication_to_open_ready_clock")
+        .and_then(Value::as_object);
+    let pass_only_evidence_present = workflow
+        .get("primary_clock")
+        .is_some_and(|primary| !primary.is_null())
+        || publication.is_some_and(|publication| {
+            [
+                "start_boundary",
+                "end_boundary",
+                "wall_clock",
+                "cpu_clock",
+                "published_at_epoch_ms",
+                "open_ready_at_epoch_ms",
+                "wall_time_ns",
+                "process_cpu_time_ns",
+                "included_in_primary_clock",
+                "transfer_mode",
+            ]
+            .iter()
+            .any(|field| publication.contains_key(*field))
+        });
+    if pass_only_evidence_present {
+        reasons.insert("failed_imported_open_ready_pass_only_evidence_present".to_owned());
+    }
+
+    let primary_is_exact_null = workflow.get("primary_clock") == Some(&Value::Null);
+    let publication_has_exact_partial_shape = publication.is_some_and(|publication| {
+        publication
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            == BTreeSet::from([
+                "publication_currentness_execution",
+                "source_verification_started_runs",
+                "source_verification_progress_updates",
+                "source_verification_cancelled_runs",
+                "source_verification_failed_runs",
+                "source_verification_successes",
+            ])
+            && publication
+                .get("publication_currentness_execution")
+                .and_then(Value::as_object)
+                .is_some_and(|currentness| {
+                    currentness
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<BTreeSet<_>>()
+                        == BTreeSet::from([
+                            "contract_id",
+                            "expected_snapshot_object_reads",
+                            "first_inventory_object_reads",
+                            "observed_snapshot_object_reads",
+                            "second_inventory_object_reads",
+                            "observed_total_object_reads",
+                            "observed_codec_decode_calls",
+                        ])
+                })
+    });
+    if !primary_is_exact_null || !publication_has_exact_partial_shape {
+        reasons.insert("failed_imported_open_ready_evidence_shape_invalid".to_owned());
+    }
+}
+
+fn imported_open_ready_outcome(outcomes: &[ProductGateOutcome]) -> Option<ProductGateStatus> {
+    outcomes
+        .iter()
+        .find(|outcome| outcome.condition == IMPORTED_OPEN_READY_CONDITION)
+        .map(|outcome| outcome.outcome)
 }
 
 fn import_u64(value: &Value, field: &str) -> Option<u64> {
@@ -5479,25 +6338,30 @@ fn validate_import_clock_evidence(
     limits: &ImportLimits,
     reasons: &mut BTreeSet<String>,
 ) -> Option<ImportClockEvidence> {
-    let inspection = workflow
-        .get("inspection_and_review_clock")
-        .filter(|value| value.is_object());
-    let primary = workflow
-        .get("primary_clock")
-        .filter(|value| value.is_object());
-    let publication = workflow
-        .get("publication_to_open_ready_clock")
-        .filter(|value| value.is_object());
-    let (Some(inspection), Some(primary), Some(publication)) = (inspection, primary, publication)
-    else {
+    let (inspection_started_at_epoch_ms, start_command_at_epoch_ms) =
+        validate_import_inspection_clock_evidence(workflow, reasons)?;
+    let primary_value = workflow.get("primary_clock");
+    let publication_value = workflow.get("publication_to_open_ready_clock");
+    if !import_object_has_exact_non_null_fields(primary_value, IMPORT_PRIMARY_CLOCK_FIELDS)
+        || !import_object_has_exact_non_null_fields(
+            publication_value,
+            IMPORT_PUBLICATION_TO_OPEN_READY_CLOCK_FIELDS,
+        )
+        || !import_object_has_exact_non_null_fields(
+            publication_value
+                .and_then(|publication| publication.get("publication_currentness_execution")),
+            IMPORT_PUBLICATION_CURRENTNESS_EXECUTION_FIELDS,
+        )
+    {
+        reasons.insert("import_clock_evidence_shape_invalid".to_owned());
+    }
+    let primary = primary_value.filter(|value| value.is_object());
+    let publication = publication_value.filter(|value| value.is_object());
+    let (Some(primary), Some(publication)) = (primary, publication) else {
         reasons.insert("import_clock_evidence_missing".to_owned());
         return None;
     };
     let numeric = (
-        import_u64(inspection, "started_at_epoch_ms"),
-        import_u64(inspection, "start_command_at_epoch_ms"),
-        import_u64(inspection, "wall_time_ns"),
-        import_u64(inspection, "process_cpu_time_ns"),
         import_u64(primary, "started_at_epoch_ms"),
         import_u64(primary, "open_ready_at_epoch_ms"),
         import_u64(primary, "wall_time_ns"),
@@ -5508,10 +6372,6 @@ fn validate_import_clock_evidence(
         import_u64(publication, "process_cpu_time_ns"),
     );
     let (
-        Some(inspection_started_at_epoch_ms),
-        Some(start_command_at_epoch_ms),
-        Some(_inspection_wall_time_ns),
-        Some(_inspection_cpu_time_ns),
         Some(primary_started_at_epoch_ms),
         Some(open_ready_at_epoch_ms),
         Some(primary_wall_time_ns),
@@ -5526,22 +6386,8 @@ fn validate_import_clock_evidence(
         return None;
     };
 
-    let boundaries_match = inspection.get("start_boundary").and_then(Value::as_str)
-        == Some("normal_import_setup_command_dispatch")
-        && inspection.get("end_boundary").and_then(Value::as_str)
-            == Some("reviewed_start_import_command_dispatch")
-        && inspection.get("wall_clock").and_then(Value::as_str) == Some("std_instant_monotonic")
-        && inspection.get("cpu_clock").and_then(Value::as_str) == Some("process_cpu_time")
-        && inspection
-            .get("excluded_from_primary_clock")
-            .and_then(Value::as_bool)
-            == Some(true)
-        && inspection
-            .get("human_review_interval_included_when_present")
-            .and_then(Value::as_bool)
-            == Some(true)
-        && primary.get("start_boundary").and_then(Value::as_str)
-            == Some("accepted_start_import_command_immediately_before_worker_spawn")
+    let boundaries_match = primary.get("start_boundary").and_then(Value::as_str)
+        == Some("accepted_start_import_command_immediately_before_worker_spawn")
         && primary.get("end_boundary").and_then(Value::as_str)
             == Some("published_destination_verified_and_open_ready_for_normal_product_use")
         && primary.get("clock").and_then(Value::as_str) == Some("std_instant_monotonic")
@@ -5584,17 +6430,6 @@ fn validate_import_clock_evidence(
     {
         reasons.insert("import_clock_limit_exceeded".to_owned());
     }
-    for field in [
-        "source_verification_started_runs",
-        "source_verification_progress_updates",
-        "source_verification_cancelled_runs",
-        "source_verification_failed_runs",
-        "source_verification_successes",
-    ] {
-        if import_u64(publication, field) != Some(0) {
-            reasons.insert("import_ordinary_source_verifier_activity_observed".to_owned());
-        }
-    }
     Some(ImportClockEvidence {
         primary_started_at_epoch_ms,
         open_ready_at_epoch_ms,
@@ -5604,6 +6439,55 @@ fn validate_import_clock_evidence(
     })
 }
 
+fn validate_import_inspection_clock_evidence(
+    workflow: &Value,
+    reasons: &mut BTreeSet<String>,
+) -> Option<(u64, u64)> {
+    let inspection_value = workflow.get("inspection_and_review_clock");
+    if !import_object_has_exact_non_null_fields(inspection_value, IMPORT_INSPECTION_CLOCK_FIELDS) {
+        reasons.insert("import_clock_evidence_shape_invalid".to_owned());
+    }
+    let Some(inspection) = inspection_value.filter(|value| value.is_object()) else {
+        reasons.insert("import_clock_evidence_missing".to_owned());
+        return None;
+    };
+    let numeric = (
+        import_u64(inspection, "started_at_epoch_ms"),
+        import_u64(inspection, "start_command_at_epoch_ms"),
+        import_u64(inspection, "wall_time_ns"),
+        import_u64(inspection, "process_cpu_time_ns"),
+    );
+    let (
+        Some(started_at_epoch_ms),
+        Some(start_command_at_epoch_ms),
+        Some(_wall_time_ns),
+        Some(_process_cpu_time_ns),
+    ) = numeric
+    else {
+        reasons.insert("import_clock_evidence_missing".to_owned());
+        return None;
+    };
+    let exact = inspection.get("start_boundary").and_then(Value::as_str)
+        == Some("normal_import_setup_command_dispatch")
+        && inspection.get("end_boundary").and_then(Value::as_str)
+            == Some("reviewed_start_import_command_dispatch")
+        && inspection.get("wall_clock").and_then(Value::as_str) == Some("std_instant_monotonic")
+        && inspection.get("cpu_clock").and_then(Value::as_str) == Some("process_cpu_time")
+        && inspection
+            .get("excluded_from_primary_clock")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && inspection
+            .get("human_review_interval_included_when_present")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && started_at_epoch_ms <= start_command_at_epoch_ms;
+    if !exact {
+        reasons.insert("import_clock_boundaries_or_order_mismatch".to_owned());
+    }
+    Some((started_at_epoch_ms, start_command_at_epoch_ms))
+}
+
 fn validate_import_publication_currentness(
     workflow: &Value,
     expected: &ImportPublicationCurrentnessExpectation,
@@ -5611,12 +6495,30 @@ fn validate_import_publication_currentness(
 ) {
     let execution =
         workflow.pointer("/publication_to_open_ready_clock/publication_currentness_execution");
-    let exact = execution.is_some_and(|execution| {
+    let fields_present = execution.is_some_and(|execution| {
+        execution
+            .get("contract_id")
+            .and_then(Value::as_str)
+            .is_some()
+            && [
+                "expected_snapshot_object_reads",
+                "first_inventory_object_reads",
+                "observed_snapshot_object_reads",
+                "second_inventory_object_reads",
+                "observed_total_object_reads",
+                "observed_codec_decode_calls",
+            ]
+            .iter()
+            .all(|field| import_u64(execution, field).is_some())
+    });
+    let authority_matches = execution.is_some_and(|execution| {
         execution.get("contract_id").and_then(Value::as_str) == Some(expected.contract_id.as_str())
             && import_u64(execution, "expected_snapshot_object_reads")
                 == Some(expected.expected_snapshot_object_reads)
-            && import_u64(execution, "first_inventory_object_reads")
-                == Some(expected.first_inventory_object_reads)
+    });
+    let observed_counts_match = execution.is_some_and(|execution| {
+        import_u64(execution, "first_inventory_object_reads")
+            == Some(expected.first_inventory_object_reads)
             && import_u64(execution, "observed_snapshot_object_reads")
                 == Some(expected.observed_snapshot_object_reads)
             && import_u64(execution, "second_inventory_object_reads")
@@ -5626,8 +6528,29 @@ fn validate_import_publication_currentness(
             && import_u64(execution, "observed_codec_decode_calls")
                 == Some(expected.observed_codec_decode_calls)
     });
-    if !exact {
+    if !fields_present || !authority_matches {
         reasons.insert("import_publication_currentness_evidence_mismatch".to_owned());
+    } else if !observed_counts_match {
+        reasons
+            .insert("product_gate_import_publication_currentness_observation_mismatch".to_owned());
+    }
+    for field in [
+        "source_verification_started_runs",
+        "source_verification_progress_updates",
+        "source_verification_cancelled_runs",
+        "source_verification_failed_runs",
+        "source_verification_successes",
+    ] {
+        let observed = workflow
+            .pointer("/publication_to_open_ready_clock")
+            .and_then(|publication| import_u64(publication, field));
+        if observed.is_none() {
+            reasons.insert("import_ordinary_source_verifier_activity_observed".to_owned());
+        } else if observed != Some(0) {
+            reasons.insert(
+                "product_gate_import_ordinary_source_verifier_activity_observed".to_owned(),
+            );
+        }
     }
 }
 
@@ -5637,9 +6560,10 @@ fn validate_import_receipt(
     receipt: &Value,
     gate: &ImportGate,
     clocks: Option<ImportClockEvidence>,
+    require_open_ready: bool,
     reasons: &mut BTreeSet<String>,
 ) {
-    validate_import_receipt_binding(report, workflow, receipt, clocks, reasons);
+    validate_import_receipt_binding(report, receipt, clocks, require_open_ready, reasons);
 
     let Some(statistics) = receipt.get("statistics").filter(|value| value.is_object()) else {
         reasons.insert("import_receipt_statistics_missing".to_owned());
@@ -5735,7 +6659,11 @@ fn validate_import_receipt(
     if !source_binding_matches {
         reasons.insert("import_receipt_source_revalidation_mismatch".to_owned());
     }
-    if !reviewed_source_bytes.is_some_and(|reviewed| {
+    if reviewed_source_bytes.is_none_or(|reviewed| reviewed == 0)
+        || gate.limits.maximum_source_read_amplification_denominator == 0
+    {
+        reasons.insert("import_receipt_source_read_amplification_operand_invalid".to_owned());
+    } else if !reviewed_source_bytes.is_some_and(|reviewed| {
         u128::from(source_bytes_read)
             * u128::from(gate.limits.maximum_source_read_amplification_denominator)
             <= u128::from(reviewed)
@@ -5795,10 +6723,11 @@ fn validate_import_receipt(
         && import_u64(statistics, "sync_time_ns")
             .is_some_and(|sync_time| sync_time <= receipt_wall_time)
         && import_u64(workflow, "maximum_peak_working_bytes") == Some(working_bytes)
-        && clocks.is_some_and(|clock| {
-            receipt_wall_time <= clock.primary_wall_time_ns
-                && receipt_cpu_time <= clock.primary_cpu_time_ns
-        });
+        && (!require_open_ready
+            || clocks.is_some_and(|clock| {
+                receipt_wall_time <= clock.primary_wall_time_ns
+                    && receipt_cpu_time <= clock.primary_cpu_time_ns
+            }));
     if !core_counters_reconcile {
         reasons.insert("import_receipt_counter_reconciliation_failed".to_owned());
     }
@@ -5815,7 +6744,9 @@ fn validate_import_receipt(
         || preflight_temporary == 0
         || peak_temporary == 0
         || sync_calls == 0
-        || working_bytes > limits.maximum_peak_working_bytes
+    {
+        reasons.insert("import_receipt_resource_operand_invalid".to_owned());
+    } else if working_bytes > limits.maximum_peak_working_bytes
         || peak_process_rss > limits.maximum_peak_process_rss_bytes
         || peak_fds > limits.maximum_product_peak_open_file_descriptors
         || structural_fds > limits.maximum_open_file_descriptor_structural_bound
@@ -5826,9 +6757,9 @@ fn validate_import_receipt(
     {
         reasons.insert("import_receipt_resource_limit_exceeded".to_owned());
     }
-    if receipt_wall_time == 0
-        || receipt_cpu_time == 0
-        || receipt_wall_time > limits.maximum_receipt_primary_wall_time_ns
+    if receipt_wall_time == 0 || receipt_cpu_time == 0 {
+        reasons.insert("import_receipt_primary_clock_operand_invalid".to_owned());
+    } else if receipt_wall_time > limits.maximum_receipt_primary_wall_time_ns
         || receipt_cpu_time > limits.maximum_receipt_primary_cpu_time_ns
     {
         reasons.insert("import_receipt_primary_clock_limit_exceeded".to_owned());
@@ -5842,7 +6773,7 @@ fn validate_import_receipt(
             });
             projected_ms <= maximum_ms
                 && receipt_wall_time / 1_000_000 <= maximum_ms
-                && maximum_ms <= app_primary_ceiling_ms
+                && (!require_open_ready || maximum_ms <= app_primary_ceiling_ms)
         });
     if !elapsed_reconciles {
         reasons.insert("import_elapsed_evidence_does_not_reconcile".to_owned());
@@ -5851,9 +6782,9 @@ fn validate_import_receipt(
 
 fn validate_import_receipt_binding(
     report: &Value,
-    workflow: &Value,
     receipt: &Value,
     clocks: Option<ImportClockEvidence>,
+    require_open_ready: bool,
     reasons: &mut BTreeSet<String>,
 ) {
     let destination = receipt
@@ -5890,7 +6821,7 @@ fn validate_import_receipt_binding(
             .all(|field| import_u64(token, field).is_some_and(|value| value > 0))
     });
     let start_details = unique_passed_event_details(report, "start_reviewed_import");
-    let open_ready_details = unique_passed_event_details(report, "wait_for_imported_open_ready");
+    let open_ready_details = unique_passed_event_details(report, "observe_imported_open_ready");
     let start_matches = start_details.is_some_and(|details| {
         import_u64(details, "review_id") == review_id
             && details.get("destination").and_then(Value::as_str) == destination
@@ -5908,31 +6839,40 @@ fn validate_import_receipt_binding(
                 .get("normal_review_command_path")
                 .and_then(Value::as_bool)
                 == Some(true)
-            && clocks.is_some_and(|clock| {
-                import_u64(details, "primary_clock_started_at_epoch_ms")
-                    == Some(clock.primary_started_at_epoch_ms)
-            })
+            && if require_open_ready {
+                clocks.is_some_and(|clock| {
+                    import_u64(details, "primary_clock_started_at_epoch_ms")
+                        == Some(clock.primary_started_at_epoch_ms)
+                })
+            } else {
+                import_u64(details, "primary_clock_started_at_epoch_ms").is_some()
+            }
     });
-    let open_ready_matches = open_ready_details.is_some_and(|details| {
-        details.get("path").and_then(Value::as_str) == destination
-            && details.get("verified").and_then(Value::as_bool) == Some(true)
-            && details.get("import_idle").and_then(Value::as_bool) == Some(true)
-            && details
-                .get("normal_product_open_path")
-                .and_then(Value::as_bool)
-                == Some(true)
-            && details.get("primary_clock") == workflow.get("primary_clock")
-    });
+    let expected_outcome = if require_open_ready {
+        ProductGateStatus::Passed
+    } else {
+        ProductGateStatus::Failed
+    };
+    let open_ready_matches = open_ready_details
+        .is_some_and(|details| imported_open_ready_details_match(details, expected_outcome));
     let published_event = receipt
         .get("published_event")
         .filter(|value| value.is_object());
     let publication_matches = published_event.is_some_and(|published| {
         import_u64(published, "process_cpu_time_ns").is_some()
-            && clocks.is_some_and(|clock| {
-                import_u64(published, "published_at_epoch_ms") == Some(clock.published_at_epoch_ms)
-                    && clock.primary_started_at_epoch_ms <= clock.published_at_epoch_ms
-                    && clock.published_at_epoch_ms <= clock.open_ready_at_epoch_ms
-            })
+            && if require_open_ready {
+                clocks.is_some_and(|clock| {
+                    import_u64(published, "published_at_epoch_ms")
+                        == Some(clock.published_at_epoch_ms)
+                        && clock.primary_started_at_epoch_ms <= clock.published_at_epoch_ms
+                        && clock.published_at_epoch_ms <= clock.open_ready_at_epoch_ms
+                })
+            } else {
+                start_details
+                    .and_then(|details| import_u64(details, "primary_clock_started_at_epoch_ms"))
+                    .zip(import_u64(published, "published_at_epoch_ms"))
+                    .is_some_and(|(started, published)| started <= published)
+            }
     });
     if destination.is_none()
         || review_id.is_none()
@@ -5945,6 +6885,63 @@ fn validate_import_receipt_binding(
         || !publication_matches
     {
         reasons.insert("import_receipt_start_or_open_ready_binding_mismatch".to_owned());
+    }
+}
+
+fn imported_open_ready_details_match(details: &Value, outcome: ProductGateStatus) -> bool {
+    let Some(details) = details.as_object() else {
+        return false;
+    };
+    if details.keys().map(String::as_str).collect::<BTreeSet<_>>()
+        != BTreeSet::from([
+            "schema",
+            "gate_id",
+            "condition",
+            "outcome",
+            "condition_met",
+            "timed_out",
+            "timeout_ms",
+            "waited_ns",
+        ])
+        || details.get("schema").and_then(Value::as_str) != Some(PRODUCT_GATE_OBSERVATION_SCHEMA)
+        || details.get("condition").and_then(Value::as_str) != Some(IMPORTED_OPEN_READY_CONDITION)
+        || details.get("outcome").and_then(Value::as_str) != Some(outcome.report_label())
+        || details
+            .get("gate_id")
+            .and_then(Value::as_str)
+            .is_none_or(|gate_id| validate_product_gate_id(gate_id).is_err())
+    {
+        return false;
+    }
+    let condition_met = details.get("condition_met").and_then(Value::as_bool);
+    let timed_out = details.get("timed_out").and_then(Value::as_bool);
+    let timeout_ms = details.get("timeout_ms").and_then(Value::as_u64);
+    let waited_ns = details.get("waited_ns").and_then(Value::as_u64);
+    match outcome {
+        ProductGateStatus::Passed => {
+            condition_met == Some(true)
+                && timed_out == Some(false)
+                && timeout_ms
+                    .and_then(|timeout| timeout.checked_mul(1_000_000))
+                    .zip(waited_ns)
+                    .is_some_and(|(timeout_ns, waited_ns)| {
+                        timeout_ns > 0
+                            && timeout_ns <= PRODUCT_GATE_TIMEOUT_MAX_MS * 1_000_000
+                            && waited_ns < timeout_ns
+                    })
+        }
+        ProductGateStatus::Failed => {
+            condition_met.is_some()
+                && timed_out == Some(true)
+                && timeout_ms
+                    .and_then(|timeout| timeout.checked_mul(1_000_000))
+                    .zip(waited_ns)
+                    .is_some_and(|(timeout_ns, waited_ns)| {
+                        timeout_ns > 0
+                            && timeout_ns <= PRODUCT_GATE_TIMEOUT_MAX_MS * 1_000_000
+                            && waited_ns >= timeout_ns
+                    })
+        }
     }
 }
 
@@ -6112,16 +7109,18 @@ fn validate_phase_script_binding(
         });
         if !later_mapped_request {
             let observed = report.pointer("/viewport_evidence/requested_mapped_client_pixels");
-            if observed
+            let width = observed
                 .and_then(|value| value.get("width"))
-                .and_then(Value::as_u64)
-                != Some(u64::from(expected.mapped_client_extent.width))
-                || observed
-                    .and_then(|value| value.get("height"))
-                    .and_then(Value::as_u64)
-                    != Some(u64::from(expected.mapped_client_extent.height))
-            {
+                .and_then(Value::as_u64);
+            let height = observed
+                .and_then(|value| value.get("height"))
+                .and_then(Value::as_u64);
+            if width.is_none() || height.is_none() {
                 reasons.insert("mapped_client_extent_fact_missing_or_mismatched".to_owned());
+            } else if width != Some(u64::from(expected.mapped_client_extent.width))
+                || height != Some(u64::from(expected.mapped_client_extent.height))
+            {
+                reasons.insert("product_gate_mapped_client_extent_mismatch".to_owned());
             }
         }
     }
@@ -6134,21 +7133,32 @@ fn validate_phase_state_facts(
     reasons: &mut BTreeSet<String>,
 ) {
     let camera = diagnostics.get("camera");
-    let camera_identity_matches = camera
+    let canonical_source = camera
         .and_then(|value| value.get("canonical_source"))
-        .and_then(Value::as_str)
-        == Some("ApplicationSnapshot_ViewState_camera")
-        && camera
-            .and_then(|value| value.get("projection"))
-            .and_then(Value::as_str)
-            == Some(expected.camera.projection.report_label())
-        && diagnostics
-            .pointer("/render/projection")
-            .and_then(Value::as_str)
-            == Some(expected.camera.projection.report_label());
-    if !camera_identity_matches {
+        .and_then(Value::as_str);
+    let camera_projection = camera
+        .and_then(|value| value.get("projection"))
+        .and_then(Value::as_str);
+    let render_projection = diagnostics
+        .pointer("/render/projection")
+        .and_then(Value::as_str);
+    if canonical_source != Some("ApplicationSnapshot_ViewState_camera")
+        || camera_projection.is_none()
+        || render_projection.is_none()
+    {
         reasons.insert("canonical_camera_identity_missing_or_mismatched".to_owned());
+    } else if camera_projection != Some(expected.camera.projection.report_label())
+        || render_projection != Some(expected.camera.projection.report_label())
+    {
+        reasons.insert("product_gate_canonical_camera_identity_mismatch".to_owned());
     }
+    let camera_geometry_valid = camera.is_some_and(|camera| {
+        finite_numeric_array(camera.get("target_world"), 3)
+            && finite_numeric_array(camera.get("orientation_xyzw"), 4)
+            && finite_numeric_field(camera.get("orthographic_world_per_screen_point"))
+            && finite_numeric_field(camera.get("perspective_focal_length_screen_points"))
+            && finite_numeric_field(camera.get("perspective_view_distance_world"))
+    });
     let camera_geometry_matches = camera.is_some_and(|camera| {
         numeric_array_matches(
             camera.get("target_world"),
@@ -6177,46 +7187,61 @@ fn validate_phase_state_facts(
             contract.scalar_relative_tolerance,
         )
     });
-    if !camera_geometry_matches {
+    if !camera_geometry_valid {
         reasons.insert("canonical_camera_geometry_missing_or_outside_contract".to_owned());
+    } else if !camera_geometry_matches {
+        reasons.insert("product_gate_canonical_camera_geometry_outside_contract".to_owned());
     }
-    if camera
+    let viewport_width = camera
         .and_then(|value| value.pointer("/viewport/width"))
-        .and_then(Value::as_u64)
-        != Some(u64::from(expected.render_extent.width))
-        || camera
-            .and_then(|value| value.pointer("/viewport/height"))
-            .and_then(Value::as_u64)
-            != Some(u64::from(expected.render_extent.height))
-    {
+        .and_then(Value::as_u64);
+    let viewport_height = camera
+        .and_then(|value| value.pointer("/viewport/height"))
+        .and_then(Value::as_u64);
+    if viewport_width.is_none() || viewport_height.is_none() {
         reasons.insert("canonical_camera_viewport_missing_or_mismatched".to_owned());
+    } else if viewport_width != Some(u64::from(expected.render_extent.width))
+        || viewport_height != Some(u64::from(expected.render_extent.height))
+    {
+        reasons.insert("product_gate_canonical_camera_viewport_mismatch".to_owned());
     }
 
     let cross = diagnostics.get("cross_section");
-    if cross
+    let cross_schema = cross
         .and_then(|value| value.get("schema"))
-        .and_then(Value::as_str)
-        != Some("mirante4d-cross-section-panel-diagnostics")
-        || cross
-            .and_then(|value| value.get("schema_version"))
-            .and_then(Value::as_u64)
-            != Some(1)
-        || cross
-            .and_then(|value| value.get("layout"))
-            .and_then(Value::as_str)
-            != Some(expected.layout.report_label())
+        .and_then(Value::as_str);
+    let cross_version = cross
+        .and_then(|value| value.get("schema_version"))
+        .and_then(Value::as_u64);
+    let cross_layout = cross
+        .and_then(|value| value.get("layout"))
+        .and_then(Value::as_str);
+    if cross_schema != Some("mirante4d-cross-section-panel-diagnostics")
+        || cross_version != Some(1)
+        || cross_layout.is_none()
     {
         reasons.insert("canonical_cross_section_schema_or_layout_mismatch".to_owned());
+    } else if cross_layout != Some(expected.layout.report_label()) {
+        reasons.insert("product_gate_canonical_cross_section_schema_or_layout_mismatch".to_owned());
     }
     if expected.active_view != ViewerPanel::ThreeD {
         let observed_active_panel = cross
             .and_then(|value| value.get("active_panel"))
             .and_then(Value::as_str);
-        if observed_active_panel != Some(expected.active_view.report_label()) {
+        if observed_active_panel.is_none() {
             reasons.insert("canonical_active_view_missing_or_mismatched".to_owned());
+        } else if observed_active_panel != Some(expected.active_view.report_label()) {
+            reasons.insert("product_gate_canonical_active_view_mismatch".to_owned());
         }
     }
     let linked = cross.and_then(|value| value.get("canonical_linked_view"));
+    let linked_valid = linked.is_some_and(|linked| {
+        linked.get("source").and_then(Value::as_str).is_some()
+            && finite_numeric_array(linked.get("center_world"), 3)
+            && finite_numeric_array(linked.get("orientation_xyzw"), 4)
+            && finite_numeric_field(linked.get("world_per_screen_point"))
+            && finite_numeric_field(linked.get("depth_world"))
+    });
     let linked_matches = linked.is_some_and(|linked| {
         linked.get("source").and_then(Value::as_str)
             == Some("ApplicationSnapshot_ViewState_cross_section")
@@ -6245,8 +7270,15 @@ fn validate_phase_state_facts(
                 contract.scalar_relative_tolerance,
             )
     });
-    if !linked_matches {
+    if !linked_valid
+        || linked
+            .and_then(|linked| linked.get("source"))
+            .and_then(Value::as_str)
+            != Some("ApplicationSnapshot_ViewState_cross_section")
+    {
         reasons.insert("canonical_cross_section_geometry_missing_or_outside_contract".to_owned());
+    } else if !linked_matches {
+        reasons.insert("product_gate_canonical_cross_section_geometry_outside_contract".to_owned());
     }
     validate_canonical_plane_geometry(cross, &expected.cross_section.planes, contract, reasons);
 }
@@ -6271,6 +7303,14 @@ fn validate_canonical_plane_geometry(
                 panel.get("panel_id").and_then(Value::as_str) == Some(expected.panel.report_label())
             })
             .and_then(|panel| panel.get("canonical_plane_geometry"));
+        let valid = geometry.is_some_and(|geometry| {
+            geometry.get("source").and_then(Value::as_str).is_some()
+                && finite_numeric_array(geometry.get("plane_origin_world"), 3)
+                && finite_numeric_array(geometry.get("u_axis_world"), 3)
+                && finite_numeric_array(geometry.get("v_axis_world"), 3)
+                && finite_numeric_array(geometry.get("normal_away_world"), 3)
+                && finite_numeric_field(geometry.get("world_per_screen_point"))
+        });
         let matches = geometry.is_some_and(|geometry| {
             geometry.get("source").and_then(Value::as_str)
                 == Some("canonical_linked_cross_section_view")
@@ -6305,13 +7345,36 @@ fn validate_canonical_plane_geometry(
                     contract.scalar_relative_tolerance,
                 )
         });
-        if !matches {
+        if !valid
+            || geometry
+                .and_then(|geometry| geometry.get("source"))
+                .and_then(Value::as_str)
+                != Some("canonical_linked_cross_section_view")
+        {
             reasons.insert(format!(
                 "canonical_{}_plane_geometry_missing_or_outside_contract",
                 expected.panel.report_label().to_ascii_lowercase()
             ));
+        } else if !matches {
+            reasons.insert(format!(
+                "product_gate_canonical_{}_plane_geometry_outside_contract",
+                expected.panel.report_label().to_ascii_lowercase()
+            ));
         }
     }
+}
+
+fn finite_numeric_array(value: Option<&Value>, expected_len: usize) -> bool {
+    value.and_then(Value::as_array).is_some_and(|values| {
+        values.len() == expected_len
+            && values
+                .iter()
+                .all(|value| value.as_f64().is_some_and(f64::is_finite))
+    })
+}
+
+fn finite_numeric_field(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_f64).is_some_and(f64::is_finite)
 }
 
 fn numeric_array_matches(
@@ -6574,40 +7637,46 @@ fn validate_current_complete(diagnostics: &Value, reasons: &mut BTreeSet<String>
     let presentation_generation = display
         .and_then(|value| value.get("current_presentation_generation"))
         .and_then(Value::as_u64);
-    if input_generation.is_none() || input_generation != presentation_generation {
+    if input_generation.is_none() || presentation_generation.is_none() {
         reasons.insert("current_presentation_generation_mismatch_or_missing".to_owned());
+    } else if input_generation != presentation_generation {
+        reasons.insert("product_gate_current_presentation_generation_mismatch".to_owned());
     }
-    if diagnostics
+    let completeness = diagnostics
         .pointer("/render/frame_fidelity/completeness")
-        .and_then(Value::as_str)
-        != Some("Complete")
-        || diagnostics
-            .pointer("/render/frame_fidelity/display_freshness")
-            .and_then(Value::as_str)
-            != Some("Current")
-        || !diagnostics
-            .pointer("/render/frame_fidelity/last_failure_kind")
-            .is_some_and(Value::is_null)
-        || !diagnostics
-            .pointer("/render/frame_fidelity/last_capacity_error")
-            .is_some_and(Value::is_null)
+        .and_then(Value::as_str);
+    let freshness = diagnostics
+        .pointer("/render/frame_fidelity/display_freshness")
+        .and_then(Value::as_str);
+    let last_failure = diagnostics.pointer("/render/frame_fidelity/last_failure_kind");
+    let last_capacity_error = diagnostics.pointer("/render/frame_fidelity/last_capacity_error");
+    if completeness.is_none()
+        || freshness.is_none()
+        || last_failure.is_none()
+        || last_capacity_error.is_none()
     {
         reasons.insert("current_complete_fidelity_fact_missing_or_false".to_owned());
+    } else if completeness != Some("Complete")
+        || freshness != Some("Current")
+        || !last_failure.is_some_and(Value::is_null)
+        || !last_capacity_error.is_some_and(Value::is_null)
+    {
+        reasons.insert("product_gate_current_complete_fidelity_false".to_owned());
     }
 }
 
 fn validate_scale(diagnostics: &Value, expected: u32, reasons: &mut BTreeSet<String>) {
     let expected = u64::from(expected);
-    if diagnostics
+    let target = diagnostics
         .pointer("/render/frame_fidelity/target_scale_level")
-        .and_then(Value::as_u64)
-        != Some(expected)
-        || diagnostics
-            .pointer("/render/frame_fidelity/displayed_scale_level")
-            .and_then(Value::as_u64)
-            != Some(expected)
-    {
+        .and_then(Value::as_u64);
+    let displayed = diagnostics
+        .pointer("/render/frame_fidelity/displayed_scale_level")
+        .and_then(Value::as_u64);
+    if target.is_none() || displayed.is_none() {
         reasons.insert("target_or_displayed_scale_mismatch_or_missing".to_owned());
+    } else if target != Some(expected) || displayed != Some(expected) {
+        reasons.insert("product_gate_target_or_displayed_scale_mismatch".to_owned());
     }
 }
 
@@ -6645,15 +7714,25 @@ fn validate_cross_section_layers(
             continue;
         };
         let scale = u64::from(expected.scale_level);
+        let expected_scale = layer.get("expected_scale_level").and_then(Value::as_u64);
+        let displayed_scale = layer.get("displayed_scale_level").and_then(Value::as_u64);
+        let current = layer.get("current").and_then(Value::as_bool);
         let available = layer.get("available_requirements").and_then(Value::as_u64);
         let total = layer.get("total_requirements").and_then(Value::as_u64);
-        if layer.get("expected_scale_level").and_then(Value::as_u64) != Some(scale)
-            || layer.get("displayed_scale_level").and_then(Value::as_u64) != Some(scale)
-            || layer.get("current").and_then(Value::as_bool) != Some(true)
+        if expected_scale.is_none()
+            || displayed_scale.is_none()
+            || current.is_none()
             || available.is_none()
+            || total.is_none()
+        {
+            reasons.insert("cross_section_layer_facts_missing".to_owned());
+        } else if expected_scale != Some(scale)
+            || displayed_scale != Some(scale)
+            || current != Some(true)
             || available != total
         {
-            reasons.insert("cross_section_layer_scale_or_coverage_mismatch".to_owned());
+            reasons
+                .insert("product_gate_cross_section_layer_scale_or_coverage_mismatch".to_owned());
         }
     }
 }
@@ -6784,14 +7863,18 @@ fn validate_gpu_gate(
     let active_mode = diagnostics
         .pointer("/render/active_render_mode")
         .and_then(Value::as_str);
-    let mode_matches = match gate {
-        GpuGate::Plane => expected_panel != ViewerPanel::ThreeD,
-        GpuGate::Mip => active_mode == Some("Mip"),
-        GpuGate::Dvr => active_mode == Some("Dvr"),
-        GpuGate::Iso => active_mode == Some("Isosurface"),
+    let expected_mode = match gate {
+        GpuGate::Plane => None,
+        GpuGate::Mip => Some("Mip"),
+        GpuGate::Dvr => Some("Dvr"),
+        GpuGate::Iso => Some("Isosurface"),
     };
-    if !mode_matches {
+    if matches!(gate, GpuGate::Plane) && expected_panel == ViewerPanel::ThreeD
+        || expected_mode.is_some() && active_mode.is_none()
+    {
         reasons.insert("gpu_gate_render_mode_mismatch_or_missing".to_owned());
+    } else if expected_mode.is_some() && active_mode != expected_mode {
+        reasons.insert("product_gate_gpu_render_mode_mismatch".to_owned());
     }
     if !matches!(gate, GpuGate::Plane) && expected_panel != ViewerPanel::ThreeD {
         reasons.insert("volume_gpu_gate_panel_mismatch".to_owned());
@@ -6829,15 +7912,17 @@ fn validate_settlement_gate(
     let display_generation = diagnostics
         .pointer("/render/display_coordination/input_generation")
         .and_then(Value::as_u64);
-    if milestones
+    let milestone_scope = milestones
         .and_then(|value| value.get("scope"))
-        .and_then(Value::as_str)
-        != Some("coordinated_visible_layout")
-        || milestones
-            .and_then(|value| value.get("input_generation"))
-            .and_then(Value::as_u64)
-            != display_generation
+        .and_then(Value::as_str);
+    let milestone_generation = milestones
+        .and_then(|value| value.get("input_generation"))
+        .and_then(Value::as_u64);
+    if milestone_scope.is_none()
+        || milestone_generation.is_none()
         || display_generation.is_none()
+        || milestone_scope != Some("coordinated_visible_layout")
+        || milestone_generation != display_generation
     {
         reasons.insert("coordinated_milestone_scope_or_generation_mismatch".to_owned());
     }
@@ -6859,16 +7944,20 @@ fn validate_settlement_gate(
     };
     let observed_panels = visible_panels
         .iter()
-        .filter_map(|panel| panel.get("panel").and_then(Value::as_str))
-        .collect::<BTreeSet<_>>();
+        .map(|panel| panel.get("panel").and_then(Value::as_str))
+        .collect::<Option<BTreeSet<_>>>();
     let expected_panels = expected_state
         .layout
         .visible_panels()
         .iter()
         .map(|panel| panel.report_label())
         .collect::<BTreeSet<_>>();
-    if observed_panels != expected_panels || visible_panels.len() != expected_panels.len() {
-        reasons.insert("visible_panel_milestone_set_mismatch".to_owned());
+    if observed_panels.is_none() {
+        reasons.insert("visible_panel_milestones_missing".to_owned());
+    } else if observed_panels.as_ref() != Some(&expected_panels)
+        || visible_panels.len() != expected_panels.len()
+    {
+        reasons.insert("product_gate_visible_panel_milestone_set_mismatch".to_owned());
     }
     let expected_layer_ordinals = expected_state
         .layers
@@ -6891,8 +7980,11 @@ fn validate_settlement_gate(
                 reasons,
             );
         }
-        if panel.get("visible_layer_overflow").and_then(Value::as_bool) != Some(false) {
+        let overflow = panel.get("visible_layer_overflow").and_then(Value::as_bool);
+        if overflow.is_none() {
             reasons.insert("visible_layer_milestone_overflow_or_fact_missing".to_owned());
+        } else if overflow != Some(false) {
+            reasons.insert("product_gate_visible_layer_milestone_overflow".to_owned());
         }
         let Some(layers) = panel.get("visible_layers").and_then(Value::as_array) else {
             reasons.insert("visible_layer_milestones_missing".to_owned());
@@ -6900,12 +7992,14 @@ fn validate_settlement_gate(
         };
         let observed_ordinals = layers
             .iter()
-            .filter_map(|layer| layer.get("layer_ordinal").and_then(Value::as_u64))
-            .collect::<BTreeSet<_>>();
-        if observed_ordinals != expected_layer_ordinals
+            .map(|layer| layer.get("layer_ordinal").and_then(Value::as_u64))
+            .collect::<Option<BTreeSet<_>>>();
+        if observed_ordinals.is_none() {
+            reasons.insert("visible_layer_milestones_missing".to_owned());
+        } else if observed_ordinals.as_ref() != Some(&expected_layer_ordinals)
             || layers.len() != expected_layer_ordinals.len()
         {
-            reasons.insert("visible_layer_milestone_set_mismatch".to_owned());
+            reasons.insert("product_gate_visible_layer_milestone_set_mismatch".to_owned());
         }
         for layer in layers {
             for (field, maximum) in checks {
@@ -6965,13 +8059,16 @@ fn validate_observed_exact_resource_union<'a>(
             "exact_cross_scope_{position}_union_authority_missing_or_mismatched"
         ));
     }
-    if union
+    let canonical_entries = union
         .and_then(|union| union.get("canonical_entries_sha256"))
-        .and_then(Value::as_str)
-        != Some(expected.canonical_entries_sha256.as_str())
-    {
+        .and_then(Value::as_str);
+    if canonical_entries.is_none() {
         reasons.insert(format!(
             "exact_cross_scope_{position}_union_canonical_entries_sha256_mismatch_or_missing"
+        ));
+    } else if canonical_entries != Some(expected.canonical_entries_sha256.as_str()) {
+        reasons.insert(format!(
+            "product_gate_exact_cross_scope_{position}_union_canonical_entries_sha256_mismatch"
         ));
     }
     for (field, value) in [
@@ -6982,13 +8079,16 @@ fn validate_observed_exact_resource_union<'a>(
             expected.summed_scope_payload_bytes,
         ),
     ] {
-        if union
+        let observed = union
             .and_then(|union| union.get(field))
-            .and_then(Value::as_u64)
-            != Some(value)
-        {
+            .and_then(Value::as_u64);
+        if observed.is_none() {
             reasons.insert(format!(
                 "exact_cross_scope_{position}_union_{field}_mismatch_or_missing"
+            ));
+        } else if observed != Some(value) {
+            reasons.insert(format!(
+                "product_gate_exact_cross_scope_{position}_union_{field}_mismatch"
             ));
         }
     }
@@ -7032,6 +8132,9 @@ fn validate_unique_work(
         }
     }
     let delta = end_union.and_then(|union| union.get("delta_from_previous_label"));
+    // These fields bind the partition evidence to the two checkpoints and its
+    // derivation.  A missing or different value makes the evidence
+    // unauthoritative rather than proving a product regression.
     for (field, value) in [
         ("previous_label", start_label),
         (
@@ -7047,6 +8150,21 @@ fn validate_unique_work(
             "partition_derivation",
             "sorted_DatasetResourceKey_payload_descriptor_three_way_merge",
         ),
+    ] {
+        if delta
+            .and_then(|delta| delta.get(field))
+            .and_then(Value::as_str)
+            != Some(value)
+        {
+            reasons.insert(format!(
+                "exact_resource_union_delta_{field}_mismatch_or_missing"
+            ));
+        }
+    }
+    // Once the digest fact is well formed, a different exact partition is a
+    // product-oracle failure.  Absence or a non-string value remains an
+    // integrity failure.
+    for (field, value) in [
         (
             "retained_entries_sha256",
             expected.delta_union.retained_entries_sha256.as_str(),
@@ -7060,33 +8178,45 @@ fn validate_unique_work(
             expected.delta_union.removed_entries_sha256.as_str(),
         ),
     ] {
-        if delta
+        let observed = delta
             .and_then(|delta| delta.get(field))
-            .and_then(Value::as_str)
-            != Some(value)
-        {
+            .and_then(Value::as_str);
+        if observed.is_none() {
             reasons.insert(format!(
                 "exact_resource_union_delta_{field}_mismatch_or_missing"
             ));
+        } else if observed != Some(value) {
+            reasons.insert(format!(
+                "product_gate_exact_resource_union_delta_{field}_mismatch"
+            ));
         }
     }
-    if delta
+    let partitions_pairwise_disjoint = delta
         .and_then(|delta| delta.get("partitions_pairwise_disjoint"))
-        .and_then(Value::as_bool)
-        != Some(expected.delta_union.partitions_pairwise_disjoint)
-    {
+        .and_then(Value::as_bool);
+    if partitions_pairwise_disjoint.is_none() {
         reasons.insert(
             "exact_resource_union_delta_partitions_pairwise_disjoint_mismatch_or_missing"
                 .to_owned(),
         );
-    }
-    if delta
-        .and_then(|delta| delta.get("retained_payload_bytes_match"))
-        .and_then(Value::as_bool)
-        != Some(true)
+    } else if partitions_pairwise_disjoint
+        != Some(expected.delta_union.partitions_pairwise_disjoint)
     {
         reasons.insert(
+            "product_gate_exact_resource_union_delta_partitions_pairwise_disjoint_mismatch"
+                .to_owned(),
+        );
+    }
+    let retained_payload_bytes_match = delta
+        .and_then(|delta| delta.get("retained_payload_bytes_match"))
+        .and_then(Value::as_bool);
+    if retained_payload_bytes_match.is_none() {
+        reasons.insert(
             "exact_resource_union_delta_retained_payload_bytes_match_missing_or_false".to_owned(),
+        );
+    } else if retained_payload_bytes_match != Some(true) {
+        reasons.insert(
+            "product_gate_exact_resource_union_delta_retained_payload_bytes_mismatch".to_owned(),
         );
     }
     for (field, value) in [
@@ -7112,13 +8242,16 @@ fn validate_unique_work(
             expected.delta_union.removed_unique_payload_bytes,
         ),
     ] {
-        if delta
+        let observed = delta
             .and_then(|delta| delta.get(field))
-            .and_then(Value::as_u64)
-            != Some(value)
-        {
+            .and_then(Value::as_u64);
+        if observed.is_none() {
             reasons.insert(format!(
                 "exact_resource_union_delta_{field}_mismatch_or_missing"
+            ));
+        } else if observed != Some(value) {
+            reasons.insert(format!(
+                "product_gate_exact_resource_union_delta_{field}_mismatch"
             ));
         }
     }
@@ -7236,17 +8369,21 @@ fn validate_verification_evidence(
     for (position, observed, expected_checkpoint) in
         [("start", start, expected.start), ("end", end, expected.end)]
     {
-        if observed
+        let state = observed
             .and_then(|value| value.get("state"))
-            .and_then(Value::as_str)
-            != Some(expected_checkpoint.state.report_label())
-            || observed
-                .and_then(|value| value.get("active_operation"))
-                .and_then(Value::as_bool)
-                != Some(expected_checkpoint.active_operation)
-        {
+            .and_then(Value::as_str);
+        let active_operation = observed
+            .and_then(|value| value.get("active_operation"))
+            .and_then(Value::as_bool);
+        if state.is_none() || active_operation.is_none() {
             reasons.insert(format!(
                 "verification_{position}_state_or_active_operation_mismatch_or_missing"
+            ));
+        } else if state != Some(expected_checkpoint.state.report_label())
+            || active_operation != Some(expected_checkpoint.active_operation)
+        {
+            reasons.insert(format!(
+                "product_gate_verification_{position}_state_or_active_operation_mismatch"
             ));
         }
         for (field, value) in [
@@ -7259,13 +8396,16 @@ fn validate_verification_evidence(
                 expected_checkpoint.completed_reader_runs,
             ),
         ] {
-            if observed
+            let observed_value = observed
                 .and_then(|value| value.pointer(&format!("/service/{field}")))
-                .and_then(Value::as_u64)
-                != Some(value)
-            {
+                .and_then(Value::as_u64);
+            if observed_value.is_none() {
                 reasons.insert(format!(
                     "verification_{position}_service_{field}_mismatch_or_missing"
+                ));
+            } else if observed_value != Some(value) {
+                reasons.insert(format!(
+                    "product_gate_verification_{position}_service_{field}_mismatch"
                 ));
             }
         }
@@ -7276,12 +8416,13 @@ fn validate_verification_evidence(
     let end_progress = end
         .and_then(|value| value.pointer("/service/accepted_progress_updates"))
         .and_then(Value::as_u64);
-    if start_progress
+    let progress_delta = start_progress
         .zip(end_progress)
-        .and_then(|(start, end)| end.checked_sub(start))
-        .is_none_or(|delta| delta < expected.minimum_accepted_progress_updates_delta)
-    {
+        .and_then(|(start, end)| end.checked_sub(start));
+    if progress_delta.is_none() {
         reasons.insert("verification_accepted_progress_delta_missing_or_below_gate".to_owned());
+    } else if progress_delta < Some(expected.minimum_accepted_progress_updates_delta) {
+        reasons.insert("product_gate_verification_accepted_progress_delta_below_gate".to_owned());
     }
     if let Some(reader) = &expected.completed_reader_work {
         for (position, observed) in [("start", start), ("end", end)] {
@@ -7420,21 +8561,25 @@ fn validate_nonresident_target_residency(
         ),
     ] {
         let observed = proof.and_then(|value| value.get(partition));
-        if observed
+        let observed_digest = observed
             .and_then(|value| value.get("canonical_entries_sha256"))
-            .and_then(Value::as_str)
-            != Some(digest)
-            || observed
-                .and_then(|value| value.get("unique_keys"))
-                .and_then(Value::as_u64)
-                != Some(keys)
-            || observed
-                .and_then(|value| value.get("unique_payload_bytes"))
-                .and_then(Value::as_u64)
-                != Some(bytes)
-        {
+            .and_then(Value::as_str);
+        let observed_keys = observed
+            .and_then(|value| value.get("unique_keys"))
+            .and_then(Value::as_u64);
+        let observed_bytes = observed
+            .and_then(|value| value.get("unique_payload_bytes"))
+            .and_then(Value::as_u64);
+        if observed_digest.is_none() || observed_keys.is_none() || observed_bytes.is_none() {
             reasons.insert(format!(
                 "nonresident_target_{partition}_mismatch_or_missing"
+            ));
+        } else if observed_digest != Some(digest)
+            || observed_keys != Some(keys)
+            || observed_bytes != Some(bytes)
+        {
+            reasons.insert(format!(
+                "product_gate_nonresident_target_{partition}_mismatch"
             ));
         }
     }
@@ -7799,9 +8944,12 @@ fn validate_sequence_commit_events(
         .pointer("/render/display_coordination/durable_gesture_commits")
         .and_then(Value::as_u64);
     match (start_commits, end_commits) {
-        (Some(start), Some(end)) if end.checked_sub(start) == Some(expected_phase_commits) => {}
+        (Some(start), Some(end)) if end < start => {
+            reasons.insert("phase_durable_gesture_commit_counter_regressed".to_owned());
+        }
+        (Some(start), Some(end)) if end - start == expected_phase_commits => {}
         (Some(_), Some(_)) => {
-            reasons.insert("phase_durable_gesture_commit_delta_mismatch".to_owned());
+            reasons.insert("product_gate_phase_durable_gesture_commit_delta_mismatch".to_owned());
         }
         _ => {
             reasons.insert("phase_durable_gesture_commit_counter_missing".to_owned());
@@ -7820,9 +8968,12 @@ fn validate_sequence_commit_events(
         let start = start_diagnostics.pointer(pointer).and_then(Value::as_u64);
         let end = end_diagnostics.pointer(pointer).and_then(Value::as_u64);
         match (start, end) {
-            (Some(start), Some(end)) if end.checked_sub(start) == Some(expected_phase_commits) => {}
+            (Some(start), Some(end)) if end < start => {
+                reasons.insert(format!("phase_{counter}_counter_regressed"));
+            }
+            (Some(start), Some(end)) if end - start == expected_phase_commits => {}
             (Some(_), Some(_)) => {
-                reasons.insert(format!("phase_{counter}_delta_mismatch"));
+                reasons.insert(format!("product_gate_phase_{counter}_delta_mismatch"));
             }
             _ => {
                 reasons.insert(format!("phase_{counter}_counter_missing"));
@@ -7856,21 +9007,29 @@ fn validate_sequence_commit_events(
         }
         let event = matches[0];
         let expected_samples = command.get("samples").and_then(Value::as_u64);
-        if event.get("status").and_then(Value::as_str) != Some("passed")
-            || event
-                .pointer("/details/observed_counter_delta/detailed_counters_enabled")
-                .and_then(Value::as_bool)
-                != Some(true)
-            || event
-                .pointer("/details/observed_counter_delta/durable_gesture_commits")
-                .and_then(Value::as_u64)
-                != Some(expected_commits)
-            || event
-                .pointer("/details/observed_counter_delta/raw_input_samples")
-                .and_then(Value::as_u64)
-                != expected_samples
+        let status = event.get("status").and_then(Value::as_str);
+        let detailed_counters_enabled = event
+            .pointer("/details/observed_counter_delta/detailed_counters_enabled")
+            .and_then(Value::as_bool);
+        let durable_gesture_commits = event
+            .pointer("/details/observed_counter_delta/durable_gesture_commits")
+            .and_then(Value::as_u64);
+        let raw_input_samples = event
+            .pointer("/details/observed_counter_delta/raw_input_samples")
+            .and_then(Value::as_u64);
+        if status != Some("passed")
+            || detailed_counters_enabled != Some(true)
+            || expected_samples.is_none()
+            || durable_gesture_commits.is_none()
+            || raw_input_samples.is_none()
         {
             reasons.insert("gesture_sequence_durable_commit_or_sample_delta_mismatch".to_owned());
+        } else if durable_gesture_commits != Some(expected_commits)
+            || raw_input_samples != expected_samples
+        {
+            reasons.insert(
+                "product_gate_gesture_sequence_durable_commit_or_sample_delta_mismatch".to_owned(),
+            );
         }
     }
 }
@@ -7882,13 +9041,13 @@ fn diagnostic_command_index(commands: &[Value], label: &str) -> Option<usize> {
     })
 }
 
-fn verification_completion_wait_index(commands: &[Value]) -> Option<usize> {
+fn verification_completion_observation_index(commands: &[Value]) -> Option<usize> {
     let request = commands.iter().position(|command| {
         command.get("command").and_then(Value::as_str) == Some("request_source_verification")
     })?;
     commands.iter().enumerate().find_map(|(index, command)| {
         (index > request
-            && command.get("command").and_then(Value::as_str) == Some("wait_for")
+            && command.get("command").and_then(Value::as_str) == Some("observe_gate")
             && command.get("condition").and_then(Value::as_str)
                 == Some("source_verification_verified"))
         .then_some(index)
@@ -7923,6 +9082,7 @@ fn raw_report(
     binding_reasons: &BTreeSet<String>,
     conformance: Option<&ConformanceEvidence>,
     samples: &[SampleEvidence],
+    population: PopulationEvidence,
     all_reasons: &BTreeSet<String>,
     repository_start: &RepositoryIdentity,
     repository_end: &RepositoryIdentity,
@@ -7938,9 +9098,17 @@ fn raw_report(
         independent_oracle_sha256: oracle.sha256.clone(),
         ep01_trace_geometry_sha256: ep01_trace_geometry_sha256(&workload.value.ep01_trace_geometry),
     };
+    let product_gate_outcomes = raw_product_gate_outcome_rows(samples);
+    let product_gate_failures = classified_product_gate_failure_rows(samples);
     json!({
         "schema": RAW_REPORT_SCHEMA,
-        "status": if all_reasons.is_empty() { "passed" } else { "failed" },
+        "evidence_status": evidence_status(all_reasons),
+        "product_gate_status": product_gate_status(
+            !has_integrity_reasons(all_reasons),
+            product_gate_outcomes.iter().any(|row| {
+                row.get("outcome").and_then(Value::as_str) == Some("failed")
+            }) || !product_gate_failures.is_empty() || has_product_gate_failures(all_reasons),
+        ),
         "claim_status": "development_E1_semantic_automation_non_OS_input_non_E4_no_product_claim",
         "build_binding": {
             "profile": profile.profile.build,
@@ -8022,8 +9190,11 @@ fn raw_report(
             "absolute_gates": profile.profile.absolute_gates,
         },
         "executable_conformance": conformance.map(ConformanceEvidence::raw_json),
+        "population": population_json(population),
+        "product_gate_outcomes": product_gate_outcomes,
+        "product_gate_failures": product_gate_failures,
         "attempts": samples.iter().map(sample_json).collect::<Vec<_>>(),
-        "reason_codes": all_reasons,
+        "integrity_reason_codes": integrity_reason_codes(all_reasons),
         "limitations": [
             "E1 semantic application commands do not inject or claim OS input",
             "development samples do not establish a product performance claim",
@@ -8037,6 +9208,37 @@ fn profile_path<'a>(_profile: &'a LoadedProfile, args: &'a RunArgs) -> &'a Path 
 }
 
 fn sample_json(sample: &SampleEvidence) -> Value {
+    let evidence_valid = !has_integrity_reasons(&sample.reasons)
+        && !has_integrity_reasons(&sample.instrumented.reasons)
+        && sample
+            .control
+            .as_ref()
+            .is_some_and(|control| !has_integrity_reasons(&control.reasons))
+        && sample
+            .phases
+            .iter()
+            .all(|phase| !has_integrity_reasons(&phase.reasons));
+    let has_failed_product_gate = sample
+        .instrumented
+        .product_gate_outcomes
+        .iter()
+        .chain(
+            sample
+                .control
+                .iter()
+                .flat_map(|control| &control.product_gate_outcomes),
+        )
+        .any(|outcome| outcome.outcome == ProductGateStatus::Failed)
+        || has_product_gate_failures(&sample.reasons)
+        || has_product_gate_failures(&sample.instrumented.reasons)
+        || sample
+            .control
+            .as_ref()
+            .is_some_and(|control| has_product_gate_failures(&control.reasons))
+        || sample
+            .phases
+            .iter()
+            .any(|phase| has_product_gate_failures(&phase.reasons));
     json!({
         "sample_index": sample.sample_index,
         "scenario": sample.scenario,
@@ -8048,15 +9250,16 @@ fn sample_json(sample: &SampleEvidence) -> Value {
         },
         "phases": sample.phases.iter().map(|phase| json!({
             "name": phase.name,
-            "reason_codes": phase.reasons,
-            "status": if phase.reasons.is_empty() { "passed" } else { "failed" },
+            "integrity_reason_codes": integrity_reason_codes(&phase.reasons),
+            "evidence_status": evidence_status(&phase.reasons),
+            "product_gate_status": product_gate_status(
+                !has_integrity_reasons(&phase.reasons),
+                has_product_gate_failures(&phase.reasons),
+            ),
         })).collect::<Vec<_>>(),
-        "reason_codes": sample.reasons,
-        "status": if sample.reasons.is_empty()
-            && sample.instrumented.reasons.is_empty()
-            && sample.control.as_ref().is_some_and(|control| control.reasons.is_empty())
-            && sample.phases.iter().all(|phase| phase.reasons.is_empty())
-        { "passed" } else { "failed" },
+        "integrity_reason_codes": integrity_reason_codes(&sample.reasons),
+        "evidence_status": if evidence_valid { "valid_complete" } else { "invalid_or_incomplete" },
+        "product_gate_status": product_gate_status(evidence_valid, has_failed_product_gate),
     })
 }
 
@@ -8103,8 +9306,456 @@ fn role_json(role: &RoleEvidence) -> Value {
             "completed": role.cleanup_completed,
             "target_was_exact_attempt_local_path": role.cleanup_completed,
         },
-        "reason_codes": role.reasons,
-        "status": if role.reasons.is_empty() { "passed" } else { "failed" },
+        "product_gate_outcomes": role.product_gate_outcomes.iter().map(raw_product_gate_outcome_json).collect::<Vec<_>>(),
+        "integrity_reason_codes": integrity_reason_codes(&role.reasons),
+        "evidence_status": evidence_status(&role.reasons),
+        "product_gate_status": product_gate_status(
+            !has_integrity_reasons(&role.reasons),
+            role.product_gate_outcomes.iter().any(|outcome| outcome.outcome == ProductGateStatus::Failed)
+                || has_product_gate_failures(&role.reasons),
+        ),
+    })
+}
+
+fn evidence_status(reasons: &BTreeSet<String>) -> &'static str {
+    if !has_integrity_reasons(reasons) {
+        "valid_complete"
+    } else {
+        "invalid_or_incomplete"
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReasonAxis {
+    Integrity,
+    ProductGate,
+}
+
+fn reason_axis(reason: &str) -> ReasonAxis {
+    if is_known_product_gate_reason(reason) {
+        ReasonAxis::ProductGate
+    } else {
+        // Every product failure is intentionally enumerated below. Unknown
+        // codes, including deceptively named prefix/suffix lookalikes, fail
+        // closed on the integrity axis.
+        ReasonAxis::Integrity
+    }
+}
+
+fn is_known_product_gate_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "coordinated_settlement_gate_exceeded"
+            | "cpu_decoded_residency_gate_exceeded"
+            | "cpu_resource_gate_exceeded"
+            | "cpu_upload_staging_gate_exceeded"
+            | "exact_useful_sample_bytes_below_oracle"
+            | "gpu_batch_envelope_gate_exceeded"
+            | "gpu_resource_gate_exceeded"
+            | "gpu_transfer_gate_exceeded"
+            | "import_clock_limit_exceeded"
+            | "import_receipt_expected_count_mismatch"
+            | "import_receipt_source_read_amplification_exceeded"
+            | "import_receipt_resource_limit_exceeded"
+            | "import_receipt_primary_clock_limit_exceeded"
+            | "imported_root_manifest_identity_mismatch"
+            | "interaction_task_gate_exceeded"
+            | "main_loop_gap_gate_exceeded"
+            | "open_object_gate_exceeded"
+            | "presentation_gap_gate_exceeded"
+            | "resident_input_latency_gate_exceeded"
+            | "runtime_queue_gate_exceeded"
+            | "visible_layer_settlement_gate_exceeded"
+            | "visible_panel_settlement_gate_exceeded"
+            | "product_gate_coordinated_layout_complete_false"
+            | "product_gate_import_workflow_run_counts_or_progress_claim_mismatch"
+            | "product_gate_import_required_stage_or_progress_mismatch"
+            | "product_gate_import_publication_currentness_observation_mismatch"
+            | "product_gate_import_ordinary_source_verifier_activity_observed"
+            | "product_gate_mapped_client_extent_mismatch"
+            | "product_gate_canonical_camera_identity_mismatch"
+            | "product_gate_canonical_camera_geometry_outside_contract"
+            | "product_gate_canonical_camera_viewport_mismatch"
+            | "product_gate_canonical_cross_section_schema_or_layout_mismatch"
+            | "product_gate_canonical_active_view_mismatch"
+            | "product_gate_canonical_cross_section_geometry_outside_contract"
+            | "product_gate_current_presentation_generation_mismatch"
+            | "product_gate_current_complete_fidelity_false"
+            | "product_gate_target_or_displayed_scale_mismatch"
+            | "product_gate_cross_section_layer_scale_or_coverage_mismatch"
+            | "product_gate_gpu_render_mode_mismatch"
+            | "product_gate_visible_panel_milestone_set_mismatch"
+            | "product_gate_visible_layer_milestone_overflow"
+            | "product_gate_visible_layer_milestone_set_mismatch"
+            | "product_gate_exact_resource_union_delta_partitions_pairwise_disjoint_mismatch"
+            | "product_gate_exact_resource_union_delta_retained_payload_bytes_mismatch"
+            | "product_gate_verification_accepted_progress_delta_below_gate"
+            | "product_gate_nonresident_target_resident_target_intersection_mismatch"
+            | "product_gate_nonresident_target_nonresident_target_difference_mismatch"
+            | "product_gate_phase_durable_gesture_commit_delta_mismatch"
+            | "product_gate_phase_durable_project_revision_delta_mismatch"
+            | "product_gate_phase_undo_history_entry_delta_mismatch"
+            | "product_gate_gesture_sequence_durable_commit_or_sample_delta_mismatch"
+    ) || is_known_canonical_plane_product_reason(reason)
+        || is_known_exact_cross_scope_product_reason(reason)
+        || is_known_exact_resource_delta_product_reason(reason)
+        || is_known_verification_product_reason(reason)
+        || is_known_unique_work_product_reason(reason)
+        || is_known_structural_product_reason(reason)
+}
+
+fn is_known_canonical_plane_product_reason(reason: &str) -> bool {
+    let Some(panel) = reason
+        .strip_prefix("product_gate_canonical_")
+        .and_then(|value| value.strip_suffix("_plane_geometry_outside_contract"))
+    else {
+        return false;
+    };
+    matches!(panel, "xy" | "xz" | "yz")
+}
+
+fn is_known_exact_cross_scope_product_reason(reason: &str) -> bool {
+    let Some(rest) = reason.strip_prefix("product_gate_exact_cross_scope_") else {
+        return false;
+    };
+    let Some(field) = ["start", "target", "residency_baseline"]
+        .iter()
+        .find_map(|position| rest.strip_prefix(&format!("{position}_union_")))
+    else {
+        return false;
+    };
+    matches!(
+        field,
+        "canonical_entries_sha256_mismatch"
+            | "unique_keys_mismatch"
+            | "unique_payload_bytes_mismatch"
+            | "summed_scope_payload_bytes_mismatch"
+    )
+}
+
+fn is_known_exact_resource_delta_product_reason(reason: &str) -> bool {
+    let Some(field) = reason
+        .strip_prefix("product_gate_exact_resource_union_delta_")
+        .and_then(|value| value.strip_suffix("_mismatch"))
+    else {
+        return false;
+    };
+    matches!(
+        field,
+        "retained_entries_sha256"
+            | "added_entries_sha256"
+            | "removed_entries_sha256"
+            | "retained_unique_keys"
+            | "retained_unique_payload_bytes"
+            | "added_unique_keys"
+            | "added_unique_payload_bytes"
+            | "removed_unique_keys"
+            | "removed_unique_payload_bytes"
+            | "partitions_pairwise_disjoint"
+            | "retained_payload_bytes"
+    )
+}
+
+fn is_known_verification_product_reason(reason: &str) -> bool {
+    let Some(rest) = reason.strip_prefix("product_gate_verification_") else {
+        return false;
+    };
+    ["start", "end"].iter().any(|position| {
+        rest.strip_prefix(&format!("{position}_"))
+            .is_some_and(|field| {
+                matches!(
+                    field,
+                    "state_or_active_operation_mismatch"
+                        | "service_started_runs_mismatch"
+                        | "service_cancelled_runs_mismatch"
+                        | "service_failed_runs_mismatch"
+                        | "service_accepted_successes_mismatch"
+                        | "service_completed_reader_runs_mismatch"
+                )
+            })
+    })
+}
+
+fn is_known_unique_work_product_reason(reason: &str) -> bool {
+    let Some(label) = reason
+        .strip_prefix("unique_work_")
+        .and_then(|value| value.strip_suffix("_delta_outside_oracle"))
+    else {
+        return false;
+    };
+    matches!(
+        label,
+        "physical_range_read_operations"
+            | "physical_encoded_bytes_read"
+            | "codec_decode_operations"
+            | "codec_decoded_bytes"
+            | "dataset_submitted_requests"
+            | "dataset_started_decodes"
+            | "runtime_decoded_output_bytes"
+            | "gpu_uploaded_resources"
+            | "gpu_uploaded_payload_bytes"
+            | "gpu_control_dynamic_updates"
+            | "gpu_control_dynamic_upload_bytes"
+            | "gpu_control_publication_writes"
+    )
+}
+
+fn is_known_structural_product_reason(reason: &str) -> bool {
+    let Some(rest) = reason.strip_prefix("structural_") else {
+        return false;
+    };
+    if let Some(label) = rest.strip_suffix("_counter_changed") {
+        return is_known_zero_work_counter_label(label);
+    }
+    rest.strip_suffix("_ceiling_exceeded")
+        .is_some_and(is_known_structural_ceiling_label)
+}
+
+fn is_known_zero_work_counter_label(label: &str) -> bool {
+    matches!(
+        label,
+        "physical_range_reads"
+            | "codec_decodes"
+            | "object_opens"
+            | "dataset_requests"
+            | "dataset_decodes"
+            | "cancelled_requests"
+            | "payload_uploads"
+            | "residency_evictions"
+            | "static_control_rebuilds"
+            | "dense_control_fallbacks"
+            | "queue_submissions"
+            | "payload_reuploads"
+            | "arena_allocator_plans"
+            | "gpu_control_buffer_allocations"
+            | "gpu_bind_group_creations"
+            | "gpu_pipeline_creations"
+            | "residency_directory_updates"
+            | "page_layout_constructions"
+            | "page_table_updates"
+            | "full_demand_traversals"
+            | "planner_candidate_visits"
+            | "ui_thread_candidate_visits"
+            | "ui_wait_for_demand_preparation"
+            | "renderer_static_preparations"
+            | "cancellation_churn"
+            | "cancellation_waste_encoded_bytes"
+            | "cancellation_waste_decoded_bytes"
+            | "cancellation_waste_uploaded_bytes"
+            | "cancellation_waste_cpu_time_ns"
+            | "durable_project_revisions"
+            | "undo_history_entries"
+            | "encoded_display_batches"
+            | "encoded_but_dropped_batches"
+            | "sealed_obsolete_submitted_batches"
+            | "stale_presented_batches"
+            | "renderer_submissions"
+            | "presentation_churn"
+            | "demand_work"
+    )
+}
+
+fn is_known_structural_ceiling_label(label: &str) -> bool {
+    matches!(
+        label,
+        "pending_display_batches_peak"
+            | "in_flight_display_batches_peak"
+            | "command_encoders"
+            | "color_passes"
+            | "renderer_submissions"
+            | "completion_notifications"
+            | "backpressure_deferrals"
+            | "encoded_display_batches"
+            | "encoded_but_dropped_batches"
+            | "sealed_obsolete_submitted_batches"
+            | "stale_presentations"
+            | "current_presentations"
+            | "demand_work"
+            | "cancellation_waste_started_decode_count"
+            | "cancellation_waste_decoded_bytes"
+            | "cancellation_waste_cpu_time_ns"
+            | "cancellation_waste_encoded_bytes"
+            | "cancellation_waste_uploaded_bytes"
+    )
+}
+
+fn integrity_reason_codes(reasons: &BTreeSet<String>) -> Vec<&str> {
+    reasons
+        .iter()
+        .filter(|reason| reason_axis(reason) == ReasonAxis::Integrity)
+        .map(String::as_str)
+        .collect()
+}
+
+fn has_integrity_reasons(reasons: &BTreeSet<String>) -> bool {
+    reasons
+        .iter()
+        .any(|reason| reason_axis(reason) == ReasonAxis::Integrity)
+}
+
+fn has_product_gate_failures(reasons: &BTreeSet<String>) -> bool {
+    reasons
+        .iter()
+        .any(|reason| reason_axis(reason) == ReasonAxis::ProductGate)
+}
+
+fn product_gate_status(evidence_valid: bool, has_failed_gate: bool) -> &'static str {
+    if !evidence_valid {
+        "not_authoritative"
+    } else if has_failed_gate {
+        "failed"
+    } else {
+        "passed"
+    }
+}
+
+fn raw_product_gate_outcome_json(outcome: &ProductGateOutcome) -> Value {
+    json!({
+        "schema": PRODUCT_GATE_OBSERVATION_SCHEMA,
+        "command_index": outcome.command_index,
+        "gate_id": outcome.gate_id,
+        "condition": outcome.condition,
+        "outcome": outcome.outcome.report_label(),
+        "condition_met": outcome.condition_met,
+        "timed_out": outcome.timed_out,
+        "timeout_ms": outcome.timeout_ms,
+        "waited_ns": outcome.waited_ns,
+    })
+}
+
+fn raw_product_gate_outcome_rows(samples: &[SampleEvidence]) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for sample in samples {
+        for role in std::iter::once(&sample.instrumented).chain(sample.control.iter()) {
+            for outcome in &role.product_gate_outcomes {
+                let mut row = raw_product_gate_outcome_json(outcome);
+                let object = row
+                    .as_object_mut()
+                    .expect("product gate outcome JSON is always an object");
+                object.insert("sample_index".to_owned(), json!(sample.sample_index));
+                object.insert("scenario".to_owned(), json!(sample.scenario));
+                object.insert("role".to_owned(), json!(role.role.directory_name()));
+                rows.push(row);
+            }
+        }
+    }
+    rows
+}
+
+fn sanitized_product_gate_outcome_rows(samples: &[SampleEvidence]) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for sample in samples {
+        for role in std::iter::once(&sample.instrumented).chain(sample.control.iter()) {
+            for outcome in &role.product_gate_outcomes {
+                rows.push(json!({
+                    "sample_index": sample.sample_index,
+                    "scenario": sample.scenario,
+                    "role": role.role.directory_name(),
+                    "gate_id": outcome.gate_id,
+                    "condition": outcome.condition,
+                    "outcome": outcome.outcome.report_label(),
+                }));
+            }
+        }
+    }
+    rows
+}
+
+fn classified_product_gate_failure_rows(samples: &[SampleEvidence]) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for sample in samples {
+        push_classified_product_gate_failures(
+            &mut rows,
+            sample,
+            "instrumentation_pair",
+            "sample",
+            &sample.reasons,
+        );
+        push_classified_product_gate_failures(
+            &mut rows,
+            sample,
+            sample.instrumented.role.directory_name(),
+            "role",
+            &sample.instrumented.reasons,
+        );
+        if let Some(control) = &sample.control {
+            push_classified_product_gate_failures(
+                &mut rows,
+                sample,
+                control.role.directory_name(),
+                "role",
+                &control.reasons,
+            );
+        }
+        for phase in &sample.phases {
+            push_classified_product_gate_failures(
+                &mut rows,
+                sample,
+                AttemptRole::Instrumented.directory_name(),
+                &phase.name,
+                &phase.reasons,
+            );
+        }
+    }
+    rows
+}
+
+fn push_classified_product_gate_failures(
+    rows: &mut Vec<Value>,
+    sample: &SampleEvidence,
+    role: &str,
+    scope: &str,
+    reasons: &BTreeSet<String>,
+) {
+    for reason in reasons
+        .iter()
+        .filter(|reason| reason_axis(reason) == ReasonAxis::ProductGate)
+    {
+        let identity = format!("{}.{}.{}", sample.scenario, scope, reason);
+        rows.push(json!({
+            "sample_index": sample.sample_index,
+            "scenario": sample.scenario,
+            "role": role,
+            "gate_id": bounded_product_gate_id(&identity),
+            "condition": "accepted_gate_satisfied",
+            "outcome": "failed",
+        }));
+    }
+}
+
+fn bounded_product_gate_id(reason: &str) -> String {
+    if validate_product_gate_id(reason).is_ok() {
+        reason.to_owned()
+    } else {
+        format!("gate.{}", Sha256Hasher::digest(reason.as_bytes()))
+    }
+}
+
+fn population_json(population: PopulationEvidence) -> Value {
+    json!({
+        "expected_sample_records": population.expected_sample_records,
+        "observed_sample_records": population.observed_sample_records,
+        "expected_role_attempts": population.expected_role_attempts,
+        "observed_role_attempts": population.observed_role_attempts,
+        "completed_role_reports": population.completed_role_reports,
+        "expected_phase_evaluations": population.expected_phase_evaluations,
+        "observed_phase_evaluations": population.observed_phase_evaluations,
+        "expected_product_gate_observations": population.expected_product_gate_observations,
+        "observed_product_gate_observations": population.observed_product_gate_observations,
+        "sample_identities_exact": population.sample_identities_exact,
+        "role_identities_exact": population.role_identities_exact,
+        "phase_identities_exact": population.phase_identities_exact,
+        "product_gate_bijections_exact": population.product_gate_bijections_exact,
+        "exact": population.expected_sample_records == population.observed_sample_records
+            && population.expected_role_attempts == population.observed_role_attempts
+            && population.expected_role_attempts == population.completed_role_reports
+            && population.expected_phase_evaluations == population.observed_phase_evaluations
+            && population.expected_product_gate_observations
+                == population.observed_product_gate_observations
+            && population.sample_identities_exact
+            && population.role_identities_exact
+            && population.phase_identities_exact
+            && population.product_gate_bijections_exact,
     })
 }
 
@@ -8125,11 +9776,21 @@ fn sanitized_receipt(
     app_binary_sha256: &str,
     raw_sha256: &str,
     conformance: Option<&ConformanceEvidence>,
+    samples: &[SampleEvidence],
+    population: PopulationEvidence,
     reasons: &BTreeSet<String>,
 ) -> Value {
+    let product_gate_outcomes = sanitized_product_gate_outcome_rows(samples);
+    let product_gate_failures = classified_product_gate_failure_rows(samples);
     json!({
         "schema": RECEIPT_SCHEMA,
-        "status": if reasons.is_empty() { "passed" } else { "failed" },
+        "evidence_status": evidence_status(reasons),
+        "product_gate_status": product_gate_status(
+            !has_integrity_reasons(reasons),
+            product_gate_outcomes.iter().any(|row| {
+                row.get("outcome").and_then(Value::as_str) == Some("failed")
+            }) || !product_gate_failures.is_empty() || has_product_gate_failures(reasons),
+        ),
         "claim_status": "development_E1_non_OS_input_non_E4_no_product_claim",
         "commitments": {
             "qualification_profile_sha256": profile.sha256,
@@ -8154,7 +9815,10 @@ fn sanitized_receipt(
             ),
         },
         "executable_conformance": conformance.map(ConformanceEvidence::sanitized_json),
-        "reason_codes": reasons,
+        "population": population_json(population),
+        "product_gate_outcomes": product_gate_outcomes,
+        "product_gate_failures": product_gate_failures,
+        "integrity_reason_codes": integrity_reason_codes(reasons),
     })
 }
 
@@ -8396,7 +10060,7 @@ mod tests {
             gpu_timing: instrumented,
             diagnostic_counters: instrumented,
             startup_bootstrap: None,
-            limits: AutomationLimits::default(),
+            hard_safety_limits: AutomationHardSafetyLimits::default(),
             commands,
         }
     }
@@ -8448,13 +10112,15 @@ mod tests {
                 }),
                 json!({ "command": "start_reviewed_import" }),
                 json!({
-                    "command": "wait_for",
+                    "command": "observe_gate",
+                    "gate_id": "IP.acceptance.000.import_idle",
                     "condition": "import_idle",
                     "timeout_ms": 1_200_000,
                 }),
                 json!({ "command": "sample_diagnostics", "label": "ip-end" }),
                 json!({
-                    "command": "wait_for_imported_open_ready",
+                    "command": "observe_imported_open_ready",
+                    "gate_id": "IP.imported_open_ready",
                     "path": "${ATTEMPT_ROOT}/output/source.m4d",
                     "timeout_ms": 1_200_000,
                 }),
@@ -8516,6 +10182,104 @@ mod tests {
                 compositor_scale_milli: 1_000,
             },
         }
+    }
+
+    fn product_gate_outcome(gate_id: &str, outcome: ProductGateStatus) -> ProductGateOutcome {
+        let failed = outcome == ProductGateStatus::Failed;
+        ProductGateOutcome {
+            command_index: 0,
+            gate_id: gate_id.to_owned(),
+            condition: "coordinated_presentation_settled".to_owned(),
+            outcome,
+            condition_met: !failed,
+            timed_out: failed,
+            timeout_ms: 30_000,
+            waited_ns: if failed { 30_000_000_000 } else { 1_000_000 },
+        }
+    }
+
+    fn population_role(role: AttemptRole, gate_id: &str) -> RoleEvidence {
+        RoleEvidence {
+            role,
+            root: PathBuf::from("/private/secret/attempt"),
+            expanded_script_sha256: "11".repeat(32),
+            template_script_sha256: "22".repeat(32),
+            process: ProcessObservation {
+                status: None,
+                external_wall_time_ns: 1,
+                timed_out: false,
+                spawn_error: None,
+            },
+            automation_report: None,
+            automation_report_sha256: Some("33".repeat(32)),
+            app_wall_time_ns: Some(1),
+            process_cpu_time_ns: Some(1),
+            source_inventory_before: None,
+            source_inventory_after: None,
+            cleanup_manifest_sha256: None,
+            cleanup_completed: false,
+            product_gate_outcomes: vec![product_gate_outcome(gate_id, ProductGateStatus::Passed)],
+            reasons: BTreeSet::new(),
+        }
+    }
+
+    fn population_scripts() -> ScriptBundle {
+        ScriptBundle {
+            schema: SCRIPT_BUNDLE_SCHEMA.to_owned(),
+            scenarios: REQUIRED_SCENARIOS
+                .into_iter()
+                .map(|id| {
+                    let gate_id = format!("{id}.settled");
+                    let gate_command = json!({
+                        "command": "observe_gate",
+                        "gate_id": gate_id,
+                        "condition": "coordinated_presentation_settled",
+                        "timeout_ms": 30_000,
+                    });
+                    let mut instrumented = template(true, vec![gate_command.clone()]);
+                    instrumented.scenario = id.to_owned();
+                    let mut control = template(false, vec![gate_command]);
+                    control.scenario = id.to_owned();
+                    ScriptScenario {
+                        id: id.to_owned(),
+                        phases: vec![ScriptPhase {
+                            name: format!("{id}-phase"),
+                            start_diagnostic_label: Some(format!("{id}-start")),
+                            end_diagnostic_label: format!("{id}-end"),
+                        }],
+                        instrumented_script: instrumented,
+                        instrumentation_control_script: Some(control),
+                        cleanup: AttemptCleanup::default(),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn complete_population_samples() -> Vec<SampleEvidence> {
+        (1..=5)
+            .flat_map(|sample_index| {
+                REQUIRED_SCENARIOS.into_iter().map(move |id| {
+                    let gate_id = format!("{id}.settled");
+                    SampleEvidence {
+                        sample_index,
+                        scenario: id.to_owned(),
+                        instrumented: population_role(AttemptRole::Instrumented, &gate_id),
+                        control: Some(population_role(
+                            AttemptRole::InstrumentationControl,
+                            &gate_id,
+                        )),
+                        phases: vec![PhaseEvaluation {
+                            name: format!("{id}-phase"),
+                            reasons: BTreeSet::new(),
+                        }],
+                        wall_overhead_basis_points: Some(0),
+                        process_cpu_overhead_basis_points: Some(0),
+                        reasons: BTreeSet::new(),
+                    }
+                })
+            })
+            .collect()
     }
 
     #[test]
@@ -8665,12 +10429,21 @@ mod tests {
         ambiguous.instrumented_script.commands.insert(
             5,
             json!({
-                "command": "wait_for",
+                "command": "observe_gate",
+                "gate_id": "IP.acceptance.999.import_idle",
                 "condition": "import_idle",
                 "timeout_ms": 1_200_000,
             }),
         );
         assert!(validate_ip_action_contract(&ambiguous).is_err());
+
+        let mut legacy = ip_action_scenario();
+        legacy.instrumented_script.commands[6] = json!({
+            "command": "wait_for_imported_open_ready",
+            "path": "${ATTEMPT_ROOT}/output/source.m4d",
+            "timeout_ms": 1_200_000,
+        });
+        assert!(validate_ip_action_contract(&legacy).is_err());
     }
 
     fn profile() -> ViewerQualificationProfile {
@@ -8774,6 +10547,79 @@ mod tests {
             },
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn hard_safety_limits_are_exact_profile_derived_caps_and_echo_without_legacy_aliases() {
+        let profile = profile();
+        let exact = expected_hard_safety_limits(&profile).unwrap();
+        assert_eq!(
+            exact.max_cpu_total_bytes,
+            Some(profile.resources.max_cpu_total_bytes)
+        );
+        assert_eq!(
+            exact.max_cpu_decoded_residency_bytes,
+            Some(profile.resources.max_cpu_total_bytes)
+        );
+        assert_eq!(
+            exact.max_cpu_upload_staging_bytes,
+            Some(profile.resources.max_cpu_total_bytes)
+        );
+        assert_eq!(
+            exact.max_runtime_queued_requests,
+            profile.resources.max_queued_requests.checked_mul(2)
+        );
+        validate_hard_safety_limits(&exact, &profile).unwrap();
+
+        let mut qualification_category_caps = exact;
+        qualification_category_caps.max_cpu_decoded_residency_bytes =
+            Some(profile.resources.max_cpu_decoded_residency_bytes);
+        qualification_category_caps.max_cpu_upload_staging_bytes =
+            Some(profile.resources.max_cpu_upload_staging_bytes);
+        assert!(validate_hard_safety_limits(&qualification_category_caps, &profile).is_err());
+
+        let mut forbidden_optional_cap = exact;
+        forbidden_optional_cap.max_runtime_pending_completions = Some(1);
+        assert!(validate_hard_safety_limits(&forbidden_optional_cap, &profile).is_err());
+
+        let mut wrong_queue_cap = exact;
+        wrong_queue_cap.max_runtime_queued_requests =
+            profile.resources.max_queued_requests.checked_mul(3);
+        assert!(validate_hard_safety_limits(&wrong_queue_cap, &profile).is_err());
+
+        let mut template = template(true, Vec::new());
+        template.hard_safety_limits = exact;
+        let exact_json = serde_json::to_value(exact).unwrap();
+        let mut report = json!({ "hard_safety_limits": exact_json });
+        assert!(automation_report_hard_safety_limits_match(
+            &report, &template
+        ));
+        report["hard_safety_limits"]["max_cpu_total_bytes"] = json!(1);
+        assert!(!automation_report_hard_safety_limits_match(
+            &report, &template
+        ));
+        report["hard_safety_limits"] = serde_json::to_value(exact).unwrap();
+        report["hard_safety_limits"]["unknown"] = json!(null);
+        assert!(!automation_report_hard_safety_limits_match(
+            &report, &template
+        ));
+        report.as_object_mut().unwrap().remove("hard_safety_limits");
+        assert!(!automation_report_hard_safety_limits_match(
+            &report, &template
+        ));
+        report["limits"] = serde_json::to_value(exact).unwrap();
+        assert!(!automation_report_hard_safety_limits_match(
+            &report, &template
+        ));
+
+        let mut legacy_template = serde_json::to_value(&template).unwrap();
+        let limits = legacy_template
+            .as_object_mut()
+            .unwrap()
+            .remove("hard_safety_limits")
+            .unwrap();
+        legacy_template["limits"] = limits;
+        assert!(serde_json::from_value::<AutomationScriptTemplate>(legacy_template).is_err());
     }
 
     #[test]
@@ -9567,14 +11413,17 @@ mod tests {
                     },
                 },
                 {
-                    "command": "wait_for_imported_open_ready",
+                    "command": "observe_imported_open_ready",
                     "status": "passed",
                     "details": {
-                        "path": "/private/attempt/imported.m4d",
-                        "verified": true,
-                        "import_idle": true,
-                        "normal_product_open_path": true,
-                        "primary_clock": primary_clock.clone(),
+                        "schema": PRODUCT_GATE_OBSERVATION_SCHEMA,
+                        "gate_id": "IP.imported_open_ready",
+                        "condition": IMPORTED_OPEN_READY_CONDITION,
+                        "outcome": "passed",
+                        "condition_met": true,
+                        "timed_out": false,
+                        "timeout_ms": 1_200_000,
+                        "waited_ns": 1_000_000_000,
                     },
                 },
             ],
@@ -9590,8 +11439,16 @@ mod tests {
         report: &Value,
         gate: &ImportGate,
     ) -> BTreeSet<String> {
+        import_workflow_gate_reasons_with_outcome(report, gate, ProductGateStatus::Passed)
+    }
+
+    fn import_workflow_gate_reasons_with_outcome(
+        report: &Value,
+        gate: &ImportGate,
+        outcome: ProductGateStatus,
+    ) -> BTreeSet<String> {
         let mut reasons = BTreeSet::new();
-        validate_import_workflow_gate(report, gate, &mut reasons);
+        validate_import_workflow_gate(report, gate, Some(outcome), &mut reasons);
         reasons
     }
 
@@ -9676,7 +11533,7 @@ mod tests {
         }
         assert!(
             import_workflow_gate_reasons_with_gate(&below_minimum_progress, &gate)
-                .contains("import_required_stage_or_progress_evidence_mismatch")
+                .contains("product_gate_import_required_stage_or_progress_mismatch")
         );
 
         let (_, mut unreconciled_receipt) = all_stage_repeated_receipt_report();
@@ -9702,12 +11559,202 @@ mod tests {
     }
 
     #[test]
+    fn passed_imported_open_ready_clocks_and_currentness_require_exact_shapes() {
+        let authentic = valid_import_workflow_report();
+        assert!(import_workflow_gate_reasons(&authentic).is_empty());
+        assert_eq!(
+            reason_axis("import_clock_evidence_shape_invalid"),
+            ReasonAxis::Integrity
+        );
+
+        for (label, pointer, required_field) in [
+            (
+                "inspection clock",
+                "/import_workflow_evidence/inspection_and_review_clock",
+                "wall_time_ns",
+            ),
+            (
+                "primary clock",
+                "/import_workflow_evidence/primary_clock",
+                "wall_time_ns",
+            ),
+            (
+                "publication clock",
+                "/import_workflow_evidence/publication_to_open_ready_clock",
+                "wall_time_ns",
+            ),
+            (
+                "publication currentness",
+                "/import_workflow_evidence/publication_to_open_ready_clock/publication_currentness_execution",
+                "observed_total_object_reads",
+            ),
+        ] {
+            let assert_shape_invalid = |report: &Value, mutation: &str| {
+                let reasons = import_workflow_gate_reasons(report);
+                assert!(
+                    reasons.contains("import_clock_evidence_shape_invalid"),
+                    "{label} {mutation} mutation did not fail exact shape: {reasons:?}"
+                );
+                assert!(has_integrity_reasons(&reasons));
+            };
+
+            let mut extra = authentic.clone();
+            extra
+                .pointer_mut(pointer)
+                .and_then(Value::as_object_mut)
+                .expect("test clock object exists")
+                .insert("unexpected".to_owned(), json!(true));
+            assert_shape_invalid(&extra, "extra-key");
+
+            let mut missing = authentic.clone();
+            missing
+                .pointer_mut(pointer)
+                .and_then(Value::as_object_mut)
+                .expect("test clock object exists")
+                .remove(required_field);
+            assert_shape_invalid(&missing, "missing-key");
+
+            let mut null = authentic.clone();
+            null.pointer_mut(pointer)
+                .and_then(Value::as_object_mut)
+                .expect("test clock object exists")
+                .insert(required_field.to_owned(), Value::Null);
+            assert_shape_invalid(&null, "null-key");
+        }
+    }
+
+    #[test]
+    fn imported_open_ready_failure_skips_only_pass_dependent_clock_evidence() {
+        let mut report = valid_import_workflow_report();
+        report["events"][1]["details"]["outcome"] = json!("failed");
+        report["events"][1]["details"]["condition_met"] = json!(false);
+        report["events"][1]["details"]["timed_out"] = json!(true);
+        report["events"][1]["details"]["waited_ns"] = json!(1_200_000_000_000_u64);
+        assert!(
+            import_workflow_gate_reasons_with_outcome(
+                &report,
+                &test_import_gate(),
+                ProductGateStatus::Failed,
+            )
+            .contains("failed_imported_open_ready_pass_only_evidence_present")
+        );
+
+        report["import_workflow_evidence"]["primary_clock"] = Value::Null;
+        for field in [
+            "start_boundary",
+            "end_boundary",
+            "wall_clock",
+            "cpu_clock",
+            "published_at_epoch_ms",
+            "open_ready_at_epoch_ms",
+            "wall_time_ns",
+            "process_cpu_time_ns",
+            "included_in_primary_clock",
+            "transfer_mode",
+        ] {
+            report["import_workflow_evidence"]["publication_to_open_ready_clock"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        assert!(
+            import_workflow_gate_reasons_with_outcome(
+                &report,
+                &test_import_gate(),
+                ProductGateStatus::Failed,
+            )
+            .is_empty()
+        );
+
+        let authentic_failed_report = report.clone();
+
+        let mut missing_primary_clock = authentic_failed_report.clone();
+        missing_primary_clock["import_workflow_evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("primary_clock");
+        assert!(
+            import_workflow_gate_reasons_with_outcome(
+                &missing_primary_clock,
+                &test_import_gate(),
+                ProductGateStatus::Failed,
+            )
+            .contains("failed_imported_open_ready_evidence_shape_invalid")
+        );
+
+        let mut null_pass_clock = authentic_failed_report.clone();
+        null_pass_clock["import_workflow_evidence"]["publication_to_open_ready_clock"]["wall_time_ns"] =
+            Value::Null;
+        let null_pass_clock_reasons = import_workflow_gate_reasons_with_outcome(
+            &null_pass_clock,
+            &test_import_gate(),
+            ProductGateStatus::Failed,
+        );
+        assert!(
+            null_pass_clock_reasons.contains("failed_imported_open_ready_evidence_shape_invalid")
+        );
+        assert!(
+            null_pass_clock_reasons
+                .contains("failed_imported_open_ready_pass_only_evidence_present")
+        );
+
+        let mut extra_partial_field = authentic_failed_report.clone();
+        extra_partial_field["import_workflow_evidence"]["publication_to_open_ready_clock"]["unexpected"] =
+            json!(true);
+        assert!(
+            import_workflow_gate_reasons_with_outcome(
+                &extra_partial_field,
+                &test_import_gate(),
+                ProductGateStatus::Failed,
+            )
+            .contains("failed_imported_open_ready_evidence_shape_invalid")
+        );
+
+        let mut extra_currentness_field = authentic_failed_report.clone();
+        extra_currentness_field["import_workflow_evidence"]["publication_to_open_ready_clock"]["publication_currentness_execution"]
+            ["unexpected"] = json!(true);
+        assert!(
+            import_workflow_gate_reasons_with_outcome(
+                &extra_currentness_field,
+                &test_import_gate(),
+                ProductGateStatus::Failed,
+            )
+            .contains("failed_imported_open_ready_evidence_shape_invalid")
+        );
+
+        let mut missing_partial_field = authentic_failed_report.clone();
+        missing_partial_field["import_workflow_evidence"]["publication_to_open_ready_clock"]
+            .as_object_mut()
+            .unwrap()
+            .remove("source_verification_successes");
+        assert!(
+            import_workflow_gate_reasons_with_outcome(
+                &missing_partial_field,
+                &test_import_gate(),
+                ProductGateStatus::Failed,
+            )
+            .contains("failed_imported_open_ready_evidence_shape_invalid")
+        );
+
+        report["import_workflow_evidence"]["publication_to_open_ready_clock"]["publication_currentness_execution"] =
+            Value::Null;
+        assert!(
+            import_workflow_gate_reasons_with_outcome(
+                &report,
+                &test_import_gate(),
+                ProductGateStatus::Failed,
+            )
+            .contains("import_publication_currentness_evidence_mismatch")
+        );
+    }
+
+    #[test]
     fn import_workflow_gate_rejects_run_clock_currentness_and_binding_mutations() {
         let mut report = valid_import_workflow_report();
         report["import_workflow_evidence"]["successful_runs"] = json!(2);
         assert!(
             import_workflow_gate_reasons(&report)
-                .contains("import_workflow_run_counts_or_progress_claim_mismatch")
+                .contains("product_gate_import_workflow_run_counts_or_progress_claim_mismatch")
         );
 
         let mut report = valid_import_workflow_report();
@@ -9715,7 +11762,7 @@ mod tests {
             json!(true);
         assert!(
             import_workflow_gate_reasons(&report)
-                .contains("import_workflow_run_counts_or_progress_claim_mismatch")
+                .contains("product_gate_import_workflow_run_counts_or_progress_claim_mismatch")
         );
 
         let mut report = valid_import_workflow_report();
@@ -9730,7 +11777,7 @@ mod tests {
             json!(1);
         assert!(
             import_workflow_gate_reasons(&report)
-                .contains("import_ordinary_source_verifier_activity_observed")
+                .contains("product_gate_import_ordinary_source_verifier_activity_observed")
         );
 
         let mut report = valid_import_workflow_report();
@@ -9738,11 +11785,11 @@ mod tests {
             ["observed_total_object_reads"] = json!(4);
         assert!(
             import_workflow_gate_reasons(&report)
-                .contains("import_publication_currentness_evidence_mismatch")
+                .contains("product_gate_import_publication_currentness_observation_mismatch")
         );
 
         let mut report = valid_import_workflow_report();
-        report["events"][1]["details"]["path"] = json!("/private/wrong.m4d");
+        report["events"][1]["details"]["condition"] = json!("wrong");
         assert!(
             import_workflow_gate_reasons(&report)
                 .contains("import_receipt_start_or_open_ready_binding_mismatch")
@@ -10334,7 +12381,7 @@ mod tests {
             &profile,
             &mut reasons,
         );
-        assert!(reasons.contains("visible_panel_milestone_set_mismatch"));
+        assert!(reasons.contains("product_gate_visible_panel_milestone_set_mismatch"));
 
         let mut diagnostics = complete_milestones();
         diagnostics["render"]["performance_milestones"]["visible_panels"][0]["visible_layers"][0]
@@ -10413,7 +12460,7 @@ mod tests {
         diagnostics["cross_section"]["panels"][0]["canonical_plane_geometry"]["source"] =
             json!("derived_copy");
         validate_phase_state_facts(&diagnostics, &state, &numerical_contract(), &mut reasons);
-        assert!(reasons.contains("canonical_camera_geometry_missing_or_outside_contract"));
+        assert!(reasons.contains("product_gate_canonical_camera_geometry_outside_contract"));
         assert!(reasons.contains("canonical_xy_plane_geometry_missing_or_outside_contract"));
     }
 
@@ -10950,7 +12997,9 @@ mod tests {
         assert!(reasons.is_empty());
         end["diagnostics"]["source_verification"]["active_operation"] = json!(false);
         validate_verification_evidence(&start, &end, &gate, &mut reasons);
-        assert!(reasons.contains("verification_end_state_or_active_operation_mismatch_or_missing"));
+        assert!(
+            reasons.contains("product_gate_verification_end_state_or_active_operation_mismatch")
+        );
 
         let regressed = checkpoint("Verifying", true, 2);
         reasons.clear();
@@ -11024,7 +13073,495 @@ mod tests {
             1,
             &mut reasons,
         );
-        assert!(reasons.contains("gesture_sequence_durable_commit_or_sample_delta_mismatch"));
+        assert!(
+            reasons
+                .contains("product_gate_gesture_sequence_durable_commit_or_sample_delta_mismatch")
+        );
+    }
+
+    fn observe_gate_command(gate_id: &str, timeout_ms: u64) -> Value {
+        json!({
+            "command": "observe_gate",
+            "gate_id": gate_id,
+            "condition": "coordinated_presentation_settled",
+            "timeout_ms": timeout_ms,
+        })
+    }
+
+    fn observe_imported_open_ready_command(gate_id: &str, timeout_ms: u64) -> Value {
+        json!({
+            "command": "observe_imported_open_ready",
+            "gate_id": gate_id,
+            "path": "${ATTEMPT_ROOT}/output/imported.m4d",
+            "timeout_ms": timeout_ms,
+        })
+    }
+
+    fn observe_gate_event(
+        command_index: usize,
+        gate_id: &str,
+        outcome: ProductGateStatus,
+    ) -> Value {
+        product_gate_event(
+            command_index,
+            "observe_gate",
+            gate_id,
+            "coordinated_presentation_settled",
+            outcome,
+            30_000,
+        )
+    }
+
+    fn observe_imported_open_ready_event(
+        command_index: usize,
+        gate_id: &str,
+        outcome: ProductGateStatus,
+    ) -> Value {
+        product_gate_event(
+            command_index,
+            "observe_imported_open_ready",
+            gate_id,
+            IMPORTED_OPEN_READY_CONDITION,
+            outcome,
+            30_000,
+        )
+    }
+
+    fn product_gate_event(
+        command_index: usize,
+        command: &str,
+        gate_id: &str,
+        condition: &str,
+        outcome: ProductGateStatus,
+        timeout_ms: u64,
+    ) -> Value {
+        let failed = outcome == ProductGateStatus::Failed;
+        json!({
+            "command_index": command_index,
+            "command": command,
+            "status": "passed",
+            "event_epoch_ms": 1_000_u64,
+            "duration_ms": 1.0,
+            "details": {
+                "schema": PRODUCT_GATE_OBSERVATION_SCHEMA,
+                "gate_id": gate_id,
+                "condition": condition,
+                "outcome": outcome.report_label(),
+                "condition_met": !failed,
+                "timed_out": failed,
+                "timeout_ms": timeout_ms,
+                "waited_ns": if failed { timeout_ms * 1_000_000 } else { 1_000_000_u64 },
+            },
+        })
+    }
+
+    fn frozen_product_gate_inventory_commands(id: &str) -> Vec<Value> {
+        let mut commands = Vec::new();
+        for (condition, count) in expected_fatal_wait_condition_multiset(id) {
+            for _ in 0..count {
+                commands.push(json!({
+                    "command": "wait_for",
+                    "condition": condition,
+                    "timeout_ms": 30_000,
+                }));
+            }
+        }
+        let mut ordinal = 0_usize;
+        for (condition, count) in expected_acceptance_condition_multiset(id) {
+            for _ in 0..count {
+                let gate_id = format!("{id}.acceptance.{ordinal:03}.{condition}");
+                if condition == IMPORTED_OPEN_READY_CONDITION {
+                    commands.push(observe_imported_open_ready_command(&gate_id, 30_000));
+                } else {
+                    let mut command = observe_gate_command(&gate_id, 30_000);
+                    command["condition"] = json!(condition);
+                    commands.push(command);
+                }
+                ordinal += 1;
+            }
+        }
+        commands
+    }
+
+    #[test]
+    fn v4_observe_gate_events_form_an_exact_ordered_bijection() {
+        let template = template(
+            true,
+            vec![
+                observe_gate_command("RZ.cross_section.settled", 30_000),
+                json!({ "command": "sleep_frames", "frames": 1 }),
+                observe_imported_open_ready_command("IP.imported_open_ready", 30_000),
+            ],
+        );
+        let report = json!({
+            "events": [
+                observe_gate_event(
+                    0,
+                    "RZ.cross_section.settled",
+                    ProductGateStatus::Passed,
+                ),
+                observe_imported_open_ready_event(
+                    2,
+                    "IP.imported_open_ready",
+                    ProductGateStatus::Failed,
+                ),
+            ],
+        });
+        let outcomes = product_gate_outcomes_from_report(&report, &template).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].outcome, ProductGateStatus::Passed);
+        assert_eq!(outcomes[1].outcome, ProductGateStatus::Failed);
+        assert_eq!(outcomes[1].condition, IMPORTED_OPEN_READY_CONDITION);
+
+        let mut missing = report.clone();
+        missing["events"].as_array_mut().unwrap().pop();
+        assert!(product_gate_outcomes_from_report(&missing, &template).is_err());
+
+        let mut reordered = report.clone();
+        reordered["events"].as_array_mut().unwrap().swap(0, 1);
+        assert!(product_gate_outcomes_from_report(&reordered, &template).is_err());
+
+        let mut duplicate = report.clone();
+        duplicate["events"][1]["command_index"] = json!(0);
+        assert!(product_gate_outcomes_from_report(&duplicate, &template).is_err());
+
+        let mut mismatched = report.clone();
+        mismatched["events"][0]["details"]["condition"] = json!("runtime_idle");
+        assert!(product_gate_outcomes_from_report(&mismatched, &template).is_err());
+    }
+
+    #[test]
+    fn observe_gate_event_shape_and_outcome_flags_fail_closed() {
+        let template = template(
+            true,
+            vec![observe_gate_command("RZ.cross_section.settled", 30_000)],
+        );
+        let report = json!({
+            "events": [observe_gate_event(
+                0,
+                "RZ.cross_section.settled",
+                ProductGateStatus::Failed,
+            )],
+        });
+        assert!(product_gate_outcomes_from_report(&report, &template).is_ok());
+
+        let mut extra = report.clone();
+        extra["events"][0]["details"]["reason"] = json!("private free text");
+        assert!(product_gate_outcomes_from_report(&extra, &template).is_err());
+
+        let mut late_true = report.clone();
+        late_true["events"][0]["details"]["condition_met"] = json!(true);
+        assert!(product_gate_outcomes_from_report(&late_true, &template).is_ok());
+
+        let mut incoherent = report.clone();
+        incoherent["events"][0]["details"]["timed_out"] = json!(false);
+        assert!(product_gate_outcomes_from_report(&incoherent, &template).is_err());
+
+        let mut early = report.clone();
+        early["events"][0]["details"]["waited_ns"] = json!(29_999_999_999_u64);
+        assert!(product_gate_outcomes_from_report(&early, &template).is_err());
+
+        let mut passed_at_deadline = report.clone();
+        passed_at_deadline["events"][0]["details"]["outcome"] = json!("passed");
+        passed_at_deadline["events"][0]["details"]["condition_met"] = json!(true);
+        passed_at_deadline["events"][0]["details"]["timed_out"] = json!(false);
+        assert!(product_gate_outcomes_from_report(&passed_at_deadline, &template).is_err());
+
+        let mut passed_before_deadline = passed_at_deadline.clone();
+        passed_before_deadline["events"][0]["details"]["waited_ns"] = json!(29_999_999_999_u64);
+        assert!(product_gate_outcomes_from_report(&passed_before_deadline, &template).is_ok());
+
+        let mut missing_outer = report.clone();
+        missing_outer["events"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("event_epoch_ms");
+        assert!(product_gate_outcomes_from_report(&missing_outer, &template).is_err());
+
+        let mut extra_outer = report.clone();
+        extra_outer["events"][0]["private_path"] = json!("/private/source");
+        assert!(product_gate_outcomes_from_report(&extra_outer, &template).is_err());
+
+        let mut bad_schema = report.clone();
+        bad_schema["events"][0]["details"]["schema"] = json!("legacy");
+        assert!(product_gate_outcomes_from_report(&bad_schema, &template).is_err());
+    }
+
+    #[test]
+    fn observe_gate_commands_require_safe_unique_ids_exact_fields_and_precede_final_quit() {
+        assert!(
+            expected_product_gate_commands(&[observe_gate_command(
+                "RZ.cross_section.settled",
+                30_000,
+            )])
+            .is_ok()
+        );
+        assert!(
+            expected_product_gate_commands(&[observe_gate_command(
+                "RZ.maximum-timeout",
+                PRODUCT_GATE_TIMEOUT_MAX_MS,
+            )])
+            .is_ok()
+        );
+        assert!(
+            expected_product_gate_commands(&[observe_gate_command(
+                "RZ.excessive-timeout",
+                PRODUCT_GATE_TIMEOUT_MAX_MS + 1,
+            )])
+            .is_err()
+        );
+        assert!(
+            expected_product_gate_commands(&[observe_imported_open_ready_command(
+                "IP.imported_open_ready",
+                PRODUCT_GATE_TIMEOUT_MAX_MS,
+            )])
+            .is_ok()
+        );
+        let mut empty_path = observe_imported_open_ready_command("IP.imported_open_ready", 30_000);
+        empty_path["path"] = json!("");
+        assert!(expected_product_gate_commands(&[empty_path]).is_err());
+        let mut extra_condition =
+            observe_imported_open_ready_command("IP.imported_open_ready", 30_000);
+        extra_condition["condition"] = json!(IMPORTED_OPEN_READY_CONDITION);
+        assert!(expected_product_gate_commands(&[extra_condition]).is_err());
+        let mut unsafe_id = observe_gate_command("/private/gate", 30_000);
+        assert!(expected_product_gate_commands(&[unsafe_id.clone()]).is_err());
+        unsafe_id["gate_id"] = json!("RZ.safe");
+        unsafe_id["private_path"] = json!("/private/source");
+        assert!(expected_product_gate_commands(&[unsafe_id]).is_err());
+        assert!(
+            expected_product_gate_commands(&[
+                observe_gate_command("RZ.duplicate", 30_000),
+                observe_gate_command("RZ.duplicate", 30_000),
+            ])
+            .is_err()
+        );
+        assert!(expected_product_gate_commands(&[observe_gate_command("RZ.zero", 0)]).is_err());
+
+        let valid_commands = vec![
+            json!({ "command": "sample_diagnostics", "label": "rz-start" }),
+            json!({ "command": "sample_diagnostics", "label": "rz-end" }),
+            // Gate placement is deliberately permitted after a phase end.
+            observe_gate_command("RZ.cross_section.settled", 30_000),
+            json!({ "command": "quit" }),
+        ];
+        let script = template(true, valid_commands);
+        assert!(validate_automation_template("RZ", &script, true, &["rz-start", "rz-end"]).is_ok());
+
+        let mut after_quit = script;
+        after_quit.commands.swap(2, 3);
+        assert!(
+            validate_automation_template("RZ", &after_quit, true, &["rz-start", "rz-end"]).is_err()
+        );
+    }
+
+    #[test]
+    fn v4_product_gate_and_fatal_wait_inventories_are_exact_and_nonempty() {
+        let mut total_gates = 0_usize;
+        let mut total_fatal_waits = 0_usize;
+        for id in REQUIRED_SCENARIOS {
+            let commands = frozen_product_gate_inventory_commands(id);
+            validate_product_gate_inventory(id, &commands).unwrap();
+            total_gates += expected_product_gate_commands(&commands).unwrap().len();
+            total_fatal_waits += commands
+                .iter()
+                .filter(|command| {
+                    command.get("command").and_then(Value::as_str) == Some("wait_for")
+                })
+                .count();
+        }
+        assert_eq!(total_gates, 74);
+        assert_eq!(total_fatal_waits, 24);
+
+        let mut missing = frozen_product_gate_inventory_commands("RZ");
+        missing.retain(|command| {
+            !command
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(is_product_gate_observation_command)
+        });
+        assert!(validate_product_gate_inventory("RZ", &missing).is_err());
+
+        let mut wrong_id = frozen_product_gate_inventory_commands("RZ");
+        let gate = wrong_id
+            .iter_mut()
+            .find(|command| {
+                command
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_product_gate_observation_command)
+            })
+            .unwrap();
+        gate["gate_id"] = json!("RZ.acceptance.999.runtime_idle");
+        assert!(validate_product_gate_inventory("RZ", &wrong_id).is_err());
+
+        let mut legacy = frozen_product_gate_inventory_commands("RZ");
+        let gate_index = legacy
+            .iter()
+            .position(|command| {
+                command
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_product_gate_observation_command)
+            })
+            .unwrap();
+        let condition = legacy[gate_index]["condition"].clone();
+        legacy[gate_index] = json!({
+            "command": "wait_for",
+            "condition": condition,
+            "timeout_ms": 30_000,
+        });
+        assert!(validate_product_gate_inventory("RZ", &legacy).is_err());
+    }
+
+    #[test]
+    fn legacy_failed_automation_reports_remain_fatal_and_never_become_gate_outcomes() {
+        let template = template(
+            false,
+            vec![json!({
+                "command": "wait_for_imported_open_ready",
+                "path": "/private/attempt/imported.m4d",
+                "timeout_ms": 30_000,
+            })],
+        );
+        let report = json!({
+            "schema": AUTOMATION_REPORT_SCHEMA,
+            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "status": "failed",
+            "failure_reason": "timed out waiting for imported package open-ready",
+            "events": [],
+        });
+        let mut outcomes = Vec::new();
+        let mut reasons = BTreeSet::new();
+        validate_basic_automation_report(
+            &report,
+            Path::new("/unavailable/app"),
+            Path::new("/unavailable/script"),
+            &template,
+            &profile(),
+            AttemptRole::InstrumentationControl,
+            &mut outcomes,
+            &mut reasons,
+        );
+        assert!(reasons.contains("automation_report_failed"));
+        assert!(outcomes.is_empty());
+    }
+
+    #[test]
+    fn exact_population_requires_all_fifty_samples_hundred_roles_and_gate_rows() {
+        let mut profile = profile();
+        profile.protocol.development_samples = 5;
+        let scripts = population_scripts();
+        let samples = complete_population_samples();
+        let mut reasons = BTreeSet::new();
+        let population = validate_attempt_population(&profile, &scripts, &samples, &mut reasons);
+        assert!(reasons.is_empty(), "{reasons:#?}");
+        assert_eq!(population.expected_sample_records, 50);
+        assert_eq!(population.observed_sample_records, 50);
+        assert_eq!(population.expected_role_attempts, 100);
+        assert_eq!(population.observed_role_attempts, 100);
+        assert_eq!(population.completed_role_reports, 100);
+        assert_eq!(population.expected_phase_evaluations, 50);
+        assert_eq!(population.observed_phase_evaluations, 50);
+        assert_eq!(population.expected_product_gate_observations, 100);
+        assert_eq!(population.observed_product_gate_observations, 100);
+        assert_eq!(population_json(population)["exact"], json!(true));
+
+        let mut filtered = complete_population_samples();
+        filtered.pop();
+        let mut reasons = BTreeSet::new();
+        validate_attempt_population(&profile, &scripts, &filtered, &mut reasons);
+        assert!(reasons.contains("sample_population_cardinality_mismatch"));
+        assert!(reasons.contains("sample_population_identity_mismatch"));
+        assert!(reasons.contains("role_attempt_population_cardinality_mismatch"));
+        assert!(reasons.contains("completed_role_report_population_mismatch"));
+        assert!(reasons.contains("phase_evaluation_population_mismatch"));
+        assert!(reasons.contains("product_gate_observation_population_mismatch"));
+
+        let mut missing_gate = complete_population_samples();
+        missing_gate[0].instrumented.product_gate_outcomes.clear();
+        let mut reasons = BTreeSet::new();
+        validate_attempt_population(&profile, &scripts, &missing_gate, &mut reasons);
+        assert!(reasons.contains("product_gate_observation_population_mismatch"));
+        assert!(reasons.contains("product_gate_observation_identity_mismatch"));
+
+        let mut duplicate_identity = complete_population_samples();
+        duplicate_identity[49].sample_index = duplicate_identity[0].sample_index;
+        duplicate_identity[49].scenario = duplicate_identity[0].scenario.clone();
+        let mut reasons = BTreeSet::new();
+        let population =
+            validate_attempt_population(&profile, &scripts, &duplicate_identity, &mut reasons);
+        assert_eq!(population.observed_sample_records, 50);
+        assert_eq!(population.observed_role_attempts, 100);
+        assert!(!population.sample_identities_exact);
+        assert_eq!(population_json(population)["exact"], json!(false));
+
+        let mut wrong_role = complete_population_samples();
+        wrong_role[0].instrumented.role = AttemptRole::InstrumentationControl;
+        let mut reasons = BTreeSet::new();
+        let population = validate_attempt_population(&profile, &scripts, &wrong_role, &mut reasons);
+        assert!(!population.role_identities_exact);
+        assert_eq!(population_json(population)["exact"], json!(false));
+
+        let mut wrong_phase = complete_population_samples();
+        wrong_phase[0].phases[0].name = "wrong-phase".to_owned();
+        let mut reasons = BTreeSet::new();
+        let population =
+            validate_attempt_population(&profile, &scripts, &wrong_phase, &mut reasons);
+        assert!(!population.phase_identities_exact);
+        assert_eq!(population_json(population)["exact"], json!(false));
+
+        let mut wrong_gate = complete_population_samples();
+        wrong_gate[0].instrumented.product_gate_outcomes[0].command_index = 1;
+        let mut reasons = BTreeSet::new();
+        let population = validate_attempt_population(&profile, &scripts, &wrong_gate, &mut reasons);
+        assert_eq!(population.observed_product_gate_observations, 100);
+        assert!(!population.product_gate_bijections_exact);
+        assert_eq!(population_json(population)["exact"], json!(false));
+    }
+
+    #[test]
+    fn native_exit_depends_only_on_evidence_integrity() {
+        assert!(require_valid_evidence(&BTreeSet::new()).is_ok());
+        let valid_negative = BTreeSet::from([
+            "product_gate_visible_panel_milestone_set_mismatch".to_owned(),
+            "import_receipt_source_read_amplification_exceeded".to_owned(),
+            "product_gate_exact_cross_scope_target_union_unique_keys_mismatch".to_owned(),
+            "unique_work_gpu_uploaded_payload_bytes_delta_outside_oracle".to_owned(),
+            "structural_queue_submissions_counter_changed".to_owned(),
+            "structural_command_encoders_ceiling_exceeded".to_owned(),
+        ]);
+        assert!(require_valid_evidence(&valid_negative).is_ok());
+        assert_eq!(evidence_status(&valid_negative), "valid_complete");
+        assert!(has_product_gate_failures(&valid_negative));
+        assert_eq!(
+            product_gate_status(true, true),
+            "failed",
+            "a valid failed product gate remains an authoritative negative outcome"
+        );
+        assert!(
+            require_valid_evidence(&BTreeSet::from(["phase_end_checkpoint_missing".to_owned()]))
+                .is_err()
+        );
+        assert_eq!(product_gate_status(false, true), "not_authoritative");
+
+        for reason in [
+            "product_gate_observation_event_set_invalid",
+            "product_gate_observation_identity_mismatch",
+            "product_gate_observation_population_mismatch",
+            "instrumentation_overhead_gate_exceeded",
+            "failed_imported_open_ready_evidence_shape_invalid",
+            "import_clock_evidence_shape_invalid",
+            "import_receipt_source_read_amplification_operand_invalid",
+            "product_gate_unknown_future_integrity_fault",
+            "unknown_delta_outside_oracle",
+            "structural_unknown_counter_changed",
+            "structural_unknown_ceiling_exceeded",
+            "new_unclassified_reason",
+        ] {
+            assert_eq!(reason_axis(reason), ReasonAxis::Integrity, "{reason}");
+            assert!(require_valid_evidence(&BTreeSet::from([reason.to_owned()])).is_err());
+        }
     }
 
     #[test]
@@ -11072,6 +13609,27 @@ mod tests {
             sha256: "44".repeat(32),
             path: PathBuf::from("/private/secret/oracle.json"),
         };
+        let mut sample = complete_population_samples().remove(0);
+        sample.instrumented.product_gate_outcomes[0] =
+            product_gate_outcome("RZ.cross_section.settled", ProductGateStatus::Failed);
+        sample.phases[0]
+            .reasons
+            .insert("product_gate_visible_panel_milestone_set_mismatch".to_owned());
+        let population = PopulationEvidence {
+            expected_sample_records: 1,
+            observed_sample_records: 1,
+            expected_role_attempts: 2,
+            observed_role_attempts: 2,
+            completed_role_reports: 2,
+            expected_phase_evaluations: 1,
+            observed_phase_evaluations: 1,
+            expected_product_gate_observations: 2,
+            observed_product_gate_observations: 2,
+            sample_identities_exact: true,
+            role_identities_exact: true,
+            phase_identities_exact: true,
+            product_gate_bijections_exact: true,
+        };
         let receipt = sanitized_receipt(
             &profile,
             &workload,
@@ -11080,6 +13638,8 @@ mod tests {
             &"66".repeat(32),
             &"77".repeat(32),
             None,
+            &[sample],
+            population,
             &BTreeSet::new(),
         );
         let encoded = serde_json::to_string(&receipt).unwrap();
@@ -11095,6 +13655,49 @@ mod tests {
         assert!(!encoded.contains("/private"));
         assert!(!encoded.contains("secret"));
         assert!(!encoded.contains("temporal.m4d"));
+        assert!(!encoded.contains("failure_reason"));
+        assert!(!encoded.contains("private_path"));
+        assert_eq!(receipt["evidence_status"], "valid_complete");
+        assert_eq!(receipt["product_gate_status"], "failed");
+        assert_eq!(receipt["population"]["exact"], true);
+        assert_eq!(
+            receipt["product_gate_outcomes"].as_array().unwrap().len(),
+            2
+        );
+        let public_gate_fields = BTreeSet::from([
+            "sample_index",
+            "scenario",
+            "role",
+            "gate_id",
+            "condition",
+            "outcome",
+        ]);
+        for collection in ["product_gate_outcomes", "product_gate_failures"] {
+            let rows = receipt[collection].as_array().unwrap();
+            assert!(!rows.is_empty());
+            for row in rows {
+                assert_eq!(
+                    row.as_object()
+                        .unwrap()
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<BTreeSet<_>>(),
+                    public_gate_fields,
+                );
+                for private_field in [
+                    "schema",
+                    "command_index",
+                    "condition_met",
+                    "timed_out",
+                    "timeout_ms",
+                    "waited_ns",
+                ] {
+                    assert!(row.get(private_field).is_none());
+                }
+            }
+        }
+        assert!(receipt.get("status").is_none());
+        assert!(receipt.get("reason_codes").is_none());
         assert!(encoded.contains("non_OS_input_non_E4"));
     }
 }

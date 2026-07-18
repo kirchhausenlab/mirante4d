@@ -2,24 +2,61 @@ use super::*;
 
 fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_resources: u64) {
     assert_eq!(script["schema_version"], PRODUCT_AUTOMATION_SCHEMA_VERSION);
-    assert_eq!(script["limits"]["max_cpu_total_bytes"], total_bytes);
     assert_eq!(
-        script["limits"]["max_cpu_decoded_residency_bytes"],
+        script["hard_safety_limits"]["max_cpu_total_bytes"],
+        total_bytes
+    );
+    assert_eq!(
+        script["hard_safety_limits"]["max_cpu_decoded_residency_bytes"],
         total_bytes / 2
     );
     assert_eq!(
-        script["limits"]["max_cpu_in_flight_decode_bytes"],
+        script["hard_safety_limits"]["max_cpu_in_flight_decode_bytes"],
         (total_bytes / 8)
             .saturating_add(PACKAGE_VALIDATION_WORKING_BYTES)
             .min(total_bytes)
     );
-    assert_eq!(script["limits"]["max_runtime_queued_requests"], 1_024);
-    assert_eq!(script["limits"]["max_runtime_in_flight_decodes"], 8);
-    assert_eq!(script["limits"]["max_runtime_pending_completions"], 1_024);
     assert_eq!(
-        script["limits"]["max_runtime_resident_resources"],
+        script["hard_safety_limits"]["max_runtime_queued_requests"],
+        1_024
+    );
+    assert_eq!(
+        script["hard_safety_limits"]["max_runtime_in_flight_decodes"],
+        8
+    );
+    assert_eq!(
+        script["hard_safety_limits"]["max_runtime_pending_completions"],
+        1_024
+    );
+    assert_eq!(
+        script["hard_safety_limits"]["max_runtime_resident_resources"],
         resident_resources
     );
+}
+
+fn bind_report_to_script(report: &mut Value, script: &Value, script_path: &Path) {
+    report["schema"] = json!(PRODUCT_AUTOMATION_REPORT_SCHEMA);
+    report["schema_version"] = json!(PRODUCT_AUTOMATION_SCHEMA_VERSION);
+    report["status"] = json!("passed");
+    report["failure_reason"] = Value::Null;
+    report["script"] = json!({
+        "path": script_path,
+        "schema": script["schema"],
+        "schema_version": script["schema_version"],
+        "scenario": script["scenario"],
+        "command_count": script["commands"].as_array().unwrap().len(),
+    });
+    report["hard_safety_limits"] =
+        canonical_product_automation_hard_safety_limits(&script["hard_safety_limits"]).unwrap();
+}
+
+fn bound_automation_report(mut report: Value) -> (tempfile::TempDir, Value, PathBuf, Value) {
+    let tempdir = tempfile::tempdir().unwrap();
+    let script_path = tempdir.path().join("product-automation-script.json");
+    let script = target_fixture_camera_smoke_script(&tempdir.path().join("fixture.m4d"));
+    write_json_file(&script_path, &script).unwrap();
+    bind_report_to_script(&mut report, &script, &script_path);
+    (tempdir, script, script_path, report)
 }
 
 fn b3_exact_capture_report(second_width: u64) -> Value {
@@ -118,13 +155,25 @@ fn b4_normal_automation_report(width: u32, height: u32) -> Value {
     })
 }
 
-fn b4_valid_attempt(number: u64) -> Value {
+fn b4_valid_attempt(number: u64, root: &Path) -> Value {
     let (width, height) = if number == 1 {
         (B4_PRIMARY_CLIENT_WIDTH, B4_PRIMARY_CLIENT_HEIGHT)
     } else {
         (B4_SECONDARY_CLIENT_WIDTH, B4_SECONDARY_CLIENT_HEIGHT)
     };
-    let (signal, exit_success, external_sigkill_sent, checkpoint, automation_report) =
+    let package = root.join("fixture.m4d");
+    let original = root.join("original.m4dproj");
+    let save_as = root.join("save-as.m4dproj");
+    let checkpoint_path = root.join("external-kill-checkpoint.json");
+    let script = match number {
+        1 => b4_launch_one_script(&package, &original, &checkpoint_path),
+        2 => b4_launch_two_script(&package, &original, &save_as),
+        3 => b4_launch_three_script(&package, &save_as),
+        _ => panic!("unsupported B4 test attempt"),
+    };
+    let script_path = root.join(format!("launch-{number}-script.json"));
+    write_json_file(&script_path, &script).unwrap();
+    let (signal, exit_success, external_sigkill_sent, checkpoint, mut automation_report) =
         if number == 1 {
             (
                 json!(9),
@@ -142,12 +191,16 @@ fn b4_valid_attempt(number: u64) -> Value {
                 b4_normal_automation_report(width, height),
             )
         };
+    if number != 1 {
+        bind_report_to_script(&mut automation_report, &script, &script_path);
+    }
     json!({
         "attempt": number,
         "phase": format!("launch-{number}"),
         "retry_index": 0,
         "status": "passed",
         "failure_reason": null,
+        "script": script_path,
         "requested_client_area_pixels": {"width": width, "height": height},
         "process": {
             "timed_out": false,
@@ -793,10 +846,11 @@ xwininfo: Window id: 0x123 \"Mirante4D\"\n\
 
 #[test]
 fn b4_aggregate_requires_signal_nine_normal_joins_and_zero_retries() {
+    let tempdir = tempfile::tempdir().unwrap();
     let attempts = vec![
-        b4_valid_attempt(1),
-        b4_valid_attempt(2),
-        b4_valid_attempt(3),
+        b4_valid_attempt(1, tempdir.path()),
+        b4_valid_attempt(2, tempdir.path()),
+        b4_valid_attempt(3, tempdir.path()),
     ];
     validate_b4_aggregate_attempts(&attempts).unwrap();
 
@@ -973,7 +1027,7 @@ fn fixed_product_automation_script_validation_rejects_wrong_schema() {
         validate_product_automation_script(&old_version)
             .unwrap_err()
             .to_string()
-            .contains("schema_version must be 3")
+            .contains("schema_version must be 4")
     );
 }
 
@@ -1011,12 +1065,21 @@ fn fixed_product_automation_script_validation_requires_open_dataset_and_quit() {
 }
 
 #[test]
-fn fixed_product_automation_script_validation_rejects_bad_limits() {
+fn fixed_product_automation_script_validation_rejects_bad_hard_safety_limits() {
+    let missing = json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "scenario": "unit",
+        "commands": [
+            { "command": "open_dataset", "path": "/tmp/demo.m4d" },
+            { "command": "quit" }
+        ]
+    });
     let unknown = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": "unit",
-        "limits": {
+        "hard_safety_limits": {
             "max_surprise_bytes": 1
         },
         "commands": [
@@ -1028,7 +1091,7 @@ fn fixed_product_automation_script_validation_rejects_bad_limits() {
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": "unit",
-        "limits": {
+        "hard_safety_limits": {
             "max_cpu_total_bytes": "lots"
         },
         "commands": [
@@ -1038,17 +1101,129 @@ fn fixed_product_automation_script_validation_rejects_bad_limits() {
     });
 
     assert!(
+        validate_product_automation_script(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("hard_safety_limits must be present")
+    );
+    assert!(
         validate_product_automation_script(&unknown)
             .unwrap_err()
             .to_string()
-            .contains("unknown automation script limit")
+            .contains("unknown automation script hard-safety limit")
     );
     assert!(
         validate_product_automation_script(&non_integer)
             .unwrap_err()
             .to_string()
-            .contains("must be an unsigned integer")
+            .contains("must be null or an unsigned integer")
     );
+}
+
+#[test]
+fn product_automation_script_shape_rejects_legacy_and_unknown_top_level_fields() {
+    let valid = json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "scenario": "unit",
+        "hard_safety_limits": {
+            "max_cpu_total_bytes": 1024,
+            "max_cpu_prefetch_bytes": null
+        },
+        "commands": [
+            { "command": "open_dataset", "path": "/tmp/demo.m4d" },
+            { "command": "quit" }
+        ]
+    });
+    validate_product_automation_script(&valid).unwrap();
+    let canonical =
+        canonical_product_automation_hard_safety_limits(&valid["hard_safety_limits"]).unwrap();
+    assert_eq!(
+        canonical.as_object().unwrap().len(),
+        PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS.len()
+    );
+    assert_eq!(canonical["max_cpu_total_bytes"], 1024);
+    assert_eq!(canonical["max_cpu_prefetch_bytes"], Value::Null);
+    assert_eq!(canonical["max_runtime_resident_resources"], Value::Null);
+
+    let mut legacy = valid.clone();
+    legacy["limits"] = json!({});
+    assert!(validate_product_automation_script(&legacy).is_err());
+
+    let mut unknown = valid;
+    unknown["unexpected"] = json!(true);
+    assert!(validate_product_automation_script(&unknown).is_err());
+}
+
+#[test]
+fn product_automation_report_contract_rejects_every_v4_binding_mutation() {
+    let report = json!({
+        "status": "passed",
+        "artifacts": []
+    });
+    let (tempdir, script, script_path, report) = bound_automation_report(report);
+    validate_product_automation_report_contract(&report, &script, &script_path).unwrap();
+
+    let mut old_schema = report.clone();
+    old_schema["schema_version"] = json!(3);
+    assert!(
+        validate_product_automation_report_contract(&old_schema, &script, &script_path).is_err()
+    );
+
+    let mut failed_status = report.clone();
+    failed_status["status"] = json!("failed");
+    failed_status["failure_reason"] = json!("hard safety cap exceeded");
+    assert!(
+        validate_product_automation_report_contract(&failed_status, &script, &script_path).is_err()
+    );
+
+    let mut missing_failure = report.clone();
+    missing_failure
+        .as_object_mut()
+        .unwrap()
+        .remove("failure_reason");
+    assert!(
+        validate_product_automation_report_contract(&missing_failure, &script, &script_path)
+            .is_err()
+    );
+
+    let mut wrong_script = report.clone();
+    wrong_script["script"]["scenario"] = json!("other");
+    assert!(
+        validate_product_automation_report_contract(&wrong_script, &script, &script_path).is_err()
+    );
+
+    let other_script_path = tempdir.path().join("other-script.json");
+    write_json_file(&other_script_path, &script).unwrap();
+    let mut wrong_path = report.clone();
+    wrong_path["script"]["path"] = json!(other_script_path);
+    assert!(
+        validate_product_automation_report_contract(&wrong_path, &script, &script_path).is_err()
+    );
+
+    let mut incomplete_limits = report.clone();
+    incomplete_limits["hard_safety_limits"]
+        .as_object_mut()
+        .unwrap()
+        .remove("max_cpu_prefetch_bytes");
+    assert!(
+        validate_product_automation_report_contract(&incomplete_limits, &script, &script_path)
+            .is_err()
+    );
+
+    let mut legacy_limits = report;
+    legacy_limits["limits"] = json!({});
+    assert!(
+        validate_product_automation_report_contract(&legacy_limits, &script, &script_path).is_err()
+    );
+    let (status, _) = completed_product_validation_outcome(
+        true,
+        Some(&legacy_limits),
+        true,
+        &script,
+        &script_path,
+    );
+    assert_eq!(status, ProductValidationStatus::Failed);
 }
 
 #[test]
@@ -1108,13 +1283,15 @@ fn completed_product_validation_fails_without_viewport_capture() {
         "status": "passed",
         "artifacts": []
     });
+    let (_tempdir, script, script_path, automation_report) =
+        bound_automation_report(automation_report);
 
     let (status, failure_reason) = completed_product_validation_outcome(
         true,
-        Some("passed"),
-        None,
         Some(&automation_report),
         true,
+        &script,
+        &script_path,
     );
 
     assert_eq!(status, ProductValidationStatus::Failed);
@@ -1143,13 +1320,15 @@ fn completed_product_validation_fails_with_blank_viewport_capture() {
             }
         }]
     });
+    let (_tempdir, script, script_path, automation_report) =
+        bound_automation_report(automation_report);
 
     let (status, failure_reason) = completed_product_validation_outcome(
         true,
-        Some("passed"),
-        None,
         Some(&automation_report),
         true,
+        &script,
+        &script_path,
     );
 
     assert_eq!(status, ProductValidationStatus::Failed);
@@ -1173,13 +1352,15 @@ fn completed_product_validation_passes_with_nonblank_viewport_capture() {
             }
         }]
     });
+    let (_tempdir, script, script_path, automation_report) =
+        bound_automation_report(automation_report);
 
     let (status, failure_reason) = completed_product_validation_outcome(
         true,
-        Some("passed"),
-        None,
         Some(&automation_report),
         true,
+        &script,
+        &script_path,
     );
 
     assert_eq!(status, ProductValidationStatus::Passed);
@@ -1203,13 +1384,15 @@ fn completed_product_validation_rejects_nonblank_loading_reference_capture() {
             }
         }]
     });
+    let (_tempdir, script, script_path, automation_report) =
+        bound_automation_report(automation_report);
 
     let (status, failure_reason) = completed_product_validation_outcome(
         true,
-        Some("passed"),
-        None,
         Some(&automation_report),
         true,
+        &script,
+        &script_path,
     );
 
     assert_eq!(status, ProductValidationStatus::Failed);
@@ -1308,9 +1491,10 @@ fn resident_navigation_report() -> Value {
 #[test]
 fn resident_navigation_completion_accepts_current_exact_no_capture_evidence() {
     let report = resident_navigation_report();
+    let (_tempdir, script, script_path, report) = bound_automation_report(report);
 
     let (status, reason) =
-        completed_product_validation_outcome(true, Some("passed"), None, Some(&report), false);
+        completed_product_validation_outcome(true, Some(&report), false, &script, &script_path);
 
     assert_eq!(status, ProductValidationStatus::Passed);
     assert_eq!(reason, None);
@@ -1741,15 +1925,15 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
     assert_eq!(report["limits"]["runtime_work_limit_enforced"], true);
     assert_eq!(
         report["limits"]["cpu_total_byte_limit_bytes"],
-        script["limits"]["max_cpu_total_bytes"]
+        script["hard_safety_limits"]["max_cpu_total_bytes"]
     );
     assert_eq!(
         report["limits"]["cpu_category_byte_limits"]["decoded_residency"],
-        script["limits"]["max_cpu_decoded_residency_bytes"]
+        script["hard_safety_limits"]["max_cpu_decoded_residency_bytes"]
     );
     assert_eq!(
         report["limits"]["runtime_work_limits"]["queued_requests"],
-        script["limits"]["max_runtime_queued_requests"]
+        script["hard_safety_limits"]["max_runtime_queued_requests"]
     );
 }
 

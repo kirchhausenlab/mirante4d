@@ -20,9 +20,23 @@ use crate::{
 };
 
 const PRODUCT_VALIDATION_SCHEMA: &str = "mirante4d-product-validation-report";
-const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
-const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-const PRODUCT_AUTOMATION_SCHEMA_VERSION: u32 = 3;
+pub(crate) const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
+pub(crate) const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
+pub(crate) const PRODUCT_AUTOMATION_SCHEMA_VERSION: u32 = 4;
+pub(crate) const PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS: [&str; 12] = [
+    "max_cpu_total_bytes",
+    "max_cpu_decoded_residency_bytes",
+    "max_cpu_upload_staging_bytes",
+    "max_cpu_in_flight_decode_bytes",
+    "max_cpu_metadata_and_indexes_bytes",
+    "max_cpu_queues_and_results_bytes",
+    "max_cpu_prefetch_bytes",
+    "max_cpu_import_working_set_bytes",
+    "max_runtime_queued_requests",
+    "max_runtime_in_flight_decodes",
+    "max_runtime_pending_completions",
+    "max_runtime_resident_resources",
+];
 const PRODUCT_VALIDATION_SCHEMA_VERSION: u32 = 2;
 const PUBLICATION_CURRENTNESS_CONTRACT_ID: &str =
     "mirante4d-publication-currentness-inventory-snapshot-inventory-1";
@@ -285,6 +299,8 @@ fn product_validate_report_inner(
 
     let (package, script, preserved_source) =
         product_validation_package_and_script(package, scenario)?;
+    validate_product_automation_script(&script)
+        .context("generated product automation script is invalid")?;
     let source_closure_before = preserved_source
         .as_deref()
         .map(SourceClosureSnapshot::capture)
@@ -475,21 +491,16 @@ fn product_validate_report_inner(
         .and_then(|report| report.get("status"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let automation_failure = automation_report
-        .as_ref()
-        .and_then(|report| report.get("failure_reason"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
     let app_exited_successfully = status.exit_success.unwrap_or(false);
     let (mut validation_status, mut failure_reason) = completed_product_validation_outcome(
         app_exited_successfully,
-        automation_status.as_deref(),
-        automation_failure.as_deref(),
         automation_report.as_ref(),
         !matches!(
             scenario,
             ProductValidationScenario::GeneratedFixtureResidentNavigation
         ),
+        &script,
+        &script_path,
     );
     if validation_status == ProductValidationStatus::Passed
         && matches!(scenario, ProductValidationScenario::B3SourceVerification)
@@ -1130,11 +1141,17 @@ fn require_b4_x11_tools() -> anyhow::Result<()> {
 
 fn completed_product_validation_outcome(
     app_exited_successfully: bool,
-    automation_status: Option<&str>,
-    automation_failure: Option<&str>,
     automation_report: Option<&Value>,
     require_nonblank_capture: bool,
+    automation_script: &Value,
+    automation_script_path: &Path,
 ) -> (ProductValidationStatus, Option<String>) {
+    let automation_status = automation_report
+        .and_then(|report| report.get("status"))
+        .and_then(Value::as_str);
+    let automation_failure = automation_report
+        .and_then(|report| report.get("failure_reason"))
+        .and_then(Value::as_str);
     if !app_exited_successfully || automation_status != Some("passed") {
         return (
             ProductValidationStatus::Failed,
@@ -1148,11 +1165,29 @@ fn completed_product_validation_outcome(
             )),
         );
     }
+    let Some(automation_report) = automation_report else {
+        return (
+            ProductValidationStatus::Failed,
+            Some("native app exited without an automation report".to_owned()),
+        );
+    };
+    if let Err(error) = validate_product_automation_report_contract(
+        automation_report,
+        automation_script,
+        automation_script_path,
+    ) {
+        return (
+            ProductValidationStatus::Failed,
+            Some(format!(
+                "product automation report contract is invalid: {error}"
+            )),
+        );
+    }
 
     let evidence = if require_nonblank_capture {
-        qualifying_nonblank_viewport_capture(automation_report).map(|_| ())
+        qualifying_nonblank_viewport_capture(Some(automation_report)).map(|_| ())
     } else {
-        qualifying_resident_navigation_presentation(automation_report)
+        qualifying_resident_navigation_presentation(Some(automation_report))
     };
     match evidence {
         Ok(_) => (ProductValidationStatus::Passed, None),
@@ -1943,7 +1978,10 @@ fn prepare_import_product_fixture(
     })
 }
 
-fn dataset_runtime_limits(max_cpu_total_bytes: u64, max_resident_resources: u64) -> Value {
+fn dataset_runtime_hard_safety_limits(
+    max_cpu_total_bytes: u64,
+    max_resident_resources: u64,
+) -> Value {
     let max_cpu_in_flight_decode_bytes = (max_cpu_total_bytes / 8)
         .saturating_add(PACKAGE_VALIDATION_WORKING_BYTES)
         .min(max_cpu_total_bytes);
@@ -1972,7 +2010,7 @@ fn target_fixture_camera_smoke_script(package: &Path) -> Value {
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": GENERATED_FIXTURE_SCENARIO,
-        "limits": dataset_runtime_limits(128 * MIB, 128),
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -2005,7 +2043,7 @@ fn target_fixture_resident_navigation_script(package: &Path) -> Value {
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": GENERATED_RESIDENT_NAVIGATION_SCENARIO,
         "gpu_timing": true,
-        "limits": dataset_runtime_limits(128 * MIB, 64),
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 64),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -2039,7 +2077,7 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": GENERATED_RENDER_MODES_SCENARIO,
-        "limits": dataset_runtime_limits(128 * MIB, 192),
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 192),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -2179,7 +2217,7 @@ fn target_source_verification_script(package: &Path) -> Value {
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": B3_SOURCE_VERIFICATION_SCENARIO,
-        "limits": dataset_runtime_limits(128 * MIB, 128),
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -2237,13 +2275,14 @@ fn import_preprocessing_script(
     // The promoted fixture has 850 base-production work units. Keep the
     // resident-record ceiling structural and finite while allowing its exact
     // s0 cohort to settle; byte residency remains independently capped below.
-    let mut limits = dataset_runtime_limits(512 * MIB, IMPORT_RESIDENT_RESOURCE_LIMIT);
-    limits["max_cpu_import_working_set_bytes"] = json!(IMPORT_WORKING_MEMORY_BYTES);
+    let mut hard_safety_limits =
+        dataset_runtime_hard_safety_limits(512 * MIB, IMPORT_RESIDENT_RESOURCE_LIMIT);
+    hard_safety_limits["max_cpu_import_working_set_bytes"] = json!(IMPORT_WORKING_MEMORY_BYTES);
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": IMPORT_PREPROCESSING_SCENARIO,
-        "limits": limits,
+        "hard_safety_limits": hard_safety_limits,
         "commands": [
             { "command": "open_dataset", "path": startup_package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5_000 },
@@ -2312,7 +2351,7 @@ fn b4_launch_one_script(package: &Path, project: &Path, checkpoint: &Path) -> Va
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": "b4_project_persistence_launch_1",
-        "limits": dataset_runtime_limits(128 * MIB, 128),
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -2355,7 +2394,7 @@ fn b4_launch_two_script(package: &Path, original: &Path, save_as: &Path) -> Valu
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": "b4_project_persistence_launch_2",
-        "limits": dataset_runtime_limits(128 * MIB, 128),
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -2401,7 +2440,7 @@ fn b4_launch_three_script(package: &Path, save_as: &Path) -> Value {
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": "b4_project_persistence_launch_3",
-        "limits": dataset_runtime_limits(128 * MIB, 128),
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -2429,7 +2468,26 @@ fn b4_launch_three_script(package: &Path, save_as: &Path) -> Value {
     })
 }
 
-fn validate_product_automation_script(script: &Value) -> anyhow::Result<()> {
+pub(crate) fn validate_product_automation_script(script: &Value) -> anyhow::Result<()> {
+    let fields = script
+        .as_object()
+        .context("automation script must be an object")?
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let allowed_fields = BTreeSet::from([
+        "schema",
+        "schema_version",
+        "scenario",
+        "gpu_timing",
+        "diagnostic_counters",
+        "startup_bootstrap",
+        "hard_safety_limits",
+        "commands",
+    ]);
+    if !fields.is_subset(&allowed_fields) {
+        bail!("automation script contains an unknown or removed top-level field");
+    }
     if script.get("schema").and_then(Value::as_str) != Some(PRODUCT_AUTOMATION_SCRIPT_SCHEMA) {
         bail!("automation script schema must be {PRODUCT_AUTOMATION_SCRIPT_SCHEMA}");
     }
@@ -2465,38 +2523,112 @@ fn validate_product_automation_script(script: &Value) -> anyhow::Result<()> {
     if !matches!(terminal_command, Some("quit" | "hold_for_external_kill")) {
         bail!("automation script final command must be quit or hold_for_external_kill");
     }
-    validate_product_automation_limits(script)?;
+    validate_product_automation_hard_safety_limits(script)?;
     Ok(())
 }
 
-fn validate_product_automation_limits(script: &Value) -> anyhow::Result<()> {
-    let Some(limits) = script.get("limits") else {
-        return Ok(());
-    };
-    let Some(map) = limits.as_object() else {
-        bail!("automation script limits must be an object");
-    };
-    const ALLOWED_LIMITS: &[&str] = &[
-        "max_cpu_total_bytes",
-        "max_cpu_decoded_residency_bytes",
-        "max_cpu_upload_staging_bytes",
-        "max_cpu_in_flight_decode_bytes",
-        "max_cpu_metadata_and_indexes_bytes",
-        "max_cpu_queues_and_results_bytes",
-        "max_cpu_prefetch_bytes",
-        "max_cpu_import_working_set_bytes",
-        "max_runtime_queued_requests",
-        "max_runtime_in_flight_decodes",
-        "max_runtime_pending_completions",
-        "max_runtime_resident_resources",
-    ];
+fn validate_product_automation_hard_safety_limits(script: &Value) -> anyhow::Result<()> {
+    let hard_safety_limits = script
+        .get("hard_safety_limits")
+        .context("automation script hard_safety_limits must be present")?;
+    canonical_product_automation_hard_safety_limits(hard_safety_limits)?;
+    Ok(())
+}
+
+pub(crate) fn canonical_product_automation_hard_safety_limits(
+    hard_safety_limits: &Value,
+) -> anyhow::Result<Value> {
+    let map = hard_safety_limits
+        .as_object()
+        .context("automation script hard_safety_limits must be an object")?;
     for (name, value) in map {
-        if !ALLOWED_LIMITS.contains(&name.as_str()) {
-            bail!("unknown automation script limit {name:?}");
+        if !PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS.contains(&name.as_str()) {
+            bail!("unknown automation script hard-safety limit {name:?}");
         }
-        if value.as_u64().is_none() {
-            bail!("automation script limit {name:?} must be an unsigned integer");
+        if !value.is_null() && value.as_u64().is_none() {
+            bail!(
+                "automation script hard-safety limit {name:?} must be null or an unsigned integer"
+            );
         }
+    }
+    let canonical = PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS
+        .into_iter()
+        .map(|name| {
+            (
+                name.to_owned(),
+                map.get(name).cloned().unwrap_or(Value::Null),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    Ok(Value::Object(canonical))
+}
+
+pub(crate) fn validate_product_automation_report_contract(
+    report: &Value,
+    script: &Value,
+    script_path: &Path,
+) -> anyhow::Result<()> {
+    validate_product_automation_script(script)?;
+    if report.get("schema").and_then(Value::as_str) != Some(PRODUCT_AUTOMATION_REPORT_SCHEMA)
+        || report.get("schema_version").and_then(Value::as_u64)
+            != Some(u64::from(PRODUCT_AUTOMATION_SCHEMA_VERSION))
+        || report.get("status").and_then(Value::as_str) != Some("passed")
+        || report.get("failure_reason") != Some(&Value::Null)
+    {
+        bail!("automation report schema, status, or failure contract is invalid");
+    }
+    if report.get("limits").is_some() {
+        bail!("automation report contains the removed limits field");
+    }
+    let expected_limits = canonical_product_automation_hard_safety_limits(
+        script
+            .get("hard_safety_limits")
+            .context("automation script hard_safety_limits must be present")?,
+    )?;
+    if report.get("hard_safety_limits") != Some(&expected_limits) {
+        bail!("automation report hard_safety_limits do not exactly echo the script");
+    }
+
+    let script_report = report
+        .get("script")
+        .and_then(Value::as_object)
+        .context("automation report script binding is missing")?;
+    if script_report
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != BTreeSet::from([
+            "path",
+            "schema",
+            "schema_version",
+            "scenario",
+            "command_count",
+        ])
+        || script_report.get("schema").and_then(Value::as_str)
+            != script.get("schema").and_then(Value::as_str)
+        || script_report.get("schema_version").and_then(Value::as_u64)
+            != script.get("schema_version").and_then(Value::as_u64)
+        || script_report.get("scenario").and_then(Value::as_str)
+            != script.get("scenario").and_then(Value::as_str)
+        || script_report.get("command_count").and_then(Value::as_u64)
+            != script
+                .get("commands")
+                .and_then(Value::as_array)
+                .and_then(|commands| u64::try_from(commands.len()).ok())
+    {
+        bail!("automation report script identity is invalid");
+    }
+    let reported_script_path = script_report
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .context("automation report script path is missing")?;
+    let expected_script_path =
+        fs::canonicalize(script_path).context("executed automation script path is unavailable")?;
+    let reported_script_path = fs::canonicalize(reported_script_path)
+        .context("reported automation script path is unavailable")?;
+    if reported_script_path != expected_script_path {
+        bail!("automation report script path does not match the executed script");
     }
     Ok(())
 }
@@ -3083,9 +3215,15 @@ fn validate_b4_attempt(attempt: &Value, expected_number: u64) -> anyhow::Result<
     let automation = attempt
         .get("automation_report")
         .context("B4 normal launch lacks its automation report")?;
-    if automation.get("status").and_then(Value::as_str) != Some("passed") {
-        bail!("B4 launch {expected_number} automation did not pass");
-    }
+    let script_path = attempt
+        .get("script")
+        .and_then(Value::as_str)
+        .map(Path::new)
+        .context("B4 normal launch lacks its exact automation script path")?;
+    let script = read_json_file(script_path)
+        .context("B4 normal launch automation script could not be read")?;
+    validate_product_automation_report_contract(automation, &script, script_path)
+        .context("B4 normal launch automation report contract is invalid")?;
     let expected_width = requested.get("width").and_then(Value::as_u64);
     let expected_height = requested.get("height").and_then(Value::as_u64);
     if automation
@@ -3529,7 +3667,7 @@ fn product_validation_cross_section_panel_metrics(
 
 fn script_limit_u64(script: &Value, name: &str) -> Value {
     script
-        .get("limits")
+        .get("hard_safety_limits")
         .and_then(|limits| limits.get(name))
         .and_then(Value::as_u64)
         .map(Value::from)
@@ -3539,7 +3677,7 @@ fn script_limit_u64(script: &Value, name: &str) -> Value {
 fn script_has_any_limit(script: &Value, names: &[&str]) -> bool {
     names.iter().any(|name| {
         script
-            .get("limits")
+            .get("hard_safety_limits")
             .and_then(|limits| limits.get(name))
             .and_then(Value::as_u64)
             .is_some()

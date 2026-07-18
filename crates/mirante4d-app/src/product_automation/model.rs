@@ -14,9 +14,12 @@ use super::{AUTOMATION_SCHEMA_VERSION, AUTOMATION_SCRIPT_SCHEMA};
 
 pub(super) const MAX_INPUT_SEQUENCE_SAMPLES: u32 = 4_096;
 pub(super) const MAX_INPUT_SEQUENCE_DURATION_MS: u64 = 120_000;
+pub(super) const MAX_OBSERVE_GATE_TIMEOUT_MS: u64 = 7_200_000;
+const MAX_GATE_ID_BYTES: usize = 128;
 const MAX_DIAGNOSTIC_SAMPLE_LABEL_BYTES: usize = 128;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ProductAutomationScript {
     pub(super) schema: String,
     pub(super) schema_version: u32,
@@ -34,8 +37,7 @@ pub(super) struct ProductAutomationScript {
     /// exact requested view without admitting an unrelated default cohort.
     #[serde(default)]
     pub(super) startup_bootstrap: Option<ProductAutomationStartupBootstrap>,
-    #[serde(default)]
-    pub(super) limits: ProductAutomationLimits,
+    pub(super) hard_safety_limits: ProductAutomationHardSafetyLimits,
     pub(super) commands: Vec<ProductAutomationCommand>,
 }
 
@@ -74,7 +76,7 @@ impl ProductAutomationScript {
             gpu_timing: false,
             diagnostic_counters: false,
             startup_bootstrap: None,
-            limits: ProductAutomationLimits::default(),
+            hard_safety_limits: ProductAutomationHardSafetyLimits::default(),
             commands: Vec::new(),
         }
     }
@@ -176,7 +178,7 @@ impl ProductAutomationStartupBootstrap {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub(super) struct ProductAutomationLimits {
+pub(super) struct ProductAutomationHardSafetyLimits {
     pub(super) max_cpu_total_bytes: Option<u64>,
     pub(super) max_cpu_decoded_residency_bytes: Option<u64>,
     pub(super) max_cpu_upload_staging_bytes: Option<u64>,
@@ -191,7 +193,7 @@ pub(super) struct ProductAutomationLimits {
     pub(super) max_runtime_resident_resources: Option<u64>,
 }
 
-impl ProductAutomationLimits {
+impl ProductAutomationHardSafetyLimits {
     pub(super) fn check_dataset_runtime(
         self,
         diagnostics: DatasetRuntimeDiagnostics,
@@ -265,7 +267,7 @@ fn check_limit(name: &'static str, observed: u64, limit: Option<u64>) -> Result<
         && observed > limit
     {
         return Err(format!(
-            "automation limit exceeded for {name}: observed {observed}, limit {limit}"
+            "automation hard-safety limit exceeded for {name}: observed {observed}, limit {limit}"
         ));
     }
     Ok(())
@@ -380,6 +382,16 @@ pub(super) enum ProductAutomationCommand {
     },
     WaitFor {
         condition: ProductAutomationWaitCondition,
+        timeout_ms: u64,
+    },
+    ObserveGate {
+        gate_id: String,
+        condition: ProductAutomationWaitCondition,
+        timeout_ms: u64,
+    },
+    ObserveImportedOpenReady {
+        gate_id: String,
+        path: PathBuf,
         timeout_ms: u64,
     },
     SetViewportSize {
@@ -577,6 +589,8 @@ impl ProductAutomationCommand {
             Self::CancelImport => "cancel_import",
             Self::WaitForImportedOpenReady { .. } => "wait_for_imported_open_ready",
             Self::WaitFor { .. } => "wait_for",
+            Self::ObserveGate { .. } => "observe_gate",
+            Self::ObserveImportedOpenReady { .. } => "observe_imported_open_ready",
             Self::SetViewportSize { .. } => "set_viewport_size",
             Self::SetMappedClientPixels { .. } => "set_mapped_client_pixels",
             Self::SetRenderTargetSize { .. } => "set_render_target_size",
@@ -780,6 +794,24 @@ impl ProductAutomationCommand {
         {
             return Err(error);
         }
+        match self {
+            Self::ObserveGate {
+                gate_id,
+                timeout_ms,
+                ..
+            } => validate_observation_gate(gate_id, *timeout_ms, "observe_gate")?,
+            Self::ObserveImportedOpenReady {
+                gate_id,
+                path,
+                timeout_ms,
+            } => {
+                validate_observation_gate(gate_id, *timeout_ms, "observe_imported_open_ready")?;
+                if path.as_os_str().is_empty() {
+                    anyhow::bail!("observe_imported_open_ready requires a nonempty package path");
+                }
+            }
+            _ => {}
+        }
         if let Self::SetLayerOrder { layer_indices } = self
             && (layer_indices.is_empty()
                 || layer_indices.len() > mirante4d_render_api::MAX_RENDER_LAYERS)
@@ -817,6 +849,29 @@ fn validate_diagnostic_sample_label(label: &str) -> anyhow::Result<()> {
         anyhow::bail!(
             "diagnostic sample label must contain 1..={MAX_DIAGNOSTIC_SAMPLE_LABEL_BYTES} bytes"
         );
+    }
+    Ok(())
+}
+
+fn validate_gate_id(gate_id: &str, command: &str) -> anyhow::Result<()> {
+    if gate_id.is_empty() || gate_id.len() > MAX_GATE_ID_BYTES {
+        anyhow::bail!("{command} gate_id must contain 1..={MAX_GATE_ID_BYTES} bytes");
+    }
+    if !gate_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        anyhow::bail!(
+            "{command} gate_id must use only ASCII letters, digits, underscore, hyphen, and dot"
+        );
+    }
+    Ok(())
+}
+
+fn validate_observation_gate(gate_id: &str, timeout_ms: u64, command: &str) -> anyhow::Result<()> {
+    validate_gate_id(gate_id, command)?;
+    if !(1..=MAX_OBSERVE_GATE_TIMEOUT_MS).contains(&timeout_ms) {
+        anyhow::bail!("{command} timeout_ms must be in 1..={MAX_OBSERVE_GATE_TIMEOUT_MS}");
     }
     Ok(())
 }

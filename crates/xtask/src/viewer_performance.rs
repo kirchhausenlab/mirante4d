@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use crate::host::{host_hardware_identity, repository_identity};
 
-const PROFILE_SCHEMA: &str = "mirante4d-viewer-performance-qualification-profile-3";
+const PROFILE_SCHEMA: &str = "mirante4d-viewer-performance-qualification-profile-4";
 const PROFILE_AUTHORITY_SCHEMA: &str = "mirante4d-viewer-performance-profile-authority";
 const PROFILE_AUTHORITY_SCHEMA_VERSION: u64 = 1;
 const PROFILE_AUTHORITY_BYTES: &[u8] =
@@ -833,8 +833,8 @@ fn validate_protocol(protocol: &ProtocolBinding) -> anyhow::Result<()> {
     if protocol.automatic_retries != 0 {
         bail!("protocol.automatic_retries must be zero")
     }
-    if !(3..=5).contains(&protocol.development_samples) {
-        bail!("protocol.development_samples must be between three and five")
+    if protocol.development_samples != 5 {
+        bail!("protocol.development_samples must be exactly five")
     }
     Ok(())
 }
@@ -1835,7 +1835,7 @@ mod tests {
         );
 
         let mut predecessor = test_profile_value(temporary.path());
-        predecessor["schema"] = json!("mirante4d-viewer-performance-qualification-profile-2");
+        predecessor["schema"] = json!("mirante4d-viewer-performance-qualification-profile-3");
         let predecessor: ViewerQualificationProfile = serde_json::from_value(predecessor).unwrap();
         assert!(validate_profile(&predecessor).is_err());
 
@@ -1891,6 +1891,19 @@ mod tests {
                 .to_string()
                 .contains("must be release")
         );
+
+        for samples in [3, 4, 6] {
+            value = test_profile_value(Path::new("/private"));
+            value["protocol"]["development_samples"] = json!(samples);
+            let profile: ViewerQualificationProfile =
+                serde_json::from_value(value.clone()).unwrap();
+            assert!(
+                validate_profile(&profile)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exactly five")
+            );
+        }
 
         value = test_profile_value(Path::new("/private"));
         value["extents"]["blocking_qualification"]["width"] = json!(1279);

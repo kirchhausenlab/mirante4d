@@ -199,7 +199,7 @@ See [testing](TESTING.md) for commands and claim language.
 The renderer, demand, scheduling, storage-read, capability-restoration, and
 small-tool implementation described above remains the current product
 baseline in the worktree. The complete PR profile passes all 11 policy phases,
-all 8 Rust phases, and 1,246 selected tests on the current dirty worktree. The
+all 8 Rust phases, and 1,275 selected tests on the current dirty worktree. The
 current ignored trusted-Vulkan inventory contains nine renderer cases; its
 exact result will be recorded again on the clean EP-00 baseline revision. Both
 native-window viewer scenarios previously passed.
@@ -225,7 +225,7 @@ It mandates one cubic-brick spatial representation shared by 2D and 3D and
 excludes anisotropic or orientation-specific payloads.
 
 EP-00 measurement authority is implemented in the current worktree. One
-strict external v3 profile binds the private representative and temporal
+strict external v4 profile binds the private representative and temporal
 packages, import source inventory, accepted hardware/display/storage tuple,
 ten exact scenarios, interaction scripts, independent LOD and numerical
 oracles, fidelity states, resource ledgers, and absolute thresholds without
@@ -239,11 +239,17 @@ Naga structural audit guard timestamp placement and production shader shape.
 A fresh normal-product IP exercise has passed its exact source-preservation,
 deterministic publication, open-ready, currentness, receipt-reconciliation,
 memory, descriptor, temporary-storage, and time gates. The strict complete
-predecessor baseline still awaits one clean immutable revision. Focused
-predecessor evidence already reproduces the off-axis perspective DVR distance
-error, unjustifiably coarse four-panel LOD, temporal refinement handoff, and
-prepared-layout lineage defects; these are baseline findings, not accepted
-successor behavior. EP-01 representation selection and the atomic EP-02
+predecessor baseline still awaits one clean immutable revision. Two superseded
+v3 partial launches are preserved but never reused: the second reproduced a
+terminal RZ settlement miss in both roles and demonstrated that later required
+checkpoints could not close. The v4 authority records such acceptance misses
+as typed product outcomes, records qualification resource peaks without
+terminating the attempt, and reserves fatal termination for separate exact
+hard-safety caps and evidence-integrity failures.
+Focused predecessor evidence already reproduces the off-axis perspective DVR
+distance error, unjustifiably coarse four-panel LOD, temporal refinement
+handoff, and prepared-layout lineage defects; these are baseline findings, not
+accepted successor behavior. EP-01 representation selection and the atomic EP-02
 through EP-06 successor remain unimplemented. Final sampling and externally
 inspected EP-07 normal-product validation also remain required before
 performance completion language is appropriate.

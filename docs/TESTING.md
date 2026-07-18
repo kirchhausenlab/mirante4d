@@ -109,8 +109,8 @@ long rays, and multi-presentation residency on the trusted Vulkan adapter. It
 is correctness/component evidence; only the two named diagnostics emit timing
 observations.
 
-The EP-00 predecessor-development protocol is now frozen through one external,
-owner-bound v3 profile plus strict workload, script, and independent-oracle
+The EP-00 predecessor-development protocol is frozen through one external,
+owner-bound v4 profile plus strict workload, v4 script, and independent-oracle
 bundles. Preflight and execution use the release-only commands shown by:
 
 ```bash
@@ -124,6 +124,43 @@ clean-revision check, hardware/display/storage observations, source inventory,
 bundle commitments, and sanitized receipt prevent a different workload or
 local edit from inheriting the result. Raw evidence stays private; public
 reporting may name only path-free counters, gates, and reason codes.
+
+The predecessor run is exactly five ordered samples of all ten frozen
+scenarios. Every scenario has one fresh instrumented process and one fresh
+instrumentation-control process, for exactly 100 role attempts. Role order
+alternates by sample. There are zero automatic retries, dropped observations,
+substitutions, or post-hoc filters.
+
+Owner-declared product acceptance waits use the v4 `observe_gate` automation
+command. It records one typed, ordered gate result and continues through the
+remaining diagnostic checkpoints whether the condition passes or reaches its
+declared deadline. A gate miss is retained as a product failure; it is never
+converted into an infrastructure failure or a pass. Ordinary `wait_for`
+commands remain fatal prerequisites and may not be used for an acceptance miss
+that must preserve later evidence.
+
+Qualification resource ceilings are not automation abort conditions. The app
+records their observed maxima and the runner evaluates them on the product-gate
+axis after the role closes. Each v4 script instead carries a distinct required
+`hard_safety_limits` object: its total-CPU cap is the configured CPU-ledger
+capacity, its decoded-residency and upload-staging caps are that total
+capacity, and its queued-request cap is exactly twice the qualification queue
+ceiling. Crossing one of those wider fail-safe bounds is an evidence-integrity
+failure because the bounded attempt must stop; the removed `limits` spelling is
+not accepted.
+
+The raw report and sanitized receipt separate two axes. Evidence is complete
+only when bindings and executable conformance pass, all 100 role attempts and
+their reports close, every required checkpoint and timing/resource population
+is present and reconciled, source currentness and cleanup hold where
+applicable, instrumentation-control overhead is valid, and the repository and
+release executable remain unchanged. Product status is the ordered population
+of typed gate outcomes and may be failed for the predecessor. Missing or
+malformed reports, commands, gate rows, checkpoints, clocks, controls, or
+operands; runner timeout or abnormal process exit; binding/currentness drift;
+or any retry remains an evidence failure. Native command success means the
+evidence envelope is complete, not that the predecessor passed its product
+gates.
 
 This protocol establishes EP-00 baseline and later work-package evidence; it
 is not yet the final EP-07 qualification protocol. Before a performance pass

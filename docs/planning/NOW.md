@@ -31,7 +31,7 @@ are excluded.
 
 The owner granted implementation authorization for the replacement plan on
 2026-07-17. EP-00 workload, fidelity, cost-truth, and absolute-gate binding is
-the active checkpoint. Its strict external v3 profile, ten-scenario scripts,
+the active checkpoint. Its strict external v4 profile, ten-scenario scripts,
 independent fidelity/oracle bundle, correctly placed GPU timing controls,
 per-view generation/scale/coverage facts, structural and unique-work counters,
 source-preservation inventory, and exact import receipt gate are implemented
@@ -39,19 +39,25 @@ and pass schema/parity checks. One fresh normal-product IP run passed; focused
 evidence also records the predecessor's perspective-distance, four-panel LOD,
 temporal handoff, and prepared-layout failures without averaging them away.
 
-The first complete predecessor sampling launch was stopped before acceptance
-when a read-only audit found that the EP-01 selection authority did not yet
-freeze byte-exact candidate identity, package, checkpoint, ordered-trace,
-GPU-lookup, gate-operand, and receipt contracts. Its partial evidence is
-preserved as interrupted evidence and is not reused. The version-3 authority
-and its nine hash-bound evidence schemas are now strict, bounded, and
-internally validated. The immediate next action is to land that correction and
-its rotated opaque profile authority as one clean immutable revision, bind the
-private profile to that exact revision, and rerun the complete predecessor
-protocol against that exact release build. EP-01 may begin only after the
-resulting receipt proves that every scenario is
-attributable and preserves every failure rather than hiding it behind a timeout
-or missing metric. The integrated first-overhaul source and its supporting
+The first predecessor sampling launch was stopped before acceptance when a
+read-only audit found that the EP-01 selection authority did not yet freeze
+byte-exact candidate identity, package, checkpoint, ordered-trace, GPU-lookup,
+gate-operand, and receipt contracts. A second exact launch was intentionally
+stopped after both RZ roles proved that v3 terminal acceptance waits collapsed
+an attributable product miss into an ambiguous automation failure and skipped
+the remaining required checkpoints. Both partial roots are retained as
+interrupted evidence and are never reused. The version-4 authority and its nine
+hash-bound evidence schemas are strict, bounded, and internally validated. The
+v4 repair separates complete evidence from typed product outcomes and makes
+owner-declared acceptance misses and qualification resource overruns
+non-terminal so all later evidence closes. Distinct exact hard-safety caps
+still stop a runaway bounded attempt and therefore fail evidence integrity.
+The immediate next action is to freeze that repair on one clean revision,
+rotate the opaque profile binding, and rerun the complete predecessor protocol
+against its exact release build. EP-01 may begin only after the resulting
+receipt proves that every scenario is attributable and preserves every failure
+rather than hiding it behind a timeout or missing metric. The integrated
+first-overhaul source and its supporting
 evidence remain current implemented facts in
 [Current state](../CURRENT_STATE.md) until the atomic successor hard cutover
 passes its ordered gates.

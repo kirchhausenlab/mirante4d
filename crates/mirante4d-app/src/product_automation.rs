@@ -158,7 +158,8 @@ fn assertion_capture_panels(condition: &ProductAutomationAssertCondition) -> Vec
 }
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-const AUTOMATION_SCHEMA_VERSION: u32 = 3;
+const AUTOMATION_GATE_OBSERVATION_SCHEMA: &str = "mirante4d-product-gate-observation-1";
+const AUTOMATION_SCHEMA_VERSION: u32 = 4;
 
 fn dispatch_application_command(
     app: &mut MiranteWorkbenchApp,
@@ -544,6 +545,104 @@ const fn automation_runtime_is_idle(
     !background_work_active && !camera_demand_planning_active && !prepared_demand_install_pending
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProductGateObservationOutcome {
+    Passed,
+    Failed,
+}
+
+#[derive(Debug, Serialize)]
+struct ProductGateObservationDetails<'a> {
+    schema: &'static str,
+    gate_id: &'a str,
+    condition: &'static str,
+    outcome: ProductGateObservationOutcome,
+    condition_met: bool,
+    timed_out: bool,
+    timeout_ms: u64,
+    waited_ns: u64,
+}
+
+fn product_gate_observation_progress(
+    gate_id: &str,
+    condition: ProductAutomationWaitCondition,
+    timeout_ms: u64,
+    condition_met: bool,
+    waited: Duration,
+) -> CommandProgress {
+    product_named_gate_observation_progress(
+        gate_id,
+        condition.name(),
+        condition.is_passive(),
+        timeout_ms,
+        condition_met,
+        waited,
+    )
+}
+
+fn product_imported_open_ready_observation_progress(
+    gate_id: &str,
+    timeout_ms: u64,
+    condition_met: bool,
+    waited: Duration,
+) -> CommandProgress {
+    product_named_gate_observation_progress(
+        gate_id,
+        "imported_open_ready",
+        false,
+        timeout_ms,
+        condition_met,
+        waited,
+    )
+}
+
+fn imported_open_ready_observation_requires_measurement(
+    timeout_ms: u64,
+    condition_met: bool,
+    waited: Duration,
+) -> bool {
+    condition_met && waited < Duration::from_millis(timeout_ms)
+}
+
+fn product_named_gate_observation_progress(
+    gate_id: &str,
+    condition: &'static str,
+    passive: bool,
+    timeout_ms: u64,
+    condition_met: bool,
+    waited: Duration,
+) -> CommandProgress {
+    let timeout = Duration::from_millis(timeout_ms);
+    if condition_met || waited >= timeout {
+        let timed_out = waited >= timeout;
+        let outcome = if timed_out {
+            ProductGateObservationOutcome::Failed
+        } else {
+            ProductGateObservationOutcome::Passed
+        };
+        let details = ProductGateObservationDetails {
+            schema: AUTOMATION_GATE_OBSERVATION_SCHEMA,
+            gate_id,
+            condition,
+            outcome,
+            condition_met,
+            timed_out,
+            timeout_ms,
+            waited_ns: u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX),
+        };
+        return CommandProgress::Done(
+            serde_json::to_value(details)
+                .expect("product gate observation details have a fixed serializable schema"),
+        );
+    }
+    if passive {
+        CommandProgress::PassiveWaiting(Some(timeout.saturating_sub(waited)))
+    } else {
+        CommandProgress::Waiting
+    }
+}
+
 fn automation_pick_json(
     request: ViewerPickRequest,
     hit: &PickHit,
@@ -619,6 +718,7 @@ pub(crate) struct ProductAutomationController {
     completed_import_primary_measurement: Option<ImportPrimaryMeasurement>,
     completed_publication_to_open_ready_measurement:
         Option<ImportPublicationToOpenReadyMeasurement>,
+    captured_import_publication_evidence: Option<ImportPublicationEvidenceSnapshot>,
     startup_bootstrap_evidence: Option<Value>,
     qualification_only_ui_overhead_ns: u64,
     report_written: bool,
@@ -785,12 +885,97 @@ struct ImportPublicationToOpenReadyMeasurement {
     open_ready_at_epoch_ms: u128,
     wall_time_ns: u64,
     process_cpu_time_ns: u64,
-    publication_currentness: ScientificPublicationTransferEvidence,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImportPublicationCurrentnessExecution {
+    contract_id: &'static str,
+    expected_snapshot_object_reads: u64,
+    first_inventory_object_reads: u64,
+    observed_snapshot_object_reads: u64,
+    second_inventory_object_reads: u64,
+    observed_total_object_reads: u64,
+    observed_codec_decode_calls: u64,
+}
+
+impl From<ScientificPublicationTransferEvidence> for ImportPublicationCurrentnessExecution {
+    fn from(evidence: ScientificPublicationTransferEvidence) -> Self {
+        Self {
+            contract_id: evidence.contract_id(),
+            expected_snapshot_object_reads: evidence.expected_snapshot_object_reads(),
+            first_inventory_object_reads: evidence.first_inventory_object_reads(),
+            observed_snapshot_object_reads: evidence.observed_snapshot_object_reads(),
+            second_inventory_object_reads: evidence.second_inventory_object_reads(),
+            observed_total_object_reads: evidence.observed_total_object_reads(),
+            observed_codec_decode_calls: evidence.observed_codec_decode_calls(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImportPublicationEvidenceSnapshot {
+    publication_currentness: ImportPublicationCurrentnessExecution,
     source_verification_started_runs: u64,
     source_verification_progress_updates: u64,
     source_verification_cancelled_runs: u64,
     source_verification_failed_runs: u64,
     source_verification_successes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImportedOpenReadyReadiness {
+    selected_matches: bool,
+    verified: bool,
+    import_idle: bool,
+    problem_absent: bool,
+}
+
+impl ImportedOpenReadyReadiness {
+    const fn condition_met(self) -> bool {
+        self.selected_matches && self.verified && self.import_idle && self.problem_absent
+    }
+}
+
+fn imported_open_ready_readiness(
+    app: &MiranteWorkbenchApp,
+    path: &Path,
+) -> ImportedOpenReadyReadiness {
+    let snapshot = app.application.snapshot();
+    ImportedOpenReadyReadiness {
+        selected_matches: normalize_path(app.dataset.selected_path()) == normalize_path(path),
+        verified: matches!(snapshot.source(), SourceVerificationSnapshot::Verified(_))
+            && app
+                .source_verification_service
+                .as_ref()
+                .is_some_and(|service| service.active_token().is_none()),
+        import_idle: !app.import.workers.status().is_active(),
+        problem_absent: app.import.problem.is_none(),
+    }
+}
+
+struct ImportedOpenReadyCommitState<'a, Origin, VerificationOrigin, Publication, Evidence> {
+    active_origin: &'a mut Option<Origin>,
+    active_verification_origin: &'a mut Option<VerificationOrigin>,
+    completed_primary: &'a mut Option<ImportPrimaryMeasurement>,
+    completed_publication: &'a mut Option<Publication>,
+    captured_publication_evidence: &'a mut Option<Evidence>,
+}
+
+impl<Origin, VerificationOrigin, Publication, Evidence>
+    ImportedOpenReadyCommitState<'_, Origin, VerificationOrigin, Publication, Evidence>
+{
+    fn commit(
+        self,
+        primary: ImportPrimaryMeasurement,
+        publication: Publication,
+        publication_evidence: Evidence,
+    ) {
+        *self.captured_publication_evidence = Some(publication_evidence);
+        *self.completed_publication = Some(publication);
+        *self.completed_primary = Some(primary);
+        *self.active_verification_origin = None;
+        *self.active_origin = None;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -906,6 +1091,7 @@ impl ProductAutomationController {
             active_import_verification_diagnostics_origin: None,
             completed_import_primary_measurement: None,
             completed_publication_to_open_ready_measurement: None,
+            captured_import_publication_evidence: None,
             startup_bootstrap_evidence: None,
             qualification_only_ui_overhead_ns: 0,
             report_written: false,
@@ -1571,7 +1757,7 @@ impl ProductAutomationController {
         }
         self.observe_import_projection(app);
         let result = self.execute_command(app, ctx, &command);
-        if let Err(reason) = self.observe_and_enforce_limits(app) {
+        if let Err(reason) = self.observe_and_enforce_hard_safety_limits(app) {
             let reason = if let Some(cancellation) = self.cancel_active_dataset_switch(app) {
                 format!("{reason}; dataset_switch_cancellation={cancellation}")
             } else {
@@ -1587,17 +1773,12 @@ impl ProductAutomationController {
         }
         match result {
             Ok(CommandProgress::Done(details)) => {
-                self.events.push(ProductAutomationEvent::passed(
+                self.record_successful_command(
                     command_index,
                     command.name(),
                     command_started.elapsed(),
                     details,
-                ));
-                self.active_wait_started = None;
-                self.sleep_frames_remaining = None;
-                if self.command_index == command_index {
-                    self.command_index += 1;
-                }
+                );
                 AutomationStatus::Continue
             }
             Ok(CommandProgress::Waiting) => AutomationStatus::Waiting {
@@ -1620,6 +1801,26 @@ impl ProductAutomationController {
                 ));
                 AutomationStatus::Failed(reason)
             }
+        }
+    }
+
+    fn record_successful_command(
+        &mut self,
+        command_index: usize,
+        command: &'static str,
+        duration: Duration,
+        details: Value,
+    ) {
+        self.events.push(ProductAutomationEvent::passed(
+            command_index,
+            command,
+            duration,
+            details,
+        ));
+        self.active_wait_started = None;
+        self.sleep_frames_remaining = None;
+        if self.command_index == command_index {
+            self.command_index += 1;
         }
     }
 
@@ -1749,6 +1950,157 @@ impl ProductAutomationController {
                 ))
             }
         }
+    }
+
+    fn capture_bound_import_publication_evidence(
+        &self,
+        app: &MiranteWorkbenchApp,
+        path: &Path,
+    ) -> Result<ImportPublicationEvidenceSnapshot, String> {
+        let timing_origin = self.active_import_timing_origin.as_ref().ok_or_else(|| {
+            "import publication evidence has no exact worker timing origin".to_owned()
+        })?;
+        let diagnostics = app.import.workers.diagnostics();
+        let successful = diagnostics.last_successful_import.as_ref().ok_or_else(|| {
+            "import publication evidence has no retained successful import".to_owned()
+        })?;
+        if successful.review_id != timing_origin.review_id
+            || successful.token != timing_origin.token
+            || successful.source_fingerprint != timing_origin.source_fingerprint
+            || successful.reviewed_source_bytes != timing_origin.reviewed_source_bytes
+            || normalize_path(&successful.destination) != normalize_path(&timing_origin.destination)
+            || normalize_path(path) != normalize_path(&successful.destination)
+        {
+            return Err(
+                "publication package, worker timing origin, and successful receipt do not describe the same import"
+                    .to_owned(),
+            );
+        }
+        let publication_transfer = app
+            .source_open_service
+            .as_ref()
+            .and_then(|service| service.completed_imported_publication_transfer())
+            .ok_or_else(|| {
+                "import publication has no storage execution evidence for its transfer".to_owned()
+            })?;
+        if normalize_path(publication_transfer.destination()) != normalize_path(path) {
+            return Err(
+                "storage publication-transfer evidence is bound to another destination".to_owned(),
+            );
+        }
+        let verification_origin = self
+            .active_import_verification_diagnostics_origin
+            .as_ref()
+            .ok_or_else(|| {
+                "import publication has no source-verification diagnostics origin".to_owned()
+            })?;
+        let verification_current = app
+            .source_verification_service
+            .as_ref()
+            .ok_or_else(|| "import publication has no source-verification diagnostics".to_owned())?
+            .diagnostics();
+        let source_verification_started_runs = verification_current
+            .started_runs
+            .checked_sub(verification_origin.started_runs)
+            .ok_or_else(|| "source-verification started-run counter regressed".to_owned())?;
+        let source_verification_progress_updates = verification_current
+            .accepted_progress_updates
+            .checked_sub(verification_origin.accepted_progress_updates)
+            .ok_or_else(|| "source-verification progress counter regressed".to_owned())?;
+        let source_verification_cancelled_runs = verification_current
+            .cancelled_runs
+            .checked_sub(verification_origin.cancelled_runs)
+            .ok_or_else(|| "source-verification cancellation counter regressed".to_owned())?;
+        let source_verification_failed_runs = verification_current
+            .failed_runs
+            .checked_sub(verification_origin.failed_runs)
+            .ok_or_else(|| "source-verification failed-run counter regressed".to_owned())?;
+        let source_verification_successes = verification_current
+            .accepted_successes
+            .checked_sub(verification_origin.accepted_successes)
+            .ok_or_else(|| "source-verification success counter regressed".to_owned())?;
+
+        Ok(ImportPublicationEvidenceSnapshot {
+            publication_currentness: publication_transfer.execution().into(),
+            source_verification_started_runs,
+            source_verification_progress_updates,
+            source_verification_cancelled_runs,
+            source_verification_failed_runs,
+            source_verification_successes,
+        })
+    }
+
+    fn complete_imported_open_ready_measurement(
+        &mut self,
+        app: &MiranteWorkbenchApp,
+        path: &Path,
+    ) -> Result<ImportPrimaryMeasurement, String> {
+        let timing_origin = self
+            .active_import_timing_origin
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                "import became open-ready without an exact worker timing origin".to_owned()
+            })?;
+        let open_ready_at = Instant::now();
+        let open_ready_at_epoch_ms = epoch_ms();
+        let open_ready_process_cpu_time_ns = process_cpu_time_ns();
+        let wall_time_ns = u64::try_from(
+            open_ready_at
+                .checked_duration_since(timing_origin.started_at)
+                .ok_or_else(|| "primary-clock instant moved backwards".to_owned())?
+                .as_nanos(),
+        )
+        .map_err(|_| "primary-clock wall time overflowed u64".to_owned())?;
+        let process_cpu_time_ns = open_ready_process_cpu_time_ns
+            .checked_sub(timing_origin.process_cpu_time_ns)
+            .ok_or_else(|| "primary-clock process CPU time moved backwards".to_owned())?;
+        let publication_evidence = self.capture_bound_import_publication_evidence(app, path)?;
+        let diagnostics = app.import.workers.diagnostics();
+        let published = diagnostics
+            .last_successful_import
+            .as_ref()
+            .and_then(|successful| successful.published_timing.as_ref())
+            .cloned()
+            .ok_or_else(|| "successful import has no exact Published-event timing".to_owned())?;
+        if published.published_at < timing_origin.started_at {
+            return Err(
+                "successful import Published-event timing precedes its worker origin".to_owned(),
+            );
+        }
+        let publication_to_open_ready_wall_time_ns = u64::try_from(
+            open_ready_at
+                .checked_duration_since(published.published_at)
+                .ok_or_else(|| "publication-to-open-ready instant moved backwards".to_owned())?
+                .as_nanos(),
+        )
+        .map_err(|_| "publication-to-open-ready wall time overflowed u64".to_owned())?;
+        let publication_to_open_ready_process_cpu_time_ns = open_ready_process_cpu_time_ns
+            .checked_sub(published.process_cpu_time_ns)
+            .ok_or_else(|| {
+                "publication-to-open-ready process CPU time moved backwards".to_owned()
+            })?;
+        let measurement = ImportPrimaryMeasurement {
+            started_at_epoch_ms: timing_origin.started_at_epoch_ms,
+            open_ready_at_epoch_ms,
+            wall_time_ns,
+            process_cpu_time_ns,
+        };
+        let publication_measurement = ImportPublicationToOpenReadyMeasurement {
+            published_at_epoch_ms: published.published_at_epoch_ms,
+            open_ready_at_epoch_ms,
+            wall_time_ns: publication_to_open_ready_wall_time_ns,
+            process_cpu_time_ns: publication_to_open_ready_process_cpu_time_ns,
+        };
+        ImportedOpenReadyCommitState {
+            active_origin: &mut self.active_import_timing_origin,
+            active_verification_origin: &mut self.active_import_verification_diagnostics_origin,
+            completed_primary: &mut self.completed_import_primary_measurement,
+            completed_publication: &mut self.completed_publication_to_open_ready_measurement,
+            captured_publication_evidence: &mut self.captured_import_publication_evidence,
+        }
+        .commit(measurement, publication_measurement, publication_evidence);
+        Ok(measurement)
     }
 
     fn execute_command(
@@ -2059,6 +2411,7 @@ impl ProductAutomationController {
                     Some(verification_diagnostics_origin);
                 self.completed_import_primary_measurement = None;
                 self.completed_publication_to_open_ready_measurement = None;
+                self.captured_import_publication_evidence = None;
                 self.completed_import_pre_start_measurement = Some(pre_start_measurement);
                 self.active_import_pre_start_origin = None;
                 Ok(CommandProgress::Done(json!({
@@ -2112,197 +2465,9 @@ impl ProductAutomationController {
             }
             ProductAutomationCommand::WaitForImportedOpenReady { path, timeout_ms } => {
                 let started = *self.active_wait_started.get_or_insert_with(Instant::now);
-                let snapshot = app.application.snapshot();
-                let selected_matches =
-                    normalize_path(app.dataset.selected_path()) == normalize_path(path);
-                let verified = matches!(snapshot.source(), SourceVerificationSnapshot::Verified(_))
-                    && app
-                        .source_verification_service
-                        .as_ref()
-                        .is_some_and(|service| service.active_token().is_none());
-                let import_idle = !app.import.workers.status().is_active();
-                if selected_matches && verified && import_idle && app.import.problem.is_none() {
-                    let timing_origin =
-                        self.active_import_timing_origin.as_ref().ok_or_else(|| {
-                            "import became open-ready without an exact worker timing origin"
-                                .to_owned()
-                        })?;
-                    let open_ready_at = Instant::now();
-                    let open_ready_at_epoch_ms = epoch_ms();
-                    let open_ready_process_cpu_time_ns = process_cpu_time_ns();
-                    let wall_time_ns = u64::try_from(
-                        open_ready_at
-                            .checked_duration_since(timing_origin.started_at)
-                            .ok_or_else(|| "primary-clock instant moved backwards".to_owned())?
-                            .as_nanos(),
-                    )
-                    .map_err(|_| "primary-clock wall time overflowed u64".to_owned())?;
-                    let process_cpu_time_ns = open_ready_process_cpu_time_ns
-                        .checked_sub(timing_origin.process_cpu_time_ns)
-                        .ok_or_else(|| {
-                            "primary-clock process CPU time moved backwards".to_owned()
-                        })?;
-                    let diagnostics = app.import.workers.diagnostics();
-                    let successful =
-                        diagnostics.last_successful_import.as_ref().ok_or_else(|| {
-                            "import became open-ready without retained successful import evidence"
-                                .to_owned()
-                        })?;
-                    if successful.review_id != timing_origin.review_id
-                        || successful.token != timing_origin.token
-                        || successful.source_fingerprint != timing_origin.source_fingerprint
-                        || successful.reviewed_source_bytes != timing_origin.reviewed_source_bytes
-                        || normalize_path(&successful.destination)
-                            != normalize_path(&timing_origin.destination)
-                        || normalize_path(path) != normalize_path(&successful.destination)
-                    {
-                        return Err(
-                            "open-ready package, worker timing origin, and successful receipt do not describe the same import"
-                                .to_owned(),
-                        );
-                    }
-                    let publication_transfer = app
-                        .source_open_service
-                        .as_ref()
-                        .and_then(|service| {
-                            service.completed_imported_publication_transfer()
-                        })
-                        .ok_or_else(|| {
-                            "import became open-ready without storage execution evidence for its publication transfer"
-                                .to_owned()
-                        })?;
-                    if normalize_path(publication_transfer.destination()) != normalize_path(path) {
-                        return Err(
-                            "storage publication-transfer evidence is bound to another destination"
-                                .to_owned(),
-                        );
-                    }
-                    let publication_currentness = publication_transfer.execution();
-                    let reconciled_currentness_reads = publication_currentness
-                        .first_inventory_object_reads()
-                        .checked_add(publication_currentness.observed_snapshot_object_reads())
-                        .and_then(|value| {
-                            value.checked_add(
-                                publication_currentness.second_inventory_object_reads(),
-                            )
-                        });
-                    if publication_currentness.expected_snapshot_object_reads() == 0
-                        || publication_currentness.first_inventory_object_reads() == 0
-                        || publication_currentness.first_inventory_object_reads()
-                            != publication_currentness.second_inventory_object_reads()
-                        || publication_currentness.observed_snapshot_object_reads()
-                            != publication_currentness.expected_snapshot_object_reads()
-                        || reconciled_currentness_reads
-                            != Some(publication_currentness.observed_total_object_reads())
-                        || publication_currentness.observed_codec_decode_calls() != 0
-                    {
-                        return Err(
-                            "storage publication-transfer execution evidence violated its currentness contract"
-                                .to_owned(),
-                        );
-                    }
-                    let published = successful.published_timing.as_ref().ok_or_else(|| {
-                        "successful import has no exact Published-event timing".to_owned()
-                    })?;
-                    if published.published_at < timing_origin.started_at {
-                        return Err(
-                            "successful import Published-event timing precedes its worker origin"
-                                .to_owned(),
-                        );
-                    }
-                    let publication_to_open_ready_wall_time_ns = u64::try_from(
-                        open_ready_at
-                            .checked_duration_since(published.published_at)
-                            .ok_or_else(|| {
-                                "publication-to-open-ready instant moved backwards".to_owned()
-                            })?
-                            .as_nanos(),
-                    )
-                    .map_err(|_| "publication-to-open-ready wall time overflowed u64".to_owned())?;
-                    let publication_to_open_ready_process_cpu_time_ns =
-                        open_ready_process_cpu_time_ns
-                            .checked_sub(published.process_cpu_time_ns)
-                            .ok_or_else(|| {
-                                "publication-to-open-ready process CPU time moved backwards"
-                                    .to_owned()
-                            })?;
-                    let verification_origin = self
-                        .active_import_verification_diagnostics_origin
-                        .take()
-                        .ok_or_else(|| {
-                            "import became open-ready without source-verification diagnostics origin"
-                                .to_owned()
-                        })?;
-                    let verification_current = app
-                        .source_verification_service
-                        .as_ref()
-                        .ok_or_else(|| {
-                            "import became open-ready without source-verification diagnostics"
-                                .to_owned()
-                        })?
-                        .diagnostics();
-                    let source_verification_started_runs = verification_current
-                        .started_runs
-                        .checked_sub(verification_origin.started_runs)
-                        .ok_or_else(|| {
-                            "source-verification started-run counter regressed".to_owned()
-                        })?;
-                    let source_verification_progress_updates = verification_current
-                        .accepted_progress_updates
-                        .checked_sub(verification_origin.accepted_progress_updates)
-                        .ok_or_else(|| {
-                            "source-verification progress counter regressed".to_owned()
-                        })?;
-                    let source_verification_cancelled_runs = verification_current
-                        .cancelled_runs
-                        .checked_sub(verification_origin.cancelled_runs)
-                        .ok_or_else(|| {
-                            "source-verification cancellation counter regressed".to_owned()
-                        })?;
-                    let source_verification_failed_runs = verification_current
-                        .failed_runs
-                        .checked_sub(verification_origin.failed_runs)
-                        .ok_or_else(|| {
-                            "source-verification failed-run counter regressed".to_owned()
-                        })?;
-                    let source_verification_successes = verification_current
-                        .accepted_successes
-                        .checked_sub(verification_origin.accepted_successes)
-                        .ok_or_else(|| {
-                            "source-verification success counter regressed".to_owned()
-                        })?;
-                    if source_verification_started_runs != 0
-                        || source_verification_progress_updates != 0
-                        || source_verification_cancelled_runs != 0
-                        || source_verification_failed_runs != 0
-                        || source_verification_successes != 0
-                    {
-                        return Err(
-                            "imported capability unexpectedly entered the ordinary source-verification route"
-                                .to_owned(),
-                        );
-                    }
-                    let measurement = ImportPrimaryMeasurement {
-                        started_at_epoch_ms: timing_origin.started_at_epoch_ms,
-                        open_ready_at_epoch_ms,
-                        wall_time_ns,
-                        process_cpu_time_ns,
-                    };
-                    self.completed_publication_to_open_ready_measurement =
-                        Some(ImportPublicationToOpenReadyMeasurement {
-                            published_at_epoch_ms: published.published_at_epoch_ms,
-                            open_ready_at_epoch_ms,
-                            wall_time_ns: publication_to_open_ready_wall_time_ns,
-                            process_cpu_time_ns: publication_to_open_ready_process_cpu_time_ns,
-                            publication_currentness,
-                            source_verification_started_runs,
-                            source_verification_progress_updates,
-                            source_verification_cancelled_runs,
-                            source_verification_failed_runs,
-                            source_verification_successes,
-                        });
-                    self.completed_import_primary_measurement = Some(measurement);
-                    self.active_import_timing_origin = None;
+                let readiness = imported_open_ready_readiness(app, path);
+                if readiness.condition_met() {
+                    let measurement = self.complete_imported_open_ready_measurement(app, path)?;
                     Ok(CommandProgress::Done(json!({
                         "path": path.display().to_string(),
                         "verified": true,
@@ -2313,13 +2478,45 @@ impl ProductAutomationController {
                     })))
                 } else if started.elapsed() >= Duration::from_millis(*timeout_ms) {
                     Err(format!(
-                        "timed out after {timeout_ms} ms waiting for imported package {} to become verified and open-ready (selected_matches={selected_matches}, verified={verified}, import_idle={import_idle}, problem={:?})",
+                        "timed out after {timeout_ms} ms waiting for imported package {} to become verified and open-ready (selected_matches={}, verified={}, import_idle={}, problem={:?})",
                         path.display(),
+                        readiness.selected_matches,
+                        readiness.verified,
+                        readiness.import_idle,
                         app.import.problem,
                     ))
                 } else {
                     Ok(CommandProgress::Waiting)
                 }
+            }
+            ProductAutomationCommand::ObserveImportedOpenReady {
+                gate_id,
+                path,
+                timeout_ms,
+            } => {
+                let started = *self.active_wait_started.get_or_insert_with(Instant::now);
+                let readiness = imported_open_ready_readiness(app, path);
+                let condition_met = readiness.condition_met();
+                let waited = started.elapsed();
+                if imported_open_ready_observation_requires_measurement(
+                    *timeout_ms,
+                    condition_met,
+                    waited,
+                ) {
+                    self.complete_imported_open_ready_measurement(app, path)?;
+                } else if waited >= Duration::from_millis(*timeout_ms)
+                    && let Ok(publication_evidence) =
+                        self.capture_bound_import_publication_evidence(app, path)
+                {
+                    self.captured_import_publication_evidence = Some(publication_evidence);
+                    self.active_import_verification_diagnostics_origin = None;
+                }
+                Ok(product_imported_open_ready_observation_progress(
+                    gate_id,
+                    *timeout_ms,
+                    condition_met,
+                    waited,
+                ))
             }
             ProductAutomationCommand::WaitFor {
                 condition,
@@ -2345,6 +2542,21 @@ impl ProductAutomationController {
                         CommandProgress::Waiting
                     })
                 }
+            }
+            ProductAutomationCommand::ObserveGate {
+                gate_id,
+                condition,
+                timeout_ms,
+            } => {
+                let started = *self.active_wait_started.get_or_insert_with(Instant::now);
+                let condition_met = self.wait_condition_met(app, *condition);
+                Ok(product_gate_observation_progress(
+                    gate_id,
+                    *condition,
+                    *timeout_ms,
+                    condition_met,
+                    started.elapsed(),
+                ))
             }
             ProductAutomationCommand::SetViewportSize { width, height } => {
                 if *width == 0 || *height == 0 {
@@ -4007,7 +4219,10 @@ impl ProductAutomationController {
             "maximum_elapsed_ms": diagnostics.maximum_elapsed_ms,
             "inspection_and_review_clock": import_pre_start_measurement_json(self.completed_import_pre_start_measurement),
             "primary_clock": import_primary_measurement_json(self.completed_import_primary_measurement),
-            "publication_to_open_ready_clock": import_publication_to_open_ready_measurement_json(self.completed_publication_to_open_ready_measurement),
+            "publication_to_open_ready_clock": import_publication_to_open_ready_measurement_json(
+                self.completed_publication_to_open_ready_measurement,
+                self.captured_import_publication_evidence,
+            ),
             "last_successful_receipt": diagnostics
                 .last_successful_import
                 .as_ref()
@@ -4250,7 +4465,7 @@ impl ProductAutomationController {
                 "command_count": self.script.commands.len(),
             },
             "startup_bootstrap": &self.startup_bootstrap_evidence,
-            "limits": self.script.limits,
+            "hard_safety_limits": self.script.hard_safety_limits,
             "limit_observations": self.limit_observations.json(),
             "dataset": {
                 "path": app.dataset.selected_path().display().to_string(),
@@ -4298,14 +4513,17 @@ impl ProductAutomationController {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
-    fn observe_and_enforce_limits(&mut self, app: &MiranteWorkbenchApp) -> Result<(), String> {
-        let limits = self.script.limits;
+    fn observe_and_enforce_hard_safety_limits(
+        &mut self,
+        app: &MiranteWorkbenchApp,
+    ) -> Result<(), String> {
+        let hard_safety_limits = self.script.hard_safety_limits;
         let diagnostics =
             app.dataset.dispatcher().diagnostics().map_err(|err| {
                 format!("failed to read unified dataset runtime diagnostics: {err}")
             })?;
         self.limit_observations.observe_dataset_runtime(diagnostics);
-        limits.check_dataset_runtime(diagnostics)?;
+        hard_safety_limits.check_dataset_runtime(diagnostics)?;
         Ok(())
     }
 
@@ -4364,35 +4582,63 @@ fn import_pre_start_measurement_json(measurement: Option<ImportPreStartMeasureme
 
 fn import_publication_to_open_ready_measurement_json(
     measurement: Option<ImportPublicationToOpenReadyMeasurement>,
+    evidence: Option<ImportPublicationEvidenceSnapshot>,
 ) -> Value {
-    measurement.map_or(Value::Null, |measurement| {
-        json!({
-            "start_boundary": "import_worker_published_event",
-            "end_boundary": "published_destination_verified_and_open_ready_for_normal_product_use",
-            "wall_clock": "std_instant_monotonic",
-            "cpu_clock": "process_cpu_time",
-            "published_at_epoch_ms": measurement.published_at_epoch_ms,
-            "open_ready_at_epoch_ms": measurement.open_ready_at_epoch_ms,
-            "wall_time_ns": measurement.wall_time_ns,
-            "process_cpu_time_ns": measurement.process_cpu_time_ns,
-            "included_in_primary_clock": true,
-            "transfer_mode": "staged_verified_capability",
-            "publication_currentness_execution": {
-                "contract_id": measurement.publication_currentness.contract_id(),
-                "expected_snapshot_object_reads": measurement.publication_currentness.expected_snapshot_object_reads(),
-                "first_inventory_object_reads": measurement.publication_currentness.first_inventory_object_reads(),
-                "observed_snapshot_object_reads": measurement.publication_currentness.observed_snapshot_object_reads(),
-                "second_inventory_object_reads": measurement.publication_currentness.second_inventory_object_reads(),
-                "observed_total_object_reads": measurement.publication_currentness.observed_total_object_reads(),
-                "observed_codec_decode_calls": measurement.publication_currentness.observed_codec_decode_calls(),
-            },
-            "source_verification_started_runs": measurement.source_verification_started_runs,
-            "source_verification_progress_updates": measurement.source_verification_progress_updates,
-            "source_verification_cancelled_runs": measurement.source_verification_cancelled_runs,
-            "source_verification_failed_runs": measurement.source_verification_failed_runs,
-            "source_verification_successes": measurement.source_verification_successes,
-        })
-    })
+    let Some(evidence) = evidence else {
+        debug_assert!(measurement.is_none());
+        return Value::Null;
+    };
+    let currentness = evidence.publication_currentness;
+    let mut result = json!({
+        "publication_currentness_execution": {
+            "contract_id": currentness.contract_id,
+            "expected_snapshot_object_reads": currentness.expected_snapshot_object_reads,
+            "first_inventory_object_reads": currentness.first_inventory_object_reads,
+            "observed_snapshot_object_reads": currentness.observed_snapshot_object_reads,
+            "second_inventory_object_reads": currentness.second_inventory_object_reads,
+            "observed_total_object_reads": currentness.observed_total_object_reads,
+            "observed_codec_decode_calls": currentness.observed_codec_decode_calls,
+        },
+        "source_verification_started_runs": evidence.source_verification_started_runs,
+        "source_verification_progress_updates": evidence.source_verification_progress_updates,
+        "source_verification_cancelled_runs": evidence.source_verification_cancelled_runs,
+        "source_verification_failed_runs": evidence.source_verification_failed_runs,
+        "source_verification_successes": evidence.source_verification_successes,
+    });
+    if let Some(measurement) = measurement {
+        let object = result
+            .as_object_mut()
+            .expect("import publication evidence is a fixed JSON object");
+        object.insert(
+            "start_boundary".to_owned(),
+            json!("import_worker_published_event"),
+        );
+        object.insert(
+            "end_boundary".to_owned(),
+            json!("published_destination_verified_and_open_ready_for_normal_product_use"),
+        );
+        object.insert("wall_clock".to_owned(), json!("std_instant_monotonic"));
+        object.insert("cpu_clock".to_owned(), json!("process_cpu_time"));
+        object.insert(
+            "published_at_epoch_ms".to_owned(),
+            json!(measurement.published_at_epoch_ms),
+        );
+        object.insert(
+            "open_ready_at_epoch_ms".to_owned(),
+            json!(measurement.open_ready_at_epoch_ms),
+        );
+        object.insert("wall_time_ns".to_owned(), json!(measurement.wall_time_ns));
+        object.insert(
+            "process_cpu_time_ns".to_owned(),
+            json!(measurement.process_cpu_time_ns),
+        );
+        object.insert("included_in_primary_clock".to_owned(), json!(true));
+        object.insert(
+            "transfer_mode".to_owned(),
+            json!("staged_verified_capability"),
+        );
+    }
+    result
 }
 
 fn import_receipt_json(receipt: &ImportReceipt) -> Value {

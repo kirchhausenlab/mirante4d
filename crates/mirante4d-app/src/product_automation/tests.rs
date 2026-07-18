@@ -31,6 +31,693 @@ fn runtime_idle_wait_includes_async_camera_demand_planning_and_install() {
 }
 
 #[test]
+fn schema_v4_strictly_parses_observe_gate() {
+    let raw = json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": 4,
+        "hard_safety_limits": {},
+        "scenario": "gate_protocol",
+        "commands": [
+            {
+                "command": "observe_gate",
+                "gate_id": "RZ.resident_3d-settled",
+                "condition": "coordinated_presentation_settled",
+                "timeout_ms": MAX_OBSERVE_GATE_TIMEOUT_MS
+            },
+            { "command": "quit" }
+        ]
+    });
+    let script: ProductAutomationScript = serde_json::from_value(raw.clone()).unwrap();
+    script.validate().unwrap();
+    assert_eq!(AUTOMATION_SCHEMA_VERSION, 4);
+    assert!(matches!(
+        &script.commands[0],
+        ProductAutomationCommand::ObserveGate {
+            gate_id,
+            condition,
+            timeout_ms,
+        } if gate_id == "RZ.resident_3d-settled"
+            && condition.name() == "coordinated_presentation_settled"
+            && *timeout_ms == MAX_OBSERVE_GATE_TIMEOUT_MS
+    ));
+
+    let mut legacy = raw;
+    legacy["schema_version"] = json!(3);
+    let legacy: ProductAutomationScript = serde_json::from_value(legacy).unwrap();
+    assert!(
+        legacy
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("expected 4")
+    );
+
+    let unknown_field = json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "strict_gate_protocol",
+        "commands": [{
+            "command": "observe_gate",
+            "gate_id": "RZ.settled",
+            "condition": "coordinated_presentation_settled",
+            "timeout_ms": 1,
+            "unexpected": true
+        }]
+    });
+    assert!(serde_json::from_value::<ProductAutomationScript>(unknown_field).is_err());
+}
+
+#[test]
+fn schema_v4_requires_exact_hard_safety_limits_without_legacy_alias() {
+    let script_without_limits = json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "scenario": "missing_hard_safety_limits",
+        "commands": [{ "command": "quit" }]
+    });
+    assert!(serde_json::from_value::<ProductAutomationScript>(script_without_limits).is_err());
+
+    let legacy_limits = json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "scenario": "legacy_limits_are_not_an_alias",
+        "limits": {},
+        "commands": [{ "command": "quit" }]
+    });
+    assert!(serde_json::from_value::<ProductAutomationScript>(legacy_limits).is_err());
+
+    let exact = json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "scenario": "exact_hard_safety_limits",
+        "hard_safety_limits": {},
+        "commands": [{ "command": "quit" }]
+    });
+    serde_json::from_value::<ProductAutomationScript>(exact)
+        .unwrap()
+        .validate()
+        .unwrap();
+}
+
+#[test]
+fn observe_gate_validates_safe_bounded_identity_and_timeout() {
+    assert_eq!(MAX_OBSERVE_GATE_TIMEOUT_MS, 7_200_000);
+    for (gate_id, timeout_ms) in [
+        (String::new(), 1),
+        ("a".repeat(129), 1),
+        ("contains space".to_owned(), 1),
+        ("non-ascii-é".to_owned(), 1),
+        ("valid".to_owned(), 0),
+        ("valid".to_owned(), 7_200_001),
+    ] {
+        let script: ProductAutomationScript = serde_json::from_value(json!({
+            "schema": AUTOMATION_SCRIPT_SCHEMA,
+            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "hard_safety_limits": {},
+            "scenario": "invalid_gate_protocol",
+            "commands": [{
+                "command": "observe_gate",
+                "gate_id": gate_id,
+                "condition": "runtime_idle",
+                "timeout_ms": timeout_ms
+            }]
+        }))
+        .unwrap();
+        assert!(script.validate().is_err());
+    }
+
+    for (gate_id, timeout_ms) in [("x".to_owned(), 1), ("x".repeat(128), 7_200_000)] {
+        let script: ProductAutomationScript = serde_json::from_value(json!({
+            "schema": AUTOMATION_SCRIPT_SCHEMA,
+            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "hard_safety_limits": {},
+            "scenario": "valid_gate_protocol_boundaries",
+            "commands": [{
+                "command": "observe_gate",
+                "gate_id": gate_id,
+                "condition": "runtime_idle",
+                "timeout_ms": timeout_ms
+            }]
+        }))
+        .unwrap();
+        script.validate().unwrap();
+    }
+}
+
+#[test]
+fn observe_gate_timeout_is_a_typed_failed_observation() {
+    assert!(matches!(
+        product_gate_observation_progress(
+            "RZ.resident_3d-settled",
+            ProductAutomationWaitCondition::CoordinatedPresentationSettled,
+            100,
+            false,
+            Duration::from_millis(99),
+        ),
+        CommandProgress::Waiting
+    ));
+
+    let CommandProgress::Done(details) = product_gate_observation_progress(
+        "RZ.resident_3d-settled",
+        ProductAutomationWaitCondition::CoordinatedPresentationSettled,
+        100,
+        false,
+        Duration::from_millis(100),
+    ) else {
+        panic!("the timeout must complete as an observed gate result");
+    };
+    assert_eq!(
+        details,
+        json!({
+            "schema": "mirante4d-product-gate-observation-1",
+            "gate_id": "RZ.resident_3d-settled",
+            "condition": "coordinated_presentation_settled",
+            "outcome": "failed",
+            "condition_met": false,
+            "timed_out": true,
+            "timeout_ms": 100,
+            "waited_ns": 100_000_000_u64,
+        })
+    );
+}
+
+#[test]
+fn observe_gate_requires_the_condition_before_the_exact_deadline() {
+    let CommandProgress::Done(details) = product_gate_observation_progress(
+        "runtime.ready",
+        ProductAutomationWaitCondition::RuntimeIdle,
+        100,
+        true,
+        Duration::from_millis(99),
+    ) else {
+        panic!("a condition observed before the deadline must pass");
+    };
+    assert_eq!(details["outcome"], "passed");
+    assert_eq!(details["condition_met"], true);
+    assert_eq!(details["timed_out"], false);
+    assert_eq!(details["waited_ns"], 99_000_000_u64);
+
+    let CommandProgress::Done(late) = product_gate_observation_progress(
+        "runtime.ready",
+        ProductAutomationWaitCondition::RuntimeIdle,
+        100,
+        true,
+        Duration::from_millis(100),
+    ) else {
+        panic!("the exact deadline must close as a failed observation");
+    };
+    assert_eq!(late["outcome"], "failed");
+    assert_eq!(late["condition_met"], true);
+    assert_eq!(late["timed_out"], true);
+    assert_eq!(late["waited_ns"], 100_000_000_u64);
+}
+
+#[test]
+fn failed_gate_observation_is_a_successful_report_event_and_continues() {
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "gate_continue",
+        "commands": [
+            {
+                "command": "observe_gate",
+                "gate_id": "RZ.resident_3d-settled",
+                "condition": "coordinated_presentation_settled",
+                "timeout_ms": 10
+            },
+            { "command": "quit" }
+        ]
+    }))
+    .unwrap();
+    script.validate().unwrap();
+    let mut controller = ProductAutomationController::new(
+        script,
+        PathBuf::from("gate-script.json"),
+        PathBuf::from("gate-report.json"),
+    );
+    controller.active_wait_started = Some(Instant::now());
+    let CommandProgress::Done(details) = product_gate_observation_progress(
+        "RZ.resident_3d-settled",
+        ProductAutomationWaitCondition::CoordinatedPresentationSettled,
+        10,
+        false,
+        Duration::from_millis(10),
+    ) else {
+        panic!("the failed observation must be command-complete");
+    };
+
+    controller.record_successful_command(0, "observe_gate", Duration::from_millis(10), details);
+
+    assert_eq!(controller.command_index, 1);
+    assert!(controller.active_wait_started.is_none());
+    assert_eq!(controller.events.len(), 1);
+    let report_events = serde_json::to_value(&controller.events).unwrap();
+    assert_eq!(report_events[0]["command_index"], 0);
+    assert_eq!(report_events[0]["command"], "observe_gate");
+    assert_eq!(report_events[0]["status"], "passed");
+    assert_eq!(report_events[0]["details"]["outcome"], "failed");
+    assert_eq!(report_events[0]["details"]["condition_met"], false);
+    assert_eq!(report_events[0]["details"]["timed_out"], true);
+
+    controller.record_successful_command(1, "quit", Duration::ZERO, json!({}));
+    assert_eq!(controller.command_index, 2);
+    assert!(
+        controller
+            .events
+            .iter()
+            .all(|event| event.status == "passed")
+    );
+}
+
+#[test]
+fn schema_v4_strictly_parses_observe_imported_open_ready() {
+    let raw = json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "ip_acceptance_gate",
+        "commands": [
+            {
+                "command": "observe_imported_open_ready",
+                "gate_id": "IP.imported-open-ready",
+                "path": "/private/session/published.m4d",
+                "timeout_ms": 7_200_000
+            },
+            { "command": "quit" }
+        ]
+    });
+    let script: ProductAutomationScript = serde_json::from_value(raw).unwrap();
+    script.validate().unwrap();
+    assert!(matches!(
+        &script.commands[0],
+        ProductAutomationCommand::ObserveImportedOpenReady {
+            gate_id,
+            path,
+            timeout_ms,
+        } if gate_id == "IP.imported-open-ready"
+            && path == &PathBuf::from("/private/session/published.m4d")
+            && *timeout_ms == 7_200_000
+    ));
+    assert_eq!(script.commands[0].name(), "observe_imported_open_ready");
+
+    for command in [
+        json!({
+            "command": "observe_imported_open_ready",
+            "gate_id": "IP.valid",
+            "path": "/private/session/published.m4d",
+            "timeout_ms": 1,
+            "unexpected": true
+        }),
+        json!({
+            "command": "observe_imported_open_ready",
+            "gate_id": "IP.valid",
+            "timeout_ms": 1
+        }),
+    ] {
+        let candidate = json!({
+            "schema": AUTOMATION_SCRIPT_SCHEMA,
+            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "hard_safety_limits": {},
+            "scenario": "strict_ip_acceptance_gate",
+            "commands": [command]
+        });
+        assert!(serde_json::from_value::<ProductAutomationScript>(candidate).is_err());
+    }
+}
+
+#[test]
+fn observe_imported_open_ready_validates_path_identity_and_timeout() {
+    for (gate_id, path, timeout_ms) in [
+        ("".to_owned(), "/tmp/published.m4d".to_owned(), 1),
+        (
+            "contains space".to_owned(),
+            "/tmp/published.m4d".to_owned(),
+            1,
+        ),
+        ("IP.valid".to_owned(), String::new(), 1),
+        ("IP.valid".to_owned(), "/tmp/published.m4d".to_owned(), 0),
+        (
+            "IP.valid".to_owned(),
+            "/tmp/published.m4d".to_owned(),
+            7_200_001,
+        ),
+    ] {
+        let script: ProductAutomationScript = serde_json::from_value(json!({
+            "schema": AUTOMATION_SCRIPT_SCHEMA,
+            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "hard_safety_limits": {},
+            "scenario": "invalid_ip_acceptance_gate",
+            "commands": [{
+                "command": "observe_imported_open_ready",
+                "gate_id": gate_id,
+                "path": path,
+                "timeout_ms": timeout_ms
+            }]
+        }))
+        .unwrap();
+        assert!(script.validate().is_err());
+    }
+}
+
+#[test]
+fn observe_imported_open_ready_reports_typed_pass_and_timeout() {
+    assert!(matches!(
+        product_imported_open_ready_observation_progress(
+            "IP.imported-open-ready",
+            100,
+            false,
+            Duration::from_millis(99),
+        ),
+        CommandProgress::Waiting
+    ));
+
+    let CommandProgress::Done(passed) = product_imported_open_ready_observation_progress(
+        "IP.imported-open-ready",
+        100,
+        true,
+        Duration::from_millis(99),
+    ) else {
+        panic!("ready import acceptance must pass before its deadline");
+    };
+    assert_eq!(
+        passed,
+        json!({
+            "schema": "mirante4d-product-gate-observation-1",
+            "gate_id": "IP.imported-open-ready",
+            "condition": "imported_open_ready",
+            "outcome": "passed",
+            "condition_met": true,
+            "timed_out": false,
+            "timeout_ms": 100,
+            "waited_ns": 99_000_000_u64,
+        })
+    );
+
+    let CommandProgress::Done(late_ready) = product_imported_open_ready_observation_progress(
+        "IP.imported-open-ready",
+        100,
+        true,
+        Duration::from_millis(100),
+    ) else {
+        panic!("ready import observed at the deadline must fail the latency gate");
+    };
+    assert_eq!(late_ready["outcome"], "failed");
+    assert_eq!(late_ready["condition_met"], true);
+    assert_eq!(late_ready["timed_out"], true);
+
+    let CommandProgress::Done(failed) = product_imported_open_ready_observation_progress(
+        "IP.imported-open-ready",
+        100,
+        false,
+        Duration::from_millis(100),
+    ) else {
+        panic!("timed-out import acceptance must complete as a failed observation");
+    };
+    assert_eq!(failed["condition"], "imported_open_ready");
+    assert_eq!(failed["outcome"], "failed");
+    assert_eq!(failed["condition_met"], false);
+    assert_eq!(failed["timed_out"], true);
+    assert_eq!(failed["timeout_ms"], 100);
+    assert_eq!(failed["waited_ns"], 100_000_000_u64);
+}
+
+#[test]
+fn imported_open_ready_runs_pass_only_measurement_strictly_before_deadline() {
+    assert!(imported_open_ready_observation_requires_measurement(
+        100,
+        true,
+        Duration::from_millis(99),
+    ));
+    assert!(!imported_open_ready_observation_requires_measurement(
+        100,
+        true,
+        Duration::from_millis(100),
+    ));
+    assert!(!imported_open_ready_observation_requires_measurement(
+        100,
+        false,
+        Duration::from_millis(99),
+    ));
+}
+
+#[test]
+fn imported_open_ready_reuses_every_existing_readiness_fact() {
+    assert!(
+        ImportedOpenReadyReadiness {
+            selected_matches: true,
+            verified: true,
+            import_idle: true,
+            problem_absent: true,
+        }
+        .condition_met()
+    );
+    for readiness in [
+        ImportedOpenReadyReadiness {
+            selected_matches: false,
+            verified: true,
+            import_idle: true,
+            problem_absent: true,
+        },
+        ImportedOpenReadyReadiness {
+            selected_matches: true,
+            verified: false,
+            import_idle: true,
+            problem_absent: true,
+        },
+        ImportedOpenReadyReadiness {
+            selected_matches: true,
+            verified: true,
+            import_idle: false,
+            problem_absent: true,
+        },
+        ImportedOpenReadyReadiness {
+            selected_matches: true,
+            verified: true,
+            import_idle: true,
+            problem_absent: false,
+        },
+    ] {
+        assert!(!readiness.condition_met());
+    }
+}
+
+#[test]
+fn imported_open_ready_measurement_commit_preserves_all_side_effects() {
+    let primary = ImportPrimaryMeasurement {
+        started_at_epoch_ms: 11,
+        open_ready_at_epoch_ms: 23,
+        wall_time_ns: 29,
+        process_cpu_time_ns: 31,
+    };
+    let mut active_origin = Some("exact-worker-origin");
+    let mut active_verification_origin = Some("exact-verification-origin");
+    let mut completed_primary = None;
+    let mut completed_publication = None;
+    let mut captured_publication_evidence = None;
+
+    ImportedOpenReadyCommitState {
+        active_origin: &mut active_origin,
+        active_verification_origin: &mut active_verification_origin,
+        completed_primary: &mut completed_primary,
+        completed_publication: &mut completed_publication,
+        captured_publication_evidence: &mut captured_publication_evidence,
+    }
+    .commit(
+        primary,
+        "publication-to-open-ready-measurement",
+        "publication-currentness-and-verifier-evidence",
+    );
+
+    assert!(active_origin.is_none());
+    assert!(active_verification_origin.is_none());
+    assert_eq!(completed_primary, Some(primary));
+    assert_eq!(
+        completed_publication,
+        Some("publication-to-open-ready-measurement")
+    );
+    assert_eq!(
+        captured_publication_evidence,
+        Some("publication-currentness-and-verifier-evidence")
+    );
+}
+
+fn test_import_publication_evidence_snapshot() -> ImportPublicationEvidenceSnapshot {
+    ImportPublicationEvidenceSnapshot {
+        publication_currentness: ImportPublicationCurrentnessExecution {
+            contract_id: "test-publication-currentness",
+            expected_snapshot_object_reads: 1,
+            first_inventory_object_reads: 2,
+            observed_snapshot_object_reads: 3,
+            second_inventory_object_reads: 4,
+            observed_total_object_reads: 10,
+            observed_codec_decode_calls: 5,
+        },
+        source_verification_started_runs: 6,
+        source_verification_progress_updates: 7,
+        source_verification_cancelled_runs: 8,
+        source_verification_failed_runs: 9,
+        source_verification_successes: 10,
+    }
+}
+
+#[test]
+fn failed_imported_open_ready_serializes_only_authentic_currentness_and_verifier_evidence() {
+    let evidence = test_import_publication_evidence_snapshot();
+
+    assert_eq!(
+        import_publication_to_open_ready_measurement_json(None, None),
+        Value::Null
+    );
+    let partial = import_publication_to_open_ready_measurement_json(None, Some(evidence));
+
+    assert_eq!(
+        partial,
+        json!({
+            "publication_currentness_execution": {
+                "contract_id": "test-publication-currentness",
+                "expected_snapshot_object_reads": 1,
+                "first_inventory_object_reads": 2,
+                "observed_snapshot_object_reads": 3,
+                "second_inventory_object_reads": 4,
+                "observed_total_object_reads": 10,
+                "observed_codec_decode_calls": 5,
+            },
+            "source_verification_started_runs": 6,
+            "source_verification_progress_updates": 7,
+            "source_verification_cancelled_runs": 8,
+            "source_verification_failed_runs": 9,
+            "source_verification_successes": 10,
+        })
+    );
+    assert_eq!(partial.as_object().map(serde_json::Map::len), Some(6));
+    for pass_only in [
+        "start_boundary",
+        "end_boundary",
+        "wall_clock",
+        "cpu_clock",
+        "published_at_epoch_ms",
+        "open_ready_at_epoch_ms",
+        "wall_time_ns",
+        "process_cpu_time_ns",
+        "included_in_primary_clock",
+        "transfer_mode",
+    ] {
+        assert!(partial.get(pass_only).is_none());
+    }
+}
+
+#[test]
+fn passed_imported_open_ready_adds_full_clocks_to_the_same_publication_evidence() {
+    let evidence = test_import_publication_evidence_snapshot();
+    let timing = ImportPublicationToOpenReadyMeasurement {
+        published_at_epoch_ms: 11,
+        open_ready_at_epoch_ms: 12,
+        wall_time_ns: 13,
+        process_cpu_time_ns: 14,
+    };
+
+    let full = import_publication_to_open_ready_measurement_json(Some(timing), Some(evidence));
+
+    assert_eq!(
+        full,
+        json!({
+            "start_boundary": "import_worker_published_event",
+            "end_boundary": "published_destination_verified_and_open_ready_for_normal_product_use",
+            "wall_clock": "std_instant_monotonic",
+            "cpu_clock": "process_cpu_time",
+            "published_at_epoch_ms": 11,
+            "open_ready_at_epoch_ms": 12,
+            "wall_time_ns": 13,
+            "process_cpu_time_ns": 14,
+            "included_in_primary_clock": true,
+            "transfer_mode": "staged_verified_capability",
+            "publication_currentness_execution": {
+                "contract_id": "test-publication-currentness",
+                "expected_snapshot_object_reads": 1,
+                "first_inventory_object_reads": 2,
+                "observed_snapshot_object_reads": 3,
+                "second_inventory_object_reads": 4,
+                "observed_total_object_reads": 10,
+                "observed_codec_decode_calls": 5,
+            },
+            "source_verification_started_runs": 6,
+            "source_verification_progress_updates": 7,
+            "source_verification_cancelled_runs": 8,
+            "source_verification_failed_runs": 9,
+            "source_verification_successes": 10,
+        })
+    );
+    assert_eq!(full.as_object().map(serde_json::Map::len), Some(16));
+}
+
+#[test]
+fn failed_imported_open_ready_gate_continues_without_serializing_path() {
+    let private_path = "/private/owner/session/published.m4d";
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "ip_gate_continue",
+        "commands": [
+            {
+                "command": "observe_imported_open_ready",
+                "gate_id": "IP.imported-open-ready",
+                "path": private_path,
+                "timeout_ms": 10
+            },
+            { "command": "quit" }
+        ]
+    }))
+    .unwrap();
+    script.validate().unwrap();
+    let mut controller = ProductAutomationController::new(
+        script,
+        PathBuf::from("gate-script.json"),
+        PathBuf::from("gate-report.json"),
+    );
+    controller.active_wait_started = Some(Instant::now());
+    let CommandProgress::Done(details) = product_imported_open_ready_observation_progress(
+        "IP.imported-open-ready",
+        10,
+        false,
+        Duration::from_millis(10),
+    ) else {
+        panic!("the failed import acceptance observation must be command-complete");
+    };
+    assert_eq!(details.as_object().map(serde_json::Map::len), Some(8));
+    assert!(details.get("path").is_none());
+
+    controller.record_successful_command(
+        0,
+        "observe_imported_open_ready",
+        Duration::from_millis(10),
+        details,
+    );
+
+    assert_eq!(controller.command_index, 1);
+    assert!(controller.active_wait_started.is_none());
+    let report_events = serde_json::to_value(&controller.events).unwrap();
+    assert_eq!(report_events[0]["status"], "passed");
+    assert_eq!(report_events[0]["details"]["outcome"], "failed");
+    assert!(
+        !serde_json::to_string(&report_events[0]["details"])
+            .unwrap()
+            .contains(private_path)
+    );
+
+    controller.record_successful_command(1, "quit", Duration::ZERO, json!({}));
+    assert_eq!(controller.command_index, 2);
+    assert!(
+        controller
+            .events
+            .iter()
+            .all(|event| event.status == "passed")
+    );
+}
+
+#[test]
 fn refinement_handoff_diagnostics_name_an_uninitialized_hidden_target() {
     assert_eq!(
         refinement_handoff_phase(false, false, false, false),
@@ -151,6 +838,7 @@ fn switch_dataset_command_is_distinct_from_the_startup_assertion() {
     let script: ProductAutomationScript = serde_json::from_value(json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
         "scenario": "temporal_switch",
         "commands": [
             { "command": "open_dataset", "path": "/tmp/representative.m4d" },
@@ -176,6 +864,7 @@ fn switch_dataset_command_is_distinct_from_the_startup_assertion() {
     let empty_target: ProductAutomationScript = serde_json::from_value(json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
         "scenario": "invalid_temporal_switch",
         "commands": [{ "command": "switch_dataset", "path": "" }]
     }))
@@ -188,6 +877,7 @@ fn ep00_script_parses_time_distributed_camera_cross_section_and_pt_commands() {
     let script: ProductAutomationScript = serde_json::from_value(json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
         "scenario": "ep00_workloads",
         "diagnostic_counters": true,
         "commands": [
@@ -224,6 +914,7 @@ fn ep00_detailed_counters_require_the_explicit_script_flag() {
     let script: ProductAutomationScript = serde_json::from_value(json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
         "scenario": "instrumentation_control",
         "diagnostic_counters": false,
         "gpu_timing": false,
@@ -244,6 +935,7 @@ fn ep00_startup_bootstrap_accepts_only_bounded_pre_demand_state() {
     let script: ProductAutomationScript = serde_json::from_value(json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
         "scenario": "cold_four_panel",
         "startup_bootstrap": {
             "capture_start_checkpoint": true,
@@ -285,6 +977,7 @@ fn ep00_startup_bootstrap_accepts_only_bounded_pre_demand_state() {
         let candidate: ProductAutomationScript = serde_json::from_value(json!({
             "schema": AUTOMATION_SCRIPT_SCHEMA,
             "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "hard_safety_limits": {},
             "scenario": "rejected_bootstrap",
             "startup_bootstrap": {
                 "capture_start_checkpoint": true,
@@ -303,6 +996,7 @@ fn ep00_setup_only_bootstrap_accepts_exact_camera_and_plane_without_checkpoint()
     let script: ProductAutomationScript = serde_json::from_value(json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
         "scenario": "nonresident_setup",
         "startup_bootstrap": {
             "capture_start_checkpoint": false,
@@ -338,6 +1032,7 @@ fn ep00_setup_only_bootstrap_accepts_exact_camera_and_plane_without_checkpoint()
     let mismatched: ProductAutomationScript = serde_json::from_value(json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
         "scenario": "invalid_setup",
         "startup_bootstrap": {
             "capture_start_checkpoint": false,
@@ -355,6 +1050,7 @@ fn ep00_exact_cross_section_view_command_is_strictly_validated() {
     let script = serde_json::json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
         "scenario": "exact_cross_section_reset",
         "commands": [
             {
@@ -373,6 +1069,7 @@ fn ep00_exact_cross_section_view_command_is_strictly_validated() {
     let invalid = serde_json::json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
         "scenario": "invalid_cross_section_reset",
         "commands": [
             {
@@ -403,6 +1100,7 @@ fn ep00_sequence_bounds_and_diagnostic_labels_are_validated() {
         let script: ProductAutomationScript = serde_json::from_value(json!({
             "schema": AUTOMATION_SCRIPT_SCHEMA,
             "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "hard_safety_limits": {},
             "scenario": "invalid_ep00_bound",
             "commands": [command]
         }))
@@ -513,7 +1211,8 @@ fn automation_alone_does_not_enable_validation_capture() {
     let navigation: ProductAutomationScript = serde_json::from_str(
         r#"{
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 3,
+          "schema_version": 4,
+          "hard_safety_limits": {},
           "scenario": "performance_navigation",
           "commands": [
             { "command": "camera_orbit", "yaw_points": 10.0, "pitch_points": 5.0 },
@@ -536,7 +1235,8 @@ fn automation_alone_does_not_enable_validation_capture() {
         let raw = format!(
             r#"{{
               "schema": "mirante4d-product-automation-script",
-              "schema_version": 3,
+              "schema_version": 4,
+              "hard_safety_limits": {{}},
               "scenario": "render_correctness",
               "commands": [{pixel_command}]
             }}"#
@@ -632,7 +1332,8 @@ fn automation_script_parses_the_b4_project_store_contract() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 3,
+          "schema_version": 4,
+          "hard_safety_limits": {},
           "scenario": "b4_project_store",
           "commands": [
             { "command": "set_mapped_client_pixels", "width": 1280, "height": 720 },
@@ -763,12 +1464,12 @@ fn automation_script_parses_semantic_camera_commands() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 3,
-          "scenario": "unit",
-          "limits": {
+          "schema_version": 4,
+          "hard_safety_limits": {
             "max_cpu_total_bytes": 1024,
             "max_runtime_queued_requests": 128
           },
+          "scenario": "unit",
           "commands": [
             { "command": "open_dataset", "path": "/tmp/demo.m4d" },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 1000 },
@@ -806,8 +1507,11 @@ fn automation_script_parses_semantic_camera_commands() {
 
     script.validate().unwrap();
     assert_eq!(script.commands.len(), 29);
-    assert_eq!(script.limits.max_cpu_total_bytes, Some(1024));
-    assert_eq!(script.limits.max_runtime_queued_requests, Some(128));
+    assert_eq!(script.hard_safety_limits.max_cpu_total_bytes, Some(1024));
+    assert_eq!(
+        script.hard_safety_limits.max_runtime_queued_requests,
+        Some(128)
+    );
     assert_eq!(script.commands[2].name(), "set_iso_display_level");
     assert_eq!(script.commands[3].name(), "set_dvr_density_scale");
     assert_eq!(script.commands[4].name(), "set_layer_render_mode");
@@ -832,7 +1536,8 @@ fn automation_script_parses_source_verification_evidence_workflow() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 3,
+          "schema_version": 4,
+          "hard_safety_limits": {},
           "scenario": "b3_source_verification",
           "commands": [
             { "command": "set_render_target_size", "width": 1280, "height": 720 },
@@ -874,7 +1579,8 @@ fn automation_script_parses_normal_import_cancel_resume_workflow() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 3,
+          "schema_version": 4,
+          "hard_safety_limits": {},
           "scenario": "import_preprocessing",
           "commands": [
             { "command": "begin_tiff_import_setup", "source": "/tmp/source", "output_parent": "/tmp/output" },
@@ -916,7 +1622,8 @@ fn automation_script_parses_retained_four_panel_assertions() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 3,
+          "schema_version": 4,
+          "hard_safety_limits": {},
           "scenario": "unit_four_panel",
           "commands": [
             { "command": "set_viewer_layout", "layout": "four_panel" },
@@ -986,6 +1693,7 @@ fn automation_script_rejects_removed_model_inputs() {
         let script = json!({
             "schema": AUTOMATION_SCRIPT_SCHEMA,
             "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "hard_safety_limits": {},
             "scenario": "removed_model_spelling",
             "commands": [command]
         });
@@ -997,12 +1705,12 @@ fn automation_script_rejects_removed_model_inputs() {
 fn automation_script_rejects_wrong_schema_version() {
     let script = ProductAutomationScript {
         schema: AUTOMATION_SCRIPT_SCHEMA.to_owned(),
-        schema_version: 1,
+        schema_version: 3,
         scenario: "unit".to_owned(),
         gpu_timing: false,
         diagnostic_counters: false,
         startup_bootstrap: None,
-        limits: ProductAutomationLimits::default(),
+        hard_safety_limits: ProductAutomationHardSafetyLimits::default(),
         commands: vec![ProductAutomationCommand::Quit],
     };
 
@@ -1012,10 +1720,10 @@ fn automation_script_rejects_wrong_schema_version() {
 }
 
 #[test]
-fn automation_limits_reject_exceeded_runtime_bytes_and_work() {
-    let limits = ProductAutomationLimits {
+fn automation_hard_safety_limits_reject_exceeded_runtime_bytes_and_work() {
+    let limits = ProductAutomationHardSafetyLimits {
         max_cpu_total_bytes: Some(100),
-        ..ProductAutomationLimits::default()
+        ..ProductAutomationHardSafetyLimits::default()
     };
     let diagnostics = runtime_diagnostics([101, 0, 0, 0, 0, 0, 0], 3, 1, 1, 2);
 
@@ -1026,9 +1734,9 @@ fn automation_limits_reject_exceeded_runtime_bytes_and_work() {
             .contains("cpu_total_bytes")
     );
 
-    let limits = ProductAutomationLimits {
+    let limits = ProductAutomationHardSafetyLimits {
         max_runtime_queued_requests: Some(2),
-        ..ProductAutomationLimits::default()
+        ..ProductAutomationHardSafetyLimits::default()
     };
     assert!(
         limits
@@ -1036,6 +1744,24 @@ fn automation_limits_reject_exceeded_runtime_bytes_and_work() {
             .unwrap_err()
             .contains("runtime_queued_requests")
     );
+}
+
+#[test]
+fn qualification_peak_above_conceptual_gate_remains_observational_below_hard_safety_cap() {
+    let conceptual_qualification_gate = 80;
+    let diagnostics = runtime_diagnostics([81, 0, 0, 0, 0, 0, 0], 3, 1, 1, 2);
+    let hard_safety_limits = ProductAutomationHardSafetyLimits {
+        max_cpu_total_bytes: Some(100),
+        ..ProductAutomationHardSafetyLimits::default()
+    };
+    let mut observations = ProductAutomationLimitObservations::default();
+
+    observations.observe_dataset_runtime(diagnostics);
+
+    assert!(observations.max_cpu_total_bytes > conceptual_qualification_gate);
+    hard_safety_limits
+        .check_dataset_runtime(diagnostics)
+        .unwrap();
 }
 
 #[test]

@@ -32,15 +32,15 @@ const GATE_OBSERVATION_SCHEMA_BYTES: &[u8] = include_bytes!(
     "../../../../verification/schemas/viewer-performance-ep01-gate-observation.schema.json"
 );
 const AUTHORITY_SCHEMA: &str = "mirante4d-viewer-performance-ep01-selection-authority";
-const AUTHORITY_SCHEMA_VERSION: u64 = 3;
+const AUTHORITY_SCHEMA_VERSION: u64 = 4;
 const COMMITTED_AUTHORITY_SHA256: &str =
-    "bcba48d78e0e522527136e90fa54ef28fb513feb8154d5ea1157ec9ab8ee4314";
+    "a36ddd0946fec512ec7e07b1b108306a2efd35dc2a4937a2764470c08521629d";
 const COMMITTED_AUTHORITY_SEMANTIC_SHA256: &str =
-    "7d2f2906650e7c81d02be5e447d9c345f836d0ab1b5df0c80b0227319face9b7";
+    "3726743ede90bc165566ff8aa7f526e100d38c1729d62d634e1c57690879c455";
 
 const GEOMETRY_AUTHORITIES: [&str; 4] = [
     "mirante4d-viewer-performance-workload-bundle-4",
-    "mirante4d-viewer-performance-script-bundle-3",
+    "mirante4d-viewer-performance-script-bundle-4",
     "mirante4d-viewer-performance-oracle-bundle-3",
     "mirante4d-viewer-performance-ep01-projection-input-1",
 ];

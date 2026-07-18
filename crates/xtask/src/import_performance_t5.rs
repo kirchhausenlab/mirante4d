@@ -45,16 +45,24 @@ use crate::{
         repository_identity,
     },
     process::cargo_command,
+    product_validate::{
+        PRODUCT_AUTOMATION_SCHEMA_VERSION, PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        canonical_product_automation_hard_safety_limits,
+        validate_product_automation_report_contract,
+    },
     t5_sentinel_oracle::{self, FACT_AUTHORITY, OracleFacts, OracleRequest},
     target_fixture::extract_target_u16_fixture,
+};
+
+#[cfg(test)]
+use crate::product_validate::{
+    PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS, PRODUCT_AUTOMATION_REPORT_SCHEMA,
 };
 
 const CONFIG_SCHEMA: &str = "mirante4d-private-import-performance-t5-2";
 const RAW_REPORT_SCHEMA: &str = "mirante4d-private-import-performance-t5-raw-5";
 const SANITIZED_REPORT_SCHEMA: &str = "mirante4d-import-performance-t5-summary-5";
 const ORACLE_AUDIT_REPORT_SCHEMA: &str = "mirante4d-import-performance-t5-oracle-audit-1";
-const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-const PRODUCT_AUTOMATION_SCHEMA_VERSION: u64 = 3;
 const PUBLICATION_CURRENTNESS_CONTRACT_ID: &str =
     "mirante4d-publication-currentness-inventory-snapshot-inventory-1";
 const SCALE_DIGEST_SCHEME: &str = "mirante4d-t5-canonical-scale-voxels-1";
@@ -2484,16 +2492,8 @@ fn run_sample(
         .mapped_window
         .context("T5 app never exposed the exact externally observed mapped client area")?;
     let automation_report = read_bounded_json(&automation_report_path, 32 * 1024 * 1024)?;
-    if automation_report.get("schema").and_then(Value::as_str)
-        != Some(PRODUCT_AUTOMATION_REPORT_SCHEMA)
-        || automation_report
-            .get("schema_version")
-            .and_then(Value::as_u64)
-            != Some(PRODUCT_AUTOMATION_SCHEMA_VERSION)
-        || automation_report.get("status").and_then(Value::as_str) != Some("passed")
-    {
-        bail!("T5 product automation report did not pass");
-    }
+    validate_product_automation_report_contract(&automation_report, &script, &script_path)
+        .context("T5 product automation report contract is invalid")?;
     let reported_binary = automation_report
         .get("binary")
         .and_then(Value::as_str)
@@ -2899,15 +2899,16 @@ fn automation_script(
     let inspection_timeout_ms = INSPECTION_TIMEOUT_SECONDS
         .checked_mul(1_000)
         .context("T5 inspection timeout overflowed")?;
+    let hard_safety_limits = canonical_product_automation_hard_safety_limits(&json!({
+        "max_cpu_total_bytes": 1024_u64 * 1024 * 1024,
+        "max_cpu_import_working_set_bytes": WORKING_MEMORY_BYTES,
+        "max_runtime_queued_requests": 192,
+    }))?;
     Ok(json!({
-        "schema": "mirante4d-product-automation-script",
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
         "scenario": "import_performance_t5_private",
-        "limits": {
-            "max_cpu_total_bytes": 1024_u64 * 1024 * 1024,
-            "max_cpu_import_working_set_bytes": WORKING_MEMORY_BYTES,
-            "max_runtime_queued_requests": 192,
-        },
+        "hard_safety_limits": hard_safety_limits,
         "commands": [
             { "command": "open_dataset", "path": startup_package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 10_000 },
@@ -4820,6 +4821,82 @@ mod tests {
             serde_json::from_value(valid_config_json(root)).unwrap();
         nonfinite_transform.expected.transforms[1].scale_zyx[0] = f64::INFINITY;
         assert!(validate_config(&nonfinite_transform).is_err());
+    }
+
+    #[test]
+    fn t5_automation_v4_binds_the_exact_canonical_hard_safety_echo() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config: T5Config = serde_json::from_value(valid_config_json(tempdir.path())).unwrap();
+        let script = automation_script(
+            &config,
+            &tempdir.path().join("startup.m4d"),
+            &tempdir.path().join("source"),
+            &tempdir.path().join("output"),
+            &tempdir.path().join("output/imported.m4d"),
+        )
+        .unwrap();
+        assert_eq!(script["schema"], PRODUCT_AUTOMATION_SCRIPT_SCHEMA);
+        assert_eq!(script["schema_version"], PRODUCT_AUTOMATION_SCHEMA_VERSION);
+        assert!(script.get("limits").is_none());
+        let hard_safety_limits = script["hard_safety_limits"].as_object().unwrap();
+        assert_eq!(
+            hard_safety_limits
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            hard_safety_limits["max_cpu_total_bytes"],
+            1024 * 1024 * 1024
+        );
+        assert_eq!(
+            hard_safety_limits["max_cpu_import_working_set_bytes"],
+            WORKING_MEMORY_BYTES
+        );
+        assert_eq!(hard_safety_limits["max_runtime_queued_requests"], 192);
+        assert_eq!(hard_safety_limits["max_cpu_prefetch_bytes"], Value::Null);
+
+        let script_path = tempdir.path().join("automation-script.json");
+        write_new_synced_json(&script_path, &script).unwrap();
+        let report = json!({
+            "schema": PRODUCT_AUTOMATION_REPORT_SCHEMA,
+            "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+            "status": "passed",
+            "failure_reason": null,
+            "script": {
+                "path": script_path,
+                "schema": script["schema"],
+                "schema_version": script["schema_version"],
+                "scenario": script["scenario"],
+                "command_count": script["commands"].as_array().unwrap().len(),
+            },
+            "hard_safety_limits": script["hard_safety_limits"],
+        });
+        validate_product_automation_report_contract(&report, &script, &script_path).unwrap();
+
+        let mut legacy = report.clone();
+        legacy["limits"] = json!({});
+        assert!(
+            validate_product_automation_report_contract(&legacy, &script, &script_path).is_err()
+        );
+        let mut missing_limit = report.clone();
+        missing_limit["hard_safety_limits"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_cpu_prefetch_bytes");
+        assert!(
+            validate_product_automation_report_contract(&missing_limit, &script, &script_path)
+                .is_err()
+        );
+        let mut wrong_count = report;
+        wrong_count["script"]["command_count"] = json!(0);
+        assert!(
+            validate_product_automation_report_contract(&wrong_count, &script, &script_path)
+                .is_err()
+        );
     }
 
     #[test]
