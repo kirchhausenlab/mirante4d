@@ -50,11 +50,24 @@ fn main() {
     .is_none_or(|output| !output.is_empty());
     let compiler = compiler_description();
     let environment = env::vars_os().collect::<BTreeMap<OsString, OsString>>();
+    let canonical_release_reasons = build_contract::canonical_release_environment_reason_codes(
+        &environment,
+        &env::var("TARGET").unwrap_or_else(|_| "unavailable".to_owned()),
+        &compiler,
+    );
     let canonical_release_contract = build_contract::canonical_release_environment_matches(
         &environment,
         &env::var("TARGET").unwrap_or_else(|_| "unavailable".to_owned()),
         &compiler,
     );
+    if environment_value_is_nonempty("MIRANTE4D_XTASK_QUALIFICATION_BUILD")
+        && !canonical_release_contract
+    {
+        println!(
+            "cargo:warning=canonical viewer release build rejected: {}",
+            canonical_release_reasons.join(",")
+        );
+    }
     let custom_rustflags = environment_value_is_nonempty("CARGO_ENCODED_RUSTFLAGS")
         || environment_value_is_nonempty("RUSTFLAGS");
     let rustc_wrapper = environment_value_is_nonempty("RUSTC_WRAPPER")

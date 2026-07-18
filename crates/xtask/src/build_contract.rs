@@ -28,30 +28,70 @@ pub(crate) fn canonical_release_environment_matches(
     target: &str,
     compiler: &str,
 ) -> bool {
-    CANONICAL_RELEASE_ENVIRONMENT
+    canonical_release_environment_reason_codes(variables, target, compiler).is_empty()
+}
+
+pub(crate) fn canonical_release_environment_reason_codes(
+    variables: &BTreeMap<OsString, OsString>,
+    target: &str,
+    compiler: &str,
+) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    for (name, expected) in CANONICAL_RELEASE_ENVIRONMENT
         .iter()
         .chain(std::iter::once(&CANONICAL_RELEASE_STRIP))
-        .all(|(name, expected)| variables.get(OsStr::new(name)) == Some(&OsString::from(expected)))
-        && variables.iter().all(|(name, value)| {
-            let name = name.to_string_lossy();
-            !name.starts_with("CARGO_PROFILE_RELEASE_")
-                || CANONICAL_RELEASE_ENVIRONMENT
-                    .iter()
-                    .chain(std::iter::once(&CANONICAL_RELEASE_STRIP))
-                    .any(|(accepted, _)| name == *accepted)
-                || value.is_empty()
-        })
-        && ["CARGO_BUILD_TARGET", "CARGO_INCREMENTAL", "RUSTC_BOOTSTRAP"]
-            .iter()
-            .all(|name| {
-                variables
-                    .get(OsStr::new(name))
-                    .is_none_or(|value| value.is_empty())
-            })
-        && compiler
-            .lines()
-            .find_map(|line| line.strip_prefix("host: "))
-            == Some(target)
+    {
+        if variables.get(OsStr::new(name)) != Some(&OsString::from(expected)) {
+            reasons.push(match *name {
+                "MIRANTE4D_XTASK_QUALIFICATION_BUILD" => "qualification_marker_mismatch",
+                "CARGO_PROFILE_RELEASE_OPT_LEVEL" => "release_opt_level_mismatch",
+                "CARGO_PROFILE_RELEASE_DEBUG" => "release_debug_mismatch",
+                "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS" => "release_debug_assertions_mismatch",
+                "CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS" => "release_overflow_checks_mismatch",
+                "CARGO_PROFILE_RELEASE_INCREMENTAL" => "release_incremental_mismatch",
+                "CARGO_PROFILE_RELEASE_LTO" => "release_lto_mismatch",
+                "CARGO_PROFILE_RELEASE_PANIC" => "release_panic_mismatch",
+                "CARGO_PROFILE_RELEASE_CODEGEN_UNITS" => "release_codegen_units_mismatch",
+                "CARGO_PROFILE_RELEASE_RPATH" => "release_rpath_mismatch",
+                "CARGO_PROFILE_RELEASE_STRIP" => "release_strip_mismatch",
+                _ => "release_environment_mismatch",
+            });
+        }
+    }
+    if !variables.iter().all(|(name, value)| {
+        let name = name.to_string_lossy();
+        !name.starts_with("CARGO_PROFILE_RELEASE_")
+            || CANONICAL_RELEASE_ENVIRONMENT
+                .iter()
+                .chain(std::iter::once(&CANONICAL_RELEASE_STRIP))
+                .any(|(accepted, _)| name == *accepted)
+            || value.is_empty()
+    }) {
+        reasons.push("unexpected_release_profile_override");
+    }
+    for (name, reason) in [
+        ("CARGO_BUILD_TARGET", "cargo_build_target_override"),
+        ("CARGO_INCREMENTAL", "cargo_incremental_override"),
+        ("RUSTC_BOOTSTRAP", "rustc_bootstrap_override"),
+    ] {
+        if variables
+            .get(OsStr::new(name))
+            .is_some_and(|value| !value.is_empty())
+        {
+            reasons.push(reason);
+        }
+    }
+    if compiler
+        .lines()
+        .flat_map(|line| line.split("\\n"))
+        .find_map(|line| line.strip_prefix("host: "))
+        != Some(target)
+    {
+        reasons.push("compiler_host_target_mismatch");
+    }
+    reasons.sort_unstable();
+    reasons.dedup();
+    reasons
 }
 
 #[cfg(test)]
