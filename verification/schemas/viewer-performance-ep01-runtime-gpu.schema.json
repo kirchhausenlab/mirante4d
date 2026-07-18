@@ -1,0 +1,403 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "viewer-performance-ep01-runtime-gpu.schema.json",
+  "title": "Mirante4D EP-01 runtime and GPU evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "selection_authority_sha256",
+    "candidate_edge",
+    "successor_executable_sha256",
+    "layout_manifest_sha256",
+    "shader_modules",
+    "layout_bindings",
+    "adapter",
+    "capacity",
+    "pipeline_counters",
+    "samples",
+    "resource_ledger_closed"
+  ],
+  "properties": {
+    "schema": {
+      "const": "mirante4d-viewer-performance-ep01-runtime-gpu-evidence-1"
+    },
+    "selection_authority_sha256": {
+      "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+    },
+    "candidate_edge": {
+      "$ref": "viewer-performance-ep01-common.schema.json#/$defs/candidate_edge"
+    },
+    "successor_executable_sha256": {
+      "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+    },
+    "layout_manifest_sha256": {
+      "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+    },
+    "shader_modules": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "$ref": "#/$defs/shader_module"
+      }
+    },
+    "layout_bindings": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "$ref": "#/$defs/layout_binding"
+      }
+    },
+    "adapter": {
+      "$ref": "#/$defs/adapter"
+    },
+    "capacity": {
+      "$ref": "#/$defs/capacity"
+    },
+    "pipeline_counters": {
+      "$ref": "#/$defs/pipeline_counters"
+    },
+    "samples": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 262144,
+      "items": {
+        "$ref": "#/$defs/sample"
+      }
+    },
+    "resource_ledger_closed": {
+      "const": true
+    }
+  },
+  "$defs": {
+    "shader_module": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pipeline_tag",
+        "pipeline",
+        "wgsl_sha256",
+        "naga_module_sha256",
+        "layout_sha256",
+        "warmed"
+      ],
+      "properties": {
+        "pipeline_tag": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u8"
+        },
+        "pipeline": {
+          "enum": [
+            "plane",
+            "mip",
+            "dvr",
+            "iso",
+            "mixed",
+            "pick"
+          ]
+        },
+        "wgsl_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "naga_module_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "layout_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "warmed": {
+          "const": true
+        }
+      }
+    },
+    "layout_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "group",
+        "binding",
+        "binding_kind",
+        "visibility_mask",
+        "minimum_binding_size_bytes",
+        "record_stride_bytes",
+        "dynamic_offset",
+        "fields"
+      ],
+      "properties": {
+        "group": {
+          "enum": [
+            0,
+            2
+          ]
+        },
+        "binding": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "binding_kind": {
+          "enum": [
+            "uniform",
+            "read_only_storage",
+            "read_write_storage"
+          ]
+        },
+        "visibility_mask": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "minimum_binding_size_bytes": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "record_stride_bytes": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "dynamic_offset": {
+          "const": false
+        },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/layout_field"
+          }
+        }
+      }
+    },
+    "layout_field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "field_ordinal",
+        "field_path",
+        "host_type",
+        "wgsl_type",
+        "byte_offset",
+        "byte_size",
+        "field_stride_bytes"
+      ],
+      "properties": {
+        "field_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "field_path": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/ascii"
+        },
+        "host_type": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/ascii"
+        },
+        "wgsl_type": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/ascii"
+        },
+        "byte_offset": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "byte_size": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "field_stride_bytes": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        }
+      }
+    },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend",
+        "adapter_name",
+        "vendor_id",
+        "device_id",
+        "driver",
+        "limits",
+        "timestamp_period_f32_bits"
+      ],
+      "properties": {
+        "backend": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/ascii"
+        },
+        "adapter_name": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/ascii"
+        },
+        "vendor_id": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "device_id": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "driver": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/ascii"
+        },
+        "limits": {
+          "$ref": "#/$defs/adapter_limits"
+        },
+        "timestamp_period_f32_bits": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}(?![\\s\\S])"
+        }
+      }
+    },
+    "adapter_limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_bind_groups",
+        "max_bindings_per_bind_group",
+        "max_uniform_buffers_per_shader_stage",
+        "max_storage_buffers_per_shader_stage",
+        "max_uniform_buffer_binding_size",
+        "max_storage_buffer_binding_size",
+        "max_buffer_size",
+        "max_dynamic_uniform_buffers_per_pipeline_layout",
+        "max_dynamic_storage_buffers_per_pipeline_layout",
+        "min_uniform_buffer_offset_alignment",
+        "min_storage_buffer_offset_alignment"
+      ],
+      "properties": {
+        "max_bind_groups": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "max_bindings_per_bind_group": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "max_uniform_buffers_per_shader_stage": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "max_storage_buffers_per_shader_stage": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "max_uniform_buffer_binding_size": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "max_storage_buffer_binding_size": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "max_buffer_size": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "max_dynamic_uniform_buffers_per_pipeline_layout": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "max_dynamic_storage_buffers_per_pipeline_layout": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "min_uniform_buffer_offset_alignment": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "min_storage_buffer_offset_alignment": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        }
+      }
+    },
+    "capacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "live_page_cap",
+        "page_record_capacity",
+        "directory_capacity",
+        "persistent_nonpayload_bytes",
+        "resource_ceiling_bytes",
+        "segment_limit_bytes",
+        "total_arena_bytes",
+        "segment_count",
+        "segment_bytes",
+        "shared_dummy_bytes"
+      ],
+      "properties": {
+        "live_page_cap": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "page_record_capacity": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "directory_capacity": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "persistent_nonpayload_bytes": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "resource_ceiling_bytes": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "segment_limit_bytes": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "total_arena_bytes": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "segment_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4
+        },
+        "segment_bytes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+          }
+        },
+        "shared_dummy_bytes": {
+          "const": "4"
+        }
+      }
+    },
+    "pipeline_counters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "renderer_pipelines",
+        "pick_pipelines",
+        "interaction_pipeline_compiles",
+        "maximum_common_private_array_entries"
+      ],
+      "properties": {
+        "renderer_pipelines": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "pick_pipelines": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "interaction_pipeline_compiles": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "maximum_common_private_array_entries": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric_path",
+        "unit",
+        "tie_key",
+        "numerator",
+        "denominator",
+        "validated"
+      ],
+      "properties": {
+        "metric_path": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/ascii"
+        },
+        "unit": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/unit"
+        },
+        "tie_key": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/tie_key"
+        },
+        "numerator": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u128d"
+        },
+        "denominator": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u128d"
+        },
+        "validated": {
+          "const": true
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "viewer-performance-ep01-trace.schema.json",
+  "title": "Mirante4D EP-01 ordered and unique trace evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "selection_authority_sha256",
+    "projection_input_sidecar_sha256",
+    "candidate_edge",
+    "package_set_generation_sha256",
+    "families"
+  ],
+  "properties": {
+    "schema": {
+      "const": "mirante4d-viewer-performance-ep01-trace-evidence-1"
+    },
+    "selection_authority_sha256": {
+      "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+    },
+    "projection_input_sidecar_sha256": {
+      "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+    },
+    "candidate_edge": {
+      "$ref": "viewer-performance-ep01-common.schema.json#/$defs/candidate_edge"
+    },
+    "package_set_generation_sha256": {
+      "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+    },
+    "families": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/family"
+      }
+    }
+  },
+  "$defs": {
+    "family": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "family_tag",
+        "family",
+        "ordered_sha256",
+        "ordered_state_count",
+        "ordered_key_count",
+        "unique_sha256",
+        "unique_key_count",
+        "unique_payload_bytes"
+      ],
+      "properties": {
+        "family_tag": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u8"
+        },
+        "family": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/trace_family"
+        },
+        "ordered_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "ordered_state_count": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "ordered_key_count": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "unique_sha256": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+        },
+        "unique_key_count": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "unique_payload_bytes": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        }
+      }
+    }
+  }
+}

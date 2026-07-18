@@ -39,12 +39,20 @@ and pass schema/parity checks. One fresh normal-product IP run passed; focused
 evidence also records the predecessor's perspective-distance, four-panel LOD,
 temporal handoff, and prepared-layout failures without averaging them away.
 
-The immediate next action is to freeze the worktree as one clean immutable
-baseline revision and run the complete predecessor protocol against that exact
-release build. EP-01 may begin only after the resulting receipt proves that
-every scenario is attributable and preserves every failure rather than hiding
-it behind a timeout or missing metric. The integrated first-overhaul source
-and its supporting evidence remain current implemented facts in
+The first complete predecessor sampling launch was stopped before acceptance
+when a read-only audit found that the EP-01 selection authority did not yet
+freeze byte-exact candidate identity, package, checkpoint, ordered-trace,
+GPU-lookup, gate-operand, and receipt contracts. Its partial evidence is
+preserved as interrupted evidence and is not reused. The version-3 authority
+and its eight hash-bound evidence schemas are now strict, bounded, and
+internally validated. The immediate next action is to land that correction and
+its rotated opaque profile authority as one clean immutable revision, bind the
+private profile to that exact revision, and rerun the complete predecessor
+protocol against that exact release build. EP-01 may begin only after the
+resulting receipt proves that every scenario is
+attributable and preserves every failure rather than hiding it behind a timeout
+or missing metric. The integrated first-overhaul source and its supporting
+evidence remain current implemented facts in
 [Current state](../CURRENT_STATE.md) until the atomic successor hard cutover
 passes its ordered gates.
 

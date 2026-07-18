@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "viewer-performance-ep01-projection-input.schema.json",
+  "title": "Mirante4D EP-01 private projection-input sidecar",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "selection_authority_sha256",
+    "workload_bundle_sha256",
+    "script_bundle_sha256",
+    "oracle_bundle_sha256",
+    "records"
+  ],
+  "properties": {
+    "schema": {
+      "const": "mirante4d-viewer-performance-ep01-projection-input-1"
+    },
+    "selection_authority_sha256": {
+      "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+    },
+    "workload_bundle_sha256": {
+      "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+    },
+    "script_bundle_sha256": {
+      "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+    },
+    "oracle_bundle_sha256": {
+      "$ref": "viewer-performance-ep01-common.schema.json#/$defs/sha256"
+    },
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 262144,
+      "items": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/plane_record"
+          },
+          {
+            "$ref": "#/$defs/volume_record"
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "plane_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_ordinal",
+        "global_state_ordinal",
+        "scenario_tag",
+        "phase_ordinal",
+        "state_kind",
+        "sample_ordinal",
+        "package_role_tag",
+        "package_role",
+        "panel_ordinal",
+        "layer_ordinal",
+        "time_index",
+        "scale_ordinal",
+        "pixel_width",
+        "pixel_height",
+        "projection_kind_tag",
+        "projection_kind",
+        "sampling",
+        "grid_at_pixel_0_center_f64_bits",
+        "grid_step_x_f64_bits",
+        "grid_step_y_f64_bits"
+      ],
+      "properties": {
+        "record_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "global_state_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "scenario_tag": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u8"
+        },
+        "phase_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "state_kind": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u8"
+        },
+        "sample_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "package_role_tag": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u8"
+        },
+        "package_role": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/package_role"
+        },
+        "panel_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "layer_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "time_index": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "scale_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "pixel_width": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "pixel_height": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "projection_kind_tag": {
+          "const": 0
+        },
+        "projection_kind": {
+          "const": "plane"
+        },
+        "sampling": {
+          "enum": [
+            "nearest",
+            "smooth_linear"
+          ]
+        },
+        "grid_at_pixel_0_center_f64_bits": {
+          "$ref": "#/$defs/f64_vector3"
+        },
+        "grid_step_x_f64_bits": {
+          "$ref": "#/$defs/f64_vector3"
+        },
+        "grid_step_y_f64_bits": {
+          "$ref": "#/$defs/f64_vector3"
+        }
+      }
+    },
+    "volume_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_ordinal",
+        "global_state_ordinal",
+        "scenario_tag",
+        "phase_ordinal",
+        "state_kind",
+        "sample_ordinal",
+        "package_role_tag",
+        "package_role",
+        "panel_ordinal",
+        "layer_ordinal",
+        "time_index",
+        "scale_ordinal",
+        "pixel_width",
+        "pixel_height",
+        "projection_kind_tag",
+        "projection_kind",
+        "mode",
+        "clip_to_grid_row_major_f64_bits"
+      ],
+      "properties": {
+        "record_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "global_state_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "scenario_tag": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u8"
+        },
+        "phase_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "state_kind": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u8"
+        },
+        "sample_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "package_role_tag": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u8"
+        },
+        "package_role": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/package_role"
+        },
+        "panel_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "layer_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "time_index": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u64d"
+        },
+        "scale_ordinal": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "pixel_width": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "pixel_height": {
+          "$ref": "viewer-performance-ep01-common.schema.json#/$defs/u32"
+        },
+        "projection_kind_tag": {
+          "const": 1
+        },
+        "projection_kind": {
+          "const": "volume"
+        },
+        "mode": {
+          "enum": [
+            "mip",
+            "dvr",
+            "iso"
+          ]
+        },
+        "clip_to_grid_row_major_f64_bits": {
+          "$ref": "#/$defs/f64_matrix4x4"
+        }
+      }
+    },
+    "f64_vector3": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "$ref": "viewer-performance-ep01-common.schema.json#/$defs/f64bits"
+      }
+    },
+    "f64_matrix4x4": {
+      "type": "array",
+      "minItems": 16,
+      "maxItems": 16,
+      "items": {
+        "$ref": "viewer-performance-ep01-common.schema.json#/$defs/f64bits"
+      }
+    }
+  }
+}

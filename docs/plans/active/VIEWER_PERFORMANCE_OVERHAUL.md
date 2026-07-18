@@ -248,6 +248,15 @@ The current 256-cubed spatial cohort is the baseline. A simple row-major
 versus Morton-order comparison is allowed if range traces show ordering is
 material. Losing candidates are deleted.
 
+The byte-exact EP-01 selection authority fixes the compound-shard candidates
+as a native Mirante4D profile with no Zarr or OME-NGFF interoperability claim.
+It emits no Zarr/OME array, group, or mirror objects. This remains an isolated
+candidate contract until the atomic EP-02-through-EP-06 activation. If a
+candidate passes and is selected, that hard cut also supersedes the current
+OME-NGFF/Zarr-specific parts of ADR-0002 and updates Data Format; the current
+product contract remains implemented until then. A non-authoritative mirror
+or dual reader is not an allowed transition mechanism.
+
 ### Codec
 
 The current native little-endian, independently framed Zstandard level-3
@@ -1319,6 +1328,12 @@ arbitrary-plane and 3D requirements before freezing the format.
 
 Required work:
 
+- Treat
+  [`verification/viewer-performance-ep01-selection.json`](../../../verification/viewer-performance-ep01-selection.json)
+  and its hash-bound files in `verification/schemas/` as the byte-exact
+  candidate, trace, gate, and evidence authority. Candidate construction or
+  qualification is invalid if that authority, any bound schema, its external
+  profile binding, or the immutable revision differs.
 - In the isolated successor importer, first replace total-work-unit-
   proportional journal/checkpoint bookkeeping with ordinal fixed records and
   bounded read windows. This benchmark/candidate substrate must be in place
