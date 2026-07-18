@@ -1219,6 +1219,7 @@ fn completed_product_validation_rejects_nonblank_loading_reference_capture() {
 fn resident_navigation_report() -> Value {
     let snapshot = |reads: u64,
                     submissions: u64,
+                    timing_preludes: u64,
                     retained: u64,
                     gpu_timings: u64,
                     cpu_timings: u64,
@@ -1255,6 +1256,7 @@ fn resident_navigation_report() -> Value {
                 "retained_navigation_frames": retained,
                 "timing": {
                     "enabled": true,
+                    "gpu_timing_prelude_submissions": timing_preludes,
                     "completed": gpu_timings,
                     "cpu": {"completed": cpu_timings},
                 },
@@ -1282,9 +1284,9 @@ fn resident_navigation_report() -> Value {
         },
         "artifacts": [],
         "diagnostics": [
-            snapshot(7, 10, 2, 1, 1, 1),
-            snapshot(7, 12, 4, 3, 3, 3),
-            snapshot(7, 12, 4, 3, 3, 3),
+            snapshot(7, 10, 1, 2, 1, 1, 1),
+            snapshot(7, 14, 3, 4, 3, 3, 3),
+            snapshot(7, 14, 3, 4, 3, 3, 3),
         ],
         "final_diagnostics": {
             "render": {
@@ -1309,7 +1311,13 @@ fn resident_navigation_completion_accepts_current_exact_no_capture_evidence() {
 
     assert_eq!(status, ProductValidationStatus::Passed);
     assert_eq!(reason, None);
-    assert!(resident_navigation_evidence(Some(&report)).is_ok());
+    let evidence = resident_navigation_evidence(Some(&report)).unwrap();
+    assert_eq!(evidence["retained_navigation_frames"], 2);
+    assert_eq!(evidence["navigation_queue_submissions"], 4);
+    assert_eq!(evidence["navigation_execution_submissions"], 2);
+    assert_eq!(evidence["navigation_gpu_timing_prelude_submissions"], 2);
+    assert_eq!(evidence["completed_gpu_timings"], 2);
+    assert_eq!(evidence["cpu_renderer_timing"]["completed"], 2);
 }
 
 #[test]
@@ -1365,6 +1373,33 @@ fn resident_navigation_evidence_rejects_fewer_gpu_timings_than_publications() {
     let error = resident_navigation_evidence(Some(&report)).unwrap_err();
 
     assert!(error.contains("execution/publication counts disagree"));
+}
+
+#[test]
+fn resident_navigation_evidence_rejects_missing_execution_submission() {
+    let mut report = resident_navigation_report();
+    report["diagnostics"][1]["gpu_adapter"]["queue_submissions"] = json!(13);
+    report["diagnostics"][2]["gpu_adapter"]["queue_submissions"] = json!(13);
+
+    let error = resident_navigation_evidence(Some(&report)).unwrap_err();
+
+    assert!(error.contains("execution/publication counts disagree"));
+    assert!(error.contains("queue_submissions=3"));
+    assert!(error.contains("execution_submissions=1"));
+    assert!(error.contains("GPU_timing_prelude_submissions=2"));
+}
+
+#[test]
+fn resident_navigation_evidence_rejects_fewer_timing_preludes_than_publications() {
+    let mut report = resident_navigation_report();
+    report["diagnostics"][1]["gpu_adapter"]["timing"]["gpu_timing_prelude_submissions"] = json!(2);
+    report["diagnostics"][2]["gpu_adapter"]["timing"]["gpu_timing_prelude_submissions"] = json!(2);
+
+    let error = resident_navigation_evidence(Some(&report)).unwrap_err();
+
+    assert!(error.contains("execution/publication counts disagree"));
+    assert!(error.contains("execution_submissions=3"));
+    assert!(error.contains("GPU_timing_prelude_submissions=1"));
 }
 
 #[test]

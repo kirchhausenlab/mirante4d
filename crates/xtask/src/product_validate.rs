@@ -1634,6 +1634,23 @@ fn resident_navigation_evidence(report: Option<&Value>) -> Result<Value, String>
     {
         return Err("resident-navigation GPU timing was requested but is not enabled".to_owned());
     }
+    let navigation_timing_prelude_submissions = resident_navigation_delta(
+        baseline,
+        navigated,
+        "/gpu_adapter/timing/gpu_timing_prelude_submissions",
+        "GPU timing prelude submissions",
+    )?;
+    let idle_timing_prelude_submissions = resident_navigation_delta(
+        navigated,
+        idle,
+        "/gpu_adapter/timing/gpu_timing_prelude_submissions",
+        "post-settle GPU timing prelude submissions",
+    )?;
+    if idle_timing_prelude_submissions != 0 {
+        return Err(format!(
+            "120 settled frames added {idle_timing_prelude_submissions} GPU timing prelude submissions"
+        ));
+    }
     let completed_gpu_timings = resident_navigation_delta(
         baseline,
         navigated,
@@ -1688,13 +1705,19 @@ fn resident_navigation_evidence(report: Option<&Value>) -> Result<Value, String>
     if navigation_publications == 0 {
         return Err("resident-navigation published no current 3D frame".to_owned());
     }
+    let navigation_execution_submissions = navigation_queue_submissions
+        .checked_sub(navigation_timing_prelude_submissions)
+        .ok_or_else(|| {
+            "resident-navigation GPU timing preludes exceeded total queue submissions".to_owned()
+        })?;
     if retained_navigation_frames != navigation_publications
-        || navigation_queue_submissions != navigation_publications
+        || navigation_execution_submissions != navigation_publications
+        || navigation_timing_prelude_submissions != navigation_publications
         || completed_gpu_timings != navigation_publications
         || completed_cpu_timings != navigation_publications
     {
         return Err(format!(
-            "resident-navigation execution/publication counts disagree: publications={navigation_publications}, retained_frames={retained_navigation_frames}, queue_submissions={navigation_queue_submissions}, GPU_timings={completed_gpu_timings}, CPU_timings={completed_cpu_timings}"
+            "resident-navigation execution/publication counts disagree: publications={navigation_publications}, retained_frames={retained_navigation_frames}, queue_submissions={navigation_queue_submissions}, execution_submissions={navigation_execution_submissions}, GPU_timing_prelude_submissions={navigation_timing_prelude_submissions}, GPU_timings={completed_gpu_timings}, CPU_timings={completed_cpu_timings}"
         ));
     }
     if idle_publications != navigated_publications {
@@ -1778,7 +1801,10 @@ fn resident_navigation_evidence(report: Option<&Value>) -> Result<Value, String>
         "warm_navigation": warm_deltas,
         "retained_navigation_frames": retained_navigation_frames,
         "navigation_queue_submissions": navigation_queue_submissions,
+        "navigation_execution_submissions": navigation_execution_submissions,
+        "navigation_gpu_timing_prelude_submissions": navigation_timing_prelude_submissions,
         "post_settle_idle_queue_submissions": idle_queue_submissions,
+        "post_settle_gpu_timing_prelude_submissions": idle_timing_prelude_submissions,
         "completed_gpu_timings": completed_gpu_timings,
         "post_settle_completed_gpu_timings": idle_gpu_timings,
         "cpu_renderer_timing": {
