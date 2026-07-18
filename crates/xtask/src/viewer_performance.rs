@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use crate::host::{host_hardware_identity, repository_identity};
 
-const PROFILE_SCHEMA: &str = "mirante4d-viewer-performance-qualification-profile-4";
+const PROFILE_SCHEMA: &str = "mirante4d-viewer-performance-qualification-profile-5";
 const PROFILE_AUTHORITY_SCHEMA: &str = "mirante4d-viewer-performance-profile-authority";
 const PROFILE_AUTHORITY_SCHEMA_VERSION: u64 = 1;
 const PROFILE_AUTHORITY_BYTES: &[u8] =
@@ -219,6 +219,7 @@ struct AbsoluteGates {
     cold_complete_coarse_ns: u64,
     cold_target_settlement_ns: u64,
     nonresident_target_settlement_ns: u64,
+    source_verification_completion_ns: u64,
     maximum_instrumentation_overhead_basis_points: u32,
 }
 
@@ -661,6 +662,10 @@ fn profile_contract_sha256(profile: &ViewerQualificationProfile) -> String {
             .to_string(),
         profile
             .absolute_gates
+            .source_verification_completion_ns
+            .to_string(),
+        profile
+            .absolute_gates
             .maximum_instrumentation_overhead_basis_points
             .to_string(),
     ]);
@@ -833,8 +838,8 @@ fn validate_protocol(protocol: &ProtocolBinding) -> anyhow::Result<()> {
     if protocol.automatic_retries != 0 {
         bail!("protocol.automatic_retries must be zero")
     }
-    if protocol.development_samples != 5 {
-        bail!("protocol.development_samples must be exactly five")
+    if protocol.development_samples != 3 {
+        bail!("protocol.development_samples must be exactly three")
     }
     Ok(())
 }
@@ -906,6 +911,7 @@ fn validate_gates(gates: &AbsoluteGates) -> anyhow::Result<()> {
         gates.cold_complete_coarse_ns,
         gates.cold_target_settlement_ns,
         gates.nonresident_target_settlement_ns,
+        gates.source_verification_completion_ns,
     ];
     if duration_gates.contains(&0) {
         bail!("every absolute duration gate must be nonzero")
@@ -928,6 +934,23 @@ fn validate_gates(gates: &AbsoluteGates) -> anyhow::Result<()> {
     {
         bail!("absolute gate ordering is incoherent")
     }
+    const MAX_LONG_VIEWER_DEADLINE_NS: u64 = 30_000_000_000;
+    if [
+        gates.cold_first_useful_ns,
+        gates.cold_complete_coarse_ns,
+        gates.cold_target_settlement_ns,
+        gates.nonresident_target_settlement_ns,
+        gates.source_verification_completion_ns,
+    ]
+    .into_iter()
+    .any(|deadline| deadline > MAX_LONG_VIEWER_DEADLINE_NS)
+    {
+        bail!("cold, nonresident, and source-verification gates must not exceed 30 seconds")
+    }
+    gates
+        .maximum_current_presentation_gap_ns
+        .checked_mul(2)
+        .context("resident presentation deadline plus one poll grace overflows")?;
     if gates.maximum_instrumentation_overhead_basis_points == 0
         || gates.maximum_instrumentation_overhead_basis_points > 10_000
     {
@@ -1679,7 +1702,7 @@ fn resource_fingerprint(resources: &ResourceBinding) -> String {
 
 fn gate_fingerprint(gates: &AbsoluteGates) -> String {
     fingerprint(
-        b"mirante4d-viewer-absolute-gate-binding-1\0",
+        b"mirante4d-viewer-absolute-gate-binding-2\0",
         &[
             gates
                 .resident_input_to_current_presentation_p95_ns
@@ -1695,6 +1718,7 @@ fn gate_fingerprint(gates: &AbsoluteGates) -> String {
             gates.cold_complete_coarse_ns.to_string(),
             gates.cold_target_settlement_ns.to_string(),
             gates.nonresident_target_settlement_ns.to_string(),
+            gates.source_verification_completion_ns.to_string(),
             gates
                 .maximum_instrumentation_overhead_basis_points
                 .to_string(),
@@ -1835,7 +1859,7 @@ mod tests {
         );
 
         let mut predecessor = test_profile_value(temporary.path());
-        predecessor["schema"] = json!("mirante4d-viewer-performance-qualification-profile-3");
+        predecessor["schema"] = json!("mirante4d-viewer-performance-qualification-profile-4");
         let predecessor: ViewerQualificationProfile = serde_json::from_value(predecessor).unwrap();
         assert!(validate_profile(&predecessor).is_err());
 
@@ -1892,7 +1916,7 @@ mod tests {
                 .contains("must be release")
         );
 
-        for samples in [3, 4, 6] {
+        for samples in [1, 2, 4, 5] {
             value = test_profile_value(Path::new("/private"));
             value["protocol"]["development_samples"] = json!(samples);
             let profile: ViewerQualificationProfile =
@@ -1901,7 +1925,7 @@ mod tests {
                 validate_profile(&profile)
                     .unwrap_err()
                     .to_string()
-                    .contains("exactly five")
+                    .contains("exactly three")
             );
         }
 
@@ -2057,6 +2081,10 @@ mod tests {
             (
                 "/absolute_gates/nonresident_target_settlement_ns",
                 json!(1_000_000_001_u64),
+            ),
+            (
+                "/absolute_gates/source_verification_completion_ns",
+                json!(2_000_000_001_u64),
             ),
             (
                 "/absolute_gates/maximum_instrumentation_overhead_basis_points",
@@ -2315,7 +2343,7 @@ GPU1:
                 "competing_activity": "none",
                 "power_state": "balanced",
                 "automatic_retries": 0,
-                "development_samples": 5,
+                "development_samples": 3,
             },
             "extents": {
                 "blocking_qualification": { "width": 1280, "height": 720 },
@@ -2344,6 +2372,7 @@ GPU1:
                 "cold_complete_coarse_ns": 250_000_000,
                 "cold_target_settlement_ns": 2_000_000_000_u64,
                 "nonresident_target_settlement_ns": 2_000_000_000_u64,
+                "source_verification_completion_ns": 2_000_000_000_u64,
                 "maximum_instrumentation_overhead_basis_points": 500,
             },
         })

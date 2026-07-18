@@ -22,7 +22,7 @@ use crate::{
 const PRODUCT_VALIDATION_SCHEMA: &str = "mirante4d-product-validation-report";
 pub(crate) const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 pub(crate) const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-pub(crate) const PRODUCT_AUTOMATION_SCHEMA_VERSION: u32 = 4;
+pub(crate) const PRODUCT_AUTOMATION_SCHEMA_VERSION: u32 = 5;
 pub(crate) const PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS: [&str; 12] = [
     "max_cpu_total_bytes",
     "max_cpu_decoded_residency_bytes",

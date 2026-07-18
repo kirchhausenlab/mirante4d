@@ -8,8 +8,9 @@ use std::{
 
 use eframe::egui;
 use mirante4d_application::{
-    ApplicationCommand, ApplicationEvent, CommandEffect, CrossSectionPanelId, OperationToken,
-    PresentationSlot, ProjectStoreLifecycle, SourceVerificationSnapshot, WorkspaceSnapshot,
+    ApplicationCommand, ApplicationEvent, ApplicationSnapshot, CommandEffect, CrossSectionPanelId,
+    OperationToken, PresentationSlot, ProjectStoreLifecycle, SourceVerificationSnapshot,
+    WorkspaceSnapshot,
     import_workflow::{
         ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportWorkflowSnapshot,
     },
@@ -158,8 +159,8 @@ fn assertion_capture_panels(condition: &ProductAutomationAssertCondition) -> Vec
 }
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-const AUTOMATION_GATE_OBSERVATION_SCHEMA: &str = "mirante4d-product-gate-observation-1";
-const AUTOMATION_SCHEMA_VERSION: u32 = 4;
+const AUTOMATION_GATE_BATCH_OBSERVATION_SCHEMA: &str = "mirante4d-product-gate-batch-observation-1";
+const AUTOMATION_SCHEMA_VERSION: u32 = 5;
 
 fn dispatch_application_command(
     app: &mut MiranteWorkbenchApp,
@@ -503,6 +504,13 @@ fn frame_freshness_is_current(fidelity: &crate::FrameFidelityStatus) -> bool {
 }
 
 fn coordinated_visible_layout_current_complete(app: &MiranteWorkbenchApp) -> bool {
+    coordinated_visible_layout_current_complete_with_snapshot(app, &app.application.snapshot())
+}
+
+fn coordinated_visible_layout_current_complete_with_snapshot(
+    app: &MiranteWorkbenchApp,
+    snapshot: &ApplicationSnapshot,
+) -> bool {
     let generation = app.render_coordination.display_generation();
     if generation.current_presentation_generation != Some(generation.input_generation)
         || app.dataset.staging_current_refinement()
@@ -515,8 +523,7 @@ fn coordinated_visible_layout_current_complete(app: &MiranteWorkbenchApp) -> boo
     {
         return false;
     }
-    let snapshot = app.application.snapshot();
-    match application_view(&snapshot).layout() {
+    match application_view(snapshot).layout() {
         ViewerLayout::Single3d => true,
         ViewerLayout::FourPanel => [
             PresentationSlot::Xy,
@@ -552,94 +559,147 @@ enum ProductGateObservationOutcome {
     Failed,
 }
 
-#[derive(Debug, Serialize)]
-struct ProductGateObservationDetails<'a> {
-    schema: &'static str,
-    gate_id: &'a str,
-    condition: &'static str,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LatchedProductGateObservation {
     outcome: ProductGateObservationOutcome,
     condition_met: bool,
     timed_out: bool,
-    timeout_ms: u64,
-    waited_ns: u64,
+    observed_after_origin_ns: u64,
 }
 
-fn product_gate_observation_progress(
-    gate_id: &str,
-    condition: ProductAutomationWaitCondition,
-    timeout_ms: u64,
-    condition_met: bool,
-    waited: Duration,
-) -> CommandProgress {
-    product_named_gate_observation_progress(
-        gate_id,
-        condition.name(),
-        condition.is_passive(),
-        timeout_ms,
-        condition_met,
-        waited,
-    )
-}
-
-fn product_imported_open_ready_observation_progress(
-    gate_id: &str,
-    timeout_ms: u64,
-    condition_met: bool,
-    waited: Duration,
-) -> CommandProgress {
-    product_named_gate_observation_progress(
-        gate_id,
-        "imported_open_ready",
-        false,
-        timeout_ms,
-        condition_met,
-        waited,
-    )
-}
-
-fn imported_open_ready_observation_requires_measurement(
-    timeout_ms: u64,
-    condition_met: bool,
-    waited: Duration,
-) -> bool {
-    condition_met && waited < Duration::from_millis(timeout_ms)
-}
-
-fn product_named_gate_observation_progress(
-    gate_id: &str,
+#[derive(Debug, Serialize)]
+struct ProductGateBatchObservationDetails<'a> {
+    observation_index: usize,
+    gate_id: &'a str,
     condition: &'static str,
-    passive: bool,
-    timeout_ms: u64,
+    deadline_authority: ProductAutomationGateDeadlineAuthority,
+    deadline_after_origin_ns: u64,
+    outcome: ProductGateObservationOutcome,
     condition_met: bool,
-    waited: Duration,
-) -> CommandProgress {
-    let timeout = Duration::from_millis(timeout_ms);
-    if condition_met || waited >= timeout {
-        let timed_out = waited >= timeout;
-        let outcome = if timed_out {
-            ProductGateObservationOutcome::Failed
-        } else {
-            ProductGateObservationOutcome::Passed
-        };
-        let details = ProductGateObservationDetails {
-            schema: AUTOMATION_GATE_OBSERVATION_SCHEMA,
-            gate_id,
-            condition,
-            outcome,
+    timed_out: bool,
+    observed_after_origin_ns: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ProductGateBatchDetails<'a> {
+    schema: &'static str,
+    batch_id: &'a str,
+    phase_id: &'a str,
+    origin: ProductAutomationGateBatchOrigin,
+    completed_after_origin_ns: u64,
+    observations: Vec<ProductGateBatchObservationDetails<'a>>,
+}
+
+fn latch_product_gate_observation(
+    observation: &ProductAutomationGateObservation,
+    condition_met: bool,
+    observed_after_origin_ns: u64,
+) -> Option<LatchedProductGateObservation> {
+    if observed_after_origin_ns >= observation.deadline_after_origin_ns {
+        return Some(LatchedProductGateObservation {
+            outcome: ProductGateObservationOutcome::Failed,
             condition_met,
-            timed_out,
-            timeout_ms,
-            waited_ns: u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX),
-        };
-        return CommandProgress::Done(
-            serde_json::to_value(details)
-                .expect("product gate observation details have a fixed serializable schema"),
-        );
+            timed_out: true,
+            observed_after_origin_ns,
+        });
     }
-    if passive {
-        CommandProgress::PassiveWaiting(Some(timeout.saturating_sub(waited)))
-    } else {
-        CommandProgress::Waiting
+    condition_met.then_some(LatchedProductGateObservation {
+        outcome: ProductGateObservationOutcome::Passed,
+        condition_met: true,
+        timed_out: false,
+        observed_after_origin_ns,
+    })
+}
+
+fn latch_product_gate_batch_observations(
+    observations: &[ProductAutomationGateObservation],
+    condition_states: &[bool],
+    observed_after_origin_ns: u64,
+    outcomes: &mut [Option<LatchedProductGateObservation>],
+) -> Result<bool, String> {
+    if observations.len() != condition_states.len() || observations.len() != outcomes.len() {
+        return Err("product gate batch state length does not match its command".to_owned());
+    }
+    for ((observation, condition_met), outcome) in observations
+        .iter()
+        .zip(condition_states.iter().copied())
+        .zip(outcomes.iter_mut())
+    {
+        if outcome.is_none() {
+            *outcome = latch_product_gate_observation(
+                observation,
+                condition_met,
+                observed_after_origin_ns,
+            );
+        }
+    }
+    Ok(outcomes.iter().all(Option::is_some))
+}
+
+fn product_gate_batch_details_value(
+    batch_id: &str,
+    phase_id: &str,
+    origin: ProductAutomationGateBatchOrigin,
+    completed_after_origin_ns: u64,
+    observations: &[ProductAutomationGateObservation],
+    outcomes: &[Option<LatchedProductGateObservation>],
+) -> Result<Value, String> {
+    if observations.len() != outcomes.len() {
+        return Err("product gate batch outcomes do not match their command".to_owned());
+    }
+    let observations = observations
+        .iter()
+        .zip(outcomes.iter().copied())
+        .enumerate()
+        .map(|(observation_index, (observation, outcome))| {
+            let outcome = outcome.ok_or_else(|| {
+                "completed product gate batch is missing an observation outcome".to_owned()
+            })?;
+            Ok(ProductGateBatchObservationDetails {
+                observation_index,
+                gate_id: &observation.gate_id,
+                condition: observation.target.condition_name(),
+                deadline_authority: observation.deadline_authority,
+                deadline_after_origin_ns: observation.deadline_after_origin_ns,
+                outcome: outcome.outcome,
+                condition_met: outcome.condition_met,
+                timed_out: outcome.timed_out,
+                observed_after_origin_ns: outcome.observed_after_origin_ns,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    serde_json::to_value(ProductGateBatchDetails {
+        schema: AUTOMATION_GATE_BATCH_OBSERVATION_SCHEMA,
+        batch_id,
+        phase_id,
+        origin,
+        completed_after_origin_ns,
+        observations,
+    })
+    .map_err(|error| format!("failed to serialize product gate batch details: {error}"))
+}
+
+fn resolve_product_gate_batch_origin_at(
+    origin: ProductAutomationGateBatchOrigin,
+    automation_started_at: Instant,
+    command_completed_at: &[Option<Instant>],
+    import_primary_started_at: Option<Instant>,
+) -> Result<Instant, String> {
+    match origin {
+        ProductAutomationGateBatchOrigin::AutomationStarted => Ok(automation_started_at),
+        ProductAutomationGateBatchOrigin::CommandCompleted { command_index } => {
+            command_completed_at
+                .get(command_index)
+                .copied()
+                .flatten()
+                .ok_or_else(|| {
+                    format!("product gate batch origin command {command_index} has not completed")
+                })
+        }
+        ProductAutomationGateBatchOrigin::ImportPrimaryStarted => import_primary_started_at
+            .ok_or_else(|| {
+                "product gate batch has no active import-primary timing origin".to_owned()
+            }),
     }
 }
 
@@ -692,7 +752,9 @@ pub(crate) struct ProductAutomationController {
     script_path: PathBuf,
     report_path: PathBuf,
     command_index: usize,
+    command_completed_at: Vec<Option<Instant>>,
     active_dataset_switch: Option<ActiveDatasetSwitch>,
+    active_gate_batch: Option<ActiveProductGateBatch>,
     active_wait_started: Option<Instant>,
     sleep_frames_remaining: Option<u32>,
     active_input_sequence: Option<ActiveInputSequence>,
@@ -722,6 +784,13 @@ pub(crate) struct ProductAutomationController {
     startup_bootstrap_evidence: Option<Value>,
     qualification_only_ui_overhead_ns: u64,
     report_written: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveProductGateBatch {
+    command_index: usize,
+    origin_at: Instant,
+    outcomes: Vec<Option<LatchedProductGateObservation>>,
 }
 
 #[derive(Clone, Debug)]
@@ -922,6 +991,12 @@ struct ImportPublicationEvidenceSnapshot {
     source_verification_successes: u64,
 }
 
+fn authentic_failed_import_publication_evidence(
+    captured: Result<ImportPublicationEvidenceSnapshot, String>,
+) -> Option<ImportPublicationEvidenceSnapshot> {
+    captured.ok()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ImportedOpenReadyReadiness {
     selected_matches: bool,
@@ -938,9 +1013,9 @@ impl ImportedOpenReadyReadiness {
 
 fn imported_open_ready_readiness(
     app: &MiranteWorkbenchApp,
+    snapshot: &ApplicationSnapshot,
     path: &Path,
 ) -> ImportedOpenReadyReadiness {
-    let snapshot = app.application.snapshot();
     ImportedOpenReadyReadiness {
         selected_matches: normalize_path(app.dataset.selected_path()) == normalize_path(path),
         verified: matches!(snapshot.source(), SourceVerificationSnapshot::Verified(_))
@@ -1062,12 +1137,15 @@ impl ProductAutomationController {
     }
 
     fn new(script: ProductAutomationScript, script_path: PathBuf, report_path: PathBuf) -> Self {
+        let command_count = script.commands.len();
         Self {
             script,
             script_path,
             report_path,
             command_index: 0,
+            command_completed_at: vec![None; command_count],
             active_dataset_switch: None,
+            active_gate_batch: None,
             active_wait_started: None,
             sleep_frames_remaining: None,
             active_input_sequence: None,
@@ -1747,13 +1825,12 @@ impl ProductAutomationController {
             if let Some(cancellation) = self.cancel_active_dataset_switch(app) {
                 reason.push_str(&format!("; dataset_switch_cancellation={cancellation}"));
             }
-            self.events.push(ProductAutomationEvent::failed(
+            return self.record_fatal_command_failure(
                 command_index,
                 command.name(),
                 command_started.elapsed(),
-                reason.clone(),
-            ));
-            return AutomationStatus::Failed(reason);
+                reason,
+            );
         }
         self.observe_import_projection(app);
         let result = self.execute_command(app, ctx, &command);
@@ -1763,13 +1840,12 @@ impl ProductAutomationController {
             } else {
                 reason
             };
-            self.events.push(ProductAutomationEvent::failed(
+            return self.record_fatal_command_failure(
                 command_index,
                 command.name(),
                 command_started.elapsed(),
-                reason.clone(),
-            ));
-            return AutomationStatus::Failed(reason);
+                reason,
+            );
         }
         match result {
             Ok(CommandProgress::Done(details)) => {
@@ -1793,15 +1869,34 @@ impl ProductAutomationController {
                 } else {
                     reason
                 };
-                self.events.push(ProductAutomationEvent::failed(
+                self.record_fatal_command_failure(
                     command_index,
                     command.name(),
                     command_started.elapsed(),
-                    reason.clone(),
-                ));
-                AutomationStatus::Failed(reason)
+                    reason,
+                )
             }
         }
+    }
+
+    fn record_fatal_command_failure(
+        &mut self,
+        command_index: usize,
+        command: &'static str,
+        duration: Duration,
+        reason: String,
+    ) -> AutomationStatus {
+        // A fatal boundary invalidates any partially latched batch. Only the
+        // failed command event is reportable; incomplete product outcomes are
+        // never promoted or synthesized during closeout.
+        self.active_gate_batch = None;
+        self.events.push(ProductAutomationEvent::failed(
+            command_index,
+            command,
+            duration,
+            reason.clone(),
+        ));
+        AutomationStatus::Failed(reason)
     }
 
     fn record_successful_command(
@@ -1811,12 +1906,17 @@ impl ProductAutomationController {
         duration: Duration,
         details: Value,
     ) {
+        let completed_at = Instant::now();
         self.events.push(ProductAutomationEvent::passed(
             command_index,
             command,
             duration,
             details,
         ));
+        if let Some(slot) = self.command_completed_at.get_mut(command_index) {
+            *slot = Some(completed_at);
+        }
+        self.active_gate_batch = None;
         self.active_wait_started = None;
         self.sleep_frames_remaining = None;
         if self.command_index == command_index {
@@ -2035,6 +2135,15 @@ impl ProductAutomationController {
         app: &MiranteWorkbenchApp,
         path: &Path,
     ) -> Result<ImportPrimaryMeasurement, String> {
+        self.complete_imported_open_ready_measurement_at(app, path, Instant::now())
+    }
+
+    fn complete_imported_open_ready_measurement_at(
+        &mut self,
+        app: &MiranteWorkbenchApp,
+        path: &Path,
+        open_ready_at: Instant,
+    ) -> Result<ImportPrimaryMeasurement, String> {
         let timing_origin = self
             .active_import_timing_origin
             .as_ref()
@@ -2042,7 +2151,6 @@ impl ProductAutomationController {
             .ok_or_else(|| {
                 "import became open-ready without an exact worker timing origin".to_owned()
             })?;
-        let open_ready_at = Instant::now();
         let open_ready_at_epoch_ms = epoch_ms();
         let open_ready_process_cpu_time_ns = process_cpu_time_ns();
         let wall_time_ns = u64::try_from(
@@ -2101,6 +2209,173 @@ impl ProductAutomationController {
         }
         .commit(measurement, publication_measurement, publication_evidence);
         Ok(measurement)
+    }
+
+    fn product_gate_batch_origin_at(
+        &self,
+        origin: ProductAutomationGateBatchOrigin,
+    ) -> Result<Instant, String> {
+        resolve_product_gate_batch_origin_at(
+            origin,
+            self.started_at,
+            &self.command_completed_at,
+            self.active_import_timing_origin
+                .as_ref()
+                .map(|origin| origin.started_at),
+        )
+    }
+
+    fn product_gate_target_met(
+        &self,
+        app: &MiranteWorkbenchApp,
+        snapshot: &ApplicationSnapshot,
+        target: &ProductAutomationGateTarget,
+    ) -> bool {
+        match target {
+            ProductAutomationGateTarget::Condition { condition } => {
+                self.wait_condition_met_with_snapshot(app, snapshot, *condition)
+            }
+            ProductAutomationGateTarget::ImportedOpenReady { path } => {
+                imported_open_ready_readiness(app, snapshot, path).condition_met()
+            }
+        }
+    }
+
+    fn execute_product_gate_batch(
+        &mut self,
+        app: &MiranteWorkbenchApp,
+        batch_id: &str,
+        phase_id: &str,
+        origin: ProductAutomationGateBatchOrigin,
+        observations: &[ProductAutomationGateObservation],
+    ) -> Result<CommandProgress, String> {
+        if self.active_gate_batch.is_none() {
+            self.active_gate_batch = Some(ActiveProductGateBatch {
+                command_index: self.command_index,
+                origin_at: self.product_gate_batch_origin_at(origin)?,
+                outcomes: vec![None; observations.len()],
+            });
+        }
+        let active = self
+            .active_gate_batch
+            .as_ref()
+            .expect("a product gate batch was installed above");
+        if active.command_index != self.command_index || active.outcomes.len() != observations.len()
+        {
+            return Err("active product gate batch does not match the current command".to_owned());
+        }
+
+        // Every still-live predicate is sampled from the same application
+        // snapshot and monotonic instant. Terminal outcomes remain latched.
+        let snapshot = app.application.snapshot();
+        let condition_states = observations
+            .iter()
+            .map(|observation| self.product_gate_target_met(app, &snapshot, &observation.target))
+            .collect::<Vec<_>>();
+        // Timestamp after the bounded predicate snapshot so a sample whose
+        // collection crosses its deadline cannot receive an early pass.
+        let now = Instant::now();
+        let origin_at = active.origin_at;
+        let observed_after_origin_ns = u64::try_from(
+            now.checked_duration_since(origin_at)
+                .ok_or_else(|| "product gate batch origin instant moved backwards".to_owned())?
+                .as_nanos(),
+        )
+        .map_err(|_| "product gate batch origin-relative time overflowed u64".to_owned())?;
+
+        let previously_terminal = active
+            .outcomes
+            .iter()
+            .map(Option::is_some)
+            .collect::<Vec<_>>();
+        let complete = {
+            let active = self
+                .active_gate_batch
+                .as_mut()
+                .expect("a product gate batch remains active");
+            latch_product_gate_batch_observations(
+                observations,
+                &condition_states,
+                observed_after_origin_ns,
+                &mut active.outcomes,
+            )?
+        };
+        let newly_terminal = self
+            .active_gate_batch
+            .as_ref()
+            .expect("a product gate batch remains active")
+            .outcomes
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, outcome)| {
+                (!previously_terminal[index]).then_some((index, outcome?))
+            })
+            .collect::<Vec<_>>();
+
+        for (index, outcome) in newly_terminal {
+            let ProductAutomationGateTarget::ImportedOpenReady { path } =
+                &observations[index].target
+            else {
+                continue;
+            };
+            match outcome.outcome {
+                ProductGateObservationOutcome::Passed => {
+                    self.complete_imported_open_ready_measurement_at(app, path, now)?;
+                }
+                ProductGateObservationOutcome::Failed => {
+                    if let Some(publication_evidence) = authentic_failed_import_publication_evidence(
+                        self.capture_bound_import_publication_evidence(app, path),
+                    ) {
+                        self.captured_import_publication_evidence = Some(publication_evidence);
+                        self.active_import_verification_diagnostics_origin = None;
+                    }
+                }
+            }
+        }
+
+        if !complete {
+            let active = self
+                .active_gate_batch
+                .as_ref()
+                .expect("an incomplete product gate batch remains active");
+            let unresolved = observations
+                .iter()
+                .zip(&active.outcomes)
+                .filter(|(_, outcome)| outcome.is_none())
+                .collect::<Vec<_>>();
+            if unresolved
+                .iter()
+                .all(|(observation, _)| observation.target.is_passive())
+            {
+                let repaint_after_ns = unresolved
+                    .iter()
+                    .map(|(observation, _)| {
+                        observation
+                            .deadline_after_origin_ns
+                            .saturating_sub(observed_after_origin_ns)
+                    })
+                    .min();
+                return Ok(CommandProgress::PassiveWaiting(
+                    repaint_after_ns.map(Duration::from_nanos),
+                ));
+            }
+            return Ok(CommandProgress::Waiting);
+        }
+
+        let active = self
+            .active_gate_batch
+            .take()
+            .expect("a complete product gate batch retains its outcomes");
+        let details = product_gate_batch_details_value(
+            batch_id,
+            phase_id,
+            origin,
+            observed_after_origin_ns,
+            observations,
+            &active.outcomes,
+        )?;
+        Ok(CommandProgress::Done(details))
     }
 
     fn execute_command(
@@ -2465,7 +2740,8 @@ impl ProductAutomationController {
             }
             ProductAutomationCommand::WaitForImportedOpenReady { path, timeout_ms } => {
                 let started = *self.active_wait_started.get_or_insert_with(Instant::now);
-                let readiness = imported_open_ready_readiness(app, path);
+                let snapshot = app.application.snapshot();
+                let readiness = imported_open_ready_readiness(app, &snapshot, path);
                 if readiness.condition_met() {
                     let measurement = self.complete_imported_open_ready_measurement(app, path)?;
                     Ok(CommandProgress::Done(json!({
@@ -2488,35 +2764,6 @@ impl ProductAutomationController {
                 } else {
                     Ok(CommandProgress::Waiting)
                 }
-            }
-            ProductAutomationCommand::ObserveImportedOpenReady {
-                gate_id,
-                path,
-                timeout_ms,
-            } => {
-                let started = *self.active_wait_started.get_or_insert_with(Instant::now);
-                let readiness = imported_open_ready_readiness(app, path);
-                let condition_met = readiness.condition_met();
-                let waited = started.elapsed();
-                if imported_open_ready_observation_requires_measurement(
-                    *timeout_ms,
-                    condition_met,
-                    waited,
-                ) {
-                    self.complete_imported_open_ready_measurement(app, path)?;
-                } else if waited >= Duration::from_millis(*timeout_ms)
-                    && let Ok(publication_evidence) =
-                        self.capture_bound_import_publication_evidence(app, path)
-                {
-                    self.captured_import_publication_evidence = Some(publication_evidence);
-                    self.active_import_verification_diagnostics_origin = None;
-                }
-                Ok(product_imported_open_ready_observation_progress(
-                    gate_id,
-                    *timeout_ms,
-                    condition_met,
-                    waited,
-                ))
             }
             ProductAutomationCommand::WaitFor {
                 condition,
@@ -2543,21 +2790,12 @@ impl ProductAutomationController {
                     })
                 }
             }
-            ProductAutomationCommand::ObserveGate {
-                gate_id,
-                condition,
-                timeout_ms,
-            } => {
-                let started = *self.active_wait_started.get_or_insert_with(Instant::now);
-                let condition_met = self.wait_condition_met(app, *condition);
-                Ok(product_gate_observation_progress(
-                    gate_id,
-                    *condition,
-                    *timeout_ms,
-                    condition_met,
-                    started.elapsed(),
-                ))
-            }
+            ProductAutomationCommand::ObserveGateBatch {
+                batch_id,
+                phase_id,
+                origin,
+                observations,
+            } => self.execute_product_gate_batch(app, batch_id, phase_id, *origin, observations),
             ProductAutomationCommand::SetViewportSize { width, height } => {
                 if *width == 0 || *height == 0 {
                     return Err("requested window inner size in points must be nonzero".to_owned());
@@ -3696,6 +3934,15 @@ impl ProductAutomationController {
         condition: ProductAutomationWaitCondition,
     ) -> bool {
         let snapshot = app.application.snapshot();
+        self.wait_condition_met_with_snapshot(app, &snapshot, condition)
+    }
+
+    fn wait_condition_met_with_snapshot(
+        &self,
+        app: &MiranteWorkbenchApp,
+        snapshot: &ApplicationSnapshot,
+        condition: ProductAutomationWaitCondition,
+    ) -> bool {
         match condition {
             ProductAutomationWaitCondition::WindowReady => true,
             ProductAutomationWaitCondition::FirstFrame => {
@@ -3713,7 +3960,7 @@ impl ProductAutomationController {
                     );
                 automation_runtime_is_idle(
                     crate::workbench_playback_runtime::background_work_active(
-                        &snapshot,
+                        snapshot,
                         &app.import.workers,
                         &app.dataset,
                         &app.render_coordination,
@@ -3728,7 +3975,7 @@ impl ProductAutomationController {
                 frame_freshness_is_current(&app.render_coordination.frame_fidelity)
             }
             ProductAutomationWaitCondition::CoordinatedPresentationSettled => {
-                coordinated_visible_layout_current_complete(app)
+                coordinated_visible_layout_current_complete_with_snapshot(app, snapshot)
             }
             ProductAutomationWaitCondition::SourceVerificationRequired => {
                 matches!(snapshot.source(), SourceVerificationSnapshot::Required)

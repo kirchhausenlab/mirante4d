@@ -32,18 +32,22 @@ use crate::host::{
 use crate::process::cargo_command;
 
 const WORKLOAD_SCHEMA: &str = "mirante4d-viewer-performance-workload-bundle-4";
-const SCRIPT_BUNDLE_SCHEMA: &str = "mirante4d-viewer-performance-script-bundle-4";
+const SCRIPT_BUNDLE_SCHEMA: &str = "mirante4d-viewer-performance-script-bundle-5";
 const ORACLE_SCHEMA: &str = "mirante4d-viewer-performance-oracle-bundle-3";
-const RAW_REPORT_SCHEMA: &str = "mirante4d-viewer-performance-raw-private-report-2";
-const RECEIPT_SCHEMA: &str = "mirante4d-viewer-performance-development-receipt-2";
+const RAW_REPORT_SCHEMA: &str = "mirante4d-viewer-performance-raw-private-report-3";
+const RECEIPT_SCHEMA: &str = "mirante4d-viewer-performance-development-receipt-3";
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-const AUTOMATION_SCHEMA_VERSION: u64 = 4;
-const PRODUCT_GATE_OBSERVATION_SCHEMA: &str = "mirante4d-product-gate-observation-1";
+const AUTOMATION_SCHEMA_VERSION: u64 = 5;
+const PRODUCT_GATE_OBSERVATION_SCHEMA: &str = "mirante4d-product-gate-batch-observation-1";
 const IMPORTED_OPEN_READY_CONDITION: &str = "imported_open_ready";
 const PRODUCT_GATE_ID_MAX_BYTES: usize = 128;
 const PRODUCT_GATE_CONDITION_MAX_BYTES: usize = 128;
-const PRODUCT_GATE_TIMEOUT_MAX_MS: u64 = 7_200_000;
+const PRODUCT_GATE_BATCH_MAX_OBSERVATIONS: usize = 64;
+const PRODUCT_GATE_DEADLINE_MAX_NS: u64 = 7_200_000_000_000;
+const MAX_NONIMPORT_STATIC_WAIT_NS: u64 = 35_000_000_000;
+const PROCESS_LAUNCH_CLOSEOUT_GRACE_NS: u64 = 10_000_000_000;
+const CONFORMANCE_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTEMPT_ROOT_PLACEHOLDER: &str = "${ATTEMPT_ROOT}";
 const WORKLOAD_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const SCRIPT_BUNDLE_MAX_BYTES: u64 = 32 * 1024 * 1024;
@@ -51,7 +55,6 @@ const ORACLE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const SUPPORTING_PACKAGE_ROOT_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 const AUTOMATION_REPORT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const RAW_REPORT_MAX_BYTES: usize = 64 * 1024 * 1024;
-const MAX_TIMEOUT_SECONDS: u64 = 3 * 60 * 60;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const EP01_TRACE_DERIVATION_CONTRACT: &str = "mirante4d-ep01-brickkey-trace-projection-1";
 const EP01_TRACE_PACKAGE_ROLE: &str = "representative_package";
@@ -68,7 +71,7 @@ viewer-performance-run --qualification-profile ABSOLUTE_EXTERNAL_PROFILE.json \
 --interaction-script-bundle ABSOLUTE_EXTERNAL_SCRIPTS.json \
 --independent-oracle ABSOLUTE_EXTERNAL_ORACLE.json \
 --result-directory NEW_ABSOLUTE_EXTERNAL_DIRECTORY \
---timeout-seconds INTEGER --cache-condition warm|cold \
+--cache-condition warm|cold \
 --competing-activity DESCRIPTION --power-state DESCRIPTION \
 --compositor-scale-milli INTEGER";
 
@@ -79,7 +82,6 @@ struct RunArgs {
     script_bundle: PathBuf,
     oracle_bundle: PathBuf,
     result_directory: PathBuf,
-    timeout: Duration,
     attestation: ProtocolAttestation,
 }
 
@@ -1111,6 +1113,7 @@ impl AttemptRole {
 
 #[derive(Debug)]
 struct ProcessObservation {
+    launch_attempted: bool,
     status: Option<ExitStatus>,
     external_wall_time_ns: u64,
     timed_out: bool,
@@ -1128,6 +1131,10 @@ struct RoleEvidence {
     automation_report_sha256: Option<String>,
     app_wall_time_ns: Option<u64>,
     process_cpu_time_ns: Option<u64>,
+    derived_process_timeout_ns: u64,
+    static_wait_bound_ns: u64,
+    gate_batch_count: usize,
+    gate_observation_count: usize,
     source_inventory_before: Option<super::source_inventory::InventoryFacts>,
     source_inventory_after: Option<super::source_inventory::InventoryFacts>,
     cleanup_manifest_sha256: Option<String>,
@@ -1139,13 +1146,19 @@ struct RoleEvidence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProductGateOutcome {
     command_index: usize,
+    batch_id: String,
+    phase_id: String,
+    observation_index: usize,
     gate_id: String,
     condition: String,
+    deadline_authority: String,
+    deadline_after_origin_ns: u64,
+    origin_kind: String,
+    origin_command_index: Option<usize>,
     outcome: ProductGateStatus,
     condition_met: bool,
     timed_out: bool,
-    timeout_ms: u64,
-    waited_ns: u64,
+    observed_after_origin_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1175,6 +1188,7 @@ struct PopulationEvidence {
     expected_product_gate_observations: usize,
     observed_product_gate_observations: usize,
     sample_identities_exact: bool,
+    sample_order_exact: bool,
     role_identities_exact: bool,
     phase_identities_exact: bool,
     product_gate_bijections_exact: bool,
@@ -1279,7 +1293,7 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
                 &repository_root,
                 fresh_target,
                 &result_root,
-                args.timeout,
+                CONFORMANCE_TIMEOUT,
                 &oracle_cases,
                 &numerical_contract,
             )
@@ -1295,9 +1309,8 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
         }
     }
     let mut samples = Vec::new();
-    if binding_reason_codes.is_empty() {
+    if !has_integrity_reasons(&all_reasons) {
         samples = execute_samples(
-            &args,
             &profile,
             &workload.value.import_source,
             &scripts.value,
@@ -1315,7 +1328,7 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
                 all_reasons.extend(phase.reasons.iter().cloned());
             }
         }
-    } else {
+    } else if !binding_reason_codes.is_empty() {
         all_reasons.insert("qualification_binding_mismatch".to_owned());
     }
     let population =
@@ -1470,7 +1483,6 @@ fn parse_args(arguments: Vec<String>) -> anyhow::Result<RunArgs> {
                 | "--interaction-script-bundle"
                 | "--independent-oracle"
                 | "--result-directory"
-                | "--timeout-seconds"
                 | "--cache-condition"
                 | "--competing-activity"
                 | "--power-state"
@@ -1491,12 +1503,6 @@ fn parse_args(arguments: Vec<String>) -> anyhow::Result<RunArgs> {
             .cloned()
             .with_context(|| format!("{name} is required; {RUN_USAGE}"))
     };
-    let timeout_seconds = required("--timeout-seconds")?
-        .parse::<u64>()
-        .context("--timeout-seconds must be an unsigned integer")?;
-    if timeout_seconds == 0 || timeout_seconds > MAX_TIMEOUT_SECONDS {
-        bail!("--timeout-seconds must be in 1..={MAX_TIMEOUT_SECONDS}")
-    }
     let compositor_scale_milli = required("--compositor-scale-milli")?
         .parse::<u32>()
         .context("--compositor-scale-milli must be an unsigned integer")?;
@@ -1506,7 +1512,6 @@ fn parse_args(arguments: Vec<String>) -> anyhow::Result<RunArgs> {
         script_bundle: PathBuf::from(required("--interaction-script-bundle")?),
         oracle_bundle: PathBuf::from(required("--independent-oracle")?),
         result_directory: PathBuf::from(required("--result-directory")?),
-        timeout: Duration::from_secs(timeout_seconds),
         attestation: ProtocolAttestation {
             cache_condition: required("--cache-condition")?,
             competing_activity: required("--competing-activity")?,
@@ -1604,15 +1609,15 @@ fn validate_bundles(
             .get(id)
             .expect("exact scenario coverage was checked");
         validate_workload_scenario(id, workload_scenario)?;
-        validate_script_scenario(id, script_scenario, profile)?;
-        for (_, gate) in
-            expected_product_gate_commands(&script_scenario.instrumented_script.commands)?
+        validate_oracle_scenario(id, oracle_scenario)?;
+        validate_script_scenario(id, script_scenario, profile, oracle_scenario)?;
+        for gate in
+            expected_product_gate_observations(&script_scenario.instrumented_script.commands)?
         {
             if !product_gate_ids.insert(gate.gate_id) {
                 bail!("viewer product gate IDs must be unique across all scenarios")
             }
         }
-        validate_oracle_scenario(id, oracle_scenario)?;
         let workload_phases = workload_scenario
             .phases
             .iter()
@@ -1969,6 +1974,7 @@ fn validate_script_scenario(
     id: &str,
     scenario: &ScriptScenario,
     profile: &ViewerQualificationProfile,
+    oracle: &OracleScenario,
 ) -> anyhow::Result<()> {
     validate_phase_names(id, scenario.phases.iter().map(|phase| phase.name.as_str()))?;
     let mut labels = Vec::new();
@@ -1986,6 +1992,7 @@ fn validate_script_scenario(
 
     validate_automation_template(id, &scenario.instrumented_script, true, labels.as_slice())?;
     validate_product_gate_inventory(id, &scenario.instrumented_script.commands)?;
+    validate_product_gate_schedule(id, scenario, &scenario.instrumented_script, profile, oracle)?;
     validate_hard_safety_limits(&scenario.instrumented_script.hard_safety_limits, profile)?;
     validate_required_action_surface(
         id,
@@ -1999,6 +2006,7 @@ fn validate_script_scenario(
         .context("every viewer scenario requires an instrumentation-control script")?;
     validate_automation_template(id, control, false, &[])?;
     validate_product_gate_inventory(id, &control.commands)?;
+    validate_product_gate_schedule(id, scenario, control, profile, oracle)?;
     validate_hard_safety_limits(&control.hard_safety_limits, profile)?;
     if normalized_semantic_script(&scenario.instrumented_script)
         != normalized_semantic_script(control)
@@ -2241,39 +2249,88 @@ fn validate_ip_action_contract(scenario: &ScriptScenario) -> anyhow::Result<()> 
         "start_reviewed_import",
         "IP reviewed import command",
     )?;
-    let open_ready = sole_command_index(
-        commands,
-        "observe_imported_open_ready",
-        "IP imported open-ready assertion",
-    )?;
+    let gate_batch = sole_command_index(commands, "observe_gate_batch", "IP gate batch")?;
     if commands.iter().any(|command| {
         command.get("command").and_then(Value::as_str) == Some("wait_for_imported_open_ready")
     }) {
         bail!("IP must not retain the legacy fatal imported open-ready wait")
     }
-    let import_idle = commands
+    let observations = expected_product_gate_observations(commands)?;
+    if observations
         .iter()
-        .enumerate()
-        .filter_map(|(index, command)| {
-            (command.get("command").and_then(Value::as_str) == Some("observe_gate")
-                && command.get("condition").and_then(Value::as_str) == Some("import_idle"))
-            .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let [import_idle] = import_idle.as_slice() else {
-        bail!("IP typed import-idle observation must appear exactly once")
-    };
+        .map(|observation| observation.condition)
+        .collect::<BTreeSet<_>>()
+        != BTreeSet::from(["import_idle", "runtime_idle", IMPORTED_OPEN_READY_CONDITION])
+        || observations.len() != 3
+    {
+        bail!("IP gate batch must contain the exact three import-primary observations")
+    }
     if !(start_checkpoint < begin_setup
         && begin_setup < start_import
-        && start_import < *import_idle
-        && *import_idle < end_checkpoint
-        && end_checkpoint < open_ready)
+        && start_import < gate_batch
+        && gate_batch < end_checkpoint)
     {
         bail!(
-            "IP must bracket setup through published import-idle at its checkpoints, then assert exact imported open-readiness"
+            "IP must batch import-idle, open-ready, and runtime-idle immediately after import start and before its end checkpoint"
         )
     }
     Ok(())
+}
+
+fn validate_ip_attempt_path_binding(scenario: &ScriptScenario) -> anyhow::Result<()> {
+    let commands = &scenario.instrumented_script.commands;
+    let setup_index =
+        sole_command_index(commands, "begin_tiff_import_setup", "IP TIFF setup command")?;
+    let output_parent = commands[setup_index]
+        .get("output_parent")
+        .and_then(Value::as_str)
+        .context("IP TIFF setup output parent is unavailable")?;
+    let output_parent = attempt_root_relative_path(output_parent, "IP output parent")?;
+    let open_ready_paths = commands
+        .iter()
+        .filter(|command| {
+            command.get("command").and_then(Value::as_str) == Some("observe_gate_batch")
+        })
+        .flat_map(|command| {
+            command
+                .get("observations")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|observation| {
+            (observation.pointer("/target/kind").and_then(Value::as_str)
+                == Some("imported_open_ready"))
+            .then(|| observation.pointer("/target/path").and_then(Value::as_str))
+            .flatten()
+        })
+        .collect::<Vec<_>>();
+    let [open_ready_path] = open_ready_paths.as_slice() else {
+        bail!("IP must bind exactly one imported-open-ready target path")
+    };
+    let open_ready_path = attempt_root_relative_path(open_ready_path, "IP open-ready target")?;
+    let cleanup_path = scenario
+        .cleanup
+        .enabled
+        .then_some(scenario.cleanup.imported_package_relative_path.as_deref())
+        .flatten()
+        .context("IP requires one enabled attempt-local package cleanup target")?;
+    validate_relative_attempt_path(cleanup_path, "IP cleanup package")?;
+    if open_ready_path != cleanup_path || open_ready_path.parent() != Some(output_parent.as_path())
+    {
+        bail!("IP output parent, open-ready target, and cleanup target do not cross-bind")
+    }
+    Ok(())
+}
+
+fn attempt_root_relative_path(value: &str, label: &str) -> anyhow::Result<PathBuf> {
+    let suffix = value
+        .strip_prefix(ATTEMPT_ROOT_PLACEHOLDER)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .with_context(|| format!("{label} must be rooted in the runner-owned attempt directory"))?;
+    let relative = PathBuf::from(suffix);
+    validate_relative_attempt_path(&relative, label)?;
+    Ok(relative)
 }
 
 fn validate_dataset_action_contract(
@@ -2548,22 +2605,9 @@ fn validate_required_action_surface(
         "IP" => {
             require("begin_tiff_import_setup")?;
             require("start_reviewed_import")?;
-            require("observe_imported_open_ready")?;
+            require("observe_gate_batch")?;
             validate_ip_action_contract(scenario)?;
-            for (command_name, path_field) in [
-                ("begin_tiff_import_setup", "output_parent"),
-                ("observe_imported_open_ready", "path"),
-            ] {
-                if !commands.iter().any(|command| {
-                    command.get("command").and_then(Value::as_str) == Some(command_name)
-                        && command
-                            .get(path_field)
-                            .and_then(Value::as_str)
-                            .is_some_and(|path| path.starts_with(ATTEMPT_ROOT_PLACEHOLDER))
-                }) {
-                    bail!("IP output paths must be rooted in the runner-owned attempt directory")
-                }
-            }
+            validate_ip_attempt_path_binding(scenario)?;
         }
         _ => unreachable!("scenario IDs were validated"),
     }
@@ -3499,7 +3543,21 @@ fn validate_automation_template(
     if script.commands.is_empty() || script.commands.len() > 16_384 {
         bail!("viewer scenario {id} script command count is outside 1..=16384")
     }
-    let product_gates = expected_product_gate_commands(&script.commands)?;
+    for command in script.commands.iter().chain(
+        script
+            .startup_bootstrap
+            .iter()
+            .flat_map(|bootstrap| &bootstrap.commands),
+    ) {
+        if command.get("timeout_ms").is_some()
+            && command.get("command").and_then(Value::as_str) != Some("wait_for")
+        {
+            bail!(
+                "viewer scenario {id} contains a timeout-bearing command outside the accounted fatal wait surface"
+            )
+        }
+    }
+    let product_gates = expected_product_gate_batches(&script.commands)?;
     if instrumented && (!script.gpu_timing || !script.diagnostic_counters) {
         bail!("viewer instrumented scripts must enable GPU timing and diagnostic counters")
     }
@@ -3534,7 +3592,7 @@ fn validate_automation_template(
     let final_quit_index = script.commands.len() - 1;
     if product_gates
         .iter()
-        .any(|(command_index, _)| *command_index >= final_quit_index)
+        .any(|batch| batch.command_index >= final_quit_index)
     {
         bail!("viewer scenario {id} product gates must precede the mandatory final quit")
     }
@@ -3546,18 +3604,18 @@ fn validate_automation_template(
 fn validate_product_gate_inventory(id: &str, commands: &[Value]) -> anyhow::Result<()> {
     let expected_acceptance = expected_acceptance_condition_multiset(id);
     let expected_fatal = expected_fatal_wait_condition_multiset(id);
-    let gates = expected_product_gate_commands(commands)?;
+    let gates = expected_product_gate_observations(commands)?;
     let observed_acceptance =
         gates
             .iter()
-            .fold(BTreeMap::<&str, usize>::new(), |mut counts, (_, gate)| {
+            .fold(BTreeMap::<&str, usize>::new(), |mut counts, gate| {
                 *counts.entry(gate.condition).or_default() += 1;
                 counts
             });
     if observed_acceptance != expected_acceptance {
-        bail!("viewer scenario {id} has an incomplete or extra v4 product-gate inventory")
+        bail!("viewer scenario {id} has an incomplete or extra v5 product-gate inventory")
     }
-    for (ordinal, (_, gate)) in gates.iter().enumerate() {
+    for (ordinal, gate) in gates.iter().enumerate() {
         let expected_id = format!("{id}.acceptance.{ordinal:03}.{}", gate.condition);
         if gate.gate_id != expected_id {
             bail!("viewer scenario {id} product-gate IDs differ from the frozen ordered identity")
@@ -3576,7 +3634,7 @@ fn validate_product_gate_inventory(id: &str, commands: &[Value]) -> anyhow::Resu
     }
     if observed_fatal != expected_fatal {
         bail!(
-            "viewer scenario {id} generic fatal-wait inventory differs from the frozen v4 contract"
+            "viewer scenario {id} generic fatal-wait inventory differs from the frozen v5 contract"
         )
     }
     Ok(())
@@ -3631,6 +3689,508 @@ fn expected_fatal_wait_condition_multiset(id: &str) -> BTreeMap<&'static str, us
         _ => &[],
     };
     entries.iter().copied().collect()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+struct RoleScheduleBound {
+    gate_batch_count: usize,
+    gate_observation_count: usize,
+    grouped_gate_wait_bound_ns: u64,
+    prerequisite_wait_bound_ns: u64,
+    action_duration_bound_ns: u64,
+    static_wait_bound_ns: u64,
+    derived_process_timeout_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhaseCheckpointKind {
+    Setup,
+    Checkpoint,
+}
+
+fn expected_product_gate_phase_ids(id: &str) -> &'static [&'static str] {
+    match id {
+        "RZ" => &[
+            "resident_cross_section_zoom.setup.000",
+            "resident_cross_section_zoom.checkpoint.000",
+            "resident_3d_zoom.setup.000",
+            "resident_3d_zoom.checkpoint.000",
+        ],
+        "ZB" => &[
+            "resident_boundary_crossing.setup.000",
+            "resident_boundary_crossing.setup.001",
+            "resident_boundary_crossing.setup.002",
+            "resident_boundary_crossing.checkpoint.000",
+            "nonresident_boundary_crossing.setup.000",
+            "nonresident_boundary_crossing.checkpoint.000",
+        ],
+        "RO" => &[
+            "resident_compound_plane_rotation.setup.000",
+            "resident_compound_plane_rotation.setup.001",
+            "resident_compound_plane_rotation.setup.002",
+            "resident_compound_plane_rotation.checkpoint.000",
+        ],
+        "ST" => &[
+            "resident_axis_slice_translation.setup.000",
+            "resident_axis_slice_translation.checkpoint.000",
+        ],
+        "NO" => &[
+            "nonresident_rotation_pan.setup.000",
+            "nonresident_rotation_pan.checkpoint.000",
+        ],
+        "FC" => &[
+            "blocking_target_settled.checkpoint.000",
+            "blocking_target_settled.checkpoint.001",
+            "exercise_extent_settled.checkpoint.000",
+        ],
+        "VM" => &[
+            "resident_mip.setup.000",
+            "resident_mip.checkpoint.000",
+            "resident_dvr.setup.000",
+            "resident_dvr.checkpoint.000",
+            "resident_iso.setup.000",
+            "resident_iso.checkpoint.000",
+            "exercise_mip.setup.000",
+            "exercise_mip.checkpoint.000",
+        ],
+        "PT" => &[
+            "advance_timepoint.setup.000",
+            "advance_timepoint.checkpoint.000",
+            "return_timepoint.checkpoint.000",
+        ],
+        "VV" => &[
+            "verification_active_resident.setup.000",
+            "verification_active_resident.setup.001",
+            "verification_complete_nonresident.checkpoint.000",
+            "verification_complete_nonresident.checkpoint.001",
+        ],
+        "IP" => &["preprocess_publish.checkpoint.000"],
+        _ => &[],
+    }
+}
+
+fn validate_product_gate_schedule(
+    id: &str,
+    scenario: &ScriptScenario,
+    script: &AutomationScriptTemplate,
+    profile: &ViewerQualificationProfile,
+    oracle: &OracleScenario,
+) -> anyhow::Result<RoleScheduleBound> {
+    let batches = expected_product_gate_batches(&script.commands)?;
+    let expected_phase_ids = expected_product_gate_phase_ids(id);
+    if batches.len() != expected_phase_ids.len() {
+        bail!(
+            "viewer scenario {id} gate-batch checkpoint count differs from the frozen v5 schedule"
+        )
+    }
+    let mut setup_ordinals = vec![0_usize; scenario.phases.len()];
+    let mut checkpoint_ordinals = vec![0_usize; scenario.phases.len()];
+    let mut phase_batch_counts = vec![0_usize; scenario.phases.len()];
+    let mut last_phase_index = 0_usize;
+    let request_verification = script.commands.iter().position(|command| {
+        command.get("command").and_then(Value::as_str) == Some("request_source_verification")
+    });
+    if id == "FC" {
+        validate_fc_source_verification_order(&script.commands, &batches)?;
+    }
+    for (batch_ordinal, batch) in batches.iter().enumerate() {
+        let expected_batch_id = format!("{id}.batch.{batch_ordinal:03}");
+        if batch.batch_id != expected_batch_id {
+            bail!("viewer scenario {id} product-gate batch IDs differ from the frozen order")
+        }
+        if batch.phase_id != expected_phase_ids[batch_ordinal] {
+            bail!(
+                "viewer scenario {id} product-gate phase IDs differ from the frozen checkpoint schedule"
+            )
+        }
+        let mut matched = None;
+        for (phase_index, phase) in scenario.phases.iter().enumerate() {
+            let setup = format!("{}.setup.{:03}", phase.name, setup_ordinals[phase_index]);
+            let checkpoint = format!(
+                "{}.checkpoint.{:03}",
+                phase.name, checkpoint_ordinals[phase_index]
+            );
+            if batch.phase_id == setup {
+                matched = Some((phase_index, PhaseCheckpointKind::Setup));
+                break;
+            }
+            if batch.phase_id == checkpoint {
+                matched = Some((phase_index, PhaseCheckpointKind::Checkpoint));
+                break;
+            }
+        }
+        let (phase_index, checkpoint_kind) = matched
+            .with_context(|| format!("viewer scenario {id} product-gate phase ID is not next"))?;
+        if phase_index < last_phase_index {
+            bail!("viewer scenario {id} product-gate phase IDs are not monotonic")
+        }
+        if checkpoint_kind == PhaseCheckpointKind::Setup && checkpoint_ordinals[phase_index] != 0 {
+            bail!("viewer scenario {id} setup gate batch follows a phase checkpoint")
+        }
+        match checkpoint_kind {
+            PhaseCheckpointKind::Setup => setup_ordinals[phase_index] += 1,
+            PhaseCheckpointKind::Checkpoint => checkpoint_ordinals[phase_index] += 1,
+        }
+        phase_batch_counts[phase_index] += 1;
+        last_phase_index = phase_index;
+
+        if script.diagnostic_counters {
+            let phase = &scenario.phases[phase_index];
+            let start = phase
+                .start_diagnostic_label
+                .as_deref()
+                .and_then(|label| diagnostic_command_index(&script.commands, label));
+            match (checkpoint_kind, start) {
+                (PhaseCheckpointKind::Setup, Some(start)) if batch.command_index >= start => {
+                    bail!("viewer scenario {id} setup gate batch is not before its phase start")
+                }
+                (PhaseCheckpointKind::Checkpoint, Some(start)) if batch.command_index <= start => {
+                    bail!("viewer scenario {id} checkpoint gate batch is not after its phase start")
+                }
+                _ => {}
+            }
+            if let Some(next_start) = scenario
+                .phases
+                .get(phase_index + 1)
+                .and_then(|phase| phase.start_diagnostic_label.as_deref())
+                .and_then(|label| diagnostic_command_index(&script.commands, label))
+                && batch.command_index >= next_start
+            {
+                bail!("viewer scenario {id} product-gate batch crosses into the next phase")
+            }
+        }
+
+        if batch.command_index == 0
+            || script.commands[batch.command_index - 1]
+                .get("command")
+                .and_then(Value::as_str)
+                == Some("observe_gate_batch")
+        {
+            bail!("viewer product-gate batches must replace one complete contiguous gate run")
+        }
+        let phase_name = scenario.phases[phase_index].name.as_str();
+        let has_source_verification = batch
+            .observations
+            .iter()
+            .any(|observation| observation.condition == "source_verification_verified");
+        let fc_cold_batch = id == "FC"
+            && phase_name == "blocking_target_settled"
+            && batch
+                .observations
+                .iter()
+                .any(|observation| observation.condition != "runtime_idle");
+        if fc_cold_batch
+            && batch
+                .observations
+                .iter()
+                .any(|observation| observation.condition == "runtime_idle")
+        {
+            bail!(
+                "FC cold milestone batch must not include the post-verification runtime-idle gate"
+            )
+        }
+        let expected_origin =
+            if id == "IP" {
+                ProductGateOrigin::ImportPrimaryStarted
+            } else if fc_cold_batch {
+                ProductGateOrigin::AutomationStarted
+            } else if has_source_verification {
+                if batch.observations.len() != 1 {
+                    bail!("VV source-verification completion must use its own gate batch")
+                }
+                ProductGateOrigin::CommandCompleted(request_verification.context(
+                    "VV source-verification gate batch lacks its request command origin",
+                )?)
+            } else {
+                ProductGateOrigin::CommandCompleted(batch.command_index - 1)
+            };
+        if batch.origin != expected_origin {
+            bail!("viewer scenario {id} product-gate batch has the wrong exact origin")
+        }
+
+        for observation in &batch.observations {
+            let (authority, deadline) = expected_product_gate_deadline(
+                id,
+                phase_name,
+                observation.condition,
+                profile,
+                oracle,
+            )?;
+            if observation.deadline_authority != authority
+                || observation.deadline_after_origin_ns != deadline
+            {
+                bail!("viewer scenario {id} product-gate deadline differs from its owner authority")
+            }
+        }
+    }
+    if phase_batch_counts.contains(&0) {
+        bail!("every declared viewer phase must own at least one product-gate batch")
+    }
+    if id == "IP" {
+        let [batch] = batches.as_slice() else {
+            bail!("IP must merge its three import-primary observations into exactly one batch")
+        };
+        let start_import = sole_command_index(
+            &script.commands,
+            "start_reviewed_import",
+            "IP reviewed import command",
+        )?;
+        if batch.command_index != start_import + 1 || batch.observations.len() != 3 {
+            bail!("IP import-primary gate batch must immediately follow import start")
+        }
+    }
+    validate_fatal_wait_deadlines(id, &script.commands, profile)?;
+    role_schedule_bound(id, script, profile, oracle)
+}
+
+fn validate_fc_source_verification_order(
+    commands: &[Value],
+    batches: &[ExpectedProductGateBatch<'_>],
+) -> anyhow::Result<()> {
+    let waits = source_verification_wait_indices(commands).collect::<Vec<_>>();
+    let [wait] = waits.as_slice() else {
+        bail!("FC must contain exactly one source-verification prerequisite wait")
+    };
+    let cold = batches
+        .iter()
+        .find(|batch| batch.phase_id == "blocking_target_settled.checkpoint.000")
+        .context("FC cold milestone batch is unavailable")?;
+    let runtime_idle = batches
+        .iter()
+        .find(|batch| batch.phase_id == "blocking_target_settled.checkpoint.001")
+        .context("FC post-verification runtime-idle batch is unavailable")?;
+    if cold.command_index >= *wait {
+        bail!("FC cold milestone batch must precede source verification")
+    }
+    if runtime_idle.command_index <= *wait {
+        bail!("FC resident runtime-idle batch must follow source verification")
+    }
+    Ok(())
+}
+
+fn expected_product_gate_deadline<'a>(
+    id: &str,
+    phase_name: &str,
+    condition: &str,
+    profile: &'a ViewerQualificationProfile,
+    oracle: &'a OracleScenario,
+) -> anyhow::Result<(&'static str, u64)> {
+    let gates = &profile.absolute_gates;
+    if id == "IP" {
+        if !matches!(
+            condition,
+            "import_idle" | "runtime_idle" | IMPORTED_OPEN_READY_CONDITION
+        ) {
+            bail!("IP product-gate condition is not part of the frozen import batch")
+        }
+        return Ok(("import_primary_wall", import_primary_wall_deadline(oracle)?));
+    }
+    if condition == "source_verification_verified" {
+        if id != "VV" {
+            bail!("only VV may use the source-verification product gate")
+        }
+        return Ok((
+            "source_verification_completion",
+            gates.source_verification_completion_ns,
+        ));
+    }
+    if id == "FC" && phase_name == "blocking_target_settled" {
+        return match condition {
+            "first_frame" => Ok(("cold_first_useful", gates.cold_first_useful_ns)),
+            "frame_freshness_current" => {
+                Ok(("cold_complete_coarse", gates.cold_complete_coarse_ns))
+            }
+            "coordinated_presentation_settled" => {
+                Ok(("cold_target_settlement", gates.cold_target_settlement_ns))
+            }
+            "runtime_idle" => Ok((
+                "maximum_current_presentation_gap_plus_poll_grace",
+                gates
+                    .maximum_current_presentation_gap_ns
+                    .checked_mul(2)
+                    .context("resident product-gate deadline overflows")?,
+            )),
+            _ => bail!("FC blocking phase has an unsupported product-gate condition"),
+        };
+    }
+    let nonresident = matches!(
+        (id, phase_name),
+        ("ZB", "nonresident_boundary_crossing")
+            | ("NO", "nonresident_rotation_pan")
+            | ("VV", "verification_complete_nonresident")
+    );
+    if !matches!(
+        condition,
+        "coordinated_presentation_settled" | "runtime_idle"
+    ) {
+        bail!("viewer phase has an unsupported product-gate condition")
+    }
+    if nonresident {
+        Ok((
+            "nonresident_target_settlement",
+            gates.nonresident_target_settlement_ns,
+        ))
+    } else {
+        Ok((
+            "maximum_current_presentation_gap_plus_poll_grace",
+            gates
+                .maximum_current_presentation_gap_ns
+                .checked_mul(2)
+                .context("resident product-gate deadline overflows")?,
+        ))
+    }
+}
+
+fn import_primary_wall_deadline(oracle: &OracleScenario) -> anyhow::Result<u64> {
+    let deadline = oracle
+        .phases
+        .iter()
+        .find_map(|phase| {
+            phase
+                .import_gate
+                .as_ref()
+                .map(|gate| gate.limits.maximum_app_primary_wall_time_ns)
+        })
+        .context("IP oracle import-primary wall authority is unavailable")?;
+    if deadline == 0 || deadline > PRODUCT_GATE_DEADLINE_MAX_NS {
+        bail!("IP oracle import-primary wall authority is outside the automation bound")
+    }
+    Ok(deadline)
+}
+
+fn ceil_ns_to_ms(value: u64) -> anyhow::Result<u64> {
+    value
+        .checked_add(999_999)
+        .map(|value| value / 1_000_000)
+        .context("viewer deadline overflows while converting to milliseconds")
+}
+
+fn validate_fatal_wait_deadlines(
+    id: &str,
+    commands: &[Value],
+    profile: &ViewerQualificationProfile,
+) -> anyhow::Result<()> {
+    for command in commands
+        .iter()
+        .filter(|command| command.get("command").and_then(Value::as_str) == Some("wait_for"))
+    {
+        let object = command
+            .as_object()
+            .context("fatal wait_for command must be an object")?;
+        if object.keys().map(String::as_str).collect::<BTreeSet<_>>()
+            != BTreeSet::from(["command", "condition", "timeout_ms"])
+        {
+            bail!("fatal wait_for command has the wrong exact field set")
+        }
+        let condition = object
+            .get("condition")
+            .and_then(Value::as_str)
+            .context("fatal wait_for condition is unavailable")?;
+        let expected_ms = match condition {
+            "window_ready" => 5_000,
+            "source_verification_verified" | "source_verification_required" => {
+                ceil_ns_to_ms(profile.absolute_gates.source_verification_completion_ns)?
+            }
+            "runtime_idle" => 30_000,
+            "import_review_ready" if id == "IP" => 60_000,
+            _ => bail!("fatal wait_for condition has no frozen v5 deadline authority"),
+        };
+        if object.get("timeout_ms").and_then(Value::as_u64) != Some(expected_ms) {
+            bail!("fatal wait_for timeout differs from its frozen v5 authority")
+        }
+    }
+    Ok(())
+}
+
+fn role_schedule_bound(
+    id: &str,
+    script: &AutomationScriptTemplate,
+    profile: &ViewerQualificationProfile,
+    oracle: &OracleScenario,
+) -> anyhow::Result<RoleScheduleBound> {
+    let batches = expected_product_gate_batches(&script.commands)?;
+    let mut grouped_gate_bounds = BTreeMap::<ProductGateOrigin, u64>::new();
+    for batch in &batches {
+        let bound = batch
+            .observations
+            .iter()
+            .map(|observation| observation.deadline_after_origin_ns)
+            .max()
+            .context("product-gate batch unexpectedly has no observations")?;
+        grouped_gate_bounds
+            .entry(batch.origin)
+            .and_modify(|current| *current = (*current).max(bound))
+            .or_insert(bound);
+    }
+    let grouped_gate_wait_bound_ns = checked_sum(grouped_gate_bounds.values().copied())?;
+    let mut prerequisite_wait_bound_ns = 0_u64;
+    let mut action_duration_bound_ns = 0_u64;
+    for command in &script.commands {
+        let name = command.get("command").and_then(Value::as_str);
+        if name == Some("wait_for") {
+            let timeout_ns = command
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .context("validated fatal wait timeout is unavailable")?
+                .checked_mul(1_000_000)
+                .context("fatal wait timeout overflows nanoseconds")?;
+            prerequisite_wait_bound_ns = prerequisite_wait_bound_ns
+                .checked_add(timeout_ns)
+                .context("prerequisite wait schedule overflows")?;
+            continue;
+        }
+        if let Some(duration_ms) = command.get("duration_ms").and_then(Value::as_u64) {
+            action_duration_bound_ns = action_duration_bound_ns
+                .checked_add(
+                    duration_ms
+                        .checked_mul(1_000_000)
+                        .context("action duration overflows nanoseconds")?,
+                )
+                .context("action duration schedule overflows")?;
+        }
+        if name == Some("sleep_frames") {
+            let frames = command
+                .get("frames")
+                .and_then(Value::as_u64)
+                .context("sleep_frames count is unavailable")?;
+            action_duration_bound_ns = action_duration_bound_ns
+                .checked_add(
+                    frames
+                        .checked_mul(profile.absolute_gates.maximum_current_presentation_gap_ns)
+                        .context("sleep-frame schedule overflows")?,
+                )
+                .context("action duration schedule overflows")?;
+        }
+    }
+    let static_wait_bound_ns = grouped_gate_wait_bound_ns
+        .checked_add(prerequisite_wait_bound_ns)
+        .context("static wait schedule overflows")?;
+    if id != "IP" && grouped_gate_wait_bound_ns > MAX_NONIMPORT_STATIC_WAIT_NS {
+        bail!("viewer role grouped product-gate schedule exceeds the 35-second v5 ceiling")
+    }
+    let derived_process_timeout_ns = static_wait_bound_ns
+        .checked_add(action_duration_bound_ns)
+        .and_then(|value| value.checked_add(PROCESS_LAUNCH_CLOSEOUT_GRACE_NS))
+        .context("derived viewer role process timeout overflows")?;
+    if id == "IP" && import_primary_wall_deadline(oracle)? > grouped_gate_wait_bound_ns {
+        bail!("IP derived schedule does not count its import-primary wall authority")
+    }
+    Ok(RoleScheduleBound {
+        gate_batch_count: batches.len(),
+        gate_observation_count: batches.iter().map(|batch| batch.observations.len()).sum(),
+        grouped_gate_wait_bound_ns,
+        prerequisite_wait_bound_ns,
+        action_duration_bound_ns,
+        static_wait_bound_ns,
+        derived_process_timeout_ns,
+    })
+}
+
+fn checked_sum(mut values: impl Iterator<Item = u64>) -> anyhow::Result<u64> {
+    values.try_fold(0_u64, |sum, value| {
+        sum.checked_add(value)
+            .context("viewer schedule bound overflows")
+    })
 }
 
 fn validate_startup_bootstrap(bootstrap: &AutomationStartupBootstrap) -> anyhow::Result<()> {
@@ -3767,7 +4327,7 @@ fn diagnostic_labels(commands: &[Value]) -> anyhow::Result<Vec<&str>> {
 }
 
 fn normalized_semantic_script(script: &AutomationScriptTemplate) -> Value {
-    let commands = script
+    let mut commands = script
         .commands
         .iter()
         .filter(|command| {
@@ -3778,6 +4338,32 @@ fn normalized_semantic_script(script: &AutomationScriptTemplate) -> Value {
         })
         .cloned()
         .collect::<Vec<_>>();
+    for command in &mut commands {
+        if command.get("command").and_then(Value::as_str) != Some("observe_gate_batch")
+            || command.pointer("/origin/kind").and_then(Value::as_str) != Some("command_completed")
+        {
+            continue;
+        }
+        let source_verification_origin = command
+            .get("observations")
+            .and_then(Value::as_array)
+            .is_some_and(|observations| {
+                observations.iter().any(|observation| {
+                    observation
+                        .pointer("/target/condition")
+                        .and_then(Value::as_str)
+                        == Some("source_verification_verified")
+                })
+            });
+        command["origin"] = json!({
+            "kind": "command_completed",
+            "semantic_origin": if source_verification_origin {
+                "request_source_verification"
+            } else {
+                "immediate_predecessor"
+            },
+        });
+    }
     json!({
         "schema": script.schema,
         "schema_version": script.schema_version,
@@ -4041,7 +4627,6 @@ fn write_resource_settings(
 }
 
 fn execute_samples(
-    args: &RunArgs,
     profile: &LoadedProfile,
     import_source: &ImportSourceBinding,
     scripts: &ScriptBundle,
@@ -4068,8 +4653,7 @@ fn execute_samples(
             let oracle_scenario = oracle_map
                 .get(scenario_id)
                 .expect("oracle coverage was validated");
-            samples.push(execute_sample(
-                args,
+            let sample = execute_sample(
                 &profile.profile,
                 import_source,
                 &oracle.numerical_contract,
@@ -4078,7 +4662,21 @@ fn execute_samples(
                 oracle_scenario,
                 app_binary,
                 result_root,
-            ));
+            );
+            let integrity_failed = has_integrity_reasons(&sample.reasons)
+                || has_integrity_reasons(&sample.instrumented.reasons)
+                || sample
+                    .control
+                    .as_ref()
+                    .is_some_and(|role| has_integrity_reasons(&role.reasons))
+                || sample
+                    .phases
+                    .iter()
+                    .any(|phase| has_integrity_reasons(&phase.reasons));
+            samples.push(sample);
+            if integrity_failed {
+                return samples;
+            }
         }
     }
     samples
@@ -4120,10 +4718,10 @@ fn validate_attempt_population(
         .iter()
         .map(|id| {
             let scenario = script_map.get(id).expect("script coverage was validated");
-            expected_product_gate_commands(&scenario.instrumented_script.commands)
+            expected_product_gate_observations(&scenario.instrumented_script.commands)
                 .expect("script product gates were validated")
                 .len()
-                + expected_product_gate_commands(
+                + expected_product_gate_observations(
                     &scenario
                         .instrumentation_control_script
                         .as_ref()
@@ -4149,6 +4747,16 @@ fn validate_attempt_population(
         .iter()
         .map(|sample| (sample.sample_index, sample.scenario.as_str()))
         .collect::<BTreeSet<_>>();
+    let sample_order_exact = samples
+        .iter()
+        .map(|sample| (sample.sample_index, sample.scenario.as_str()))
+        .eq(
+            (1..=profile.protocol.development_samples).flat_map(|sample_index| {
+                REQUIRED_SCENARIOS
+                    .into_iter()
+                    .map(move |scenario| (sample_index, scenario))
+            }),
+        );
     if samples.len() != expected_sample_records {
         reasons.insert("sample_population_cardinality_mismatch".to_owned());
     }
@@ -4156,6 +4764,9 @@ fn validate_attempt_population(
         observed_keys == expected_keys && observed_keys.len() == samples.len();
     if !sample_identities_exact {
         reasons.insert("sample_population_identity_mismatch".to_owned());
+    }
+    if !sample_order_exact {
+        reasons.insert("sample_population_order_mismatch".to_owned());
     }
 
     let mut observed_role_attempts = 0_usize;
@@ -4166,7 +4777,8 @@ fn validate_attempt_population(
     let mut phase_identities_exact = true;
     let mut product_gate_bijections_exact = true;
     for sample in samples {
-        observed_role_attempts = observed_role_attempts.saturating_add(1);
+        observed_role_attempts = observed_role_attempts
+            .saturating_add(usize::from(sample.instrumented.process.launch_attempted));
         completed_role_reports = completed_role_reports.saturating_add(usize::from(
             sample.instrumented.automation_report_sha256.is_some(),
         ));
@@ -4178,7 +4790,8 @@ fn validate_attempt_population(
         }
         match &sample.control {
             Some(control) => {
-                observed_role_attempts = observed_role_attempts.saturating_add(1);
+                observed_role_attempts = observed_role_attempts
+                    .saturating_add(usize::from(control.process.launch_attempted));
                 completed_role_reports = completed_role_reports
                     .saturating_add(usize::from(control.automation_report_sha256.is_some()));
                 observed_product_gate_observations = observed_product_gate_observations
@@ -4254,6 +4867,7 @@ fn validate_attempt_population(
         expected_product_gate_observations,
         observed_product_gate_observations,
         sample_identities_exact,
+        sample_order_exact,
         role_identities_exact,
         phase_identities_exact,
         product_gate_bijections_exact,
@@ -4264,37 +4878,41 @@ fn product_gate_outcomes_match_template(
     outcomes: &[ProductGateOutcome],
     template: &AutomationScriptTemplate,
 ) -> bool {
-    let Ok(expected) = expected_product_gate_commands(&template.commands) else {
+    let Ok(expected) = expected_product_gate_observations(&template.commands) else {
         return false;
     };
     outcomes.len() == expected.len()
-        && outcomes
-            .iter()
-            .zip(expected)
-            .all(|(outcome, (command_index, command))| {
-                outcome.command_index == command_index
-                    && outcome.gate_id == command.gate_id
-                    && outcome.condition == command.condition
-                    && outcome.timeout_ms == command.timeout_ms
-                    && product_gate_outcome_is_coherent(outcome)
-            })
+        && outcomes.iter().zip(expected).all(|(outcome, expected)| {
+            outcome.command_index == expected.command_index
+                && outcome.batch_id == expected.batch_id
+                && outcome.phase_id == expected.phase_id
+                && outcome.observation_index == expected.observation_index
+                && outcome.gate_id == expected.gate_id
+                && outcome.condition == expected.condition
+                && outcome.deadline_authority == expected.deadline_authority
+                && outcome.deadline_after_origin_ns == expected.deadline_after_origin_ns
+                && outcome.origin_kind == expected.origin.kind_label()
+                && outcome.origin_command_index == expected.origin.command_index()
+                && product_gate_outcome_is_coherent(outcome)
+        })
 }
 
 fn product_gate_outcome_is_coherent(outcome: &ProductGateOutcome) -> bool {
-    let Some(timeout_ns) = outcome.timeout_ms.checked_mul(1_000_000) else {
-        return false;
-    };
     match outcome.outcome {
         ProductGateStatus::Passed => {
-            outcome.condition_met && !outcome.timed_out && outcome.waited_ns < timeout_ns
+            outcome.condition_met
+                && !outcome.timed_out
+                && outcome.observed_after_origin_ns < outcome.deadline_after_origin_ns
         }
-        ProductGateStatus::Failed => outcome.timed_out && outcome.waited_ns >= timeout_ns,
+        ProductGateStatus::Failed => {
+            outcome.timed_out
+                && outcome.observed_after_origin_ns >= outcome.deadline_after_origin_ns
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn execute_sample(
-    args: &RunArgs,
     profile: &ViewerQualificationProfile,
     import_source: &ImportSourceBinding,
     numerical_contract: &NumericalContract,
@@ -4306,7 +4924,13 @@ fn execute_sample(
 ) -> SampleEvidence {
     let mut instrumented = None;
     let mut control = None;
-    let roles = if sample_index.is_multiple_of(2) {
+    let scenario_ordinal = REQUIRED_SCENARIOS
+        .iter()
+        .position(|id| *id == scenario.id)
+        .expect("validated scenario has a frozen ordinal");
+    let roles = if (usize::try_from(sample_index).unwrap_or_default() + scenario_ordinal)
+        .is_multiple_of(2)
+    {
         [
             AttemptRole::Instrumented,
             AttemptRole::InstrumentationControl,
@@ -4326,11 +4950,11 @@ fn execute_sample(
             || missing_control_evidence(result_root, sample_index, &scenario.id),
             |template| {
                 execute_role(
-                    args,
                     profile,
                     (scenario.id == "IP").then_some(import_source),
                     sample_index,
                     scenario,
+                    oracle,
                     template,
                     role,
                     app_binary,
@@ -4338,12 +4962,31 @@ fn execute_sample(
                 )
             },
         );
+        let integrity_failed = has_integrity_reasons(&evidence.reasons);
         match role {
             AttemptRole::Instrumented => instrumented = Some(evidence),
             AttemptRole::InstrumentationControl => control = Some(evidence),
         }
+        if integrity_failed {
+            break;
+        }
     }
-    let mut instrumented = instrumented.expect("instrumented role is always scheduled");
+    let mut instrumented = instrumented.unwrap_or_else(|| {
+        unlaunched_role_evidence(
+            result_root,
+            sample_index,
+            &scenario.id,
+            AttemptRole::Instrumented,
+        )
+    });
+    if control.is_none() {
+        control = Some(unlaunched_role_evidence(
+            result_root,
+            sample_index,
+            &scenario.id,
+            AttemptRole::InstrumentationControl,
+        ));
+    }
     if let Some(expected_manifest) = oracle
         .phases
         .iter()
@@ -4425,6 +5068,13 @@ fn execute_sample(
 }
 
 fn validate_imported_manifest_identity(role: &mut RoleEvidence, expected: &str) {
+    if prepublication_import_failure_is_exact(role) {
+        if !role.cleanup_completed || role.cleanup_manifest_sha256.is_some() {
+            role.reasons
+                .insert("prepublication_import_cleanup_or_absence_evidence_invalid".to_owned());
+        }
+        return;
+    }
     match role.cleanup_manifest_sha256.as_deref() {
         Some(observed) if observed == expected => {}
         Some(_) => {
@@ -4436,6 +5086,44 @@ fn validate_imported_manifest_identity(role: &mut RoleEvidence, expected: &str) 
                 .insert("imported_root_manifest_identity_missing".to_owned());
         }
     }
+}
+
+fn prepublication_import_failure_is_exact(role: &RoleEvidence) -> bool {
+    let Some(workflow) = role
+        .automation_report
+        .as_ref()
+        .and_then(|report| report.get("import_workflow_evidence"))
+    else {
+        return false;
+    };
+    if workflow.get("primary_clock") != Some(&Value::Null)
+        || workflow.get("publication_to_open_ready_clock") != Some(&Value::Null)
+        || workflow.get("last_successful_receipt") != Some(&Value::Null)
+        || role_product_gate_status(role, IMPORTED_OPEN_READY_CONDITION)
+            != Some(ProductGateStatus::Failed)
+        || role_product_gate_status(role, "import_idle") != Some(ProductGateStatus::Failed)
+    {
+        return false;
+    }
+    let run_counts = (
+        import_u64(workflow, "successful_runs"),
+        import_u64(workflow, "published_events"),
+        import_u64(workflow, "failed_runs"),
+        import_u64(workflow, "cancelled_runs"),
+    );
+    (run_counts == (Some(0), Some(0), Some(1), Some(0))
+        && role_product_gate_status(role, "runtime_idle") == Some(ProductGateStatus::Passed))
+        || (run_counts == (Some(0), Some(0), Some(0), Some(0))
+            && role_product_gate_status(role, "runtime_idle") == Some(ProductGateStatus::Failed))
+}
+
+fn role_product_gate_status(role: &RoleEvidence, condition: &str) -> Option<ProductGateStatus> {
+    let mut matches = role
+        .product_gate_outcomes
+        .iter()
+        .filter(|outcome| outcome.condition == condition);
+    let status = matches.next()?.outcome;
+    matches.next().is_none().then_some(status)
 }
 
 fn capture_bound_import_source(
@@ -4465,21 +5153,34 @@ fn import_source_inventory_matches_binding(
         && facts.sha256 == binding.inventory_sha256
 }
 
-fn validate_import_receipt_source_binding(
+fn validate_import_report_source_binding(
     report: &Value,
     binding: &ImportSourceBinding,
     reasons: &mut BTreeSet<String>,
 ) {
+    let start_matches =
+        unique_passed_event_details(report, "start_reviewed_import").is_some_and(|details| {
+            details
+                .get("reviewed_source_fingerprint_sha256")
+                .and_then(Value::as_str)
+                == Some(binding.reviewed_source_fingerprint_sha256.as_str())
+                && details.get("reviewed_source_bytes").and_then(Value::as_u64)
+                    == Some(binding.source_bytes)
+        });
     let receipt = report.pointer("/import_workflow_evidence/last_successful_receipt");
-    if receipt
-        .and_then(|value| value.get("reviewed_source_fingerprint_sha256"))
-        .and_then(Value::as_str)
-        != Some(binding.reviewed_source_fingerprint_sha256.as_str())
-        || receipt
-            .and_then(|value| value.get("reviewed_source_bytes"))
-            .and_then(Value::as_u64)
-            != Some(binding.source_bytes)
-    {
+    let receipt_matches = match receipt {
+        Some(Value::Null) => true,
+        Some(receipt) if receipt.is_object() => {
+            receipt
+                .get("reviewed_source_fingerprint_sha256")
+                .and_then(Value::as_str)
+                == Some(binding.reviewed_source_fingerprint_sha256.as_str())
+                && receipt.get("reviewed_source_bytes").and_then(Value::as_u64)
+                    == Some(binding.source_bytes)
+        }
+        _ => false,
+    };
+    if !start_matches || !receipt_matches {
         reasons.insert("import_receipt_workload_source_binding_mismatch".to_owned());
     }
 }
@@ -4493,6 +5194,7 @@ fn missing_control_evidence(result_root: &Path, sample_index: u32, scenario: &st
         expanded_script_sha256: String::new(),
         template_script_sha256: String::new(),
         process: ProcessObservation {
+            launch_attempted: false,
             status: None,
             external_wall_time_ns: 0,
             timed_out: false,
@@ -4502,6 +5204,10 @@ fn missing_control_evidence(result_root: &Path, sample_index: u32, scenario: &st
         automation_report_sha256: None,
         app_wall_time_ns: None,
         process_cpu_time_ns: None,
+        derived_process_timeout_ns: 0,
+        static_wait_bound_ns: 0,
+        gate_batch_count: 0,
+        gate_observation_count: 0,
         source_inventory_before: None,
         source_inventory_after: None,
         cleanup_manifest_sha256: None,
@@ -4511,18 +5217,58 @@ fn missing_control_evidence(result_root: &Path, sample_index: u32, scenario: &st
     }
 }
 
+fn unlaunched_role_evidence(
+    result_root: &Path,
+    sample_index: u32,
+    scenario: &str,
+    role: AttemptRole,
+) -> RoleEvidence {
+    RoleEvidence {
+        role,
+        root: result_root.join(format!(
+            "sample-{sample_index:02}/{scenario}/{}",
+            role.directory_name()
+        )),
+        expanded_script_sha256: String::new(),
+        template_script_sha256: String::new(),
+        process: ProcessObservation {
+            launch_attempted: false,
+            status: None,
+            external_wall_time_ns: 0,
+            timed_out: false,
+            spawn_error: None,
+        },
+        automation_report: None,
+        automation_report_sha256: None,
+        app_wall_time_ns: None,
+        process_cpu_time_ns: None,
+        derived_process_timeout_ns: 0,
+        static_wait_bound_ns: 0,
+        gate_batch_count: 0,
+        gate_observation_count: 0,
+        source_inventory_before: None,
+        source_inventory_after: None,
+        cleanup_manifest_sha256: None,
+        cleanup_completed: false,
+        product_gate_outcomes: Vec::new(),
+        reasons: BTreeSet::from(["population_aborted_after_integrity_failure".to_owned()]),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_role(
-    args: &RunArgs,
     profile: &ViewerQualificationProfile,
     import_source: Option<&ImportSourceBinding>,
     sample_index: u32,
     scenario: &ScriptScenario,
+    oracle: &OracleScenario,
     template: &AutomationScriptTemplate,
     role: AttemptRole,
     app_binary: &Path,
     result_root: &Path,
 ) -> RoleEvidence {
+    let schedule = role_schedule_bound(&scenario.id, template, profile, oracle)
+        .expect("validated viewer script has a derived process schedule");
     let intended_root = result_root.join(format!(
         "sample-{sample_index:02}/{}/{role_name}",
         scenario.id,
@@ -4549,6 +5295,7 @@ fn execute_role(
                 expanded_script_sha256: String::new(),
                 template_script_sha256: String::new(),
                 process: ProcessObservation {
+                    launch_attempted: false,
                     status: None,
                     external_wall_time_ns: 0,
                     timed_out: false,
@@ -4558,6 +5305,10 @@ fn execute_role(
                 automation_report_sha256: None,
                 app_wall_time_ns: None,
                 process_cpu_time_ns: None,
+                derived_process_timeout_ns: schedule.derived_process_timeout_ns,
+                static_wait_bound_ns: schedule.static_wait_bound_ns,
+                gate_batch_count: schedule.gate_batch_count,
+                gate_observation_count: schedule.gate_observation_count,
                 source_inventory_before: None,
                 source_inventory_after: None,
                 cleanup_manifest_sha256: None,
@@ -4577,6 +5328,7 @@ fn execute_role(
                     expanded_script_sha256,
                     template_script_sha256,
                     process: ProcessObservation {
+                        launch_attempted: false,
                         status: None,
                         external_wall_time_ns: 0,
                         timed_out: false,
@@ -4588,6 +5340,10 @@ fn execute_role(
                     automation_report_sha256: None,
                     app_wall_time_ns: None,
                     process_cpu_time_ns: None,
+                    derived_process_timeout_ns: schedule.derived_process_timeout_ns,
+                    static_wait_bound_ns: schedule.static_wait_bound_ns,
+                    gate_batch_count: schedule.gate_batch_count,
+                    gate_observation_count: schedule.gate_observation_count,
                     source_inventory_before: None,
                     source_inventory_after: None,
                     cleanup_manifest_sha256: None,
@@ -4605,7 +5361,7 @@ fn execute_role(
         app_binary,
         &profile.workload.representative_package.root,
         &role_root,
-        args.timeout,
+        Duration::from_nanos(schedule.derived_process_timeout_ns),
     );
     let mut reasons = BTreeSet::new();
     if process.spawn_error.is_some() {
@@ -4668,7 +5424,7 @@ fn execute_role(
             reasons.insert("automation_process_cpu_time_missing".to_owned());
         }
         if let Some(binding) = import_source {
-            validate_import_receipt_source_binding(report, binding, &mut reasons);
+            validate_import_report_source_binding(report, binding, &mut reasons);
         }
     }
     let source_inventory_after =
@@ -4694,7 +5450,7 @@ fn execute_role(
     if !has_integrity_reasons(&reasons) && scenario.cleanup.enabled {
         match cleanup_attempt_package(&role_root, &scenario.cleanup) {
             Ok(digest) => {
-                cleanup_manifest_sha256 = Some(digest);
+                cleanup_manifest_sha256 = digest;
                 cleanup_completed = true;
             }
             Err(_) => {
@@ -4712,6 +5468,10 @@ fn execute_role(
         automation_report_sha256,
         app_wall_time_ns,
         process_cpu_time_ns,
+        derived_process_timeout_ns: schedule.derived_process_timeout_ns,
+        static_wait_bound_ns: schedule.static_wait_bound_ns,
+        gate_batch_count: schedule.gate_batch_count,
+        gate_observation_count: schedule.gate_observation_count,
         source_inventory_before,
         source_inventory_after,
         cleanup_manifest_sha256,
@@ -4764,6 +5524,7 @@ fn run_app_process(
     let stderr = open_attempt_output(&role_root.join("stderr.log"));
     let (Ok(stdout), Ok(stderr)) = (stdout, stderr) else {
         return ProcessObservation {
+            launch_attempted: false,
             status: None,
             external_wall_time_ns: 0,
             timed_out: false,
@@ -4800,6 +5561,7 @@ fn run_app_process(
     let child = command.spawn();
     let Ok(mut child) = child else {
         return ProcessObservation {
+            launch_attempted: true,
             status: None,
             external_wall_time_ns: elapsed_ns(started),
             timed_out: false,
@@ -4811,6 +5573,7 @@ fn run_app_process(
         match child.try_wait() {
             Ok(Some(status)) => {
                 return ProcessObservation {
+                    launch_attempted: true,
                     status: Some(status),
                     external_wall_time_ns: elapsed_ns(started),
                     timed_out: false,
@@ -4821,6 +5584,7 @@ fn run_app_process(
             Err(_) => {
                 terminate_process_group(&mut child);
                 return ProcessObservation {
+                    launch_attempted: true,
                     status: None,
                     external_wall_time_ns: elapsed_ns(started),
                     timed_out: false,
@@ -4832,6 +5596,7 @@ fn run_app_process(
             terminate_process_group(&mut child);
             let status = child.wait().ok();
             return ProcessObservation {
+                launch_attempted: true,
                 status,
                 external_wall_time_ns: elapsed_ns(started),
                 timed_out: true,
@@ -5023,29 +5788,33 @@ fn product_gate_outcomes_from_report(
     report: &Value,
     template: &AutomationScriptTemplate,
 ) -> anyhow::Result<Vec<ProductGateOutcome>> {
-    let expected = expected_product_gate_commands(&template.commands)?;
+    let expected = expected_product_gate_batches(&template.commands)?;
     let events = report
         .get("events")
         .and_then(Value::as_array)
         .context("automation product-gate events are unavailable")?;
+    if events.iter().any(|event| {
+        matches!(
+            event.get("command").and_then(Value::as_str),
+            Some("observe_gate" | "observe_imported_open_ready")
+        )
+    }) {
+        bail!("automation report contains a removed serial product-gate event")
+    }
     let observed = events
         .iter()
-        .filter(|event| {
-            event
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(is_product_gate_observation_command)
-        })
+        .filter(|event| event.get("command").and_then(Value::as_str) == Some("observe_gate_batch"))
         .collect::<Vec<_>>();
     if observed.len() != expected.len() {
-        bail!("automation product-gate event cardinality differs from the script")
+        bail!("automation product-gate batch event cardinality differs from the script")
     }
 
-    let mut outcomes = Vec::with_capacity(expected.len());
-    for ((expected_index, expected_command), event) in expected.iter().zip(observed) {
+    let observation_count = expected.iter().map(|batch| batch.observations.len()).sum();
+    let mut outcomes = Vec::with_capacity(observation_count);
+    for (expected_batch, event) in expected.iter().zip(observed) {
         let event_object = event
             .as_object()
-            .context("automation product-gate event must be an object")?;
+            .context("automation product-gate batch event must be an object")?;
         if event_object
             .keys()
             .map(String::as_str)
@@ -5067,172 +5836,388 @@ fn product_gate_outcomes_from_report(
                 .and_then(Value::as_f64)
                 .is_some_and(|duration| duration.is_finite() && duration >= 0.0)
         {
-            bail!("automation product-gate event has an invalid exact outer shape")
+            bail!("automation product-gate batch event has an invalid exact outer shape")
         }
-        if event.get("command_index").and_then(Value::as_u64) != u64::try_from(*expected_index).ok()
-            || event.get("command").and_then(Value::as_str) != Some(expected_command.command)
+        if event.get("command_index").and_then(Value::as_u64)
+            != u64::try_from(expected_batch.command_index).ok()
+            || event.get("command").and_then(Value::as_str) != Some("observe_gate_batch")
             || event.get("status").and_then(Value::as_str) != Some("passed")
         {
-            bail!("automation product-gate event identity or order is invalid")
+            bail!("automation product-gate batch event identity or order is invalid")
         }
         let details = event
             .get("details")
             .and_then(Value::as_object)
-            .context("automation product-gate event details are unavailable")?;
+            .context("automation product-gate batch event details are unavailable")?;
         let expected_fields = BTreeSet::from([
             "schema",
-            "gate_id",
-            "condition",
-            "outcome",
-            "condition_met",
-            "timed_out",
-            "timeout_ms",
-            "waited_ns",
+            "batch_id",
+            "phase_id",
+            "origin",
+            "completed_after_origin_ns",
+            "observations",
         ]);
         if details.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_fields {
-            bail!("automation product-gate event details have the wrong exact field set")
+            bail!("automation product-gate batch details have the wrong exact field set")
         }
-        let gate_id = details
-            .get("gate_id")
-            .and_then(Value::as_str)
-            .context("automation product-gate event gate ID is unavailable")?;
-        let condition = details
-            .get("condition")
-            .and_then(Value::as_str)
-            .context("automation product-gate event condition is unavailable")?;
-        let timeout_ms = details
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .context("automation product-gate event timeout is unavailable")?;
         if details.get("schema").and_then(Value::as_str) != Some(PRODUCT_GATE_OBSERVATION_SCHEMA)
-            || gate_id != expected_command.gate_id
-            || condition != expected_command.condition
-            || timeout_ms != expected_command.timeout_ms
+            || details.get("batch_id").and_then(Value::as_str) != Some(expected_batch.batch_id)
+            || details.get("phase_id").and_then(Value::as_str) != Some(expected_batch.phase_id)
         {
-            bail!("automation product-gate event differs from its bound command")
+            bail!("automation product-gate batch details differ from the bound command")
         }
-        validate_product_gate_id(gate_id)?;
-        validate_product_gate_condition(condition)?;
-
-        let outcome = match details.get("outcome").and_then(Value::as_str) {
-            Some("passed") => ProductGateStatus::Passed,
-            Some("failed") => ProductGateStatus::Failed,
-            _ => bail!("automation product-gate event outcome is invalid"),
-        };
-        let condition_met = details
-            .get("condition_met")
-            .and_then(Value::as_bool)
-            .context("automation product-gate event condition result is unavailable")?;
-        let timed_out = details
-            .get("timed_out")
-            .and_then(Value::as_bool)
-            .context("automation product-gate event timeout result is unavailable")?;
-        let waited_ns = details
-            .get("waited_ns")
+        let observed_origin = parse_product_gate_origin(
+            details
+                .get("origin")
+                .context("automation product-gate batch origin is unavailable")?,
+        )?;
+        if observed_origin != expected_batch.origin {
+            bail!("automation product-gate batch origin differs from its bound command")
+        }
+        let completed_after_origin_ns = details
+            .get("completed_after_origin_ns")
             .and_then(Value::as_u64)
-            .context("automation product-gate event wait duration is unavailable")?;
-        let timeout_ns = timeout_ms
-            .checked_mul(1_000_000)
-            .context("automation product-gate timeout overflows nanoseconds")?;
-        match outcome {
-            ProductGateStatus::Passed if condition_met && !timed_out && waited_ns < timeout_ns => {}
-            ProductGateStatus::Failed if timed_out => {
-                if waited_ns < timeout_ns {
-                    bail!("failed automation product-gate event ended before its timeout")
-                }
-            }
-            _ => bail!("automation product-gate outcome flags are incoherent"),
+            .context("automation product-gate batch completion offset is unavailable")?;
+        let observed_rows = details
+            .get("observations")
+            .and_then(Value::as_array)
+            .context("automation product-gate batch observations are unavailable")?;
+        if observed_rows.len() != expected_batch.observations.len() {
+            bail!("automation product-gate batch observation cardinality differs")
         }
-        outcomes.push(ProductGateOutcome {
-            command_index: *expected_index,
-            gate_id: gate_id.to_owned(),
-            condition: condition.to_owned(),
-            outcome,
-            condition_met,
-            timed_out,
-            timeout_ms,
-            waited_ns,
-        });
+        for (observation_index, (expected_observation, observed)) in expected_batch
+            .observations
+            .iter()
+            .zip(observed_rows)
+            .enumerate()
+        {
+            let observed = observed
+                .as_object()
+                .context("automation product-gate batch observation must be an object")?;
+            if observed.keys().map(String::as_str).collect::<BTreeSet<_>>()
+                != BTreeSet::from([
+                    "observation_index",
+                    "gate_id",
+                    "condition",
+                    "deadline_authority",
+                    "deadline_after_origin_ns",
+                    "outcome",
+                    "condition_met",
+                    "timed_out",
+                    "observed_after_origin_ns",
+                ])
+            {
+                bail!("automation product-gate batch observation has the wrong exact field set")
+            }
+            let gate_id = observed
+                .get("gate_id")
+                .and_then(Value::as_str)
+                .context("automation product-gate observation gate ID is unavailable")?;
+            let condition = observed
+                .get("condition")
+                .and_then(Value::as_str)
+                .context("automation product-gate observation condition is unavailable")?;
+            let deadline_authority = observed
+                .get("deadline_authority")
+                .and_then(Value::as_str)
+                .context("automation product-gate observation deadline authority is unavailable")?;
+            let deadline_after_origin_ns = observed
+                .get("deadline_after_origin_ns")
+                .and_then(Value::as_u64)
+                .context("automation product-gate observation deadline is unavailable")?;
+            if observed.get("observation_index").and_then(Value::as_u64)
+                != u64::try_from(observation_index).ok()
+                || gate_id != expected_observation.gate_id
+                || condition != expected_observation.condition
+                || deadline_authority != expected_observation.deadline_authority
+                || deadline_after_origin_ns != expected_observation.deadline_after_origin_ns
+            {
+                bail!("automation product-gate observation differs from its bound command")
+            }
+            validate_product_gate_id(gate_id)?;
+            validate_product_gate_condition(condition)?;
+            validate_deadline_authority(deadline_authority)?;
+            let outcome = match observed.get("outcome").and_then(Value::as_str) {
+                Some("passed") => ProductGateStatus::Passed,
+                Some("failed") => ProductGateStatus::Failed,
+                _ => bail!("automation product-gate observation outcome is invalid"),
+            };
+            let condition_met = observed
+                .get("condition_met")
+                .and_then(Value::as_bool)
+                .context("automation product-gate observation condition result is unavailable")?;
+            let timed_out = observed
+                .get("timed_out")
+                .and_then(Value::as_bool)
+                .context("automation product-gate observation timeout result is unavailable")?;
+            let observed_after_origin_ns = observed
+                .get("observed_after_origin_ns")
+                .and_then(Value::as_u64)
+                .context("automation product-gate observation offset is unavailable")?;
+            if observed_after_origin_ns > completed_after_origin_ns {
+                bail!("automation product-gate observation occurs after its batch completion")
+            }
+            match outcome {
+                ProductGateStatus::Passed
+                    if condition_met
+                        && !timed_out
+                        && observed_after_origin_ns < deadline_after_origin_ns => {}
+                ProductGateStatus::Failed
+                    if timed_out && observed_after_origin_ns >= deadline_after_origin_ns => {}
+                _ => bail!("automation product-gate observation outcome flags are incoherent"),
+            }
+            outcomes.push(ProductGateOutcome {
+                command_index: expected_batch.command_index,
+                batch_id: expected_batch.batch_id.to_owned(),
+                phase_id: expected_batch.phase_id.to_owned(),
+                observation_index,
+                gate_id: gate_id.to_owned(),
+                condition: condition.to_owned(),
+                deadline_authority: deadline_authority.to_owned(),
+                deadline_after_origin_ns,
+                origin_kind: expected_batch.origin.kind_label().to_owned(),
+                origin_command_index: expected_batch.origin.command_index(),
+                outcome,
+                condition_met,
+                timed_out,
+                observed_after_origin_ns,
+            });
+        }
     }
     Ok(outcomes)
 }
 
-#[derive(Clone, Copy)]
-struct ExpectedProductGateCommand<'a> {
-    command: &'a str,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ProductGateOrigin {
+    AutomationStarted,
+    CommandCompleted(usize),
+    ImportPrimaryStarted,
+}
+
+impl ProductGateOrigin {
+    const fn kind_label(self) -> &'static str {
+        match self {
+            Self::AutomationStarted => "automation_started",
+            Self::CommandCompleted(_) => "command_completed",
+            Self::ImportPrimaryStarted => "import_primary_started",
+        }
+    }
+
+    const fn command_index(self) -> Option<usize> {
+        match self {
+            Self::CommandCompleted(index) => Some(index),
+            Self::AutomationStarted | Self::ImportPrimaryStarted => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExpectedProductGateObservation<'a> {
+    command_index: usize,
+    batch_id: &'a str,
+    phase_id: &'a str,
+    observation_index: usize,
     gate_id: &'a str,
     condition: &'a str,
-    timeout_ms: u64,
+    deadline_authority: &'a str,
+    deadline_after_origin_ns: u64,
+    origin: ProductGateOrigin,
 }
 
-fn is_product_gate_observation_command(command: &str) -> bool {
-    matches!(command, "observe_gate" | "observe_imported_open_ready")
+#[derive(Clone, Debug)]
+struct ExpectedProductGateBatch<'a> {
+    command_index: usize,
+    batch_id: &'a str,
+    phase_id: &'a str,
+    origin: ProductGateOrigin,
+    observations: Vec<ExpectedProductGateObservation<'a>>,
 }
 
-fn expected_product_gate_commands(
+fn parse_product_gate_origin(value: &Value) -> anyhow::Result<ProductGateOrigin> {
+    let object = value
+        .as_object()
+        .context("product-gate batch origin must be an object")?;
+    match object.get("kind").and_then(Value::as_str) {
+        Some("automation_started")
+            if object.keys().map(String::as_str).collect::<BTreeSet<_>>()
+                == BTreeSet::from(["kind"]) =>
+        {
+            Ok(ProductGateOrigin::AutomationStarted)
+        }
+        Some("import_primary_started")
+            if object.keys().map(String::as_str).collect::<BTreeSet<_>>()
+                == BTreeSet::from(["kind"]) =>
+        {
+            Ok(ProductGateOrigin::ImportPrimaryStarted)
+        }
+        Some("command_completed")
+            if object.keys().map(String::as_str).collect::<BTreeSet<_>>()
+                == BTreeSet::from(["kind", "command_index"]) =>
+        {
+            let index = object
+                .get("command_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+                .context("product-gate command-completed origin index is invalid")?;
+            Ok(ProductGateOrigin::CommandCompleted(index))
+        }
+        _ => bail!("product-gate batch origin has an invalid exact shape"),
+    }
+}
+
+fn expected_product_gate_batches(
     commands: &[Value],
-) -> anyhow::Result<Vec<(usize, ExpectedProductGateCommand<'_>)>> {
+) -> anyhow::Result<Vec<ExpectedProductGateBatch<'_>>> {
     let mut expected = Vec::new();
     let mut gate_ids = BTreeSet::new();
+    let mut batch_ids = BTreeSet::new();
     for (index, command) in commands.iter().enumerate() {
         let Some(command_name) = command.get("command").and_then(Value::as_str) else {
             continue;
         };
-        if !is_product_gate_observation_command(command_name) {
+        if matches!(command_name, "observe_gate" | "observe_imported_open_ready") {
+            bail!("removed serial product-gate observation command is not accepted")
+        }
+        if command_name != "observe_gate_batch" {
             continue;
         }
         let object = command
             .as_object()
-            .context("product-gate observation command must be a JSON object")?;
+            .context("product-gate batch command must be a JSON object")?;
         let fields = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
-        let condition = match command_name {
-            "observe_gate" => {
-                if fields != BTreeSet::from(["command", "gate_id", "condition", "timeout_ms"]) {
-                    bail!("observe_gate command has the wrong exact field set")
-                }
-                object
-                    .get("condition")
-                    .and_then(Value::as_str)
-                    .context("observe_gate command condition is unavailable")?
-            }
-            "observe_imported_open_ready" => {
-                if fields != BTreeSet::from(["command", "gate_id", "path", "timeout_ms"]) {
-                    bail!("observe_imported_open_ready command has the wrong exact field set")
-                }
-                object
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .filter(|path| !path.is_empty())
-                    .context("observe_imported_open_ready command path is unavailable")?;
-                IMPORTED_OPEN_READY_CONDITION
-            }
-            _ => unreachable!("product-gate observation command names are closed"),
-        };
-        let gate_id = object
-            .get("gate_id")
-            .and_then(Value::as_str)
-            .context("product-gate observation command gate ID is unavailable")?;
-        validate_product_gate_id(gate_id)?;
-        if !gate_ids.insert(gate_id) {
-            bail!("product-gate observation command gate IDs must be unique within one script")
+        if fields != BTreeSet::from(["command", "batch_id", "phase_id", "origin", "observations"]) {
+            bail!("observe_gate_batch command has the wrong exact field set")
         }
-        validate_product_gate_condition(condition)?;
-        let timeout_ms = object
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .filter(|timeout| *timeout > 0 && *timeout <= PRODUCT_GATE_TIMEOUT_MAX_MS)
-            .context("product-gate observation command timeout is outside its fixed bound")?;
-        expected.push((
-            index,
-            ExpectedProductGateCommand {
-                command: command_name,
+        let batch_id = object
+            .get("batch_id")
+            .and_then(Value::as_str)
+            .context("product-gate batch ID is unavailable")?;
+        let phase_id = object
+            .get("phase_id")
+            .and_then(Value::as_str)
+            .context("product-gate phase ID is unavailable")?;
+        validate_product_gate_id(batch_id)?;
+        validate_product_gate_id(phase_id)?;
+        if !batch_ids.insert(batch_id) {
+            bail!("product-gate batch IDs must be unique within one script")
+        }
+        let origin = parse_product_gate_origin(
+            object
+                .get("origin")
+                .context("product-gate batch origin is unavailable")?,
+        )?;
+        let rows = object
+            .get("observations")
+            .and_then(Value::as_array)
+            .filter(|rows| (1..=PRODUCT_GATE_BATCH_MAX_OBSERVATIONS).contains(&rows.len()))
+            .context("product-gate batch observation count is outside 1..=64")?;
+        let mut observations = Vec::with_capacity(rows.len());
+        for (observation_index, row) in rows.iter().enumerate() {
+            let row = row
+                .as_object()
+                .context("product-gate batch observation must be an object")?;
+            if row.keys().map(String::as_str).collect::<BTreeSet<_>>()
+                != BTreeSet::from([
+                    "gate_id",
+                    "deadline_authority",
+                    "deadline_after_origin_ns",
+                    "target",
+                ])
+            {
+                bail!("product-gate batch observation has the wrong exact field set")
+            }
+            let gate_id = row
+                .get("gate_id")
+                .and_then(Value::as_str)
+                .context("product-gate observation gate ID is unavailable")?;
+            validate_product_gate_id(gate_id)?;
+            if !gate_ids.insert(gate_id) {
+                bail!("product-gate observation IDs must be unique within one script")
+            }
+            let deadline_authority = row
+                .get("deadline_authority")
+                .and_then(Value::as_str)
+                .context("product-gate deadline authority is unavailable")?;
+            validate_deadline_authority(deadline_authority)?;
+            let deadline_after_origin_ns = row
+                .get("deadline_after_origin_ns")
+                .and_then(Value::as_u64)
+                .filter(|deadline| *deadline > 0 && *deadline <= PRODUCT_GATE_DEADLINE_MAX_NS)
+                .context("product-gate deadline is outside its fixed bound")?;
+            let target = row
+                .get("target")
+                .and_then(Value::as_object)
+                .context("product-gate observation target must be an object")?;
+            let condition = match target.get("kind").and_then(Value::as_str) {
+                Some("condition")
+                    if target.keys().map(String::as_str).collect::<BTreeSet<_>>()
+                        == BTreeSet::from(["kind", "condition"]) =>
+                {
+                    target
+                        .get("condition")
+                        .and_then(Value::as_str)
+                        .context("product-gate condition target is unavailable")?
+                }
+                Some("imported_open_ready")
+                    if target.keys().map(String::as_str).collect::<BTreeSet<_>>()
+                        == BTreeSet::from(["kind", "path"]) =>
+                {
+                    target
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .filter(|path| !path.is_empty())
+                        .context("product-gate imported-open-ready path is unavailable")?;
+                    IMPORTED_OPEN_READY_CONDITION
+                }
+                _ => bail!("product-gate observation target has an invalid exact shape"),
+            };
+            validate_product_gate_condition(condition)?;
+            observations.push(ExpectedProductGateObservation {
+                command_index: index,
+                batch_id,
+                phase_id,
+                observation_index,
                 gate_id,
                 condition,
-                timeout_ms,
-            },
-        ));
+                deadline_authority,
+                deadline_after_origin_ns,
+                origin,
+            });
+        }
+        expected.push(ExpectedProductGateBatch {
+            command_index: index,
+            batch_id,
+            phase_id,
+            origin,
+            observations,
+        });
     }
     Ok(expected)
+}
+
+fn expected_product_gate_observations(
+    commands: &[Value],
+) -> anyhow::Result<Vec<ExpectedProductGateObservation<'_>>> {
+    Ok(expected_product_gate_batches(commands)?
+        .into_iter()
+        .flat_map(|batch| batch.observations)
+        .collect())
+}
+
+fn validate_deadline_authority(value: &str) -> anyhow::Result<()> {
+    if !matches!(
+        value,
+        "maximum_current_presentation_gap_plus_poll_grace"
+            | "cold_first_useful"
+            | "cold_complete_coarse"
+            | "cold_target_settlement"
+            | "nonresident_target_settlement"
+            | "source_verification_completion"
+            | "import_primary_wall"
+    ) {
+        bail!("product-gate deadline authority is not one of the frozen v5 authorities")
+    }
+    Ok(())
 }
 
 fn validate_product_gate_id(value: &str) -> anyhow::Result<()> {
@@ -5724,13 +6709,19 @@ fn paired_overhead_basis_points(
     Some(u64::try_from(basis_points).unwrap_or(u64::MAX))
 }
 
-fn cleanup_attempt_package(role_root: &Path, cleanup: &AttemptCleanup) -> anyhow::Result<String> {
+fn cleanup_attempt_package(
+    role_root: &Path,
+    cleanup: &AttemptCleanup,
+) -> anyhow::Result<Option<String>> {
     let relative = cleanup
         .imported_package_relative_path
         .as_deref()
         .context("enabled cleanup lacks its package path")?;
     validate_relative_attempt_path(relative, "cleanup package")?;
     let package = role_root.join(relative);
+    if verified_attempt_path_is_absent(role_root, relative)? {
+        return Ok(None);
+    }
     require_nonsymlink_components(&package, "attempt-local cleanup package")?;
     let canonical_root = fs::canonicalize(role_root)?;
     let canonical_package =
@@ -5749,7 +6740,27 @@ fn cleanup_attempt_package(role_root: &Path, cleanup: &AttemptCleanup) -> anyhow
     if canonical_package.exists() {
         bail!("attempt-local imported package remains after cleanup")
     }
-    Ok(manifest_sha256)
+    Ok(Some(manifest_sha256))
+}
+
+fn verified_attempt_path_is_absent(role_root: &Path, relative: &Path) -> anyhow::Result<bool> {
+    let canonical_root = fs::canonicalize(role_root)?;
+    let mut cursor = canonical_root;
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            bail!("attempt-local cleanup path contains a non-normal component")
+        };
+        cursor.push(component);
+        match fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("attempt-local cleanup path contains a symlink component")
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error).context("attempt-local cleanup path is unavailable"),
+        }
+    }
+    Ok(false)
 }
 
 fn evaluate_phases(
@@ -6124,6 +7135,14 @@ fn validate_import_workflow_gate(
         reasons.insert("import_workflow_evidence_missing".to_owned());
         return;
     };
+    if !require_open_ready
+        && workflow.get("primary_clock") == Some(&Value::Null)
+        && workflow.get("publication_to_open_ready_clock") == Some(&Value::Null)
+        && workflow.get("last_successful_receipt") == Some(&Value::Null)
+    {
+        validate_prepublication_import_failure(report, workflow, gate, reasons);
+        return;
+    }
     let expected = &gate.expected;
     let run_facts = (
         import_u64(workflow, "successful_runs"),
@@ -6229,6 +7248,207 @@ fn validate_import_workflow_gate(
         require_open_ready,
         reasons,
     );
+}
+
+const IMPORT_WORKFLOW_EVIDENCE_FIELDS: &[&str] = &[
+    "worker_emitted_stage_names",
+    "projected_named_stage_observations",
+    "maximum_projected_elapsed_ms",
+    "maximum_completed_by_stage",
+    "progress_updates",
+    "published_events",
+    "cancelled_runs",
+    "successful_runs",
+    "failed_runs",
+    "maximum_resumed_work_units",
+    "maximum_peak_working_bytes",
+    "maximum_elapsed_ms",
+    "inspection_and_review_clock",
+    "primary_clock",
+    "publication_to_open_ready_clock",
+    "last_successful_receipt",
+    "fabricated_global_percentage_or_eta_observed",
+];
+
+fn validate_prepublication_import_failure(
+    report: &Value,
+    workflow: &Value,
+    gate: &ImportGate,
+    reasons: &mut BTreeSet<String>,
+) {
+    let inspection = validate_import_inspection_clock_evidence(workflow, reasons);
+    let start = unique_passed_event_details(report, "start_reviewed_import");
+    let start_shape_is_exact = start.is_some_and(prepublication_import_start_is_exact);
+    let start_time_reconciles = inspection
+        .zip(start.and_then(|details| import_u64(details, "primary_clock_started_at_epoch_ms")))
+        .is_some_and(|((inspection_started, start_command), primary_started)| {
+            inspection_started <= start_command && start_command <= primary_started
+        });
+    let imported_open_ready_matches =
+        unique_imported_open_ready_observation(report).is_some_and(|details| {
+            imported_open_ready_details_match(
+                details,
+                ProductGateStatus::Failed,
+                gate.limits.maximum_app_primary_wall_time_ns,
+            )
+        });
+    let import_idle = unique_import_batch_observation_status(report, "import_idle");
+    let runtime_idle = unique_import_batch_observation_status(report, "runtime_idle");
+    let run_counts = (
+        import_u64(workflow, "successful_runs"),
+        import_u64(workflow, "published_events"),
+        import_u64(workflow, "failed_runs"),
+        import_u64(workflow, "cancelled_runs"),
+    );
+    let terminal_worker_failure = run_counts == (Some(0), Some(0), Some(1), Some(0))
+        && import_idle == Some(ProductGateStatus::Failed)
+        && runtime_idle == Some(ProductGateStatus::Passed);
+    let active_at_deadline = run_counts == (Some(0), Some(0), Some(0), Some(0))
+        && import_idle == Some(ProductGateStatus::Failed)
+        && runtime_idle == Some(ProductGateStatus::Failed);
+    let exact_fields = workflow.as_object().is_some_and(|object| {
+        object.keys().map(String::as_str).collect::<BTreeSet<_>>()
+            == IMPORT_WORKFLOW_EVIDENCE_FIELDS
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+    });
+    if !exact_fields
+        || !prepublication_progress_shape_is_exact(workflow)
+        || workflow.get("primary_clock") != Some(&Value::Null)
+        || workflow.get("publication_to_open_ready_clock") != Some(&Value::Null)
+        || workflow.get("last_successful_receipt") != Some(&Value::Null)
+        || import_u64(workflow, "maximum_resumed_work_units") != Some(0)
+        || workflow
+            .get("fabricated_global_percentage_or_eta_observed")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || !start_shape_is_exact
+        || !start_time_reconciles
+        || !imported_open_ready_matches
+        || (!terminal_worker_failure && !active_at_deadline)
+    {
+        reasons.insert("prepublication_import_failure_evidence_shape_invalid".to_owned());
+    }
+}
+
+fn prepublication_import_start_is_exact(details: &Value) -> bool {
+    let Some(details) = details.as_object() else {
+        return false;
+    };
+    let exact_fields = details.keys().map(String::as_str).collect::<BTreeSet<_>>()
+        == BTreeSet::from([
+            "review_id",
+            "destination",
+            "operation_token",
+            "reviewed_source_fingerprint_sha256",
+            "reviewed_source_bytes",
+            "working_memory_bytes",
+            "primary_clock_started_at_epoch_ms",
+            "primary_clock_start_boundary",
+            "normal_review_command_path",
+        ]);
+    let token = details.get("operation_token").and_then(Value::as_object);
+    let exact_token = token.is_some_and(|token| {
+        token.keys().map(String::as_str).collect::<BTreeSet<_>>()
+            == BTreeSet::from([
+                "operation_id",
+                "task_id",
+                "kind",
+                "source_session_generation",
+                "currentness_generation",
+            ])
+            && token.get("kind").and_then(Value::as_str) == Some("Import")
+            && [
+                "operation_id",
+                "task_id",
+                "source_session_generation",
+                "currentness_generation",
+            ]
+            .iter()
+            .all(|field| {
+                token
+                    .get(*field)
+                    .and_then(Value::as_u64)
+                    .is_some_and(|value| value > 0)
+            })
+    });
+    exact_fields
+        && import_u64(&Value::Object(details.clone()), "review_id").is_some_and(|value| value > 0)
+        && details
+            .get("destination")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && details
+            .get("reviewed_source_fingerprint_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|value| require_sha256(value, "IP reviewed-source fingerprint").is_ok())
+        && [
+            "reviewed_source_bytes",
+            "working_memory_bytes",
+            "primary_clock_started_at_epoch_ms",
+        ]
+        .iter()
+        .all(|field| {
+            details
+                .get(*field)
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value > 0)
+        })
+        && details
+            .get("primary_clock_start_boundary")
+            .and_then(Value::as_str)
+            == Some("accepted_start_import_command_immediately_before_worker_spawn")
+        && details
+            .get("normal_review_command_path")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && exact_token
+}
+
+fn prepublication_progress_shape_is_exact(workflow: &Value) -> bool {
+    let Some(worker_stages) = import_string_set(workflow, "worker_emitted_stage_names") else {
+        return false;
+    };
+    let Some(projected_stages) = import_string_set(workflow, "projected_named_stage_observations")
+    else {
+        return false;
+    };
+    let Some(progress_rows) = workflow
+        .get("maximum_completed_by_stage")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let rows_are_exact = progress_rows.iter().all(|row| {
+        row.as_object().is_some_and(|row| {
+            row.keys().map(String::as_str).collect::<BTreeSet<_>>()
+                == BTreeSet::from(["stage", "completed_work_units"])
+                && row
+                    .get("stage")
+                    .and_then(Value::as_str)
+                    .is_some_and(|stage| !stage.is_empty() && stage.len() <= 128)
+                && row
+                    .get("completed_work_units")
+                    .and_then(Value::as_u64)
+                    .is_some()
+        })
+    });
+    let progress_stages = progress_rows
+        .iter()
+        .filter_map(|row| row.get("stage").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    rows_are_exact
+        && progress_stages == worker_stages
+        && projected_stages.is_subset(&worker_stages)
+        && [
+            "maximum_projected_elapsed_ms",
+            "progress_updates",
+            "maximum_peak_working_bytes",
+            "maximum_elapsed_ms",
+        ]
+        .iter()
+        .all(|field| import_u64(workflow, field).is_some())
 }
 
 fn validate_failed_import_open_ready_evidence_shape(
@@ -6563,7 +7783,14 @@ fn validate_import_receipt(
     require_open_ready: bool,
     reasons: &mut BTreeSet<String>,
 ) {
-    validate_import_receipt_binding(report, receipt, clocks, require_open_ready, reasons);
+    validate_import_receipt_binding(
+        report,
+        receipt,
+        clocks,
+        require_open_ready,
+        gate.limits.maximum_app_primary_wall_time_ns,
+        reasons,
+    );
 
     let Some(statistics) = receipt.get("statistics").filter(|value| value.is_object()) else {
         reasons.insert("import_receipt_statistics_missing".to_owned());
@@ -6785,6 +8012,7 @@ fn validate_import_receipt_binding(
     receipt: &Value,
     clocks: Option<ImportClockEvidence>,
     require_open_ready: bool,
+    import_primary_wall_ns: u64,
     reasons: &mut BTreeSet<String>,
 ) {
     let destination = receipt
@@ -6821,7 +8049,7 @@ fn validate_import_receipt_binding(
             .all(|field| import_u64(token, field).is_some_and(|value| value > 0))
     });
     let start_details = unique_passed_event_details(report, "start_reviewed_import");
-    let open_ready_details = unique_passed_event_details(report, "observe_imported_open_ready");
+    let open_ready_details = unique_imported_open_ready_observation(report);
     let start_matches = start_details.is_some_and(|details| {
         import_u64(details, "review_id") == review_id
             && details.get("destination").and_then(Value::as_str) == destination
@@ -6853,8 +8081,9 @@ fn validate_import_receipt_binding(
     } else {
         ProductGateStatus::Failed
     };
-    let open_ready_matches = open_ready_details
-        .is_some_and(|details| imported_open_ready_details_match(details, expected_outcome));
+    let open_ready_matches = open_ready_details.is_some_and(|details| {
+        imported_open_ready_details_match(details, expected_outcome, import_primary_wall_ns)
+    });
     let published_event = receipt
         .get("published_event")
         .filter(|value| value.is_object());
@@ -6888,23 +8117,32 @@ fn validate_import_receipt_binding(
     }
 }
 
-fn imported_open_ready_details_match(details: &Value, outcome: ProductGateStatus) -> bool {
+fn imported_open_ready_details_match(
+    details: &Value,
+    outcome: ProductGateStatus,
+    import_primary_wall_ns: u64,
+) -> bool {
     let Some(details) = details.as_object() else {
         return false;
     };
     if details.keys().map(String::as_str).collect::<BTreeSet<_>>()
         != BTreeSet::from([
-            "schema",
+            "observation_index",
             "gate_id",
             "condition",
+            "deadline_authority",
+            "deadline_after_origin_ns",
             "outcome",
             "condition_met",
             "timed_out",
-            "timeout_ms",
-            "waited_ns",
+            "observed_after_origin_ns",
         ])
-        || details.get("schema").and_then(Value::as_str) != Some(PRODUCT_GATE_OBSERVATION_SCHEMA)
         || details.get("condition").and_then(Value::as_str) != Some(IMPORTED_OPEN_READY_CONDITION)
+        || details.get("deadline_authority").and_then(Value::as_str) != Some("import_primary_wall")
+        || details
+            .get("deadline_after_origin_ns")
+            .and_then(Value::as_u64)
+            != Some(import_primary_wall_ns)
         || details.get("outcome").and_then(Value::as_str) != Some(outcome.report_label())
         || details
             .get("gate_id")
@@ -6915,33 +8153,69 @@ fn imported_open_ready_details_match(details: &Value, outcome: ProductGateStatus
     }
     let condition_met = details.get("condition_met").and_then(Value::as_bool);
     let timed_out = details.get("timed_out").and_then(Value::as_bool);
-    let timeout_ms = details.get("timeout_ms").and_then(Value::as_u64);
-    let waited_ns = details.get("waited_ns").and_then(Value::as_u64);
+    let observed_after_origin_ns = details
+        .get("observed_after_origin_ns")
+        .and_then(Value::as_u64);
     match outcome {
         ProductGateStatus::Passed => {
             condition_met == Some(true)
                 && timed_out == Some(false)
-                && timeout_ms
-                    .and_then(|timeout| timeout.checked_mul(1_000_000))
-                    .zip(waited_ns)
-                    .is_some_and(|(timeout_ns, waited_ns)| {
-                        timeout_ns > 0
-                            && timeout_ns <= PRODUCT_GATE_TIMEOUT_MAX_MS * 1_000_000
-                            && waited_ns < timeout_ns
-                    })
+                && observed_after_origin_ns
+                    .is_some_and(|observed| observed < import_primary_wall_ns)
         }
         ProductGateStatus::Failed => {
             condition_met.is_some()
                 && timed_out == Some(true)
-                && timeout_ms
-                    .and_then(|timeout| timeout.checked_mul(1_000_000))
-                    .zip(waited_ns)
-                    .is_some_and(|(timeout_ns, waited_ns)| {
-                        timeout_ns > 0
-                            && timeout_ns <= PRODUCT_GATE_TIMEOUT_MAX_MS * 1_000_000
-                            && waited_ns >= timeout_ns
-                    })
+                && observed_after_origin_ns
+                    .is_some_and(|observed| observed >= import_primary_wall_ns)
         }
+    }
+}
+
+fn unique_imported_open_ready_observation(report: &Value) -> Option<&Value> {
+    unique_import_batch_observation(report, IMPORTED_OPEN_READY_CONDITION)
+}
+
+fn unique_import_batch_observation<'a>(report: &'a Value, condition: &str) -> Option<&'a Value> {
+    let mut matches = report
+        .get("events")?
+        .as_array()?
+        .iter()
+        .filter(|event| {
+            event.get("command").and_then(Value::as_str) == Some("observe_gate_batch")
+                && event.get("status").and_then(Value::as_str) == Some("passed")
+                && event.pointer("/details/schema").and_then(Value::as_str)
+                    == Some(PRODUCT_GATE_OBSERVATION_SCHEMA)
+                && event
+                    .pointer("/details/origin/kind")
+                    .and_then(Value::as_str)
+                    == Some("import_primary_started")
+        })
+        .flat_map(|event| {
+            event
+                .pointer("/details/observations")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|observation| {
+            observation.get("condition").and_then(Value::as_str) == Some(condition)
+        });
+    let observation = matches.next()?;
+    (matches.next().is_none()).then_some(observation)
+}
+
+fn unique_import_batch_observation_status(
+    report: &Value,
+    condition: &str,
+) -> Option<ProductGateStatus> {
+    match unique_import_batch_observation(report, condition)?
+        .get("outcome")?
+        .as_str()?
+    {
+        "passed" => Some(ProductGateStatus::Passed),
+        "failed" => Some(ProductGateStatus::Failed),
+        _ => None,
     }
 }
 
@@ -9047,9 +10321,18 @@ fn verification_completion_observation_index(commands: &[Value]) -> Option<usize
     })?;
     commands.iter().enumerate().find_map(|(index, command)| {
         (index > request
-            && command.get("command").and_then(Value::as_str) == Some("observe_gate")
-            && command.get("condition").and_then(Value::as_str)
-                == Some("source_verification_verified"))
+            && command.get("command").and_then(Value::as_str) == Some("observe_gate_batch")
+            && command
+                .get("observations")
+                .and_then(Value::as_array)
+                .is_some_and(|observations| {
+                    observations.iter().any(|observation| {
+                        observation
+                            .pointer("/target/condition")
+                            .and_then(Value::as_str)
+                            == Some("source_verification_verified")
+                    })
+                }))
         .then_some(index)
     })
 }
@@ -9132,12 +10415,13 @@ fn raw_report(
             "development_samples": profile.profile.protocol.development_samples,
             "fresh_process_per_role_per_scenario_sample": true,
             "automatic_retries": 0,
-            "timeout_seconds": args.timeout.as_secs(),
+            "process_timeouts_are_script_derived": true,
+            "launch_closeout_grace_ns": PROCESS_LAUNCH_CLOSEOUT_GRACE_NS,
             "cache_condition_attestation": args.attestation.cache_condition,
             "competing_activity_attestation": args.attestation.competing_activity,
             "power_state_attestation": args.attestation.power_state,
             "compositor_scale_milli_attestation": args.attestation.compositor_scale_milli,
-            "instrumented_control_order_alternates_by_sample": true,
+            "instrumented_control_order_balanced_by_sample_and_scenario": true,
         },
         "private_paths": {
             "qualification_profile": profile_path(profile, args),
@@ -9282,6 +10566,7 @@ fn role_json(role: &RoleEvidence) -> Value {
             "automation_report_sha256": role.automation_report_sha256,
         },
         "process": {
+            "launch_attempted": role.process.launch_attempted,
             "exit_code": role.process.status.and_then(|status| status.code()),
             "signal": role.process.status.and_then(|status| status.signal()),
             "external_wall_time_ns": role.process.external_wall_time_ns,
@@ -9289,6 +10574,10 @@ fn role_json(role: &RoleEvidence) -> Value {
             "spawn_error": role.process.spawn_error,
             "app_wall_time_ns": role.app_wall_time_ns,
             "process_cpu_time_ns": role.process_cpu_time_ns,
+            "derived_process_timeout_ns": role.derived_process_timeout_ns,
+            "static_wait_bound_ns": role.static_wait_bound_ns,
+            "gate_batch_count": role.gate_batch_count,
+            "gate_observation_count": role.gate_observation_count,
         },
         "import_source_inventory": {
             "before": role.source_inventory_before.as_ref().map(import_source_inventory_json),
@@ -9613,13 +10902,21 @@ fn raw_product_gate_outcome_json(outcome: &ProductGateOutcome) -> Value {
     json!({
         "schema": PRODUCT_GATE_OBSERVATION_SCHEMA,
         "command_index": outcome.command_index,
+        "batch_id": outcome.batch_id,
+        "phase_id": outcome.phase_id,
+        "observation_index": outcome.observation_index,
         "gate_id": outcome.gate_id,
         "condition": outcome.condition,
+        "deadline_authority": outcome.deadline_authority,
+        "deadline_after_origin_ns": outcome.deadline_after_origin_ns,
+        "origin": {
+            "kind": outcome.origin_kind,
+            "command_index": outcome.origin_command_index,
+        },
         "outcome": outcome.outcome.report_label(),
         "condition_met": outcome.condition_met,
         "timed_out": outcome.timed_out,
-        "timeout_ms": outcome.timeout_ms,
-        "waited_ns": outcome.waited_ns,
+        "observed_after_origin_ns": outcome.observed_after_origin_ns,
     })
 }
 
@@ -9651,11 +10948,35 @@ fn sanitized_product_gate_outcome_rows(samples: &[SampleEvidence]) -> Vec<Value>
                     "sample_index": sample.sample_index,
                     "scenario": sample.scenario,
                     "role": role.role.directory_name(),
+                    "batch_id": outcome.batch_id,
+                    "phase_id": outcome.phase_id,
+                    "observation_index": outcome.observation_index,
                     "gate_id": outcome.gate_id,
                     "condition": outcome.condition,
+                    "deadline_authority": outcome.deadline_authority,
+                    "deadline_after_origin_ns": outcome.deadline_after_origin_ns,
                     "outcome": outcome.outcome.report_label(),
                 }));
             }
+        }
+    }
+    rows
+}
+
+fn sanitized_role_schedule_rows(samples: &[SampleEvidence]) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for sample in samples {
+        for role in std::iter::once(&sample.instrumented).chain(sample.control.iter()) {
+            rows.push(json!({
+                "sample_index": sample.sample_index,
+                "scenario": sample.scenario,
+                "role": role.role.directory_name(),
+                "launch_attempted": role.process.launch_attempted,
+                "gate_batch_count": role.gate_batch_count,
+                "gate_observation_count": role.gate_observation_count,
+                "static_wait_bound_ns": role.static_wait_bound_ns,
+                "derived_process_timeout_ns": role.derived_process_timeout_ns,
+            }));
         }
     }
     rows
@@ -9743,6 +11064,7 @@ fn population_json(population: PopulationEvidence) -> Value {
         "expected_product_gate_observations": population.expected_product_gate_observations,
         "observed_product_gate_observations": population.observed_product_gate_observations,
         "sample_identities_exact": population.sample_identities_exact,
+        "sample_order_exact": population.sample_order_exact,
         "role_identities_exact": population.role_identities_exact,
         "phase_identities_exact": population.phase_identities_exact,
         "product_gate_bijections_exact": population.product_gate_bijections_exact,
@@ -9753,6 +11075,7 @@ fn population_json(population: PopulationEvidence) -> Value {
             && population.expected_product_gate_observations
                 == population.observed_product_gate_observations
             && population.sample_identities_exact
+            && population.sample_order_exact
             && population.role_identities_exact
             && population.phase_identities_exact
             && population.product_gate_bijections_exact,
@@ -9817,6 +11140,7 @@ fn sanitized_receipt(
         "executable_conformance": conformance.map(ConformanceEvidence::sanitized_json),
         "population": population_json(population),
         "product_gate_outcomes": product_gate_outcomes,
+        "role_schedule_bounds": sanitized_role_schedule_rows(samples),
         "product_gate_failures": product_gate_failures,
         "integrity_reason_codes": integrity_reason_codes(reasons),
     })
@@ -10112,18 +11436,35 @@ mod tests {
                 }),
                 json!({ "command": "start_reviewed_import" }),
                 json!({
-                    "command": "observe_gate",
-                    "gate_id": "IP.acceptance.000.import_idle",
-                    "condition": "import_idle",
-                    "timeout_ms": 1_200_000,
+                    "command": "observe_gate_batch",
+                    "batch_id": "IP.batch.000",
+                    "phase_id": "preprocess_publish.checkpoint.000",
+                    "origin": { "kind": "import_primary_started" },
+                    "observations": [
+                        {
+                            "gate_id": "IP.acceptance.000.import_idle",
+                            "deadline_authority": "import_primary_wall",
+                            "deadline_after_origin_ns": 1_200_000_000_000_u64,
+                            "target": { "kind": "condition", "condition": "import_idle" },
+                        },
+                        {
+                            "gate_id": "IP.acceptance.001.imported_open_ready",
+                            "deadline_authority": "import_primary_wall",
+                            "deadline_after_origin_ns": 1_200_000_000_000_u64,
+                            "target": {
+                                "kind": "imported_open_ready",
+                                "path": "${ATTEMPT_ROOT}/output/source.m4d",
+                            },
+                        },
+                        {
+                            "gate_id": "IP.acceptance.002.runtime_idle",
+                            "deadline_authority": "import_primary_wall",
+                            "deadline_after_origin_ns": 1_200_000_000_000_u64,
+                            "target": { "kind": "condition", "condition": "runtime_idle" },
+                        },
+                    ],
                 }),
                 json!({ "command": "sample_diagnostics", "label": "ip-end" }),
-                json!({
-                    "command": "observe_imported_open_ready",
-                    "gate_id": "IP.imported_open_ready",
-                    "path": "${ATTEMPT_ROOT}/output/source.m4d",
-                    "timeout_ms": 1_200_000,
-                }),
                 json!({ "command": "quit" }),
             ],
         );
@@ -10137,7 +11478,10 @@ mod tests {
             }],
             instrumented_script,
             instrumentation_control_script: None,
-            cleanup: AttemptCleanup::default(),
+            cleanup: AttemptCleanup {
+                enabled: true,
+                imported_package_relative_path: Some(PathBuf::from("output/source.m4d")),
+            },
         }
     }
 
@@ -10167,34 +11511,31 @@ mod tests {
         }
     }
 
-    fn test_run_args() -> RunArgs {
-        RunArgs {
-            profile: PathBuf::from("unused-profile.json"),
-            workload_bundle: PathBuf::from("unused-workload.json"),
-            script_bundle: PathBuf::from("unused-scripts.json"),
-            oracle_bundle: PathBuf::from("unused-oracle.json"),
-            result_directory: PathBuf::from("unused-result"),
-            timeout: Duration::from_secs(2),
-            attestation: ProtocolAttestation {
-                cache_condition: "warm".to_owned(),
-                competing_activity: "none".to_owned(),
-                power_state: "balanced".to_owned(),
-                compositor_scale_milli: 1_000,
-            },
+    fn ip_oracle_scenario() -> OracleScenario {
+        OracleScenario {
+            id: "IP".to_owned(),
+            phases: vec![matrix_phase("IP", "preprocess_publish")],
         }
     }
 
     fn product_gate_outcome(gate_id: &str, outcome: ProductGateStatus) -> ProductGateOutcome {
         let failed = outcome == ProductGateStatus::Failed;
+        let scenario = gate_id.split('.').next().unwrap_or("RZ");
         ProductGateOutcome {
-            command_index: 0,
+            command_index: 1,
+            batch_id: format!("{scenario}.batch.000"),
+            phase_id: format!("{scenario}-phase.checkpoint.000"),
+            observation_index: 0,
             gate_id: gate_id.to_owned(),
             condition: "coordinated_presentation_settled".to_owned(),
+            deadline_authority: "maximum_current_presentation_gap_plus_poll_grace".to_owned(),
+            deadline_after_origin_ns: 66_666_668,
+            origin_kind: "command_completed".to_owned(),
+            origin_command_index: Some(0),
             outcome,
             condition_met: !failed,
             timed_out: failed,
-            timeout_ms: 30_000,
-            waited_ns: if failed { 30_000_000_000 } else { 1_000_000 },
+            observed_after_origin_ns: if failed { 66_666_668 } else { 1_000_000 },
         }
     }
 
@@ -10205,6 +11546,7 @@ mod tests {
             expanded_script_sha256: "11".repeat(32),
             template_script_sha256: "22".repeat(32),
             process: ProcessObservation {
+                launch_attempted: true,
                 status: None,
                 external_wall_time_ns: 1,
                 timed_out: false,
@@ -10214,6 +11556,10 @@ mod tests {
             automation_report_sha256: Some("33".repeat(32)),
             app_wall_time_ns: Some(1),
             process_cpu_time_ns: Some(1),
+            derived_process_timeout_ns: 10_066_666_668,
+            static_wait_bound_ns: 66_666_668,
+            gate_batch_count: 1,
+            gate_observation_count: 1,
             source_inventory_before: None,
             source_inventory_after: None,
             cleanup_manifest_sha256: None,
@@ -10231,14 +11577,25 @@ mod tests {
                 .map(|id| {
                     let gate_id = format!("{id}.settled");
                     let gate_command = json!({
-                        "command": "observe_gate",
-                        "gate_id": gate_id,
-                        "condition": "coordinated_presentation_settled",
-                        "timeout_ms": 30_000,
+                        "command": "observe_gate_batch",
+                        "batch_id": format!("{id}.batch.000"),
+                        "phase_id": format!("{id}-phase.checkpoint.000"),
+                        "origin": { "kind": "command_completed", "command_index": 0 },
+                        "observations": [{
+                            "gate_id": gate_id,
+                            "deadline_authority": "maximum_current_presentation_gap_plus_poll_grace",
+                            "deadline_after_origin_ns": 66_666_668_u64,
+                            "target": {
+                                "kind": "condition",
+                                "condition": "coordinated_presentation_settled",
+                            },
+                        }],
                     });
-                    let mut instrumented = template(true, vec![gate_command.clone()]);
+                    let predecessor = json!({ "command": "sleep_frames", "frames": 1 });
+                    let mut instrumented =
+                        template(true, vec![predecessor.clone(), gate_command.clone()]);
                     instrumented.scenario = id.to_owned();
-                    let mut control = template(false, vec![gate_command]);
+                    let mut control = template(false, vec![predecessor, gate_command]);
                     control.scenario = id.to_owned();
                     ScriptScenario {
                         id: id.to_owned(),
@@ -10257,7 +11614,7 @@ mod tests {
     }
 
     fn complete_population_samples() -> Vec<SampleEvidence> {
-        (1..=5)
+        (1..=3)
             .flat_map(|sample_index| {
                 REQUIRED_SCENARIOS.into_iter().map(move |id| {
                     let gate_id = format!("{id}.settled");
@@ -10329,11 +11686,11 @@ mod tests {
 
         let result_root = tempfile::tempdir().unwrap();
         let evidence = execute_role(
-            &test_run_args(),
             &profile(),
             Some(&binding),
             1,
             &scenario,
+            &ip_oracle_scenario(),
             &scenario.instrumented_script,
             AttemptRole::Instrumented,
             &result_root.path().join("must-not-run"),
@@ -10348,9 +11705,55 @@ mod tests {
             evidence.process.spawn_error.as_deref(),
             Some("import source inventory preflight was rejected")
         );
+        assert!(!evidence.process.launch_attempted);
         assert!(evidence.source_inventory_before.is_none());
         assert!(evidence.source_inventory_after.is_none());
         assert!(!evidence.root.join("stdout.log").exists());
+    }
+
+    #[test]
+    fn execute_role_setup_failure_is_not_counted_as_a_process_launch() {
+        let scenario = ip_action_scenario();
+        let result_root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(result_root.path().join("sample-01/IP/instrumented")).unwrap();
+
+        let evidence = execute_role(
+            &profile(),
+            None,
+            1,
+            &scenario,
+            &ip_oracle_scenario(),
+            &scenario.instrumented_script,
+            AttemptRole::Instrumented,
+            &result_root.path().join("must-not-run"),
+            result_root.path(),
+        );
+
+        assert_eq!(
+            evidence.reasons,
+            BTreeSet::from(["attempt_setup_failed".to_owned()])
+        );
+        assert!(!evidence.process.launch_attempted);
+        assert!(!evidence.root.join("stdout.log").exists());
+    }
+
+    #[test]
+    fn output_setup_failure_is_not_counted_as_a_process_launch() {
+        let role_root = tempfile::tempdir().unwrap();
+        fs::write(role_root.path().join("stdout.log"), b"already owned").unwrap();
+
+        let process = run_app_process(
+            &role_root.path().join("must-not-run"),
+            &role_root.path().join("unused-dataset"),
+            role_root.path(),
+            Duration::ZERO,
+        );
+
+        assert!(!process.launch_attempted);
+        assert_eq!(
+            process.spawn_error.as_deref(),
+            Some("failed to create attempt stdout/stderr")
+        );
     }
 
     #[test]
@@ -10373,11 +11776,11 @@ mod tests {
         let binding = import_source_binding(&scenario.instrumented_script);
         let result_root = tempfile::tempdir().unwrap();
         let evidence = execute_role(
-            &test_run_args(),
             &profile(),
             Some(&binding),
             1,
             &scenario,
+            &ip_oracle_scenario(),
             &scenario.instrumented_script,
             AttemptRole::Instrumented,
             &app,
@@ -10422,7 +11825,7 @@ mod tests {
         validate_ip_action_contract(&scenario).unwrap();
 
         let mut premature = scenario.clone();
-        premature.instrumented_script.commands.swap(5, 6);
+        premature.instrumented_script.commands.swap(4, 5);
         assert!(validate_ip_action_contract(&premature).is_err());
 
         let mut ambiguous = scenario;
@@ -10444,6 +11847,88 @@ mod tests {
             "timeout_ms": 1_200_000,
         });
         assert!(validate_ip_action_contract(&legacy).is_err());
+    }
+
+    #[test]
+    fn ip_attempt_paths_cross_bind_before_any_launch() {
+        let scenario = ip_action_scenario();
+        validate_ip_attempt_path_binding(&scenario).unwrap();
+
+        let mut wrong_target = scenario.clone();
+        let observation = wrong_target
+            .instrumented_script
+            .commands
+            .iter_mut()
+            .find_map(|command| {
+                command
+                    .get_mut("observations")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|observations| {
+                        observations.iter_mut().find(|observation| {
+                            observation.pointer("/target/kind").and_then(Value::as_str)
+                                == Some("imported_open_ready")
+                        })
+                    })
+            })
+            .unwrap();
+        observation["target"]["path"] = json!("${ATTEMPT_ROOT}/output/other.m4d");
+        assert!(validate_ip_attempt_path_binding(&wrong_target).is_err());
+
+        let mut wrong_parent = scenario.clone();
+        let setup = wrong_parent
+            .instrumented_script
+            .commands
+            .iter_mut()
+            .find(|command| {
+                command.get("command").and_then(Value::as_str) == Some("begin_tiff_import_setup")
+            })
+            .unwrap();
+        setup["output_parent"] = json!("${ATTEMPT_ROOT}/other");
+        assert!(validate_ip_attempt_path_binding(&wrong_parent).is_err());
+
+        let mut wrong_cleanup = scenario;
+        wrong_cleanup.cleanup.imported_package_relative_path =
+            Some(PathBuf::from("output/other.m4d"));
+        assert!(validate_ip_attempt_path_binding(&wrong_cleanup).is_err());
+    }
+
+    #[test]
+    fn fc_cold_and_runtime_batches_bracket_source_verification() {
+        let commands = vec![
+            json!({ "command": "sleep_frames", "frames": 1 }),
+            json!({ "command": "observe_gate_batch" }),
+            json!({
+                "command": "wait_for",
+                "condition": "source_verification_verified",
+                "timeout_ms": 30_000,
+            }),
+            json!({ "command": "sleep_frames", "frames": 1 }),
+            json!({ "command": "observe_gate_batch" }),
+        ];
+        let batch = |command_index, phase_id| ExpectedProductGateBatch {
+            command_index,
+            batch_id: "FC.batch",
+            phase_id,
+            origin: ProductGateOrigin::AutomationStarted,
+            observations: Vec::new(),
+        };
+        let valid = vec![
+            batch(1, "blocking_target_settled.checkpoint.000"),
+            batch(4, "blocking_target_settled.checkpoint.001"),
+        ];
+        validate_fc_source_verification_order(&commands, &valid).unwrap();
+
+        let late_cold = vec![
+            batch(2, "blocking_target_settled.checkpoint.000"),
+            batch(4, "blocking_target_settled.checkpoint.001"),
+        ];
+        assert!(validate_fc_source_verification_order(&commands, &late_cold).is_err());
+
+        let early_idle = vec![
+            batch(1, "blocking_target_settled.checkpoint.000"),
+            batch(2, "blocking_target_settled.checkpoint.001"),
+        ];
+        assert!(validate_fc_source_verification_order(&commands, &early_idle).is_err());
     }
 
     fn profile() -> ViewerQualificationProfile {
@@ -10543,6 +12028,7 @@ mod tests {
                 "cold_complete_coarse_ns": 250_000_000,
                 "cold_target_settlement_ns": 2_000_000_000_u64,
                 "nonresident_target_settlement_ns": 1_000_000_000_u64,
+                "source_verification_completion_ns": 30_000_000_000_u64,
                 "maximum_instrumentation_overhead_basis_points": 200,
             },
         }))
@@ -10647,7 +12133,7 @@ mod tests {
     }
 
     #[test]
-    fn runner_arguments_require_every_external_binding_and_timeout() {
+    fn runner_arguments_require_every_external_binding_and_reject_removed_timeout() {
         let arguments = [
             "--qualification-profile",
             "/private/profile.json",
@@ -10659,8 +12145,6 @@ mod tests {
             "/private/oracle.json",
             "--result-directory",
             "/private/result",
-            "--timeout-seconds",
-            "90",
             "--cache-condition",
             "warm",
             "--competing-activity",
@@ -10674,11 +12158,46 @@ mod tests {
         .map(ToOwned::to_owned)
         .collect();
         let parsed = parse_args(arguments).unwrap();
-        assert_eq!(parsed.timeout, Duration::from_secs(90));
         assert_eq!(parsed.result_directory, Path::new("/private/result"));
 
         let error = parse_args(Vec::new()).unwrap_err().to_string();
-        assert!(error.contains("--timeout-seconds is required"));
+        assert!(error.contains(" is required"));
+        assert!(
+            parse_args(vec!["--timeout-seconds".to_owned(), "90".to_owned()])
+                .unwrap_err()
+                .to_string()
+                .contains("unknown viewer performance runner argument")
+        );
+    }
+
+    #[test]
+    fn automation_template_rejects_unaccounted_timeout_bearing_commands() {
+        let hidden_wait = template(
+            true,
+            vec![
+                json!({
+                    "command": "wait_for_import_progress",
+                    "stage": "base-production",
+                    "minimum_completed_work_units": 1,
+                    "timeout_ms": 900_000,
+                }),
+                json!({ "command": "quit" }),
+            ],
+        );
+        assert!(validate_automation_template("RZ", &hidden_wait, true, &[]).is_err());
+
+        let accounted_wait = template(
+            true,
+            vec![
+                json!({
+                    "command": "wait_for",
+                    "condition": "runtime_idle",
+                    "timeout_ms": 30_000,
+                }),
+                json!({ "command": "quit" }),
+            ],
+        );
+        validate_automation_template("RZ", &accounted_wait, true, &[]).unwrap();
     }
 
     #[test]
@@ -11396,6 +12915,17 @@ mod tests {
             "publication_to_open_ready_clock": publication_clock,
             "last_successful_receipt": receipt,
         });
+        let open_ready_command = observe_gate_batch_command(
+            "IP.batch.000",
+            "IP-preprocess.checkpoint.000",
+            json!({ "kind": "import_primary_started" }),
+            &[(
+                "IP.imported_open_ready",
+                IMPORTED_OPEN_READY_CONDITION,
+                "import_primary_wall",
+                1_200_000_000_000,
+            )],
+        );
         json!({
             "events": [
                 {
@@ -11407,28 +12937,70 @@ mod tests {
                         "operation_token": operation_token.clone(),
                         "reviewed_source_fingerprint_sha256": "11".repeat(32),
                         "reviewed_source_bytes": 100,
+                        "working_memory_bytes": 1_024,
                         "primary_clock_started_at_epoch_ms": 1_100,
                         "primary_clock_start_boundary": "accepted_start_import_command_immediately_before_worker_spawn",
                         "normal_review_command_path": true,
                     },
                 },
-                {
-                    "command": "observe_imported_open_ready",
-                    "status": "passed",
-                    "details": {
-                        "schema": PRODUCT_GATE_OBSERVATION_SCHEMA,
-                        "gate_id": "IP.imported_open_ready",
-                        "condition": IMPORTED_OPEN_READY_CONDITION,
-                        "outcome": "passed",
-                        "condition_met": true,
-                        "timed_out": false,
-                        "timeout_ms": 1_200_000,
-                        "waited_ns": 1_000_000_000,
-                    },
-                },
+                observe_gate_batch_event(
+                    1,
+                    &open_ready_command,
+                    &[ProductGateStatus::Passed],
+                ),
             ],
             "import_workflow_evidence": workflow,
         })
+    }
+
+    fn prepublication_import_workflow_report(terminal_failure: bool) -> Value {
+        let mut report = valid_import_workflow_report();
+        let workflow = &mut report["import_workflow_evidence"];
+        workflow["successful_runs"] = json!(0);
+        workflow["published_events"] = json!(0);
+        workflow["failed_runs"] = json!(u64::from(terminal_failure));
+        workflow["primary_clock"] = Value::Null;
+        workflow["publication_to_open_ready_clock"] = Value::Null;
+        workflow["last_successful_receipt"] = Value::Null;
+        let command = observe_gate_batch_command(
+            "IP.batch.000",
+            "preprocess_publish.checkpoint.000",
+            json!({ "kind": "import_primary_started" }),
+            &[
+                (
+                    "IP.acceptance.000.import_idle",
+                    "import_idle",
+                    "import_primary_wall",
+                    1_200_000_000_000,
+                ),
+                (
+                    "IP.acceptance.001.imported_open_ready",
+                    IMPORTED_OPEN_READY_CONDITION,
+                    "import_primary_wall",
+                    1_200_000_000_000,
+                ),
+                (
+                    "IP.acceptance.002.runtime_idle",
+                    "runtime_idle",
+                    "import_primary_wall",
+                    1_200_000_000_000,
+                ),
+            ],
+        );
+        report["events"][1] = observe_gate_batch_event(
+            1,
+            &command,
+            &[
+                ProductGateStatus::Failed,
+                ProductGateStatus::Failed,
+                if terminal_failure {
+                    ProductGateStatus::Passed
+                } else {
+                    ProductGateStatus::Failed
+                },
+            ],
+        );
+        report
     }
 
     fn import_workflow_gate_reasons(report: &Value) -> BTreeSet<String> {
@@ -11626,10 +13198,11 @@ mod tests {
     #[test]
     fn imported_open_ready_failure_skips_only_pass_dependent_clock_evidence() {
         let mut report = valid_import_workflow_report();
-        report["events"][1]["details"]["outcome"] = json!("failed");
-        report["events"][1]["details"]["condition_met"] = json!(false);
-        report["events"][1]["details"]["timed_out"] = json!(true);
-        report["events"][1]["details"]["waited_ns"] = json!(1_200_000_000_000_u64);
+        let observation = &mut report["events"][1]["details"]["observations"][0];
+        observation["outcome"] = json!("failed");
+        observation["condition_met"] = json!(false);
+        observation["timed_out"] = json!(true);
+        observation["observed_after_origin_ns"] = json!(1_200_000_000_000_u64);
         assert!(
             import_workflow_gate_reasons_with_outcome(
                 &report,
@@ -11749,6 +13322,72 @@ mod tests {
     }
 
     #[test]
+    fn prepublication_import_timeout_accepts_only_the_two_coherent_worker_states() {
+        for terminal_failure in [true, false] {
+            let report = prepublication_import_workflow_report(terminal_failure);
+            let reasons = import_workflow_gate_reasons_with_outcome(
+                &report,
+                &test_import_gate(),
+                ProductGateStatus::Failed,
+            );
+            assert!(reasons.is_empty(), "{terminal_failure}: {reasons:?}");
+        }
+
+        let mut mixed = prepublication_import_workflow_report(true);
+        mixed["import_workflow_evidence"]["failed_runs"] = json!(0);
+        let reasons = import_workflow_gate_reasons_with_outcome(
+            &mixed,
+            &test_import_gate(),
+            ProductGateStatus::Failed,
+        );
+        assert!(reasons.contains("prepublication_import_failure_evidence_shape_invalid"));
+        assert!(has_integrity_reasons(&reasons));
+
+        let mut cancelled = prepublication_import_workflow_report(false);
+        cancelled["import_workflow_evidence"]["cancelled_runs"] = json!(1);
+        assert!(
+            import_workflow_gate_reasons_with_outcome(
+                &cancelled,
+                &test_import_gate(),
+                ProductGateStatus::Failed,
+            )
+            .contains("prepublication_import_failure_evidence_shape_invalid")
+        );
+    }
+
+    #[test]
+    fn prepublication_import_source_binding_uses_start_event_without_a_receipt() {
+        let report = prepublication_import_workflow_report(false);
+        let binding = ImportSourceBinding {
+            regular_files: 1,
+            source_bytes: 100,
+            inventory_sha256: "22".repeat(32),
+            reviewed_source_fingerprint_sha256: "11".repeat(32),
+        };
+        let mut reasons = BTreeSet::new();
+        validate_import_report_source_binding(&report, &binding, &mut reasons);
+        assert!(reasons.is_empty());
+
+        let mut mismatched = report;
+        mismatched["events"][0]["details"]["reviewed_source_bytes"] = json!(99);
+        validate_import_report_source_binding(&mismatched, &binding, &mut reasons);
+        assert!(reasons.contains("import_receipt_workload_source_binding_mismatch"));
+    }
+
+    #[test]
+    fn cleanup_accepts_a_verified_absent_attempt_local_import_target() {
+        let role_root = tempfile::tempdir().unwrap();
+        let cleanup = AttemptCleanup {
+            enabled: true,
+            imported_package_relative_path: Some(PathBuf::from("output/imported.m4d")),
+        };
+        assert_eq!(
+            cleanup_attempt_package(role_root.path(), &cleanup).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn import_workflow_gate_rejects_run_clock_currentness_and_binding_mutations() {
         let mut report = valid_import_workflow_report();
         report["import_workflow_evidence"]["successful_runs"] = json!(2);
@@ -11789,7 +13428,7 @@ mod tests {
         );
 
         let mut report = valid_import_workflow_report();
-        report["events"][1]["details"]["condition"] = json!("wrong");
+        report["events"][1]["details"]["observations"][0]["condition"] = json!("wrong");
         assert!(
             import_workflow_gate_reasons(&report)
                 .contains("import_receipt_start_or_open_ready_binding_mismatch")
@@ -13079,78 +14718,84 @@ mod tests {
         );
     }
 
-    fn observe_gate_command(gate_id: &str, timeout_ms: u64) -> Value {
+    fn gate_target(condition: &str) -> Value {
+        if condition == IMPORTED_OPEN_READY_CONDITION {
+            json!({
+                "kind": "imported_open_ready",
+                "path": "${ATTEMPT_ROOT}/output/imported.m4d",
+            })
+        } else {
+            json!({ "kind": "condition", "condition": condition })
+        }
+    }
+
+    fn observe_gate_batch_command(
+        batch_id: &str,
+        phase_id: &str,
+        origin: Value,
+        observations: &[(&str, &str, &str, u64)],
+    ) -> Value {
         json!({
-            "command": "observe_gate",
-            "gate_id": gate_id,
-            "condition": "coordinated_presentation_settled",
-            "timeout_ms": timeout_ms,
+            "command": "observe_gate_batch",
+            "batch_id": batch_id,
+            "phase_id": phase_id,
+            "origin": origin,
+            "observations": observations.iter().map(|(gate_id, condition, authority, deadline)| json!({
+                "gate_id": gate_id,
+                "deadline_authority": authority,
+                "deadline_after_origin_ns": deadline,
+                "target": gate_target(condition),
+            })).collect::<Vec<_>>(),
         })
     }
 
-    fn observe_imported_open_ready_command(gate_id: &str, timeout_ms: u64) -> Value {
-        json!({
-            "command": "observe_imported_open_ready",
-            "gate_id": gate_id,
-            "path": "${ATTEMPT_ROOT}/output/imported.m4d",
-            "timeout_ms": timeout_ms,
-        })
-    }
-
-    fn observe_gate_event(
+    fn observe_gate_batch_event(
         command_index: usize,
-        gate_id: &str,
-        outcome: ProductGateStatus,
+        command: &Value,
+        outcomes: &[ProductGateStatus],
     ) -> Value {
-        product_gate_event(
-            command_index,
-            "observe_gate",
-            gate_id,
-            "coordinated_presentation_settled",
-            outcome,
-            30_000,
-        )
-    }
-
-    fn observe_imported_open_ready_event(
-        command_index: usize,
-        gate_id: &str,
-        outcome: ProductGateStatus,
-    ) -> Value {
-        product_gate_event(
-            command_index,
-            "observe_imported_open_ready",
-            gate_id,
-            IMPORTED_OPEN_READY_CONDITION,
-            outcome,
-            30_000,
-        )
-    }
-
-    fn product_gate_event(
-        command_index: usize,
-        command: &str,
-        gate_id: &str,
-        condition: &str,
-        outcome: ProductGateStatus,
-        timeout_ms: u64,
-    ) -> Value {
-        let failed = outcome == ProductGateStatus::Failed;
+        let observations = command["observations"].as_array().unwrap();
+        assert_eq!(observations.len(), outcomes.len());
+        let rows = observations
+            .iter()
+            .zip(outcomes)
+            .enumerate()
+            .map(|(observation_index, (observation, outcome))| {
+                let failed = *outcome == ProductGateStatus::Failed;
+                let deadline = observation["deadline_after_origin_ns"].as_u64().unwrap();
+                let condition = observation
+                    .pointer("/target/condition")
+                    .and_then(Value::as_str)
+                    .unwrap_or(IMPORTED_OPEN_READY_CONDITION);
+                json!({
+                    "observation_index": observation_index,
+                    "gate_id": observation["gate_id"],
+                    "condition": condition,
+                    "deadline_authority": observation["deadline_authority"],
+                    "deadline_after_origin_ns": deadline,
+                    "outcome": outcome.report_label(),
+                    "condition_met": !failed,
+                    "timed_out": failed,
+                    "observed_after_origin_ns": if failed { deadline } else { deadline - 1 },
+                })
+            })
+            .collect::<Vec<_>>();
         json!({
             "command_index": command_index,
-            "command": command,
+            "command": "observe_gate_batch",
             "status": "passed",
             "event_epoch_ms": 1_000_u64,
             "duration_ms": 1.0,
             "details": {
                 "schema": PRODUCT_GATE_OBSERVATION_SCHEMA,
-                "gate_id": gate_id,
-                "condition": condition,
-                "outcome": outcome.report_label(),
-                "condition_met": !failed,
-                "timed_out": failed,
-                "timeout_ms": timeout_ms,
-                "waited_ns": if failed { timeout_ms * 1_000_000 } else { 1_000_000_u64 },
+                "batch_id": command["batch_id"],
+                "phase_id": command["phase_id"],
+                "origin": command["origin"],
+                "completed_after_origin_ns": rows.iter()
+                    .filter_map(|row| row["observed_after_origin_ns"].as_u64())
+                    .max()
+                    .unwrap(),
+                "observations": rows,
             },
         })
     }
@@ -13159,116 +14804,196 @@ mod tests {
         let mut commands = Vec::new();
         for (condition, count) in expected_fatal_wait_condition_multiset(id) {
             for _ in 0..count {
+                let timeout_ms = match condition {
+                    "window_ready" => 5_000,
+                    "source_verification_verified" | "source_verification_required" => 30_000,
+                    "runtime_idle" => 30_000,
+                    "import_review_ready" => 60_000,
+                    _ => unreachable!(),
+                };
                 commands.push(json!({
                     "command": "wait_for",
                     "condition": condition,
-                    "timeout_ms": 30_000,
+                    "timeout_ms": timeout_ms,
                 }));
             }
         }
-        let mut ordinal = 0_usize;
-        for (condition, count) in expected_acceptance_condition_multiset(id) {
-            for _ in 0..count {
-                let gate_id = format!("{id}.acceptance.{ordinal:03}.{condition}");
-                if condition == IMPORTED_OPEN_READY_CONDITION {
-                    commands.push(observe_imported_open_ready_command(&gate_id, 30_000));
-                } else {
-                    let mut command = observe_gate_command(&gate_id, 30_000);
-                    command["condition"] = json!(condition);
-                    commands.push(command);
-                }
-                ordinal += 1;
-            }
+        let conditions = expected_acceptance_condition_multiset(id)
+            .into_iter()
+            .flat_map(|(condition, count)| std::iter::repeat_n(condition, count))
+            .collect::<Vec<_>>();
+        let phase_ids = expected_product_gate_phase_ids(id);
+        let mut condition_offset = 0_usize;
+        for (batch_ordinal, phase_id) in phase_ids.iter().enumerate() {
+            commands.push(json!({ "command": "sleep_frames", "frames": 1 }));
+            let batches_left = phase_ids.len() - batch_ordinal;
+            let conditions_left = conditions.len() - condition_offset;
+            let take = conditions_left.div_ceil(batches_left);
+            let observations = conditions[condition_offset..condition_offset + take]
+                .iter()
+                .enumerate()
+                .map(|(local, condition)| {
+                    let ordinal = condition_offset + local;
+                    (
+                        format!("{id}.acceptance.{ordinal:03}.{condition}"),
+                        *condition,
+                        if id == "IP" {
+                            "import_primary_wall"
+                        } else {
+                            "maximum_current_presentation_gap_plus_poll_grace"
+                        },
+                        if id == "IP" {
+                            1_200_000_000_000
+                        } else {
+                            66_666_668
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let borrowed = observations
+                .iter()
+                .map(|(gate_id, condition, authority, deadline)| {
+                    (gate_id.as_str(), *condition, *authority, *deadline)
+                })
+                .collect::<Vec<_>>();
+            let origin = if id == "IP" {
+                json!({ "kind": "import_primary_started" })
+            } else {
+                json!({
+                    "kind": "command_completed",
+                    "command_index": commands.len() - 1,
+                })
+            };
+            commands.push(observe_gate_batch_command(
+                &format!("{id}.batch.{batch_ordinal:03}"),
+                phase_id,
+                origin,
+                &borrowed,
+            ));
+            condition_offset += take;
         }
         commands
     }
 
     #[test]
-    fn v4_observe_gate_events_form_an_exact_ordered_bijection() {
+    fn v5_gate_batch_events_form_an_exact_hierarchical_bijection() {
+        let command = observe_gate_batch_command(
+            "RZ.batch.000",
+            "resident_cross_section_zoom.checkpoint.000",
+            json!({ "kind": "command_completed", "command_index": 0 }),
+            &[
+                (
+                    "RZ.acceptance.000.coordinated_presentation_settled",
+                    "coordinated_presentation_settled",
+                    "maximum_current_presentation_gap_plus_poll_grace",
+                    66_666_668,
+                ),
+                (
+                    "RZ.acceptance.001.runtime_idle",
+                    "runtime_idle",
+                    "maximum_current_presentation_gap_plus_poll_grace",
+                    66_666_668,
+                ),
+            ],
+        );
         let template = template(
             true,
             vec![
-                observe_gate_command("RZ.cross_section.settled", 30_000),
                 json!({ "command": "sleep_frames", "frames": 1 }),
-                observe_imported_open_ready_command("IP.imported_open_ready", 30_000),
+                command.clone(),
             ],
         );
         let report = json!({
-            "events": [
-                observe_gate_event(
-                    0,
-                    "RZ.cross_section.settled",
-                    ProductGateStatus::Passed,
-                ),
-                observe_imported_open_ready_event(
-                    2,
-                    "IP.imported_open_ready",
-                    ProductGateStatus::Failed,
-                ),
-            ],
+            "events": [observe_gate_batch_event(1, &command, &[ProductGateStatus::Passed, ProductGateStatus::Failed])],
         });
         let outcomes = product_gate_outcomes_from_report(&report, &template).unwrap();
         assert_eq!(outcomes.len(), 2);
         assert_eq!(outcomes[0].outcome, ProductGateStatus::Passed);
         assert_eq!(outcomes[1].outcome, ProductGateStatus::Failed);
-        assert_eq!(outcomes[1].condition, IMPORTED_OPEN_READY_CONDITION);
+        assert_eq!(outcomes[1].observation_index, 1);
 
         let mut missing = report.clone();
-        missing["events"].as_array_mut().unwrap().pop();
+        missing["events"][0]["details"]["observations"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
         assert!(product_gate_outcomes_from_report(&missing, &template).is_err());
 
         let mut reordered = report.clone();
-        reordered["events"].as_array_mut().unwrap().swap(0, 1);
+        reordered["events"][0]["details"]["observations"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
         assert!(product_gate_outcomes_from_report(&reordered, &template).is_err());
 
         let mut duplicate = report.clone();
-        duplicate["events"][1]["command_index"] = json!(0);
+        duplicate["events"][0]["details"]["observations"][1]["observation_index"] = json!(0);
         assert!(product_gate_outcomes_from_report(&duplicate, &template).is_err());
 
         let mut mismatched = report.clone();
-        mismatched["events"][0]["details"]["condition"] = json!("runtime_idle");
+        mismatched["events"][0]["details"]["observations"][0]["condition"] = json!("runtime_idle");
         assert!(product_gate_outcomes_from_report(&mismatched, &template).is_err());
+
+        let mut legacy_event = report;
+        legacy_event["events"].as_array_mut().unwrap().push(json!({
+            "command": "observe_gate",
+            "command_index": 99,
+        }));
+        assert!(product_gate_outcomes_from_report(&legacy_event, &template).is_err());
     }
 
     #[test]
-    fn observe_gate_event_shape_and_outcome_flags_fail_closed() {
+    fn gate_batch_event_shape_and_deadline_wins_fail_closed() {
+        let command = observe_gate_batch_command(
+            "RZ.batch.000",
+            "resident_cross_section_zoom.checkpoint.000",
+            json!({ "kind": "command_completed", "command_index": 0 }),
+            &[(
+                "RZ.acceptance.000.coordinated_presentation_settled",
+                "coordinated_presentation_settled",
+                "maximum_current_presentation_gap_plus_poll_grace",
+                66_666_668,
+            )],
+        );
         let template = template(
             true,
-            vec![observe_gate_command("RZ.cross_section.settled", 30_000)],
+            vec![
+                json!({ "command": "sleep_frames", "frames": 1 }),
+                command.clone(),
+            ],
         );
         let report = json!({
-            "events": [observe_gate_event(
-                0,
-                "RZ.cross_section.settled",
-                ProductGateStatus::Failed,
-            )],
+            "events": [observe_gate_batch_event(1, &command, &[ProductGateStatus::Failed])],
         });
         assert!(product_gate_outcomes_from_report(&report, &template).is_ok());
 
         let mut extra = report.clone();
-        extra["events"][0]["details"]["reason"] = json!("private free text");
+        extra["events"][0]["details"]["observations"][0]["reason"] = json!("private free text");
         assert!(product_gate_outcomes_from_report(&extra, &template).is_err());
 
         let mut late_true = report.clone();
-        late_true["events"][0]["details"]["condition_met"] = json!(true);
+        late_true["events"][0]["details"]["observations"][0]["condition_met"] = json!(true);
         assert!(product_gate_outcomes_from_report(&late_true, &template).is_ok());
 
         let mut incoherent = report.clone();
-        incoherent["events"][0]["details"]["timed_out"] = json!(false);
+        incoherent["events"][0]["details"]["observations"][0]["timed_out"] = json!(false);
         assert!(product_gate_outcomes_from_report(&incoherent, &template).is_err());
 
         let mut early = report.clone();
-        early["events"][0]["details"]["waited_ns"] = json!(29_999_999_999_u64);
+        early["events"][0]["details"]["observations"][0]["observed_after_origin_ns"] =
+            json!(66_666_667_u64);
         assert!(product_gate_outcomes_from_report(&early, &template).is_err());
 
         let mut passed_at_deadline = report.clone();
-        passed_at_deadline["events"][0]["details"]["outcome"] = json!("passed");
-        passed_at_deadline["events"][0]["details"]["condition_met"] = json!(true);
-        passed_at_deadline["events"][0]["details"]["timed_out"] = json!(false);
+        let row = &mut passed_at_deadline["events"][0]["details"]["observations"][0];
+        row["outcome"] = json!("passed");
+        row["condition_met"] = json!(true);
+        row["timed_out"] = json!(false);
         assert!(product_gate_outcomes_from_report(&passed_at_deadline, &template).is_err());
 
         let mut passed_before_deadline = passed_at_deadline.clone();
-        passed_before_deadline["events"][0]["details"]["waited_ns"] = json!(29_999_999_999_u64);
+        passed_before_deadline["events"][0]["details"]["observations"][0]["observed_after_origin_ns"] =
+            json!(66_666_667_u64);
         assert!(product_gate_outcomes_from_report(&passed_before_deadline, &template).is_ok());
 
         let mut missing_outer = report.clone();
@@ -13288,61 +15013,51 @@ mod tests {
     }
 
     #[test]
-    fn observe_gate_commands_require_safe_unique_ids_exact_fields_and_precede_final_quit() {
-        assert!(
-            expected_product_gate_commands(&[observe_gate_command(
-                "RZ.cross_section.settled",
-                30_000,
-            )])
-            .is_ok()
+    fn gate_batch_commands_are_strict_bounded_and_v4_is_rejected() {
+        let valid = observe_gate_batch_command(
+            "RZ.batch.000",
+            "resident_cross_section_zoom.checkpoint.000",
+            json!({ "kind": "command_completed", "command_index": 0 }),
+            &[(
+                "RZ.acceptance.000.coordinated_presentation_settled",
+                "coordinated_presentation_settled",
+                "maximum_current_presentation_gap_plus_poll_grace",
+                PRODUCT_GATE_DEADLINE_MAX_NS,
+            )],
         );
+        assert!(expected_product_gate_batches(std::slice::from_ref(&valid)).is_ok());
+        let mut excessive = valid.clone();
+        excessive["observations"][0]["deadline_after_origin_ns"] =
+            json!(PRODUCT_GATE_DEADLINE_MAX_NS + 1);
+        assert!(expected_product_gate_batches(&[excessive]).is_err());
+        let mut empty_path = valid.clone();
+        empty_path["observations"][0]["target"] =
+            json!({ "kind": "imported_open_ready", "path": "" });
+        assert!(expected_product_gate_batches(&[empty_path]).is_err());
+        let mut unsafe_id = valid.clone();
+        unsafe_id["observations"][0]["gate_id"] = json!("/private/gate");
+        assert!(expected_product_gate_batches(&[unsafe_id]).is_err());
+        let mut duplicate = valid.clone();
+        let duplicate_observation = duplicate["observations"][0].clone();
+        duplicate["observations"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate_observation);
+        assert!(expected_product_gate_batches(&[duplicate]).is_err());
         assert!(
-            expected_product_gate_commands(&[observe_gate_command(
-                "RZ.maximum-timeout",
-                PRODUCT_GATE_TIMEOUT_MAX_MS,
-            )])
-            .is_ok()
-        );
-        assert!(
-            expected_product_gate_commands(&[observe_gate_command(
-                "RZ.excessive-timeout",
-                PRODUCT_GATE_TIMEOUT_MAX_MS + 1,
-            )])
+            expected_product_gate_batches(&[json!({
+                "command": "observe_gate",
+                "gate_id": "RZ.removed",
+                "condition": "runtime_idle",
+                "timeout_ms": 30_000,
+            })])
             .is_err()
         );
-        assert!(
-            expected_product_gate_commands(&[observe_imported_open_ready_command(
-                "IP.imported_open_ready",
-                PRODUCT_GATE_TIMEOUT_MAX_MS,
-            )])
-            .is_ok()
-        );
-        let mut empty_path = observe_imported_open_ready_command("IP.imported_open_ready", 30_000);
-        empty_path["path"] = json!("");
-        assert!(expected_product_gate_commands(&[empty_path]).is_err());
-        let mut extra_condition =
-            observe_imported_open_ready_command("IP.imported_open_ready", 30_000);
-        extra_condition["condition"] = json!(IMPORTED_OPEN_READY_CONDITION);
-        assert!(expected_product_gate_commands(&[extra_condition]).is_err());
-        let mut unsafe_id = observe_gate_command("/private/gate", 30_000);
-        assert!(expected_product_gate_commands(&[unsafe_id.clone()]).is_err());
-        unsafe_id["gate_id"] = json!("RZ.safe");
-        unsafe_id["private_path"] = json!("/private/source");
-        assert!(expected_product_gate_commands(&[unsafe_id]).is_err());
-        assert!(
-            expected_product_gate_commands(&[
-                observe_gate_command("RZ.duplicate", 30_000),
-                observe_gate_command("RZ.duplicate", 30_000),
-            ])
-            .is_err()
-        );
-        assert!(expected_product_gate_commands(&[observe_gate_command("RZ.zero", 0)]).is_err());
 
         let valid_commands = vec![
             json!({ "command": "sample_diagnostics", "label": "rz-start" }),
             json!({ "command": "sample_diagnostics", "label": "rz-end" }),
-            // Gate placement is deliberately permitted after a phase end.
-            observe_gate_command("RZ.cross_section.settled", 30_000),
+            valid,
             json!({ "command": "quit" }),
         ];
         let script = template(true, valid_commands);
@@ -13356,13 +15071,15 @@ mod tests {
     }
 
     #[test]
-    fn v4_product_gate_and_fatal_wait_inventories_are_exact_and_nonempty() {
+    fn v5_product_gate_and_fatal_wait_inventories_are_exact_and_nonempty() {
         let mut total_gates = 0_usize;
+        let mut total_batches = 0_usize;
         let mut total_fatal_waits = 0_usize;
         for id in REQUIRED_SCENARIOS {
             let commands = frozen_product_gate_inventory_commands(id);
             validate_product_gate_inventory(id, &commands).unwrap();
-            total_gates += expected_product_gate_commands(&commands).unwrap().len();
+            total_gates += expected_product_gate_observations(&commands).unwrap().len();
+            total_batches += expected_product_gate_batches(&commands).unwrap().len();
             total_fatal_waits += commands
                 .iter()
                 .filter(|command| {
@@ -13371,14 +15088,13 @@ mod tests {
                 .count();
         }
         assert_eq!(total_gates, 74);
+        assert_eq!(total_batches, 37);
         assert_eq!(total_fatal_waits, 24);
+        assert_eq!(total_gates * 3 * 2, 444);
 
         let mut missing = frozen_product_gate_inventory_commands("RZ");
         missing.retain(|command| {
-            !command
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(is_product_gate_observation_command)
+            command.get("command").and_then(Value::as_str) != Some("observe_gate_batch")
         });
         assert!(validate_product_gate_inventory("RZ", &missing).is_err());
 
@@ -13386,10 +15102,7 @@ mod tests {
         let gate = wrong_id
             .iter_mut()
             .find(|command| {
-                command
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(is_product_gate_observation_command)
+                command.get("command").and_then(Value::as_str) == Some("observe_gate_batch")
             })
             .unwrap();
         gate["gate_id"] = json!("RZ.acceptance.999.runtime_idle");
@@ -13399,13 +15112,10 @@ mod tests {
         let gate_index = legacy
             .iter()
             .position(|command| {
-                command
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(is_product_gate_observation_command)
+                command.get("command").and_then(Value::as_str) == Some("observe_gate_batch")
             })
             .unwrap();
-        let condition = legacy[gate_index]["condition"].clone();
+        let condition = legacy[gate_index]["observations"][0]["target"]["condition"].clone();
         legacy[gate_index] = json!({
             "command": "wait_for",
             "condition": condition,
@@ -13448,23 +15158,23 @@ mod tests {
     }
 
     #[test]
-    fn exact_population_requires_all_fifty_samples_hundred_roles_and_gate_rows() {
-        let mut profile = profile();
-        profile.protocol.development_samples = 5;
+    fn exact_population_requires_all_thirty_samples_sixty_roles_and_gate_rows() {
+        let profile = profile();
         let scripts = population_scripts();
         let samples = complete_population_samples();
         let mut reasons = BTreeSet::new();
         let population = validate_attempt_population(&profile, &scripts, &samples, &mut reasons);
         assert!(reasons.is_empty(), "{reasons:#?}");
-        assert_eq!(population.expected_sample_records, 50);
-        assert_eq!(population.observed_sample_records, 50);
-        assert_eq!(population.expected_role_attempts, 100);
-        assert_eq!(population.observed_role_attempts, 100);
-        assert_eq!(population.completed_role_reports, 100);
-        assert_eq!(population.expected_phase_evaluations, 50);
-        assert_eq!(population.observed_phase_evaluations, 50);
-        assert_eq!(population.expected_product_gate_observations, 100);
-        assert_eq!(population.observed_product_gate_observations, 100);
+        assert_eq!(population.expected_sample_records, 30);
+        assert_eq!(population.observed_sample_records, 30);
+        assert_eq!(population.expected_role_attempts, 60);
+        assert_eq!(population.observed_role_attempts, 60);
+        assert_eq!(population.completed_role_reports, 60);
+        assert_eq!(population.expected_phase_evaluations, 30);
+        assert_eq!(population.observed_phase_evaluations, 30);
+        assert_eq!(population.expected_product_gate_observations, 60);
+        assert_eq!(population.observed_product_gate_observations, 60);
+        assert!(population.sample_order_exact);
         assert_eq!(population_json(population)["exact"], json!(true));
 
         let mut filtered = complete_population_samples();
@@ -13486,15 +15196,40 @@ mod tests {
         assert!(reasons.contains("product_gate_observation_identity_mismatch"));
 
         let mut duplicate_identity = complete_population_samples();
-        duplicate_identity[49].sample_index = duplicate_identity[0].sample_index;
-        duplicate_identity[49].scenario = duplicate_identity[0].scenario.clone();
+        duplicate_identity[29].sample_index = duplicate_identity[0].sample_index;
+        duplicate_identity[29].scenario = duplicate_identity[0].scenario.clone();
         let mut reasons = BTreeSet::new();
         let population =
             validate_attempt_population(&profile, &scripts, &duplicate_identity, &mut reasons);
-        assert_eq!(population.observed_sample_records, 50);
-        assert_eq!(population.observed_role_attempts, 100);
+        assert_eq!(population.observed_sample_records, 30);
+        assert_eq!(population.observed_role_attempts, 60);
         assert!(!population.sample_identities_exact);
         assert_eq!(population_json(population)["exact"], json!(false));
+
+        let mut reordered = complete_population_samples();
+        reordered.swap(0, 1);
+        let mut reasons = BTreeSet::new();
+        let population = validate_attempt_population(&profile, &scripts, &reordered, &mut reasons);
+        assert!(population.sample_identities_exact);
+        assert!(!population.sample_order_exact);
+        assert!(reasons.contains("sample_population_order_mismatch"));
+        assert_eq!(population_json(population)["exact"], json!(false));
+
+        let mut unlaunched = complete_population_samples();
+        unlaunched[0]
+            .control
+            .as_mut()
+            .unwrap()
+            .process
+            .launch_attempted = false;
+        let mut reasons = BTreeSet::new();
+        let population = validate_attempt_population(&profile, &scripts, &unlaunched, &mut reasons);
+        assert_eq!(population.observed_role_attempts, 59);
+        assert!(reasons.contains("role_attempt_population_cardinality_mismatch"));
+        assert_eq!(
+            sanitized_role_schedule_rows(&unlaunched)[1]["launch_attempted"],
+            json!(false)
+        );
 
         let mut wrong_role = complete_population_samples();
         wrong_role[0].instrumented.role = AttemptRole::InstrumentationControl;
@@ -13512,10 +15247,10 @@ mod tests {
         assert_eq!(population_json(population)["exact"], json!(false));
 
         let mut wrong_gate = complete_population_samples();
-        wrong_gate[0].instrumented.product_gate_outcomes[0].command_index = 1;
+        wrong_gate[0].instrumented.product_gate_outcomes[0].command_index = 2;
         let mut reasons = BTreeSet::new();
         let population = validate_attempt_population(&profile, &scripts, &wrong_gate, &mut reasons);
-        assert_eq!(population.observed_product_gate_observations, 100);
+        assert_eq!(population.observed_product_gate_observations, 60);
         assert!(!population.product_gate_bijections_exact);
         assert_eq!(population_json(population)["exact"], json!(false));
     }
@@ -13626,6 +15361,7 @@ mod tests {
             expected_product_gate_observations: 2,
             observed_product_gate_observations: 2,
             sample_identities_exact: true,
+            sample_order_exact: true,
             role_identities_exact: true,
             phase_identities_exact: true,
             product_gate_bijections_exact: true,
@@ -13668,34 +15404,42 @@ mod tests {
             "sample_index",
             "scenario",
             "role",
+            "batch_id",
+            "phase_id",
+            "observation_index",
             "gate_id",
             "condition",
+            "deadline_authority",
+            "deadline_after_origin_ns",
             "outcome",
         ]);
-        for collection in ["product_gate_outcomes", "product_gate_failures"] {
-            let rows = receipt[collection].as_array().unwrap();
-            assert!(!rows.is_empty());
-            for row in rows {
-                assert_eq!(
-                    row.as_object()
-                        .unwrap()
-                        .keys()
-                        .map(String::as_str)
-                        .collect::<BTreeSet<_>>(),
-                    public_gate_fields,
-                );
-                for private_field in [
-                    "schema",
-                    "command_index",
-                    "condition_met",
-                    "timed_out",
-                    "timeout_ms",
-                    "waited_ns",
-                ] {
-                    assert!(row.get(private_field).is_none());
-                }
+        for row in receipt["product_gate_outcomes"].as_array().unwrap() {
+            assert_eq!(
+                row.as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+                public_gate_fields,
+            );
+            for private_field in [
+                "schema",
+                "command_index",
+                "condition_met",
+                "timed_out",
+                "observed_after_origin_ns",
+                "origin",
+            ] {
+                assert!(row.get(private_field).is_none());
             }
         }
+        assert!(
+            !receipt["product_gate_failures"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(receipt["role_schedule_bounds"].as_array().unwrap().len(), 2);
         assert!(receipt.get("status").is_none());
         assert!(receipt.get("reason_codes").is_none());
         assert!(encoded.contains("non_OS_input_non_E4"));

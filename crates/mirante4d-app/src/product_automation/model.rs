@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use mirante4d_dataset::CpuLedgerCategory;
 use mirante4d_dataset_runtime::DatasetRuntimeDiagnostics;
@@ -14,8 +14,11 @@ use super::{AUTOMATION_SCHEMA_VERSION, AUTOMATION_SCRIPT_SCHEMA};
 
 pub(super) const MAX_INPUT_SEQUENCE_SAMPLES: u32 = 4_096;
 pub(super) const MAX_INPUT_SEQUENCE_DURATION_MS: u64 = 120_000;
-pub(super) const MAX_OBSERVE_GATE_TIMEOUT_MS: u64 = 7_200_000;
+pub(super) const MAX_GATE_BATCH_OBSERVATIONS: usize = 64;
+pub(super) const MAX_GATE_DEADLINE_AFTER_ORIGIN_NS: u64 = 7_200_000_000_000;
 const MAX_GATE_ID_BYTES: usize = 128;
+const MAX_GATE_BATCH_ID_BYTES: usize = 128;
+const MAX_GATE_PHASE_ID_BYTES: usize = 128;
 const MAX_DIAGNOSTIC_SAMPLE_LABEL_BYTES: usize = 128;
 
 #[derive(Debug, Deserialize)]
@@ -62,8 +65,46 @@ impl ProductAutomationScript {
         if let Some(bootstrap) = &self.startup_bootstrap {
             bootstrap.validate()?;
         }
-        for command in &self.commands {
+        let mut batch_ids = BTreeSet::new();
+        let mut gate_ids = BTreeSet::new();
+        for (command_index, command) in self.commands.iter().enumerate() {
             command.validate()?;
+            if let ProductAutomationCommand::ObserveGateBatch {
+                batch_id,
+                observations,
+                ..
+            } = command
+            {
+                if !batch_ids.insert(batch_id.as_str()) {
+                    anyhow::bail!(
+                        "observe_gate_batch batch_id {:?} is duplicated within the script",
+                        batch_id
+                    );
+                }
+                for observation in observations {
+                    if !gate_ids.insert(observation.gate_id.as_str()) {
+                        anyhow::bail!(
+                            "observe_gate_batch gate_id {:?} is duplicated within the script",
+                            observation.gate_id
+                        );
+                    }
+                }
+            }
+            if let ProductAutomationCommand::ObserveGateBatch {
+                origin:
+                    ProductAutomationGateBatchOrigin::CommandCompleted {
+                        command_index: origin_command_index,
+                    },
+                ..
+            } = command
+                && *origin_command_index >= command_index
+            {
+                anyhow::bail!(
+                    "observe_gate_batch command_completed origin {} must name an earlier command than {}",
+                    origin_command_index,
+                    command_index
+                );
+            }
         }
         Ok(())
     }
@@ -191,6 +232,62 @@ pub(super) struct ProductAutomationHardSafetyLimits {
     pub(super) max_runtime_in_flight_decodes: Option<u64>,
     pub(super) max_runtime_pending_completions: Option<u64>,
     pub(super) max_runtime_resident_resources: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ProductAutomationGateBatchOrigin {
+    AutomationStarted,
+    CommandCompleted { command_index: usize },
+    ImportPrimaryStarted,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProductAutomationGateDeadlineAuthority {
+    MaximumCurrentPresentationGapPlusPollGrace,
+    ColdFirstUseful,
+    ColdCompleteCoarse,
+    ColdTargetSettlement,
+    NonresidentTargetSettlement,
+    SourceVerificationCompletion,
+    ImportPrimaryWall,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ProductAutomationGateTarget {
+    Condition {
+        condition: ProductAutomationWaitCondition,
+    },
+    ImportedOpenReady {
+        path: PathBuf,
+    },
+}
+
+impl ProductAutomationGateTarget {
+    pub(super) fn condition_name(&self) -> &'static str {
+        match self {
+            Self::Condition { condition } => condition.name(),
+            Self::ImportedOpenReady { .. } => "imported_open_ready",
+        }
+    }
+
+    pub(super) const fn is_passive(&self) -> bool {
+        match self {
+            Self::Condition { condition } => condition.is_passive(),
+            Self::ImportedOpenReady { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProductAutomationGateObservation {
+    pub(super) gate_id: String,
+    pub(super) deadline_authority: ProductAutomationGateDeadlineAuthority,
+    pub(super) deadline_after_origin_ns: u64,
+    pub(super) target: ProductAutomationGateTarget,
 }
 
 impl ProductAutomationHardSafetyLimits {
@@ -384,15 +481,11 @@ pub(super) enum ProductAutomationCommand {
         condition: ProductAutomationWaitCondition,
         timeout_ms: u64,
     },
-    ObserveGate {
-        gate_id: String,
-        condition: ProductAutomationWaitCondition,
-        timeout_ms: u64,
-    },
-    ObserveImportedOpenReady {
-        gate_id: String,
-        path: PathBuf,
-        timeout_ms: u64,
+    ObserveGateBatch {
+        batch_id: String,
+        phase_id: String,
+        origin: ProductAutomationGateBatchOrigin,
+        observations: Vec<ProductAutomationGateObservation>,
     },
     SetViewportSize {
         width: u32,
@@ -589,8 +682,7 @@ impl ProductAutomationCommand {
             Self::CancelImport => "cancel_import",
             Self::WaitForImportedOpenReady { .. } => "wait_for_imported_open_ready",
             Self::WaitFor { .. } => "wait_for",
-            Self::ObserveGate { .. } => "observe_gate",
-            Self::ObserveImportedOpenReady { .. } => "observe_imported_open_ready",
+            Self::ObserveGateBatch { .. } => "observe_gate_batch",
             Self::SetViewportSize { .. } => "set_viewport_size",
             Self::SetMappedClientPixels { .. } => "set_mapped_client_pixels",
             Self::SetRenderTargetSize { .. } => "set_render_target_size",
@@ -794,23 +886,92 @@ impl ProductAutomationCommand {
         {
             return Err(error);
         }
-        match self {
-            Self::ObserveGate {
-                gate_id,
-                timeout_ms,
-                ..
-            } => validate_observation_gate(gate_id, *timeout_ms, "observe_gate")?,
-            Self::ObserveImportedOpenReady {
-                gate_id,
-                path,
-                timeout_ms,
-            } => {
-                validate_observation_gate(gate_id, *timeout_ms, "observe_imported_open_ready")?;
-                if path.as_os_str().is_empty() {
-                    anyhow::bail!("observe_imported_open_ready requires a nonempty package path");
+        if let Self::ObserveGateBatch {
+            batch_id,
+            phase_id,
+            origin,
+            observations,
+        } = self
+        {
+            validate_safe_gate_identity(
+                batch_id,
+                MAX_GATE_BATCH_ID_BYTES,
+                "observe_gate_batch batch_id",
+            )?;
+            validate_safe_gate_identity(
+                phase_id,
+                MAX_GATE_PHASE_ID_BYTES,
+                "observe_gate_batch phase_id",
+            )?;
+            if observations.is_empty() || observations.len() > MAX_GATE_BATCH_OBSERVATIONS {
+                anyhow::bail!(
+                    "observe_gate_batch observations must contain 1..={MAX_GATE_BATCH_OBSERVATIONS} entries"
+                );
+            }
+            let mut gate_ids = BTreeSet::new();
+            let mut imported_open_ready_count = 0_usize;
+            for observation in observations {
+                validate_gate_id(&observation.gate_id, "observe_gate_batch")?;
+                if !gate_ids.insert(observation.gate_id.as_str()) {
+                    anyhow::bail!(
+                        "observe_gate_batch gate_id {:?} is duplicated within the batch",
+                        observation.gate_id
+                    );
+                }
+                if !(1..=MAX_GATE_DEADLINE_AFTER_ORIGIN_NS)
+                    .contains(&observation.deadline_after_origin_ns)
+                {
+                    anyhow::bail!(
+                        "observe_gate_batch deadline_after_origin_ns must be in 1..={MAX_GATE_DEADLINE_AFTER_ORIGIN_NS}"
+                    );
+                }
+                let authority_matches_origin = match observation.deadline_authority {
+                    ProductAutomationGateDeadlineAuthority::ColdFirstUseful
+                    | ProductAutomationGateDeadlineAuthority::ColdCompleteCoarse
+                    | ProductAutomationGateDeadlineAuthority::ColdTargetSettlement => matches!(
+                        origin,
+                        ProductAutomationGateBatchOrigin::AutomationStarted
+                    ),
+                    ProductAutomationGateDeadlineAuthority::MaximumCurrentPresentationGapPlusPollGrace
+                    | ProductAutomationGateDeadlineAuthority::NonresidentTargetSettlement
+                    | ProductAutomationGateDeadlineAuthority::SourceVerificationCompletion => {
+                        matches!(
+                            origin,
+                            ProductAutomationGateBatchOrigin::CommandCompleted { .. }
+                        )
+                    }
+                    ProductAutomationGateDeadlineAuthority::ImportPrimaryWall => matches!(
+                        origin,
+                        ProductAutomationGateBatchOrigin::ImportPrimaryStarted
+                    ),
+                };
+                if !authority_matches_origin {
+                    anyhow::bail!(
+                        "observe_gate_batch deadline_authority is inconsistent with its origin"
+                    );
+                }
+                if let ProductAutomationGateTarget::ImportedOpenReady { path } = &observation.target
+                {
+                    imported_open_ready_count = imported_open_ready_count.saturating_add(1);
+                    if observation.deadline_authority
+                        != ProductAutomationGateDeadlineAuthority::ImportPrimaryWall
+                    {
+                        anyhow::bail!(
+                            "observe_gate_batch imported_open_ready requires import_primary_wall deadline authority"
+                        );
+                    }
+                    if path.as_os_str().is_empty() {
+                        anyhow::bail!(
+                            "observe_gate_batch imported_open_ready requires a nonempty package path"
+                        );
+                    }
                 }
             }
-            _ => {}
+            if imported_open_ready_count > 1 {
+                anyhow::bail!(
+                    "observe_gate_batch accepts at most one imported_open_ready observation"
+                );
+            }
         }
         if let Self::SetLayerOrder { layer_indices } = self
             && (layer_indices.is_empty()
@@ -854,24 +1015,22 @@ fn validate_diagnostic_sample_label(label: &str) -> anyhow::Result<()> {
 }
 
 fn validate_gate_id(gate_id: &str, command: &str) -> anyhow::Result<()> {
-    if gate_id.is_empty() || gate_id.len() > MAX_GATE_ID_BYTES {
-        anyhow::bail!("{command} gate_id must contain 1..={MAX_GATE_ID_BYTES} bytes");
+    validate_safe_gate_identity(gate_id, MAX_GATE_ID_BYTES, &format!("{command} gate_id"))
+}
+
+fn validate_safe_gate_identity(
+    value: &str,
+    maximum_bytes: usize,
+    field: &str,
+) -> anyhow::Result<()> {
+    if value.is_empty() || value.len() > maximum_bytes {
+        anyhow::bail!("{field} must contain 1..={maximum_bytes} bytes");
     }
-    if !gate_id
+    if !value
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
-        anyhow::bail!(
-            "{command} gate_id must use only ASCII letters, digits, underscore, hyphen, and dot"
-        );
-    }
-    Ok(())
-}
-
-fn validate_observation_gate(gate_id: &str, timeout_ms: u64, command: &str) -> anyhow::Result<()> {
-    validate_gate_id(gate_id, command)?;
-    if !(1..=MAX_OBSERVE_GATE_TIMEOUT_MS).contains(&timeout_ms) {
-        anyhow::bail!("{command} timeout_ms must be in 1..={MAX_OBSERVE_GATE_TIMEOUT_MS}");
+        anyhow::bail!("{field} must use only ASCII letters, digits, underscore, hyphen, and dot");
     }
     Ok(())
 }

@@ -110,7 +110,7 @@ is correctness/component evidence; only the two named diagnostics emit timing
 observations.
 
 The EP-00 predecessor-development protocol is frozen through one external,
-owner-bound v4 profile plus strict workload, v4 script, and independent-oracle
+owner-bound v5 profile plus strict workload, v5 script, and independent-oracle
 bundles. Preflight and execution use the release-only commands shown by:
 
 ```bash
@@ -125,23 +125,51 @@ bundle commitments, and sanitized receipt prevent a different workload or
 local edit from inheriting the result. Raw evidence stays private; public
 reporting may name only path-free counters, gates, and reason codes.
 
-The predecessor run is exactly five ordered samples of all ten frozen
+The predecessor run is exactly three ordered samples of all ten frozen
 scenarios. Every scenario has one fresh instrumented process and one fresh
-instrumentation-control process, for exactly 100 role attempts. Role order
-alternates by sample. There are zero automatic retries, dropped observations,
-substitutions, or post-hoc filters.
+matched instrumentation-control process, for exactly 60 role attempts. Role
+order is balanced from sample and scenario parity. There are zero automatic
+retries, dropped observations, substitutions, or post-hoc filters.
 
-Owner-declared product acceptance waits use the v4 `observe_gate` automation
-command. It records one typed, ordered gate result and continues through the
-remaining diagnostic checkpoints whether the condition passes or reaches its
-declared deadline. A gate miss is retained as a product failure; it is never
+Owner-declared product acceptance observations use the v5
+`observe_gate_batch` automation command. All observations at one contiguous
+acceptance checkpoint are sampled concurrently from one shared origin and
+retain independent typed, ordered outcomes. The checkpoint wall bound is the
+maximum applicable deadline,
+not the sum of serial gate timers. A gate miss is retained as a product
+failure and does not suppress later diagnostic checkpoints; it is never
 converted into an infrastructure failure or a pass. Ordinary `wait_for`
 commands remain fatal prerequisites and may not be used for an acceptance miss
-that must preserve later evidence.
+that must preserve later evidence. Typed gate misses continue through the
+remaining role checkpoints and complete population. The first fatal setup,
+process, hard-safety, or evidence-integrity failure instead stops the launch
+immediately and preserves the exact partial lineage; later roles are not run
+after the evidence envelope has become unusable.
+
+Deadline values are exact validated profile, oracle, or protocol operands
+rather than private script policy. Resident gates use the frozen current-presentation bound plus
+one polling grace; cold, nonresident, and verification classes retain short
+explicit ceilings; and all import-primary observations share the import-
+primary origin. Every non-import fatal prerequisite is fixed by the validated
+profile or protocol and is at most 30 seconds. No private script may author a
+multi-minute viewer prerequisite. The runner accepts no caller-authored
+role-process timeout; it
+derives the exact process bound from the validated action, prerequisite, and
+concurrent-batch schedule plus bounded launch and closeout grace. IP includes
+its import-primary wall bound exactly once. A script/profile mismatch fails
+preflight. The predecessor v4 baseline launch is preserved as interrupted
+evidence but never reused: owner observation rejected its serialized long
+waits after they left otherwise active product processes visibly static for
+minutes. It produced no complete sample and supports no performance claim.
+
+The ordinary product-validation scenarios and private T5 runner use the same
+v5 automation script/report envelope even when a script needs no acceptance
+batch. Automation v4 input or output is rejected; there is no compatibility
+reader.
 
 Qualification resource ceilings are not automation abort conditions. The app
 records their observed maxima and the runner evaluates them on the product-gate
-axis after the role closes. Each v4 script instead carries a distinct required
+axis after the role closes. Each v5 script instead carries a distinct required
 `hard_safety_limits` object: its total-CPU cap is the configured CPU-ledger
 capacity, its decoded-residency and upload-staging caps are that total
 capacity, and its queued-request cap is exactly twice the qualification queue
@@ -150,15 +178,16 @@ failure because the bounded attempt must stop; the removed `limits` spelling is
 not accepted.
 
 The raw report and sanitized receipt separate two axes. Evidence is complete
-only when bindings and executable conformance pass, all 100 role attempts and
+only when bindings and executable conformance pass, all 60 role attempts and
 their reports close, every required checkpoint and timing/resource population
 is present and reconciled, source currentness and cleanup hold where
 applicable, instrumentation-control overhead is valid, and the repository and
 release executable remain unchanged. Product status is the ordered population
 of typed gate outcomes and may be failed for the predecessor. Missing or
 malformed reports, commands, gate rows, checkpoints, clocks, controls, or
-operands; runner timeout or abnormal process exit; binding/currentness drift;
-or any retry remains an evidence failure. Native command success means the
+operands; derived role-process deadline expiry or abnormal process exit;
+binding/currentness drift; or any retry remains an evidence failure. Native
+command success means the
 evidence envelope is complete, not that the predecessor passed its product
 gates.
 

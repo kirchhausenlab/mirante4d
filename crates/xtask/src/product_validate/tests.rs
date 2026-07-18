@@ -1,7 +1,8 @@
 use super::*;
 
 fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_resources: u64) {
-    assert_eq!(script["schema_version"], PRODUCT_AUTOMATION_SCHEMA_VERSION);
+    assert_eq!(PRODUCT_AUTOMATION_SCHEMA_VERSION, 5);
+    assert_eq!(script["schema_version"], 5);
     assert_eq!(
         script["hard_safety_limits"]["max_cpu_total_bytes"],
         total_bytes
@@ -1014,9 +1015,9 @@ fn fixed_product_automation_script_validation_rejects_wrong_schema() {
 
     assert!(err.contains(PRODUCT_AUTOMATION_SCRIPT_SCHEMA));
 
-    let old_version = json!({
+    let predecessor_version = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": 1,
+        "schema_version": 4,
         "scenario": "unit",
         "commands": [
             { "command": "open_dataset", "path": "/tmp/demo.m4d" },
@@ -1024,10 +1025,10 @@ fn fixed_product_automation_script_validation_rejects_wrong_schema() {
         ]
     });
     assert!(
-        validate_product_automation_script(&old_version)
+        validate_product_automation_script(&predecessor_version)
             .unwrap_err()
             .to_string()
-            .contains("schema_version must be 4")
+            .contains("schema_version must be 5")
     );
 }
 
@@ -1156,7 +1157,7 @@ fn product_automation_script_shape_rejects_legacy_and_unknown_top_level_fields()
 }
 
 #[test]
-fn product_automation_report_contract_rejects_every_v4_binding_mutation() {
+fn product_automation_report_contract_rejects_every_v5_binding_mutation() {
     let report = json!({
         "status": "passed",
         "artifacts": []
@@ -1165,7 +1166,7 @@ fn product_automation_report_contract_rejects_every_v4_binding_mutation() {
     validate_product_automation_report_contract(&report, &script, &script_path).unwrap();
 
     let mut old_schema = report.clone();
-    old_schema["schema_version"] = json!(3);
+    old_schema["schema_version"] = json!(4);
     assert!(
         validate_product_automation_report_contract(&old_schema, &script, &script_path).is_err()
     );

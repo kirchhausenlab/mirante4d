@@ -31,65 +31,77 @@ fn runtime_idle_wait_includes_async_camera_demand_planning_and_install() {
 }
 
 #[test]
-fn schema_v4_strictly_parses_observe_gate() {
+fn schema_v5_strictly_parses_observe_gate_batch_and_rejects_v4_commands() {
     let raw = json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": 4,
+        "schema_version": 5,
         "hard_safety_limits": {},
         "scenario": "gate_protocol",
         "commands": [
+            { "command": "set_viewport_size", "width": 1, "height": 1 },
             {
-                "command": "observe_gate",
-                "gate_id": "RZ.resident_3d-settled",
-                "condition": "coordinated_presentation_settled",
-                "timeout_ms": MAX_OBSERVE_GATE_TIMEOUT_MS
+                "command": "observe_gate_batch",
+                "batch_id": "RZ.resident_3d",
+                "phase_id": "resident_3d",
+                "origin": { "kind": "command_completed", "command_index": 0 },
+                "observations": [{
+                    "gate_id": "RZ.resident_3d-settled",
+                    "deadline_authority": "maximum_current_presentation_gap_plus_poll_grace",
+                    "deadline_after_origin_ns": MAX_GATE_DEADLINE_AFTER_ORIGIN_NS,
+                    "target": {
+                        "kind": "condition",
+                        "condition": "coordinated_presentation_settled"
+                    }
+                }]
             },
             { "command": "quit" }
         ]
     });
     let script: ProductAutomationScript = serde_json::from_value(raw.clone()).unwrap();
     script.validate().unwrap();
-    assert_eq!(AUTOMATION_SCHEMA_VERSION, 4);
+    assert_eq!(AUTOMATION_SCHEMA_VERSION, 5);
     assert!(matches!(
-        &script.commands[0],
-        ProductAutomationCommand::ObserveGate {
-            gate_id,
-            condition,
-            timeout_ms,
-        } if gate_id == "RZ.resident_3d-settled"
-            && condition.name() == "coordinated_presentation_settled"
-            && *timeout_ms == MAX_OBSERVE_GATE_TIMEOUT_MS
+        &script.commands[1],
+        ProductAutomationCommand::ObserveGateBatch {
+            batch_id,
+            phase_id,
+            origin: ProductAutomationGateBatchOrigin::CommandCompleted { command_index: 0 },
+            observations,
+        } if batch_id == "RZ.resident_3d"
+            && phase_id == "resident_3d"
+            && observations[0].gate_id == "RZ.resident_3d-settled"
+            && observations[0].target.condition_name() == "coordinated_presentation_settled"
+            && observations[0].deadline_after_origin_ns == MAX_GATE_DEADLINE_AFTER_ORIGIN_NS
     ));
 
     let mut legacy = raw;
-    legacy["schema_version"] = json!(3);
+    legacy["schema_version"] = json!(4);
     let legacy: ProductAutomationScript = serde_json::from_value(legacy).unwrap();
     assert!(
         legacy
             .validate()
             .unwrap_err()
             .to_string()
-            .contains("expected 4")
+            .contains("expected 5")
     );
 
-    let unknown_field = json!({
+    let predecessor_command = json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
         "hard_safety_limits": {},
-        "scenario": "strict_gate_protocol",
+        "scenario": "v4_is_not_a_compatibility_input",
         "commands": [{
             "command": "observe_gate",
             "gate_id": "RZ.settled",
             "condition": "coordinated_presentation_settled",
-            "timeout_ms": 1,
-            "unexpected": true
+            "timeout_ms": 1
         }]
     });
-    assert!(serde_json::from_value::<ProductAutomationScript>(unknown_field).is_err());
+    assert!(serde_json::from_value::<ProductAutomationScript>(predecessor_command).is_err());
 }
 
 #[test]
-fn schema_v4_requires_exact_hard_safety_limits_without_legacy_alias() {
+fn schema_v5_requires_exact_hard_safety_limits_without_legacy_alias() {
     let script_without_limits = json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
@@ -121,15 +133,35 @@ fn schema_v4_requires_exact_hard_safety_limits_without_legacy_alias() {
 }
 
 #[test]
-fn observe_gate_validates_safe_bounded_identity_and_timeout() {
-    assert_eq!(MAX_OBSERVE_GATE_TIMEOUT_MS, 7_200_000);
-    for (gate_id, timeout_ms) in [
-        (String::new(), 1),
-        ("a".repeat(129), 1),
-        ("contains space".to_owned(), 1),
-        ("non-ascii-é".to_owned(), 1),
-        ("valid".to_owned(), 0),
-        ("valid".to_owned(), 7_200_001),
+fn observe_gate_batch_validates_safe_bounded_identity_and_deadline() {
+    assert_eq!(MAX_GATE_DEADLINE_AFTER_ORIGIN_NS, 7_200_000_000_000);
+    for (batch_id, phase_id, gate_id, deadline_after_origin_ns) in [
+        (String::new(), "phase".to_owned(), "gate".to_owned(), 1),
+        ("batch".to_owned(), "a".repeat(129), "gate".to_owned(), 1),
+        (
+            "batch".to_owned(),
+            "phase".to_owned(),
+            "contains space".to_owned(),
+            1,
+        ),
+        (
+            "batch".to_owned(),
+            "phase".to_owned(),
+            "non-ascii-é".to_owned(),
+            1,
+        ),
+        (
+            "batch".to_owned(),
+            "phase".to_owned(),
+            "valid".to_owned(),
+            0,
+        ),
+        (
+            "batch".to_owned(),
+            "phase".to_owned(),
+            "valid".to_owned(),
+            MAX_GATE_DEADLINE_AFTER_ORIGIN_NS + 1,
+        ),
     ] {
         let script: ProductAutomationScript = serde_json::from_value(json!({
             "schema": AUTOMATION_SCRIPT_SCHEMA,
@@ -137,27 +169,42 @@ fn observe_gate_validates_safe_bounded_identity_and_timeout() {
             "hard_safety_limits": {},
             "scenario": "invalid_gate_protocol",
             "commands": [{
-                "command": "observe_gate",
-                "gate_id": gate_id,
-                "condition": "runtime_idle",
-                "timeout_ms": timeout_ms
+                "command": "observe_gate_batch",
+                "batch_id": batch_id,
+                "phase_id": phase_id,
+                "origin": { "kind": "automation_started" },
+                "observations": [{
+                    "gate_id": gate_id,
+                    "deadline_authority": "cold_target_settlement",
+                    "deadline_after_origin_ns": deadline_after_origin_ns,
+                    "target": { "kind": "condition", "condition": "runtime_idle" }
+                }]
             }]
         }))
         .unwrap();
         assert!(script.validate().is_err());
     }
 
-    for (gate_id, timeout_ms) in [("x".to_owned(), 1), ("x".repeat(128), 7_200_000)] {
+    for (gate_id, deadline_after_origin_ns) in [
+        ("x".to_owned(), 1),
+        ("x".repeat(128), MAX_GATE_DEADLINE_AFTER_ORIGIN_NS),
+    ] {
         let script: ProductAutomationScript = serde_json::from_value(json!({
             "schema": AUTOMATION_SCRIPT_SCHEMA,
             "schema_version": AUTOMATION_SCHEMA_VERSION,
             "hard_safety_limits": {},
             "scenario": "valid_gate_protocol_boundaries",
             "commands": [{
-                "command": "observe_gate",
-                "gate_id": gate_id,
-                "condition": "runtime_idle",
-                "timeout_ms": timeout_ms
+                "command": "observe_gate_batch",
+                "batch_id": "batch",
+                "phase_id": "phase",
+                "origin": { "kind": "automation_started" },
+                "observations": [{
+                    "gate_id": gate_id,
+                    "deadline_authority": "cold_target_settlement",
+                    "deadline_after_origin_ns": deadline_after_origin_ns,
+                    "target": { "kind": "condition", "condition": "runtime_idle" }
+                }]
             }]
         }))
         .unwrap();
@@ -166,86 +213,345 @@ fn observe_gate_validates_safe_bounded_identity_and_timeout() {
 }
 
 #[test]
-fn observe_gate_timeout_is_a_typed_failed_observation() {
-    assert!(matches!(
-        product_gate_observation_progress(
-            "RZ.resident_3d-settled",
-            ProductAutomationWaitCondition::CoordinatedPresentationSettled,
-            100,
-            false,
-            Duration::from_millis(99),
-        ),
-        CommandProgress::Waiting
-    ));
+fn observe_gate_batch_requires_bounded_unique_script_identities_and_past_origins() {
+    let observation = |gate_id: &str| {
+        json!({
+            "gate_id": gate_id,
+            "deadline_authority": "cold_target_settlement",
+            "deadline_after_origin_ns": 1,
+            "target": { "kind": "condition", "condition": "runtime_idle" }
+        })
+    };
+    let batch = |batch_id: &str, gate_id: &str| {
+        json!({
+            "command": "observe_gate_batch",
+            "batch_id": batch_id,
+            "phase_id": "phase",
+            "origin": { "kind": "automation_started" },
+            "observations": [observation(gate_id)]
+        })
+    };
 
-    let CommandProgress::Done(details) = product_gate_observation_progress(
-        "RZ.resident_3d-settled",
-        ProductAutomationWaitCondition::CoordinatedPresentationSettled,
-        100,
-        false,
-        Duration::from_millis(100),
-    ) else {
-        panic!("the timeout must complete as an observed gate result");
+    for commands in [
+        vec![batch("batch", "gate-a"), batch("batch", "gate-b")],
+        vec![batch("batch-a", "gate"), batch("batch-b", "gate")],
+        vec![json!({
+            "command": "observe_gate_batch",
+            "batch_id": "future-origin",
+            "phase_id": "phase",
+            "origin": { "kind": "command_completed", "command_index": 0 },
+            "observations": [observation("gate")]
+        })],
+    ] {
+        let script: ProductAutomationScript = serde_json::from_value(json!({
+            "schema": AUTOMATION_SCRIPT_SCHEMA,
+            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "hard_safety_limits": {},
+            "scenario": "invalid_batch_identity",
+            "commands": commands,
+        }))
+        .unwrap();
+        assert!(script.validate().is_err());
+    }
+
+    let observations = (0..=MAX_GATE_BATCH_OBSERVATIONS)
+        .map(|index| observation(&format!("gate-{index}")))
+        .collect::<Vec<_>>();
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "too_many_batch_observations",
+        "commands": [{
+            "command": "observe_gate_batch",
+            "batch_id": "batch",
+            "phase_id": "phase",
+            "origin": { "kind": "automation_started" },
+            "observations": observations,
+        }],
+    }))
+    .unwrap();
+    assert!(script.validate().is_err());
+}
+
+#[test]
+fn gate_deadline_authorities_require_their_closed_origin_class() {
+    let condition = |gate_id: &str, deadline_authority: &str| {
+        json!({
+            "gate_id": gate_id,
+            "deadline_authority": deadline_authority,
+            "deadline_after_origin_ns": 1,
+            "target": { "kind": "condition", "condition": "runtime_idle" }
+        })
+    };
+    let valid: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "closed_origin_classes",
+        "commands": [
+            {
+                "command": "observe_gate_batch",
+                "batch_id": "cold",
+                "phase_id": "cold",
+                "origin": { "kind": "automation_started" },
+                "observations": [
+                    condition("cold-first", "cold_first_useful"),
+                    condition("cold-coarse", "cold_complete_coarse"),
+                    condition("cold-target", "cold_target_settlement")
+                ]
+            },
+            { "command": "set_viewport_size", "width": 1, "height": 1 },
+            {
+                "command": "observe_gate_batch",
+                "batch_id": "resident",
+                "phase_id": "resident",
+                "origin": { "kind": "command_completed", "command_index": 1 },
+                "observations": [
+                    condition("resident-gap", "maximum_current_presentation_gap_plus_poll_grace"),
+                    condition("nonresident-target", "nonresident_target_settlement"),
+                    condition("verification", "source_verification_completion")
+                ]
+            },
+            {
+                "command": "observe_gate_batch",
+                "batch_id": "import",
+                "phase_id": "import",
+                "origin": { "kind": "import_primary_started" },
+                "observations": [condition("import-wall", "import_primary_wall")]
+            }
+        ]
+    }))
+    .unwrap();
+    valid.validate().unwrap();
+
+    let invalid: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "mismatched_origin_class",
+        "commands": [{
+            "command": "observe_gate_batch",
+            "batch_id": "invalid",
+            "phase_id": "invalid",
+            "origin": { "kind": "automation_started" },
+            "observations": [condition(
+                "resident-with-cold-origin",
+                "maximum_current_presentation_gap_plus_poll_grace"
+            )]
+        }]
+    }))
+    .unwrap();
+    assert!(invalid.validate().is_err());
+}
+
+#[test]
+fn gate_batch_origin_resolution_uses_only_the_exact_declared_instant() {
+    let automation_started_at = Instant::now();
+    let command_completed_at = automation_started_at + Duration::from_nanos(11);
+    let import_primary_started_at = automation_started_at + Duration::from_nanos(23);
+    let completions = [Some(command_completed_at), None];
+
+    assert_eq!(
+        resolve_product_gate_batch_origin_at(
+            ProductAutomationGateBatchOrigin::AutomationStarted,
+            automation_started_at,
+            &completions,
+            Some(import_primary_started_at),
+        )
+        .unwrap(),
+        automation_started_at
+    );
+    assert_eq!(
+        resolve_product_gate_batch_origin_at(
+            ProductAutomationGateBatchOrigin::CommandCompleted { command_index: 0 },
+            automation_started_at,
+            &completions,
+            Some(import_primary_started_at),
+        )
+        .unwrap(),
+        command_completed_at
+    );
+    assert!(
+        resolve_product_gate_batch_origin_at(
+            ProductAutomationGateBatchOrigin::CommandCompleted { command_index: 1 },
+            automation_started_at,
+            &completions,
+            Some(import_primary_started_at),
+        )
+        .is_err()
+    );
+    assert_eq!(
+        resolve_product_gate_batch_origin_at(
+            ProductAutomationGateBatchOrigin::ImportPrimaryStarted,
+            automation_started_at,
+            &completions,
+            Some(import_primary_started_at),
+        )
+        .unwrap(),
+        import_primary_started_at
+    );
+    assert!(
+        resolve_product_gate_batch_origin_at(
+            ProductAutomationGateBatchOrigin::ImportPrimaryStarted,
+            automation_started_at,
+            &completions,
+            None,
+        )
+        .is_err()
+    );
+
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "recorded_command_origin",
+        "commands": [{ "command": "quit" }, { "command": "quit" }]
+    }))
+    .unwrap();
+    script.validate().unwrap();
+    let mut controller = ProductAutomationController::new(
+        script,
+        PathBuf::from("gate-script.json"),
+        PathBuf::from("gate-report.json"),
+    );
+    assert!(
+        controller
+            .product_gate_batch_origin_at(ProductAutomationGateBatchOrigin::CommandCompleted {
+                command_index: 0
+            })
+            .is_err()
+    );
+    controller.record_successful_command(0, "quit", Duration::ZERO, json!({}));
+    let recorded = controller.command_completed_at[0].unwrap();
+    assert_eq!(
+        controller
+            .product_gate_batch_origin_at(ProductAutomationGateBatchOrigin::CommandCompleted {
+                command_index: 0
+            })
+            .unwrap(),
+        recorded
+    );
+}
+
+#[test]
+fn observe_gate_batch_latches_concurrently_and_completes_at_the_maximum_deadline() {
+    let observations = vec![
+        ProductAutomationGateObservation {
+            gate_id: "first".to_owned(),
+            deadline_authority:
+                ProductAutomationGateDeadlineAuthority::MaximumCurrentPresentationGapPlusPollGrace,
+            deadline_after_origin_ns: 10,
+            target: ProductAutomationGateTarget::Condition {
+                condition: ProductAutomationWaitCondition::RuntimeIdle,
+            },
+        },
+        ProductAutomationGateObservation {
+            gate_id: "second".to_owned(),
+            deadline_authority: ProductAutomationGateDeadlineAuthority::NonresidentTargetSettlement,
+            deadline_after_origin_ns: 20,
+            target: ProductAutomationGateTarget::Condition {
+                condition: ProductAutomationWaitCondition::CoordinatedPresentationSettled,
+            },
+        },
+    ];
+    let mut outcomes = vec![None; observations.len()];
+
+    assert!(
+        !latch_product_gate_batch_observations(&observations, &[false, false], 9, &mut outcomes,)
+            .unwrap()
+    );
+    assert_eq!(outcomes, [None, None]);
+
+    assert!(
+        !latch_product_gate_batch_observations(&observations, &[false, false], 10, &mut outcomes,)
+            .unwrap()
+    );
+    assert_eq!(
+        outcomes[0],
+        Some(LatchedProductGateObservation {
+            outcome: ProductGateObservationOutcome::Failed,
+            condition_met: false,
+            timed_out: true,
+            observed_after_origin_ns: 10,
+        })
+    );
+    assert_eq!(outcomes[1], None);
+
+    assert!(
+        latch_product_gate_batch_observations(&observations, &[true, true], 19, &mut outcomes,)
+            .unwrap()
+    );
+    assert_eq!(outcomes[0].unwrap().observed_after_origin_ns, 10);
+    assert_eq!(
+        outcomes[1].unwrap().outcome,
+        ProductGateObservationOutcome::Passed
+    );
+    assert_eq!(outcomes[1].unwrap().observed_after_origin_ns, 19);
+    let serial_deadline_sum = observations
+        .iter()
+        .map(|observation| observation.deadline_after_origin_ns)
+        .sum::<u64>();
+    assert!(
+        outcomes[1].unwrap().observed_after_origin_ns < serial_deadline_sum,
+        "batch time is max-like, never a serial sum"
+    );
+}
+
+#[test]
+fn observe_gate_batch_deadline_wins_at_equality_and_records_late_true() {
+    let observation = ProductAutomationGateObservation {
+        gate_id: "runtime.ready".to_owned(),
+        deadline_authority:
+            ProductAutomationGateDeadlineAuthority::MaximumCurrentPresentationGapPlusPollGrace,
+        deadline_after_origin_ns: 100,
+        target: ProductAutomationGateTarget::Condition {
+            condition: ProductAutomationWaitCondition::RuntimeIdle,
+        },
     };
     assert_eq!(
-        details,
-        json!({
-            "schema": "mirante4d-product-gate-observation-1",
-            "gate_id": "RZ.resident_3d-settled",
-            "condition": "coordinated_presentation_settled",
-            "outcome": "failed",
-            "condition_met": false,
-            "timed_out": true,
-            "timeout_ms": 100,
-            "waited_ns": 100_000_000_u64,
+        latch_product_gate_observation(&observation, true, 99),
+        Some(LatchedProductGateObservation {
+            outcome: ProductGateObservationOutcome::Passed,
+            condition_met: true,
+            timed_out: false,
+            observed_after_origin_ns: 99,
+        })
+    );
+    assert_eq!(
+        latch_product_gate_observation(&observation, true, 100),
+        Some(LatchedProductGateObservation {
+            outcome: ProductGateObservationOutcome::Failed,
+            condition_met: true,
+            timed_out: true,
+            observed_after_origin_ns: 100,
         })
     );
 }
 
 #[test]
-fn observe_gate_requires_the_condition_before_the_exact_deadline() {
-    let CommandProgress::Done(details) = product_gate_observation_progress(
-        "runtime.ready",
-        ProductAutomationWaitCondition::RuntimeIdle,
-        100,
-        true,
-        Duration::from_millis(99),
-    ) else {
-        panic!("a condition observed before the deadline must pass");
-    };
-    assert_eq!(details["outcome"], "passed");
-    assert_eq!(details["condition_met"], true);
-    assert_eq!(details["timed_out"], false);
-    assert_eq!(details["waited_ns"], 99_000_000_u64);
-
-    let CommandProgress::Done(late) = product_gate_observation_progress(
-        "runtime.ready",
-        ProductAutomationWaitCondition::RuntimeIdle,
-        100,
-        true,
-        Duration::from_millis(100),
-    ) else {
-        panic!("the exact deadline must close as a failed observation");
-    };
-    assert_eq!(late["outcome"], "failed");
-    assert_eq!(late["condition_met"], true);
-    assert_eq!(late["timed_out"], true);
-    assert_eq!(late["waited_ns"], 100_000_000_u64);
-}
-
-#[test]
-fn failed_gate_observation_is_a_successful_report_event_and_continues() {
+fn failed_gate_batch_is_a_successful_report_event_and_continues() {
     let script: ProductAutomationScript = serde_json::from_value(json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
         "hard_safety_limits": {},
         "scenario": "gate_continue",
         "commands": [
+            { "command": "set_viewport_size", "width": 1, "height": 1 },
             {
-                "command": "observe_gate",
-                "gate_id": "RZ.resident_3d-settled",
-                "condition": "coordinated_presentation_settled",
-                "timeout_ms": 10
+                "command": "observe_gate_batch",
+                "batch_id": "RZ.resident_3d",
+                "phase_id": "resident_3d",
+                "origin": { "kind": "command_completed", "command_index": 0 },
+                "observations": [{
+                    "gate_id": "RZ.resident_3d-settled",
+                    "deadline_authority": "maximum_current_presentation_gap_plus_poll_grace",
+                    "deadline_after_origin_ns": 10,
+                    "target": {
+                        "kind": "condition",
+                        "condition": "coordinated_presentation_settled"
+                    }
+                }]
             },
             { "command": "quit" }
         ]
@@ -257,32 +563,57 @@ fn failed_gate_observation_is_a_successful_report_event_and_continues() {
         PathBuf::from("gate-script.json"),
         PathBuf::from("gate-report.json"),
     );
-    controller.active_wait_started = Some(Instant::now());
-    let CommandProgress::Done(details) = product_gate_observation_progress(
-        "RZ.resident_3d-settled",
-        ProductAutomationWaitCondition::CoordinatedPresentationSettled,
-        10,
-        false,
-        Duration::from_millis(10),
-    ) else {
-        panic!("the failed observation must be command-complete");
-    };
+    controller.record_successful_command(0, "set_viewport_size", Duration::ZERO, json!({}));
+    let details = serde_json::to_value(ProductGateBatchDetails {
+        schema: AUTOMATION_GATE_BATCH_OBSERVATION_SCHEMA,
+        batch_id: "RZ.resident_3d",
+        phase_id: "resident_3d",
+        origin: ProductAutomationGateBatchOrigin::CommandCompleted { command_index: 0 },
+        completed_after_origin_ns: 10,
+        observations: vec![ProductGateBatchObservationDetails {
+            observation_index: 0,
+            gate_id: "RZ.resident_3d-settled",
+            condition: "coordinated_presentation_settled",
+            deadline_authority:
+                ProductAutomationGateDeadlineAuthority::MaximumCurrentPresentationGapPlusPollGrace,
+            deadline_after_origin_ns: 10,
+            outcome: ProductGateObservationOutcome::Failed,
+            condition_met: false,
+            timed_out: true,
+            observed_after_origin_ns: 10,
+        }],
+    })
+    .unwrap();
 
-    controller.record_successful_command(0, "observe_gate", Duration::from_millis(10), details);
+    controller.record_successful_command(
+        1,
+        "observe_gate_batch",
+        Duration::from_nanos(10),
+        details,
+    );
 
-    assert_eq!(controller.command_index, 1);
-    assert!(controller.active_wait_started.is_none());
-    assert_eq!(controller.events.len(), 1);
-    let report_events = serde_json::to_value(&controller.events).unwrap();
-    assert_eq!(report_events[0]["command_index"], 0);
-    assert_eq!(report_events[0]["command"], "observe_gate");
-    assert_eq!(report_events[0]["status"], "passed");
-    assert_eq!(report_events[0]["details"]["outcome"], "failed");
-    assert_eq!(report_events[0]["details"]["condition_met"], false);
-    assert_eq!(report_events[0]["details"]["timed_out"], true);
-
-    controller.record_successful_command(1, "quit", Duration::ZERO, json!({}));
     assert_eq!(controller.command_index, 2);
+    assert!(controller.active_wait_started.is_none());
+    assert_eq!(controller.events.len(), 2);
+    let report_events = serde_json::to_value(&controller.events).unwrap();
+    assert_eq!(report_events[1]["command_index"], 1);
+    assert_eq!(report_events[1]["command"], "observe_gate_batch");
+    assert_eq!(report_events[1]["status"], "passed");
+    assert_eq!(
+        report_events[1]["details"]["schema"],
+        "mirante4d-product-gate-batch-observation-1"
+    );
+    assert_eq!(
+        report_events[1]["details"]["observations"][0]["outcome"],
+        "failed"
+    );
+    assert_eq!(
+        report_events[1]["details"]["observations"][0]["timed_out"],
+        true
+    );
+
+    controller.record_successful_command(2, "quit", Duration::ZERO, json!({}));
+    assert_eq!(controller.command_index, 3);
     assert!(
         controller
             .events
@@ -292,7 +623,7 @@ fn failed_gate_observation_is_a_successful_report_event_and_continues() {
 }
 
 #[test]
-fn schema_v4_strictly_parses_observe_imported_open_ready() {
+fn schema_v5_strictly_parses_imported_open_ready_batch_target() {
     let raw = json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
@@ -300,10 +631,19 @@ fn schema_v4_strictly_parses_observe_imported_open_ready() {
         "scenario": "ip_acceptance_gate",
         "commands": [
             {
-                "command": "observe_imported_open_ready",
-                "gate_id": "IP.imported-open-ready",
-                "path": "/private/session/published.m4d",
-                "timeout_ms": 7_200_000
+                "command": "observe_gate_batch",
+                "batch_id": "IP.primary",
+                "phase_id": "primary",
+                "origin": { "kind": "import_primary_started" },
+                "observations": [{
+                    "gate_id": "IP.imported-open-ready",
+                    "deadline_authority": "import_primary_wall",
+                    "deadline_after_origin_ns": 7_200_000_000_000_u64,
+                    "target": {
+                        "kind": "imported_open_ready",
+                        "path": "/tmp/test-published.m4d"
+                    }
+                }]
             },
             { "command": "quit" }
         ]
@@ -312,56 +652,64 @@ fn schema_v4_strictly_parses_observe_imported_open_ready() {
     script.validate().unwrap();
     assert!(matches!(
         &script.commands[0],
-        ProductAutomationCommand::ObserveImportedOpenReady {
-            gate_id,
-            path,
-            timeout_ms,
-        } if gate_id == "IP.imported-open-ready"
-            && path == &PathBuf::from("/private/session/published.m4d")
-            && *timeout_ms == 7_200_000
+        ProductAutomationCommand::ObserveGateBatch { observations, .. }
+            if matches!(
+                &observations[0].target,
+                ProductAutomationGateTarget::ImportedOpenReady { path }
+                    if path == &PathBuf::from("/tmp/test-published.m4d")
+            )
     ));
-    assert_eq!(script.commands[0].name(), "observe_imported_open_ready");
+    assert_eq!(script.commands[0].name(), "observe_gate_batch");
 
-    for command in [
+    for target in [
         json!({
-            "command": "observe_imported_open_ready",
-            "gate_id": "IP.valid",
-            "path": "/private/session/published.m4d",
-            "timeout_ms": 1,
+            "kind": "imported_open_ready",
+            "path": "/tmp/test-published.m4d",
             "unexpected": true
         }),
-        json!({
-            "command": "observe_imported_open_ready",
-            "gate_id": "IP.valid",
-            "timeout_ms": 1
-        }),
+        json!({ "kind": "imported_open_ready" }),
     ] {
         let candidate = json!({
             "schema": AUTOMATION_SCRIPT_SCHEMA,
             "schema_version": AUTOMATION_SCHEMA_VERSION,
             "hard_safety_limits": {},
             "scenario": "strict_ip_acceptance_gate",
-            "commands": [command]
+            "commands": [{
+                "command": "observe_gate_batch",
+                "batch_id": "IP.primary",
+                "phase_id": "primary",
+                "origin": { "kind": "import_primary_started" },
+                "observations": [{
+                    "gate_id": "IP.valid",
+                    "deadline_authority": "import_primary_wall",
+                    "deadline_after_origin_ns": 1,
+                    "target": target
+                }]
+            }]
         });
         assert!(serde_json::from_value::<ProductAutomationScript>(candidate).is_err());
     }
 }
 
 #[test]
-fn observe_imported_open_ready_validates_path_identity_and_timeout() {
-    for (gate_id, path, timeout_ms) in [
-        ("".to_owned(), "/tmp/published.m4d".to_owned(), 1),
+fn imported_open_ready_batch_target_validates_path_identity_and_deadline() {
+    for (gate_id, path, deadline_after_origin_ns) in [
+        ("".to_owned(), "/tmp/test-published.m4d".to_owned(), 1),
         (
             "contains space".to_owned(),
-            "/tmp/published.m4d".to_owned(),
+            "/tmp/test-published.m4d".to_owned(),
             1,
         ),
         ("IP.valid".to_owned(), String::new(), 1),
-        ("IP.valid".to_owned(), "/tmp/published.m4d".to_owned(), 0),
         (
             "IP.valid".to_owned(),
-            "/tmp/published.m4d".to_owned(),
-            7_200_001,
+            "/tmp/test-published.m4d".to_owned(),
+            0,
+        ),
+        (
+            "IP.valid".to_owned(),
+            "/tmp/test-published.m4d".to_owned(),
+            MAX_GATE_DEADLINE_AFTER_ORIGIN_NS + 1,
         ),
     ] {
         let script: ProductAutomationScript = serde_json::from_value(json!({
@@ -370,96 +718,112 @@ fn observe_imported_open_ready_validates_path_identity_and_timeout() {
             "hard_safety_limits": {},
             "scenario": "invalid_ip_acceptance_gate",
             "commands": [{
-                "command": "observe_imported_open_ready",
-                "gate_id": gate_id,
-                "path": path,
-                "timeout_ms": timeout_ms
+                "command": "observe_gate_batch",
+                "batch_id": "IP.primary",
+                "phase_id": "primary",
+                "origin": { "kind": "import_primary_started" },
+                "observations": [{
+                    "gate_id": gate_id,
+                    "deadline_authority": "import_primary_wall",
+                    "deadline_after_origin_ns": deadline_after_origin_ns,
+                    "target": { "kind": "imported_open_ready", "path": path }
+                }]
             }]
         }))
         .unwrap();
         assert!(script.validate().is_err());
     }
+
+    let wrong_authority: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "imported_open_ready_wrong_authority",
+        "commands": [{
+            "command": "observe_gate_batch",
+            "batch_id": "IP.wrong-authority",
+            "phase_id": "wrong-authority",
+            "origin": { "kind": "automation_started" },
+            "observations": [{
+                "gate_id": "IP.imported-open-ready-wrong-authority",
+                "deadline_authority": "cold_target_settlement",
+                "deadline_after_origin_ns": 1,
+                "target": {
+                    "kind": "imported_open_ready",
+                    "path": "/tmp/test-published.m4d"
+                }
+            }]
+        }]
+    }))
+    .unwrap();
+    assert!(wrong_authority.validate().is_err());
 }
 
 #[test]
-fn observe_imported_open_ready_reports_typed_pass_and_timeout() {
-    assert!(matches!(
-        product_imported_open_ready_observation_progress(
-            "IP.imported-open-ready",
-            100,
-            false,
-            Duration::from_millis(99),
-        ),
-        CommandProgress::Waiting
-    ));
-
-    let CommandProgress::Done(passed) = product_imported_open_ready_observation_progress(
-        "IP.imported-open-ready",
-        100,
-        true,
-        Duration::from_millis(99),
-    ) else {
-        panic!("ready import acceptance must pass before its deadline");
+fn imported_open_ready_batch_target_reports_typed_pass_and_timeout() {
+    let observation = ProductAutomationGateObservation {
+        gate_id: "IP.imported-open-ready".to_owned(),
+        deadline_authority: ProductAutomationGateDeadlineAuthority::ImportPrimaryWall,
+        deadline_after_origin_ns: 100,
+        target: ProductAutomationGateTarget::ImportedOpenReady {
+            path: PathBuf::from("/tmp/test-published.m4d"),
+        },
     };
     assert_eq!(
-        passed,
-        json!({
-            "schema": "mirante4d-product-gate-observation-1",
-            "gate_id": "IP.imported-open-ready",
-            "condition": "imported_open_ready",
-            "outcome": "passed",
-            "condition_met": true,
-            "timed_out": false,
-            "timeout_ms": 100,
-            "waited_ns": 99_000_000_u64,
+        latch_product_gate_observation(&observation, false, 99),
+        None
+    );
+    assert_eq!(
+        latch_product_gate_observation(&observation, true, 99),
+        Some(LatchedProductGateObservation {
+            outcome: ProductGateObservationOutcome::Passed,
+            condition_met: true,
+            timed_out: false,
+            observed_after_origin_ns: 99,
         })
     );
-
-    let CommandProgress::Done(late_ready) = product_imported_open_ready_observation_progress(
-        "IP.imported-open-ready",
-        100,
-        true,
-        Duration::from_millis(100),
-    ) else {
-        panic!("ready import observed at the deadline must fail the latency gate");
-    };
-    assert_eq!(late_ready["outcome"], "failed");
-    assert_eq!(late_ready["condition_met"], true);
-    assert_eq!(late_ready["timed_out"], true);
-
-    let CommandProgress::Done(failed) = product_imported_open_ready_observation_progress(
-        "IP.imported-open-ready",
-        100,
-        false,
-        Duration::from_millis(100),
-    ) else {
-        panic!("timed-out import acceptance must complete as a failed observation");
-    };
-    assert_eq!(failed["condition"], "imported_open_ready");
-    assert_eq!(failed["outcome"], "failed");
-    assert_eq!(failed["condition_met"], false);
-    assert_eq!(failed["timed_out"], true);
-    assert_eq!(failed["timeout_ms"], 100);
-    assert_eq!(failed["waited_ns"], 100_000_000_u64);
+    assert_eq!(
+        latch_product_gate_observation(&observation, true, 100),
+        Some(LatchedProductGateObservation {
+            outcome: ProductGateObservationOutcome::Failed,
+            condition_met: true,
+            timed_out: true,
+            observed_after_origin_ns: 100,
+        })
+    );
+    assert_eq!(
+        latch_product_gate_observation(&observation, false, 100),
+        Some(LatchedProductGateObservation {
+            outcome: ProductGateObservationOutcome::Failed,
+            condition_met: false,
+            timed_out: true,
+            observed_after_origin_ns: 100,
+        })
+    );
 }
 
 #[test]
-fn imported_open_ready_runs_pass_only_measurement_strictly_before_deadline() {
-    assert!(imported_open_ready_observation_requires_measurement(
-        100,
-        true,
-        Duration::from_millis(99),
-    ));
-    assert!(!imported_open_ready_observation_requires_measurement(
-        100,
-        true,
-        Duration::from_millis(100),
-    ));
-    assert!(!imported_open_ready_observation_requires_measurement(
-        100,
-        false,
-        Duration::from_millis(99),
-    ));
+fn imported_open_ready_full_measurement_is_admitted_only_by_a_latched_pass() {
+    let observation = ProductAutomationGateObservation {
+        gate_id: "IP.imported-open-ready".to_owned(),
+        deadline_authority: ProductAutomationGateDeadlineAuthority::ImportPrimaryWall,
+        deadline_after_origin_ns: 100,
+        target: ProductAutomationGateTarget::ImportedOpenReady {
+            path: PathBuf::from("/tmp/test-published.m4d"),
+        },
+    };
+    assert_eq!(
+        latch_product_gate_observation(&observation, true, 99).map(|outcome| outcome.outcome),
+        Some(ProductGateObservationOutcome::Passed)
+    );
+    assert_eq!(
+        latch_product_gate_observation(&observation, true, 100).map(|outcome| outcome.outcome),
+        Some(ProductGateObservationOutcome::Failed)
+    );
+    assert_eq!(
+        latch_product_gate_observation(&observation, false, 99),
+        None
+    );
 }
 
 #[test]
@@ -653,8 +1017,8 @@ fn passed_imported_open_ready_adds_full_clocks_to_the_same_publication_evidence(
 }
 
 #[test]
-fn failed_imported_open_ready_gate_continues_without_serializing_path() {
-    let private_path = "/private/owner/session/published.m4d";
+fn failed_imported_open_ready_batch_continues_without_serializing_path() {
+    let private_path_marker = "/tmp/sensitive-path-marker/published.m4d";
     let script: ProductAutomationScript = serde_json::from_value(json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
@@ -662,10 +1026,19 @@ fn failed_imported_open_ready_gate_continues_without_serializing_path() {
         "scenario": "ip_gate_continue",
         "commands": [
             {
-                "command": "observe_imported_open_ready",
-                "gate_id": "IP.imported-open-ready",
-                "path": private_path,
-                "timeout_ms": 10
+                "command": "observe_gate_batch",
+                "batch_id": "IP.primary",
+                "phase_id": "primary",
+                "origin": { "kind": "import_primary_started" },
+                "observations": [{
+                    "gate_id": "IP.imported-open-ready",
+                    "deadline_authority": "import_primary_wall",
+                    "deadline_after_origin_ns": 10,
+                    "target": {
+                        "kind": "imported_open_ready",
+                        "path": private_path_marker
+                    }
+                }]
             },
             { "command": "quit" }
         ]
@@ -677,22 +1050,42 @@ fn failed_imported_open_ready_gate_continues_without_serializing_path() {
         PathBuf::from("gate-script.json"),
         PathBuf::from("gate-report.json"),
     );
-    controller.active_wait_started = Some(Instant::now());
-    let CommandProgress::Done(details) = product_imported_open_ready_observation_progress(
-        "IP.imported-open-ready",
-        10,
-        false,
-        Duration::from_millis(10),
-    ) else {
-        panic!("the failed import acceptance observation must be command-complete");
+    let observations = match &controller.script.commands[0] {
+        ProductAutomationCommand::ObserveGateBatch { observations, .. } => observations.clone(),
+        _ => panic!("test script must begin with its imported-open-ready batch"),
     };
-    assert_eq!(details.as_object().map(serde_json::Map::len), Some(8));
-    assert!(details.get("path").is_none());
+    let outcome = latch_product_gate_observation(&observations[0], false, 10)
+        .expect("the imported-open-ready deadline must latch a failed outcome");
+    let details = product_gate_batch_details_value(
+        "IP.primary",
+        "primary",
+        ProductAutomationGateBatchOrigin::ImportPrimaryStarted,
+        10,
+        &observations,
+        &[Some(outcome)],
+    )
+    .unwrap();
+    assert_eq!(details["observations"][0]["outcome"], "failed");
+    assert_eq!(details["observations"][0]["timed_out"], true);
+    assert_eq!(import_primary_measurement_json(None), Value::Null);
+    assert_eq!(
+        import_publication_to_open_ready_measurement_json(None, None),
+        Value::Null
+    );
+    assert!(
+        authentic_failed_import_publication_evidence(Err("not published".to_owned())).is_none()
+    );
+    let partial = authentic_failed_import_publication_evidence(Ok(
+        test_import_publication_evidence_snapshot(),
+    ))
+    .expect("authentic currentness evidence must remain available on a failed deadline");
+    let partial = import_publication_to_open_ready_measurement_json(None, Some(partial));
+    assert_eq!(partial.as_object().map(serde_json::Map::len), Some(6));
 
     controller.record_successful_command(
         0,
-        "observe_imported_open_ready",
-        Duration::from_millis(10),
+        "observe_gate_batch",
+        Duration::from_nanos(10),
         details,
     );
 
@@ -700,11 +1093,19 @@ fn failed_imported_open_ready_gate_continues_without_serializing_path() {
     assert!(controller.active_wait_started.is_none());
     let report_events = serde_json::to_value(&controller.events).unwrap();
     assert_eq!(report_events[0]["status"], "passed");
-    assert_eq!(report_events[0]["details"]["outcome"], "failed");
+    assert_eq!(
+        report_events[0]["details"]["observations"][0]["outcome"],
+        "failed"
+    );
     assert!(
         !serde_json::to_string(&report_events[0]["details"])
             .unwrap()
-            .contains(private_path)
+            .contains(private_path_marker)
+    );
+    assert!(
+        !serde_json::to_string(&partial)
+            .unwrap()
+            .contains(private_path_marker)
     );
 
     controller.record_successful_command(1, "quit", Duration::ZERO, json!({}));
@@ -715,6 +1116,80 @@ fn failed_imported_open_ready_gate_continues_without_serializing_path() {
             .iter()
             .all(|event| event.status == "passed")
     );
+}
+
+#[test]
+fn fatal_automation_exit_does_not_synthesize_gate_batch_outcomes() {
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "fatal_partial_batch",
+        "commands": [{
+            "command": "observe_gate_batch",
+            "batch_id": "FC.partial",
+            "phase_id": "blocking",
+            "origin": { "kind": "automation_started" },
+            "observations": [
+                {
+                    "gate_id": "FC.first",
+                    "deadline_authority": "cold_first_useful",
+                    "deadline_after_origin_ns": 10,
+                    "target": { "kind": "condition", "condition": "first_frame" }
+                },
+                {
+                    "gate_id": "FC.settled",
+                    "deadline_authority": "cold_target_settlement",
+                    "deadline_after_origin_ns": 20,
+                    "target": {
+                        "kind": "condition",
+                        "condition": "coordinated_presentation_settled"
+                    }
+                }
+            ]
+        }]
+    }))
+    .unwrap();
+    script.validate().unwrap();
+    let mut controller = ProductAutomationController::new(
+        script,
+        PathBuf::from("gate-script.json"),
+        PathBuf::from("gate-report.json"),
+    );
+    controller.active_gate_batch = Some(ActiveProductGateBatch {
+        command_index: 0,
+        origin_at: controller.started_at,
+        outcomes: vec![
+            Some(LatchedProductGateObservation {
+                outcome: ProductGateObservationOutcome::Passed,
+                condition_met: true,
+                timed_out: false,
+                observed_after_origin_ns: 9,
+            }),
+            None,
+        ],
+    });
+
+    let status = controller.record_fatal_command_failure(
+        0,
+        "observe_gate_batch",
+        Duration::from_nanos(17),
+        "hard-safety limit or external cancellation".to_owned(),
+    );
+    assert!(matches!(status, AutomationStatus::Failed(_)));
+    assert!(controller.active_gate_batch.is_none());
+    assert_eq!(controller.events.len(), 1);
+    let value = serde_json::to_value(&controller.events[0]).unwrap();
+    assert_eq!(value["command"], "observe_gate_batch");
+    assert_eq!(value["status"], "failed");
+    assert_eq!(
+        value["details"].as_object().map(serde_json::Map::len),
+        Some(1)
+    );
+    assert!(value["details"].get("observations").is_none());
+    let serialized = serde_json::to_string(&controller.events).unwrap();
+    assert!(!serialized.contains(AUTOMATION_GATE_BATCH_OBSERVATION_SCHEMA));
+    assert!(!serialized.contains("FC.first"));
 }
 
 #[test]
@@ -1211,7 +1686,7 @@ fn automation_alone_does_not_enable_validation_capture() {
     let navigation: ProductAutomationScript = serde_json::from_str(
         r#"{
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 4,
+          "schema_version": 5,
           "hard_safety_limits": {},
           "scenario": "performance_navigation",
           "commands": [
@@ -1235,7 +1710,7 @@ fn automation_alone_does_not_enable_validation_capture() {
         let raw = format!(
             r#"{{
               "schema": "mirante4d-product-automation-script",
-              "schema_version": 4,
+              "schema_version": 5,
               "hard_safety_limits": {{}},
               "scenario": "render_correctness",
               "commands": [{pixel_command}]
@@ -1332,7 +1807,7 @@ fn automation_script_parses_the_b4_project_store_contract() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 4,
+          "schema_version": 5,
           "hard_safety_limits": {},
           "scenario": "b4_project_store",
           "commands": [
@@ -1464,7 +1939,7 @@ fn automation_script_parses_semantic_camera_commands() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 4,
+          "schema_version": 5,
           "hard_safety_limits": {
             "max_cpu_total_bytes": 1024,
             "max_runtime_queued_requests": 128
@@ -1536,7 +2011,7 @@ fn automation_script_parses_source_verification_evidence_workflow() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 4,
+          "schema_version": 5,
           "hard_safety_limits": {},
           "scenario": "b3_source_verification",
           "commands": [
@@ -1579,7 +2054,7 @@ fn automation_script_parses_normal_import_cancel_resume_workflow() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 4,
+          "schema_version": 5,
           "hard_safety_limits": {},
           "scenario": "import_preprocessing",
           "commands": [
@@ -1622,7 +2097,7 @@ fn automation_script_parses_retained_four_panel_assertions() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 4,
+          "schema_version": 5,
           "hard_safety_limits": {},
           "scenario": "unit_four_panel",
           "commands": [

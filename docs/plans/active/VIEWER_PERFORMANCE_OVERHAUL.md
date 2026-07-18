@@ -1,7 +1,7 @@
 # Viewer Performance Overhaul Plan
 
 Status: ACTIVE — EP-00 WORKLOAD, FIDELITY, AND COST-TRUTH BINDING IN
-PROGRESS
+PROGRESS; BOUNDED V5 DEVELOPMENT PROTOCOL IMPLEMENTED
 Planning authorization: OWNER REQUESTED 2026-07-17
 Implementation authorization: OWNER GRANTED 2026-07-17
 Last reviewed: 2026-07-18
@@ -964,6 +964,37 @@ coarse coverage within 250 milliseconds. The exact target-settlement ceiling
 will be frozen from measured unique-byte throughput and the usability floor
 before EP-00 exits; this delegation does not permit EP-01 to begin while that
 ceiling, the exact scripts, or the fidelity/oracle bundle remains unresolved.
+
+The owner rejected the first v4 predecessor-baseline launch as an evidence
+protocol on 2026-07-18. Scripted product actions did execute, but serial
+acceptance observations each restarted an independent long deadline and left
+the visible application static for minutes while their times accumulated.
+That partial evidence is retained as interrupted lineage, never reused, and
+does not establish a sample or performance claim.
+
+The replacement v5 development protocol is an authorized bounded hard cut,
+not a relaxation of any product gate. It runs exactly three ordered samples of
+the ten scenarios, with one fresh instrumented role and one fresh matched
+control role for each scenario and sample: 60 role attempts total, balanced
+role order, zero retries, and no substitution or post-hoc filtering. Product
+observations belonging to one contiguous acceptance checkpoint run concurrently
+from one shared declared origin, so the checkpoint wait is bounded by the
+maximum applicable deadline rather
+than the sum of independent timers. Deadline classes are fixed exactly by the
+validated profile, oracle, or protocol, use short explicit viewer ceilings, and share
+the import-primary origin for the import observations. Fatal setup waits,
+exact hard-safety termination, evidence integrity, and typed product failures
+remain separate. Every non-import prerequisite is fixed by the validated
+profile or protocol and is at most 30 seconds; no script-authored multi-minute
+viewer prerequisite remains. Typed
+product-gate misses continue through the complete population for attribution,
+but the first fatal setup, process, hard-safety, or evidence-integrity failure
+stops immediately and preserves the exact partial lineage. The role-process
+timeout is derived from the validated action, prerequisite, and concurrent-
+batch schedule plus bounded launch and closeout grace, with the IP import wall
+counted once; there is no caller-authored timeout. This three-sample population
+is development evidence under the existing progression rule and cannot
+establish a performance claim.
 
 ### Claim boundary
 

@@ -1,6 +1,6 @@
 {
   "schema": "mirante4d-viewer-performance-ep01-selection-authority",
-  "schema_version": 4,
+  "schema_version": 5,
   "candidate_identity": {
     "scientific_content_identity_rule": "stable_only_when_exact_s0_scalar_s0_validity_logical_layers_base_shapes_time_calibration_and_base_grid_to_world_facts_are_unchanged",
     "scientific_content_identity_bytes": "existing_ScientificContentId_digest_raw32_not_typed_ASCII",
@@ -97,7 +97,7 @@
     "scheme": "mirante4d-ep01-brickkey-trace-projection-2",
     "geometry_authorities": [
       "mirante4d-viewer-performance-workload-bundle-4",
-      "mirante4d-viewer-performance-script-bundle-4",
+      "mirante4d-viewer-performance-script-bundle-5",
       "mirante4d-viewer-performance-oracle-bundle-3",
       "mirante4d-viewer-performance-ep01-projection-input-1"
     ],

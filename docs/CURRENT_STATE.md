@@ -198,11 +198,12 @@ See [testing](TESTING.md) for commands and claim language.
 
 The renderer, demand, scheduling, storage-read, capability-restoration, and
 small-tool implementation described above remains the current product
-baseline in the worktree. The complete PR profile passes all 11 policy phases,
-all 8 Rust phases, and 1,275 selected tests on the current dirty worktree. The
-current ignored trusted-Vulkan inventory contains nine renderer cases; its
-exact result will be recorded again on the clean EP-00 baseline revision. Both
-native-window viewer scenarios previously passed.
+baseline in the worktree. Clean predecessor-repair revision
+`90c0f200c3bbbf080648b34113bca2633ae0f820` passed all 11 PR-profile policy
+phases, all 8 Rust phases, and 1,275 selected tests. The current ignored
+trusted-Vulkan inventory contains nine renderer cases; its exact result will
+be recorded again on the clean EP-00 baseline revision. Both native-window
+viewer scenarios previously passed.
 The render-modes scenario exercised the restored mode/tool surface without a
 validation error. The no-readback resident-navigation scenario observed zero
 physical reads, decodes, dataset requests, payload uploads, or post-idle
@@ -225,27 +226,49 @@ It mandates one cubic-brick spatial representation shared by 2D and 3D and
 excludes anisotropic or orientation-specific payloads.
 
 EP-00 measurement authority is implemented in the current worktree. One
-strict external v4 profile binds the private representative and temporal
+strict external v5 profile binds the private representative and temporal
 packages, import source inventory, accepted hardware/display/storage tuple,
 ten exact scenarios, interaction scripts, independent LOD and numerical
-oracles, fidelity states, resource ledgers, and absolute thresholds without
-placing private paths or unpublished identities in the repository. Product
-diagnostics now expose exact generation/target timing identity, per-view
-scale and coverage, coordinated-frame and structural work, canonical resource
-unions, bounded timing histories, source/import receipts, and correctly named
-copy/control/render intervals. Synthetic copy and empty-pass controls plus a
-Naga structural audit guard timestamp placement and production shader shape.
+oracles, fidelity states, resource ledgers, short validated profile, oracle,
+and protocol deadline classes, and absolute thresholds without placing private
+paths or unpublished
+identities in the repository. Product diagnostics expose exact generation/
+target timing identity, per-view scale and coverage, coordinated-frame and
+structural work, canonical resource unions, bounded timing histories, source/
+import receipts, and correctly named copy/control/render intervals. Synthetic
+copy and empty-pass controls plus a Naga structural audit guard timestamp
+placement and production shader shape.
 
-A fresh normal-product IP exercise has passed its exact source-preservation,
-deterministic publication, open-ready, currentness, receipt-reconciliation,
-memory, descriptor, temporary-storage, and time gates. The strict complete
+An earlier fresh normal-product IP exercise passed its exact source-
+preservation, deterministic-publication, open-ready, currentness, receipt-
+reconciliation, memory, descriptor, temporary-storage, and time gates; it is
+focused predecessor evidence rather than a v5 sample. The strict complete
 predecessor baseline still awaits one clean immutable revision. Two superseded
 v3 partial launches are preserved but never reused: the second reproduced a
 terminal RZ settlement miss in both roles and demonstrated that later required
-checkpoints could not close. The v4 authority records such acceptance misses
-as typed product outcomes, records qualification resource peaks without
-terminating the attempt, and reserves fatal termination for separate exact
-hard-safety caps and evidence-integrity failures.
+checkpoints could not close. A subsequent v4 launch was also stopped and
+preserved when owner observation rejected its serialized acceptance timers:
+the product actions ran, but independent long waits left the visible
+application static for minutes and made the protocol itself an unacceptable
+cost. It produced no complete sample and supports no performance claim.
+
+The v5 hard cut retains typed product outcomes and separate exact hard-safety
+termination while grouping each contiguous checkpoint's acceptance
+observations under a shared origin. Each checkpoint's wall bound is the maximum
+applicable deadline rather than
+the sum of independent timers. The predecessor development population is
+exactly three ordered samples of ten scenarios, with one fresh instrumented
+process and one fresh matched control process for every scenario and sample:
+60 role attempts, zero retries, and no substitution or post-hoc filtering.
+Typed product-gate misses continue through the complete population so every
+outcome remains attributable. The first fatal setup, process, hard-safety, or
+evidence-integrity failure instead stops immediately and preserves the exact
+partial lineage; it does not spend the rest of the population after evidence
+has become unusable. Every non-import prerequisite deadline is fixed by the
+validated profile or protocol and is at most 30 seconds, with no script-authored
+multi-minute viewer wait.
+This protocol correction is implemented evidence infrastructure, not a
+qualified viewer-performance result.
 Focused predecessor evidence already reproduces the off-axis perspective DVR
 distance error, unjustifiably coarse four-panel LOD, temporal refinement
 handoff, and prepared-layout lineage defects; these are baseline findings, not
