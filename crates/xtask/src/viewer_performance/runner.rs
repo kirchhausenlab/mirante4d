@@ -1953,6 +1953,13 @@ fn validate_oracle_contract(oracle: &OracleBundle) -> anyhow::Result<()> {
     if observed_ids != required_ids {
         bail!("viewer oracle must bind the six frozen EP-00 numerical conformance cases")
     }
+    let canonical_cases = oracle
+        .conformance_cases
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .context("viewer numerical conformance cases could not be canonicalized")?;
+    conformance_receipt::validate_oracle_case_commitments(&canonical_cases)?;
     let mut imported_manifest_facts = 0_u8;
     for scenario in &oracle.scenarios {
         for phase in &scenario.phases {
@@ -10861,11 +10868,53 @@ fn is_known_product_gate_reason(reason: &str) -> bool {
             | "product_gate_phase_undo_history_entry_delta_mismatch"
             | "product_gate_gesture_sequence_durable_commit_or_sample_delta_mismatch"
     ) || is_known_canonical_plane_product_reason(reason)
+        || is_known_conformance_product_reason(reason)
         || is_known_exact_cross_scope_product_reason(reason)
         || is_known_exact_resource_delta_product_reason(reason)
         || is_known_verification_product_reason(reason)
         || is_known_unique_work_product_reason(reason)
         || is_known_structural_product_reason(reason)
+}
+
+fn is_known_conformance_product_reason(reason: &str) -> bool {
+    if matches!(
+        reason,
+        "conformance_primary_numerical_result_not_passed"
+            | "conformance_dvr_frozen_world_distance_oracle_failed"
+            | "conformance_dvr_observed_coverage_mismatch"
+            | "conformance_dvr_observed_validity_mismatch"
+    ) {
+        return true;
+    }
+    const CASES: [&str; 6] = [
+        "plane_smooth_valid",
+        "plane_smooth_invalid",
+        "perspective_mip",
+        "perspective_dvr_world_distance",
+        "perspective_iso",
+        "perspective_iso_depth_order",
+    ];
+    const OBSERVATIONS: [&str; 13] = [
+        "pixel_mismatch",
+        "rgba8_mismatch",
+        "premultiplied_rgba_mismatch",
+        "coverage_mismatch",
+        "validity_mismatch",
+        "authored_order_mismatch",
+        "source_order_mismatch",
+        "hit_depth_mismatch",
+        "pick_kind_mismatch",
+        "pick_completeness_mismatch",
+        "pick_value_mismatch",
+        "pick_world_mismatch",
+        "pick_distance_mismatch",
+    ];
+    CASES.iter().any(|case| {
+        let prefix = format!("conformance_{case}_");
+        reason
+            .strip_prefix(&prefix)
+            .is_some_and(|suffix| OBSERVATIONS.contains(&suffix))
+    })
 }
 
 fn is_known_canonical_plane_product_reason(reason: &str) -> bool {
@@ -15512,6 +15561,8 @@ mod tests {
             "unique_work_gpu_uploaded_payload_bytes_delta_outside_oracle".to_owned(),
             "structural_queue_submissions_counter_changed".to_owned(),
             "structural_command_encoders_ceiling_exceeded".to_owned(),
+            "conformance_dvr_frozen_world_distance_oracle_failed".to_owned(),
+            "conformance_perspective_iso_pick_value_mismatch".to_owned(),
         ]);
         assert!(require_valid_evidence(&valid_negative).is_ok());
         assert_eq!(evidence_status(&valid_negative), "valid_complete");

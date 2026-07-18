@@ -563,7 +563,15 @@ fn validate_harness(
             validate_queue_write_marker(marker, &mut receipt.reasons)
         }
     }
-    if receipt.process.exit_code != Some(0) {
+    let exact_numerical_product_failure = matches!(
+        receipt.kind,
+        HarnessKind::NumericalPlaneMipIso | HarnessKind::NumericalPerspectiveDvr
+    ) && receipt.process.exit_code == Some(101)
+        && !receipt.process.timed_out
+        && !receipt.process.spawn_failed
+        && marker.get("schema").and_then(Value::as_str) == Some(receipt.kind.expected_schema())
+        && marker.get("result").and_then(Value::as_str) == Some("failed");
+    if receipt.process.exit_code != Some(0) && !exact_numerical_product_failure {
         receipt
             .reasons
             .insert(format!("conformance_{id}_process_failed"));
@@ -845,13 +853,14 @@ fn expected_case_sha256(case: &Value) -> Option<String> {
 
 fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> anyhow::Result<()> {
     match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+        Value::Null | Value::Bool(_) | Value::String(_) => {
             output.extend_from_slice(
                 serde_json::to_string(value)
                     .context("failed to encode a canonical numerical fact scalar")?
                     .as_bytes(),
             );
         }
+        Value::Number(number) => write_canonical_number(number, output)?,
         Value::Array(values) => {
             output.push(b'[');
             for (index, value) in values.iter().enumerate() {
@@ -879,6 +888,40 @@ fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> anyhow::Result<(
                 write_canonical_json(&values[key], output)?;
             }
             output.push(b'}');
+        }
+    }
+    Ok(())
+}
+
+fn write_canonical_number(number: &serde_json::Number, output: &mut Vec<u8>) -> anyhow::Result<()> {
+    if number.is_i64() || number.is_u64() {
+        output.extend_from_slice(number.to_string().as_bytes());
+        return Ok(());
+    }
+    let value = number
+        .as_f64()
+        .context("canonical numerical fact contains an unsupported number")?;
+    if !value.is_finite() {
+        bail!("canonical numerical fact contains a non-finite number")
+    }
+    if value == 0.0 {
+        output.push(b'0');
+    } else if value.fract() == 0.0 && value.abs() < 1.0e21 {
+        output.extend_from_slice(format!("{value:.0}").as_bytes());
+    } else {
+        output.extend_from_slice(number.to_string().as_bytes());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_oracle_case_commitments(cases: &[Value]) -> anyhow::Result<()> {
+    for case in cases {
+        let expected = case
+            .get("expected_fact_sha256")
+            .and_then(Value::as_str)
+            .context("numerical oracle expected commitment is unavailable")?;
+        if expected_case_sha256(case).as_deref() != Some(expected) {
+            bail!("numerical oracle expected fact commitment is not canonical")
         }
     }
     Ok(())
@@ -1200,6 +1243,40 @@ mod tests {
     fn duplicate_or_missing_markers_fail_closed() {
         assert!(extract_unique_marker(b"no evidence", "marker:").is_err());
         assert!(extract_unique_marker(b"marker:{} marker:{}", "marker:").is_err());
+    }
+
+    #[test]
+    fn expected_fact_canonicalization_is_independent_of_integer_float_json_spelling() {
+        let integer_spelling = json!({
+            "id": "case",
+            "pixel": [0, 1],
+            "sampling": "voxel_exact",
+            "mode": "mip",
+            "expected_rgba8": [0, 1, 2, 255],
+            "expected_premultiplied_rgba": [0, 1, 0.5, 1],
+            "covered": true,
+            "valid": true,
+            "hit_depth_world": 1,
+            "pick": {
+                "kind": "voxel",
+                "value": 1,
+                "world": [0, 1, 2],
+                "distance_world": 1,
+                "complete": true,
+            },
+            "authored_order": [0],
+            "source_order": [0],
+        });
+        let mut float_spelling = integer_spelling.clone();
+        float_spelling["expected_premultiplied_rgba"] = json!([0.0, 1.0, 0.5, 1.0]);
+        float_spelling["hit_depth_world"] = json!(1.0);
+        float_spelling["pick"]["value"] = json!(1.0);
+        float_spelling["pick"]["world"] = json!([0.0, 1.0, 2.0]);
+        float_spelling["pick"]["distance_world"] = json!(1.0);
+        assert_eq!(
+            expected_case_sha256(&integer_spelling),
+            expected_case_sha256(&float_spelling)
+        );
     }
 
     #[test]

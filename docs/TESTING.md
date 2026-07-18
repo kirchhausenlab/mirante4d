@@ -149,7 +149,11 @@ retain independent typed, ordered outcomes. The checkpoint wall bound is the
 maximum applicable deadline,
 not the sum of serial gate timers. A gate miss is retained as a product
 failure and does not suppress later diagnostic checkpoints; it is never
-converted into an infrastructure failure or a pass. Ordinary `wait_for`
+converted into an infrastructure failure or a pass. The same split applies to
+executable numerical conformance: an exact parsed marker bound to the
+canonical oracle may report a fidelity miss and remain an authoritative
+product outcome, while a missing marker, bad commitment, unexpected process
+exit, or malformed evidence is fatal. Ordinary `wait_for`
 commands remain fatal prerequisites and may not be used for an acceptance miss
 that must preserve later evidence. Typed gate misses continue through the
 remaining role checkpoints and complete population. The first fatal setup,

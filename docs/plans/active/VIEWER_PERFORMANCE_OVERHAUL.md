@@ -1005,6 +1005,10 @@ conformance from a detached clean worktree of the profile revision, then
 rechecks the live repository, detached source, and app digest before every
 role launch. Private attempt-local output, open-ready, and cleanup paths are
 cross-bound before any product process may launch.
+Canonical numerical fact commitments normalize equivalent integer/float JSON
+spellings before harness execution. An exact oracle-bound negative numerical
+marker is retained as a product fidelity miss and does not abort the remaining
+baseline; malformed commitments, markers, or process evidence remain fatal.
 
 ### Claim boundary
 
