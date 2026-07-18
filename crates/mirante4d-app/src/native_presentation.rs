@@ -667,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_timing_completion_uses_execution_not_reused_progressive_frame_identity() {
+    fn superseded_publication_receives_exact_gpu_timing_without_becoming_current() {
         let origin = Instant::now();
         let frame = FrameIdentity::new(9);
         let presentation = PresentationToken::new(3).unwrap();
@@ -675,14 +675,14 @@ mod tests {
             execution_id: 41,
             target: presentation,
             renderer_frame: frame,
-            display_generation: 7,
+            display_generation: 3,
             pass_kind: RenderPassKind::Volume,
         };
         let newer = ProductGpuExecutionIdentity {
             execution_id: 42,
             target: presentation,
             renderer_frame: frame,
-            display_generation: 7,
+            display_generation: 4,
             pass_kind: RenderPassKind::Volume,
         };
         let mut diagnostics = PresentedFrameIntervalDiagnostics::new(true);
@@ -707,6 +707,9 @@ mod tests {
             render_pass_ns: Some(19),
         };
         assert!(!diagnostics.complete_gpu_timing_for_test(older, older_timing));
+        // The historical publication receives its exact result, but false is
+        // the guard used by the caller to keep stale timing out of current-
+        // frame metrics.
         assert_eq!(diagnostics.samples[0].gpu_timing, Some(older_timing));
         assert_eq!(diagnostics.samples[1].gpu_timing, None);
         assert!(diagnostics.complete_gpu_timing_for_test(newer, newer_timing));

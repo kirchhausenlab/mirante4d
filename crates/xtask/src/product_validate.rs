@@ -1758,12 +1758,15 @@ fn resident_navigation_evidence(report: Option<&Value>) -> Result<Value, String>
         );
     }
     let mut gpu_execution_ids = BTreeSet::new();
+    let mut gpu_targets = BTreeSet::new();
+    let mut previous_gpu_generation = None;
     for (index, sample) in navigated_samples.iter().enumerate() {
         let sequence = sample.get("sequence").and_then(Value::as_u64);
         let frame = sample.get("frame").and_then(Value::as_u64);
         let gpu_execution_id = sample.get("gpu_execution_id").and_then(Value::as_u64);
-        let gpu_presentation = sample.get("gpu_presentation").and_then(Value::as_u64);
-        let gpu_frame = sample.get("gpu_frame").and_then(Value::as_u64);
+        let gpu_target = sample.get("gpu_target").and_then(Value::as_u64);
+        let gpu_generation = sample.get("gpu_generation").and_then(Value::as_u64);
+        let gpu_renderer_frame = sample.get("gpu_renderer_frame").and_then(Value::as_u64);
         let expected_sequence = baseline_publications
             .checked_add(index as u64 + 1)
             .ok_or_else(|| "resident-navigation sample sequence overflowed".to_owned())?;
@@ -1782,13 +1785,22 @@ fn resident_navigation_evidence(report: Option<&Value>) -> Result<Value, String>
                 .and_then(Value::as_u64)
                 .is_none()
             || gpu_execution_id.is_none_or(|identity| identity == 0)
-            || gpu_presentation.is_none_or(|presentation| presentation == 0)
-            || gpu_frame != frame
+            || gpu_target.is_none_or(|target| target == 0)
+            || gpu_generation.is_none_or(|generation| generation == 0)
+            || previous_gpu_generation.is_some_and(|previous| {
+                gpu_generation.is_some_and(|generation| generation <= previous)
+            })
+            || gpu_renderer_frame != frame
+            || sample.get("panel").and_then(Value::as_str) != Some("3D")
+            || sample.get("gpu_pass_kind").and_then(Value::as_str) != Some("Volume")
             || sample.get("gpu_timing_complete").and_then(Value::as_bool) != Some(true)
             || sample
-                .get("gpu_volume_pass_ns")
+                .get("gpu_render_pass_ns")
                 .and_then(Value::as_u64)
                 .is_none()
+            || sample.get("gpu_presentation").is_some()
+            || sample.get("gpu_frame").is_some()
+            || sample.get("gpu_volume_pass_ns").is_some()
             || !gpu_execution_ids.insert(gpu_execution_id.expect("checked above"))
         {
             return Err(
@@ -1796,6 +1808,13 @@ fn resident_navigation_evidence(report: Option<&Value>) -> Result<Value, String>
                     .to_owned(),
             );
         }
+        gpu_targets.insert(gpu_target.expect("checked above"));
+        previous_gpu_generation = gpu_generation;
+    }
+    if gpu_targets.len() != 1 {
+        return Err(
+            "resident-navigation publications did not retain one exact 3D GPU target".to_owned(),
+        );
     }
     Ok(json!({
         "warm_navigation": warm_deltas,

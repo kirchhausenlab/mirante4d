@@ -1036,7 +1036,11 @@ impl MiranteWorkbenchApp {
             target.last_renderer_available_resources = 0;
             target.pending_capture = None;
             target.completed_capture = None;
-            target.pending_gpu_timings.clear();
+            // A request rebind supersedes the current execution but does not
+            // retire the renderer target. Keep tickets for frames that were
+            // already published so their exact asynchronous result can still
+            // complete publication history. Full-ticket matching prevents an
+            // older result from attaching to this newer request.
             target.last_execution_timing = None;
             target.partial_seen = false;
             if !same_requirement_body {
@@ -1713,9 +1717,10 @@ impl MiranteWorkbenchApp {
                     execution.complete_gpu(ticket, timing);
                 }
             }
-            let completed_latest_publication = panel == Some(PanelId::ThreeD)
-                && product.complete_presented_frame_gpu_timing(ticket, timing);
-            if completed_latest_publication
+            let completed_latest_publication =
+                product.complete_presented_frame_gpu_timing(ticket, timing);
+            if panel == Some(PanelId::ThreeD)
+                && completed_latest_publication
                 && let Some(refresh) = self
                     .render_coordination
                     .last_display_refresh_timing

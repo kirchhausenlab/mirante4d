@@ -1228,16 +1228,19 @@ fn resident_navigation_report() -> Value {
             .map(|sequence| {
                 json!({
                     "sequence": sequence,
+                    "panel": "3D",
                     "frame": sequence + 1,
                     "interval_ns": (sequence > 1).then_some(16_000_000_u64),
                     "cpu_planning_ns": 10_000,
                     "cpu_queue_submit_ns": 1_000,
                     "gpu_execution_id": 100 + sequence,
-                    "gpu_presentation": 7,
-                    "gpu_frame": sequence + 1,
+                    "gpu_target": 7,
+                    "gpu_generation": sequence + 1,
+                    "gpu_renderer_frame": sequence + 1,
+                    "gpu_pass_kind": "Volume",
                     "gpu_timing_complete": true,
-                    "gpu_upload_ns": Value::Null,
-                    "gpu_volume_pass_ns": 1_000_000,
+                    "gpu_payload_copy_ns": Value::Null,
+                    "gpu_render_pass_ns": 1_000_000,
                 })
             })
             .collect::<Vec<_>>();
@@ -1357,7 +1360,40 @@ fn resident_navigation_evidence_rejects_missing_exact_gpu_publication_binding() 
     report["diagnostics"][1]["render"]["progressive_presentation"]["presented_frame_intervals"]["samples"]
         [1]["gpu_timing_complete"] = json!(false);
     report["diagnostics"][1]["render"]["progressive_presentation"]["presented_frame_intervals"]["samples"]
-        [1]["gpu_volume_pass_ns"] = Value::Null;
+        [1]["gpu_render_pass_ns"] = Value::Null;
+
+    let error = resident_navigation_evidence(Some(&report)).unwrap_err();
+
+    assert!(error.contains("unique exact-execution CPU/GPU timing"));
+}
+
+#[test]
+fn resident_navigation_evidence_requires_canonical_gpu_publication_identity() {
+    for (field, invalid) in [
+        ("gpu_target", json!(0)),
+        ("gpu_generation", Value::Null),
+        ("gpu_renderer_frame", json!(999)),
+        ("panel", json!("XY")),
+        ("gpu_pass_kind", json!("Plane")),
+    ] {
+        let mut report = resident_navigation_report();
+        report["diagnostics"][1]["render"]["progressive_presentation"]["presented_frame_intervals"]
+            ["samples"][1][field] = invalid;
+
+        let error = resident_navigation_evidence(Some(&report)).unwrap_err();
+
+        assert!(
+            error.contains("unique exact-execution CPU/GPU timing"),
+            "field {field} unexpectedly passed: {error}"
+        );
+    }
+}
+
+#[test]
+fn resident_navigation_evidence_rejects_removed_gpu_timing_aliases() {
+    let mut report = resident_navigation_report();
+    report["diagnostics"][1]["render"]["progressive_presentation"]["presented_frame_intervals"]["samples"]
+        [1]["gpu_volume_pass_ns"] = json!(1_000_000);
 
     let error = resident_navigation_evidence(Some(&report)).unwrap_err();
 
