@@ -22,12 +22,12 @@ use super::{
     ViewerQualificationProfile, binding_reasons, commitment_fingerprint,
     conformance_receipt::{self, ConformanceEvidence},
     load_external_profile, observe, profile_contract_sha256, read_bounded_regular_file,
-    require_nonsymlink_components, require_sha256, require_text,
-    sanitized_report as preflight_report, validate_owner_accepted_profile,
+    require_exact_release_build_binding, require_nonsymlink_components, require_sha256,
+    require_text, sanitized_report as preflight_report, validate_owner_accepted_profile,
 };
 use crate::host::{
     QualificationBuildProvenance, RepositoryIdentity, qualification_build_provenance,
-    qualification_build_provenance_evidence, qualification_build_reason_codes, repository_identity,
+    qualification_build_provenance_evidence, repository_identity,
 };
 use crate::process::cargo_command;
 
@@ -1229,7 +1229,7 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
     let profile = load_external_profile(&args.profile, &repository_root)?;
     validate_owner_accepted_profile(&profile.profile)?;
     let xtask_build = qualification_build_provenance();
-    require_runner_build_binding(&profile.profile, &repository, &xtask_build)?;
+    require_exact_release_build_binding(&profile.profile, &repository, &xtask_build)?;
     let workload = load_external_json::<WorkloadBundle>(
         &args.workload_bundle,
         &repository_root,
@@ -1421,38 +1421,6 @@ fn validate_oracle_source_commitments(
         if observed != expected {
             bail!("{label} commitment does not match the clean repository source")
         }
-    }
-    Ok(())
-}
-
-fn require_runner_build_binding(
-    profile: &ViewerQualificationProfile,
-    repository: &RepositoryIdentity,
-    provenance: &QualificationBuildProvenance,
-) -> anyhow::Result<()> {
-    let mut reasons = qualification_build_reason_codes(provenance, repository);
-    if cfg!(debug_assertions) {
-        reasons.push("runner_build_not_release");
-    }
-    if repository.dirty_worktree != Some(false) {
-        reasons.push("repository_worktree_dirty_or_unavailable");
-    }
-    if repository.commit.as_deref() != Some(profile.build.repository_revision.as_str()) {
-        reasons.push("profile_repository_revision_mismatch");
-    }
-    if provenance.git_head != profile.build.repository_revision {
-        reasons.push("xtask_revision_mismatch");
-    }
-    if provenance.compiler != profile.build.compiler {
-        reasons.push("xtask_compiler_mismatch");
-    }
-    reasons.sort_unstable();
-    reasons.dedup();
-    if !reasons.is_empty() {
-        bail!(
-            "viewer performance runner requires the exact clean immutable release build: {}",
-            reasons.join(", ")
-        )
     }
     Ok(())
 }

@@ -996,6 +996,12 @@ counted once; there is no caller-authored timeout. This three-sample population
 is development evidence under the existing progression rule and cannot
 establish a performance claim.
 
+Preflight and execution also share one exact clean-release executable gate.
+The invoking `xtask` must embed the profile-bound revision, compiler, release
+profile, and standard build settings; a stale cached preflight binary cannot
+bless bundles for a newer runner. Private attempt-local output, open-ready,
+and cleanup paths are cross-bound before any product process may launch.
+
 ### Claim boundary
 
 Normal packaged-application absolute gates establish viewer performance.

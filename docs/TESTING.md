@@ -124,6 +124,10 @@ clean-revision check, hardware/display/storage observations, source inventory,
 bundle commitments, and sanitized receipt prevent a different workload or
 local edit from inheriting the result. Raw evidence stays private; public
 reporting may name only path-free counters, gates, and reason codes.
+Both preflight and execution require the invoking release `xtask` to carry the
+exact clean profile-bound repository revision, compiler, and standard build
+provenance. A stale cached preflight executable fails before its result can be
+used to authorize a measurement.
 
 The predecessor run is exactly three ordered samples of all ten frozen
 scenarios. Every scenario has one fresh instrumented process and one fresh

@@ -13,7 +13,10 @@ use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::host::{host_hardware_identity, repository_identity};
+use crate::host::{
+    QualificationBuildProvenance, RepositoryIdentity, host_hardware_identity,
+    qualification_build_provenance, qualification_build_reason_codes, repository_identity,
+};
 
 const PROFILE_SCHEMA: &str = "mirante4d-viewer-performance-qualification-profile-5";
 const PROFILE_AUTHORITY_SCHEMA: &str = "mirante4d-viewer-performance-profile-authority";
@@ -305,6 +308,8 @@ pub(crate) fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         .context("viewer preflight could not resolve the repository root")?;
     let loaded = load_external_profile(&arguments.profile, &repository_root)?;
     validate_owner_accepted_profile(&loaded.profile)?;
+    let build_provenance = qualification_build_provenance();
+    require_exact_release_build_binding(&loaded.profile, &repository, &build_provenance)?;
     let bundle_commitments = runner::load_and_validate_preflight_bundles(
         &loaded.profile,
         &arguments.workload_bundle,
@@ -513,6 +518,53 @@ fn validate_owner_accepted_profile(profile: &ViewerQualificationProfile) -> anyh
     validate_profile(profile)?;
     let expected = owner_accepted_profile_contract_sha256()?;
     validate_profile_contract(profile, &expected)
+}
+
+fn exact_release_build_binding_reason_codes(
+    profile: &ViewerQualificationProfile,
+    repository: &RepositoryIdentity,
+    provenance: &QualificationBuildProvenance,
+    debug_assertions: bool,
+) -> Vec<&'static str> {
+    let mut reasons = qualification_build_reason_codes(provenance, repository);
+    if debug_assertions {
+        reasons.push("runner_build_not_release");
+    }
+    if repository.dirty_worktree != Some(false) {
+        reasons.push("repository_worktree_dirty_or_unavailable");
+    }
+    if repository.commit.as_deref() != Some(profile.build.repository_revision.as_str()) {
+        reasons.push("profile_repository_revision_mismatch");
+    }
+    if provenance.git_head != profile.build.repository_revision {
+        reasons.push("xtask_revision_mismatch");
+    }
+    if provenance.compiler != profile.build.compiler {
+        reasons.push("xtask_compiler_mismatch");
+    }
+    reasons.sort_unstable();
+    reasons.dedup();
+    reasons
+}
+
+fn require_exact_release_build_binding(
+    profile: &ViewerQualificationProfile,
+    repository: &RepositoryIdentity,
+    provenance: &QualificationBuildProvenance,
+) -> anyhow::Result<()> {
+    let reasons = exact_release_build_binding_reason_codes(
+        profile,
+        repository,
+        provenance,
+        cfg!(debug_assertions),
+    );
+    if !reasons.is_empty() {
+        bail!(
+            "viewer performance command requires the exact clean immutable release build: {}",
+            reasons.join(", ")
+        )
+    }
+    Ok(())
 }
 
 fn validate_profile_contract(
@@ -1745,6 +1797,50 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    fn matching_build_binding(
+        profile: &ViewerQualificationProfile,
+    ) -> (RepositoryIdentity, QualificationBuildProvenance) {
+        (
+            RepositoryIdentity {
+                root: Some(PathBuf::from("/repository")),
+                commit: Some(profile.build.repository_revision.clone()),
+                dirty_worktree: Some(false),
+            },
+            QualificationBuildProvenance {
+                git_head: profile.build.repository_revision.clone(),
+                git_dirty: false,
+                cargo_profile: "release".to_owned(),
+                opt_level: "3".to_owned(),
+                debug: "false".to_owned(),
+                compiler: profile.build.compiler.clone(),
+                custom_rustflags: false,
+                rustc_wrapper: false,
+            },
+        )
+    }
+
+    #[test]
+    fn preflight_and_runner_share_the_exact_clean_release_build_gate() {
+        let profile: ViewerQualificationProfile =
+            serde_json::from_value(test_profile_value(Path::new("/private"))).unwrap();
+        let (repository, provenance) = matching_build_binding(&profile);
+        assert!(
+            exact_release_build_binding_reason_codes(&profile, &repository, &provenance, false,)
+                .is_empty()
+        );
+
+        let mut stale = provenance.clone();
+        stale.git_head = "f".repeat(40);
+        assert!(
+            exact_release_build_binding_reason_codes(&profile, &repository, &stale, false)
+                .contains(&"xtask_revision_mismatch")
+        );
+        assert!(
+            exact_release_build_binding_reason_codes(&profile, &repository, &provenance, true)
+                .contains(&"runner_build_not_release")
+        );
+    }
 
     #[test]
     fn argument_parser_requires_explicit_protocol_attestation() {
