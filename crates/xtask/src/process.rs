@@ -63,8 +63,7 @@ pub(crate) fn run_command_with_timeout(
     command: &mut Command,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    command.process_group(0);
+    isolate_process_tree(command);
 
     println!("running with timeout {timeout:?}: {:?}", command);
     let started = Instant::now();
@@ -91,8 +90,13 @@ pub(crate) fn run_command_with_timeout(
     }
 }
 
+pub(crate) fn isolate_process_tree(command: &mut Command) {
+    #[cfg(unix)]
+    command.process_group(0);
+}
+
 #[cfg(unix)]
-fn terminate_process_tree(child: &mut std::process::Child) {
+pub(crate) fn terminate_process_tree(child: &mut std::process::Child) {
     const SIGKILL: i32 = 9;
     let process_group = -(child.id() as i32);
     // SAFETY: the command was placed in its own process group immediately
@@ -108,7 +112,7 @@ unsafe extern "C" {
 }
 
 #[cfg(not(unix))]
-fn terminate_process_tree(child: &mut std::process::Child) {
+pub(crate) fn terminate_process_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
