@@ -1,5 +1,23 @@
 use super::*;
 
+#[test]
+fn x11_automation_helpers_have_short_silence_absolute_and_output_bounds() {
+    assert_eq!(
+        X11_AUTOMATION_OUTPUT_POLICY.inactivity_timeout,
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        X11_AUTOMATION_OUTPUT_POLICY.absolute_timeout,
+        Duration::from_secs(3)
+    );
+    assert!(
+        X11_AUTOMATION_OUTPUT_POLICY.inactivity_timeout
+            < X11_AUTOMATION_OUTPUT_POLICY.absolute_timeout
+    );
+    assert_eq!(X11_AUTOMATION_OUTPUT_POLICY.max_stdout_bytes, 64 * 1024);
+    assert_eq!(X11_AUTOMATION_OUTPUT_POLICY.max_stderr_bytes, 64 * 1024);
+}
+
 fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_resources: u64) {
     assert_eq!(SCRIPT_SCHEMA_VERSION, 5);
     assert_eq!(REPORT_SCHEMA_VERSION, 6);

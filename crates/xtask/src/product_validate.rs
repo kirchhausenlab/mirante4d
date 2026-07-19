@@ -15,7 +15,10 @@ use serde_json::{Value, json};
 
 use crate::{
     host::benchmark_host_context,
-    process::{isolate_process_tree, run_cargo, terminate_process_tree},
+    process::{
+        BoundedOutputPolicy, isolate_process_tree, run_cargo, run_command_with_bounded_output,
+        terminate_process_tree,
+    },
     product_automation_progress::{
         FILE_POLL_INTERVAL, ProductAutomationProgressLaunch, ProductAutomationProgressPlan,
         ProgressMonitorAction, safe_automation_progress_line,
@@ -95,6 +98,14 @@ const MIB: u64 = 1024 * 1024;
 const PREFLIGHT_ONLY_DISPLAY_SOURCE: &str = "preflight_only";
 const SOURCE_CLOSURE_EVIDENCE_ENTRY_MAX: usize = 131_072;
 const SOURCE_CLOSURE_EVIDENCE_BYTES_MAX: u64 = 256 * MIB;
+const X11_AUTOMATION_OUTPUT_POLICY: BoundedOutputPolicy = BoundedOutputPolicy {
+    scope: "x11_automation",
+    inactivity_timeout: Duration::from_secs(2),
+    absolute_timeout: Duration::from_secs(3),
+    progress_interval: Duration::from_secs(1),
+    max_stdout_bytes: 64 * 1024,
+    max_stderr_bytes: 64 * 1024,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceClosureSnapshot {
@@ -1175,9 +1186,9 @@ fn require_b4_x11_tools() -> anyhow::Result<()> {
         ("xwininfo", "-version"),
         ("wmctrl", "-h"),
     ] {
-        Command::new(program)
-            .arg(arg)
-            .output()
+        let mut command = Command::new(program);
+        command.arg(arg);
+        run_command_with_bounded_output(&mut command, X11_AUTOMATION_OUTPUT_POLICY)
             .with_context(|| format!("B4 product validation requires {program}"))?;
     }
     Ok(())
@@ -3075,9 +3086,9 @@ fn probe_b4_x11_client_geometry(
     expected_height: u32,
     fullscreen_action: &mut Option<Value>,
 ) -> anyhow::Result<Option<Value>> {
-    let search = Command::new("xdotool")
-        .args(["search", "--onlyvisible", "--pid", &pid.to_string()])
-        .output()
+    let mut search = Command::new("xdotool");
+    search.args(["search", "--onlyvisible", "--pid", &pid.to_string()]);
+    let search = run_command_with_bounded_output(&mut search, X11_AUTOMATION_OUTPUT_POLICY)
         .context("failed to run xdotool window search")?;
     if !search.status.success() {
         return Ok(None);
@@ -3092,9 +3103,9 @@ fn probe_b4_x11_client_geometry(
             continue;
         };
         let id_hex = format!("0x{window_id:x}");
-        let info = Command::new("xwininfo")
-            .args(["-id", &id_hex])
-            .output()
+        let mut info = Command::new("xwininfo");
+        info.args(["-id", &id_hex]);
+        let info = run_command_with_bounded_output(&mut info, X11_AUTOMATION_OUTPUT_POLICY)
             .context("failed to run xwininfo")?;
         if !info.status.success() {
             continue;
@@ -3117,9 +3128,9 @@ fn probe_b4_x11_client_geometry(
             && expected_height == B4_SECONDARY_CLIENT_HEIGHT
             && fullscreen_action.is_none()
         {
-            let action = Command::new("wmctrl")
-                .args(["-i", "-r", &id_hex, "-b", "add,fullscreen"])
-                .output()
+            let mut action = Command::new("wmctrl");
+            action.args(["-i", "-r", &id_hex, "-b", "add,fullscreen"]);
+            let action = run_command_with_bounded_output(&mut action, X11_AUTOMATION_OUTPUT_POLICY)
                 .context("failed to request external fullscreen through wmctrl")?;
             if action.status.success() {
                 *fullscreen_action = Some(json!({

@@ -7,6 +7,7 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use anyhow::{Context, bail};
@@ -24,7 +25,7 @@ use crate::{
         QualificationBuildProvenance, RepositoryIdentity, host_hardware_identity,
         qualification_build_provenance, qualification_build_reason_codes, repository_identity,
     },
-    process::cargo_command,
+    process::{BoundedOutputPolicy, cargo_command, run_command_with_bounded_output},
 };
 
 const PROFILE_SCHEMA: &str = "mirante4d-viewer-performance-qualification-profile-5";
@@ -42,6 +43,14 @@ const BLOCKING_WIDTH: u32 = 1280;
 const BLOCKING_HEIGHT: u32 = 720;
 const EXERCISE_WIDTH: u32 = 1920;
 const EXERCISE_HEIGHT: u32 = 1080;
+const VIEWER_HOST_PROBE_OUTPUT_POLICY: BoundedOutputPolicy = BoundedOutputPolicy {
+    scope: "viewer_host_probe",
+    inactivity_timeout: Duration::from_secs(5),
+    absolute_timeout: Duration::from_secs(10),
+    progress_interval: Duration::from_secs(2),
+    max_stdout_bytes: 1024 * 1024,
+    max_stderr_bytes: 1024 * 1024,
+};
 
 mod conformance_receipt;
 mod ep01_selection;
@@ -1326,7 +1335,10 @@ fn observe_graphics(expected_adapter: &str) -> Option<GraphicsObservation> {
     ]
     .into_iter()
     .find(|candidate| candidate.is_file())?;
-    let output = Command::new(vulkaninfo).arg("--summary").output().ok()?;
+    let mut command = Command::new(vulkaninfo);
+    command.arg("--summary");
+    let output =
+        run_command_with_bounded_output(&mut command, VIEWER_HOST_PROBE_OUTPUT_POLICY).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1399,13 +1411,13 @@ fn observe_nvidia_vram(expected_adapter: &str) -> Option<u64> {
     ]
     .into_iter()
     .find(|candidate| candidate.is_file())?;
-    let output = Command::new(nvidia_smi)
-        .args([
-            "--query-gpu=name,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .ok()?;
+    let mut command = Command::new(nvidia_smi);
+    command.args([
+        "--query-gpu=name,memory.total",
+        "--format=csv,noheader,nounits",
+    ]);
+    let output =
+        run_command_with_bounded_output(&mut command, VIEWER_HOST_PROBE_OUTPUT_POLICY).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1425,7 +1437,10 @@ fn observe_display(expected_output: &str) -> Option<DisplayObservation> {
     let xrandr = [Path::new("/usr/bin/xrandr"), Path::new("/bin/xrandr")]
         .into_iter()
         .find(|candidate| candidate.is_file())?;
-    let output = Command::new(xrandr).arg("--current").output().ok()?;
+    let mut command = Command::new(xrandr);
+    command.arg("--current");
+    let output =
+        run_command_with_bounded_output(&mut command, VIEWER_HOST_PROBE_OUTPUT_POLICY).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1503,7 +1518,10 @@ fn observe_compositor() -> Option<String> {
     let wmctrl = [Path::new("/usr/bin/wmctrl"), Path::new("/bin/wmctrl")]
         .into_iter()
         .find(|candidate| candidate.is_file())?;
-    let output = Command::new(wmctrl).arg("-m").output().ok()?;
+    let mut command = Command::new(wmctrl);
+    command.arg("-m");
+    let output =
+        run_command_with_bounded_output(&mut command, VIEWER_HOST_PROBE_OUTPUT_POLICY).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1532,7 +1550,10 @@ fn command_stdout(command: &Path, arguments: &[&str]) -> Option<String> {
     if !command.is_file() {
         return None;
     }
-    let output = Command::new(command).args(arguments).output().ok()?;
+    let mut invocation = Command::new(command);
+    invocation.args(arguments);
+    let output =
+        run_command_with_bounded_output(&mut invocation, VIEWER_HOST_PROBE_OUTPUT_POLICY).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1989,6 +2010,30 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    #[test]
+    fn viewer_host_probes_have_bounded_silence_wall_time_and_output() {
+        assert_eq!(
+            VIEWER_HOST_PROBE_OUTPUT_POLICY.inactivity_timeout,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            VIEWER_HOST_PROBE_OUTPUT_POLICY.absolute_timeout,
+            Duration::from_secs(10)
+        );
+        assert!(
+            VIEWER_HOST_PROBE_OUTPUT_POLICY.inactivity_timeout
+                < VIEWER_HOST_PROBE_OUTPUT_POLICY.absolute_timeout
+        );
+        assert_eq!(
+            VIEWER_HOST_PROBE_OUTPUT_POLICY.max_stdout_bytes,
+            1024 * 1024
+        );
+        assert_eq!(
+            VIEWER_HOST_PROBE_OUTPUT_POLICY.max_stderr_bytes,
+            1024 * 1024
+        );
+    }
 
     fn matching_build_binding(
         profile: &ViewerQualificationProfile,
