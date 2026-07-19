@@ -999,6 +999,13 @@ and 10-second closeout grace, with the IP import wall counted once; there is no
 caller-authored timeout. This three-sample population is development evidence
 under the existing progression rule and cannot establish a performance claim.
 
+Qualification scripts contain no fatal product-state assertions. Every
+expected negative product result, including a predecessor render failure,
+stays in the typed gate and phase-evaluation surfaces so it cannot invalidate
+an otherwise complete automation report. PT also binds its projection through
+an explicit semantic command after switching to the supporting package; an
+observed camera default is not substituted for that script authority.
+
 Every GPU-gated phase resolves its concurrent acceptance checkpoint before
 the end diagnostic, then uses one five-second-bounded nonblocking
 active-target timing await. A valid schema-6 outcome is exactly one of two

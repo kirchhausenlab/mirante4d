@@ -2715,6 +2715,7 @@ fn validate_required_action_surface(
             }
         }
         "PT" => {
+            require("set_projection")?;
             if names
                 .iter()
                 .filter(|name| **name == "set_time_index")
@@ -3723,6 +3724,11 @@ fn validate_automation_template(
             .iter()
             .flat_map(|bootstrap| &bootstrap.commands),
     ) {
+        if command.get("command").and_then(Value::as_str) == Some("assert") {
+            bail!(
+                "viewer scenario {id} contains a fatal product assertion; qualification product results must use typed gates and phase evaluation"
+            )
+        }
         if command.get("timeout_ms").is_some()
             && !matches!(
                 command.get("command").and_then(Value::as_str),
@@ -13778,7 +13784,7 @@ mod tests {
     }
 
     #[test]
-    fn automation_template_rejects_unaccounted_timeout_bearing_commands() {
+    fn automation_template_rejects_unaccounted_waits_and_fatal_product_assertions() {
         let hidden_wait = template(
             true,
             vec![
@@ -13805,6 +13811,18 @@ mod tests {
             ],
         );
         validate_automation_template("RZ", &accounted_wait, true, &[]).unwrap();
+
+        let fatal_product_assertion = template(
+            true,
+            vec![
+                json!({ "command": "assert", "condition": "no_render_error" }),
+                json!({ "command": "quit" }),
+            ],
+        );
+        let error = validate_automation_template("RZ", &fatal_product_assertion, true, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fatal product assertion"));
     }
 
     #[test]
