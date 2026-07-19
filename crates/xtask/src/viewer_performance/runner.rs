@@ -30,6 +30,10 @@ use crate::host::{
     qualification_build_provenance_evidence, repository_identity, repository_identity_at,
 };
 use crate::process::cargo_command;
+use crate::product_automation_progress::{
+    FILE_POLL_INTERVAL, ProductAutomationProgressLaunch, ProductAutomationProgressPlan,
+    ProgressMonitorAction, safe_progress_line,
+};
 
 const WORKLOAD_SCHEMA: &str = "mirante4d-viewer-performance-workload-bundle-4";
 const SCRIPT_BUNDLE_SCHEMA: &str = "mirante4d-viewer-performance-script-bundle-5";
@@ -1125,6 +1129,7 @@ struct ProcessObservation {
     external_wall_time_ns: u64,
     timed_out: bool,
     spawn_error: Option<String>,
+    progress_failure_reason: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -3743,6 +3748,7 @@ fn validate_automation_template(
         }
     }
     let product_gates = expected_product_gate_batches(&script.commands)?;
+    viewer_progress_plan(&script.commands)?;
     if instrumented && (!script.gpu_timing || !script.diagnostic_counters) {
         bail!("viewer instrumented scripts must enable GPU timing and diagnostic counters")
     }
@@ -3791,6 +3797,20 @@ fn validate_automation_template(
     let value = serde_json::to_value(script)?;
     validate_placeholder_strings(&value)?;
     Ok(())
+}
+
+fn viewer_progress_plan(commands: &[Value]) -> anyhow::Result<ProductAutomationProgressPlan> {
+    let mut plan = ProductAutomationProgressPlan::from_commands(commands)?;
+    for batch in expected_product_gate_batches(commands)? {
+        let maximum = batch
+            .observations
+            .iter()
+            .map(|observation| observation.deadline_after_origin_ns)
+            .max()
+            .context("validated product-gate batch is empty")?;
+        plan.set_command_budget(batch.command_index, Duration::from_nanos(maximum))?;
+    }
+    Ok(plan)
 }
 
 fn validate_product_gate_inventory(id: &str, commands: &[Value]) -> anyhow::Result<()> {
@@ -5745,6 +5765,7 @@ fn missing_control_evidence(result_root: &Path, sample_index: u32, scenario: &st
             external_wall_time_ns: 0,
             timed_out: false,
             spawn_error: Some("instrumentation control is absent".to_owned()),
+            progress_failure_reason: None,
         },
         automation_report: None,
         automation_report_sha256: None,
@@ -5783,6 +5804,7 @@ fn unlaunched_role_evidence(
             external_wall_time_ns: 0,
             timed_out: false,
             spawn_error: None,
+            progress_failure_reason: None,
         },
         automation_report: None,
         automation_report_sha256: None,
@@ -5852,10 +5874,14 @@ fn execute_role_with_prelaunch_check(
     if !prelaunch_reasons.is_empty() {
         return rejected_prelaunch_role_evidence(role, intended_root, schedule, prelaunch_reasons);
     }
-    let setup = (|| -> anyhow::Result<(PathBuf, String, String)> {
+    let setup = (|| {
         let role_root = create_attempt_tree(result_root, sample_index, &scenario.id, role)?;
         prepare_attempt_import_parent(&role_root, &scenario.cleanup)?;
         write_resource_settings(&role_root, profile)?;
+        let progress_plan = viewer_progress_plan(&template.commands)?;
+        let progress_launch = ProductAutomationProgressLaunch::new(&role_root)?;
+        debug_assert_eq!(progress_plan.command_count(), template.commands.len());
+        debug_assert_eq!(progress_launch.path().parent(), Some(role_root.as_path()));
         let template_value = serde_json::to_value(template)?;
         let template_bytes = serde_json::to_vec(&template_value)?;
         let template_sha256 = Sha256Hasher::digest(&template_bytes).to_string();
@@ -5863,40 +5889,48 @@ fn execute_role_with_prelaunch_check(
         let expanded_bytes = serde_json::to_vec_pretty(&expanded)?;
         let expanded_sha256 = Sha256Hasher::digest(&expanded_bytes).to_string();
         write_new_synced(&role_root.join("automation-script.json"), &expanded_bytes)?;
-        Ok((role_root, template_sha256, expanded_sha256))
+        Ok::<_, anyhow::Error>((
+            role_root,
+            template_sha256,
+            expanded_sha256,
+            progress_plan,
+            progress_launch,
+        ))
     })();
-    let (role_root, template_script_sha256, expanded_script_sha256) = match setup {
-        Ok(setup) => setup,
-        Err(error) => {
-            return RoleEvidence {
-                role,
-                root: intended_root,
-                expanded_script_sha256: String::new(),
-                template_script_sha256: String::new(),
-                process: ProcessObservation {
-                    launch_attempted: false,
-                    status: None,
-                    external_wall_time_ns: 0,
-                    timed_out: false,
-                    spawn_error: Some(error.to_string()),
-                },
-                automation_report: None,
-                automation_report_sha256: None,
-                app_wall_time_ns: None,
-                process_cpu_time_ns: None,
-                derived_process_timeout_ns: schedule.derived_process_timeout_ns,
-                static_wait_bound_ns: schedule.static_wait_bound_ns,
-                gate_batch_count: schedule.gate_batch_count,
-                gate_observation_count: schedule.gate_observation_count,
-                source_inventory_before: None,
-                source_inventory_after: None,
-                cleanup_manifest_sha256: None,
-                cleanup_completed: false,
-                product_gate_outcomes: Vec::new(),
-                reasons: BTreeSet::from(["attempt_setup_failed".to_owned()]),
-            };
-        }
-    };
+    let (role_root, template_script_sha256, expanded_script_sha256, progress_plan, progress_launch) =
+        match setup {
+            Ok(setup) => setup,
+            Err(error) => {
+                return RoleEvidence {
+                    role,
+                    root: intended_root,
+                    expanded_script_sha256: String::new(),
+                    template_script_sha256: String::new(),
+                    process: ProcessObservation {
+                        launch_attempted: false,
+                        status: None,
+                        external_wall_time_ns: 0,
+                        timed_out: false,
+                        spawn_error: Some(error.to_string()),
+                        progress_failure_reason: None,
+                    },
+                    automation_report: None,
+                    automation_report_sha256: None,
+                    app_wall_time_ns: None,
+                    process_cpu_time_ns: None,
+                    derived_process_timeout_ns: schedule.derived_process_timeout_ns,
+                    static_wait_bound_ns: schedule.static_wait_bound_ns,
+                    gate_batch_count: schedule.gate_batch_count,
+                    gate_observation_count: schedule.gate_observation_count,
+                    source_inventory_before: None,
+                    source_inventory_after: None,
+                    cleanup_manifest_sha256: None,
+                    cleanup_completed: false,
+                    product_gate_outcomes: Vec::new(),
+                    reasons: BTreeSet::from(["attempt_setup_failed".to_owned()]),
+                };
+            }
+        };
     let source_inventory_before = match import_source {
         Some(binding) => match capture_bound_import_source(template, binding) {
             Ok(facts) => Some(facts),
@@ -5914,6 +5948,7 @@ fn execute_role_with_prelaunch_check(
                         spawn_error: Some(
                             "import source inventory preflight was rejected".to_owned(),
                         ),
+                        progress_failure_reason: None,
                     },
                     automation_report: None,
                     automation_report_sha256: None,
@@ -5941,6 +5976,11 @@ fn execute_role_with_prelaunch_check(
         &profile.workload.representative_package.root,
         &role_root,
         Duration::from_nanos(schedule.derived_process_timeout_ns),
+        progress_plan,
+        progress_launch,
+        sample_index,
+        &scenario.id,
+        role,
     );
     let mut reasons = BTreeSet::new();
     if process.spawn_error.is_some() {
@@ -5949,11 +5989,15 @@ fn execute_role_with_prelaunch_check(
     if process.timed_out {
         reasons.insert("app_process_timed_out".to_owned());
     }
+    if let Some(progress_failure) = process.progress_failure_reason {
+        reasons.insert(progress_failure.to_owned());
+    }
     match process.status {
         Some(status) if status.success() => {}
-        Some(_) => {
+        Some(_) if process.progress_failure_reason.is_none() => {
             reasons.insert("app_process_exit_failed".to_owned());
         }
+        Some(_) => {}
         None => {
             reasons.insert("app_process_exit_unavailable".to_owned());
         }
@@ -6077,6 +6121,7 @@ fn rejected_prelaunch_role_evidence(
             external_wall_time_ns: 0,
             timed_out: false,
             spawn_error: Some("prelaunch immutability binding rejected".to_owned()),
+            progress_failure_reason: None,
         },
         automation_report: None,
         automation_report_sha256: None,
@@ -6133,6 +6178,11 @@ fn run_app_process(
     startup_package: &Path,
     role_root: &Path,
     timeout: Duration,
+    progress_plan: ProductAutomationProgressPlan,
+    progress_launch: ProductAutomationProgressLaunch,
+    sample_index: u32,
+    scenario: &str,
+    role: AttemptRole,
 ) -> ProcessObservation {
     let stdout = open_attempt_output(&role_root.join("stdout.log"));
     let stderr = open_attempt_output(&role_root.join("stderr.log"));
@@ -6143,6 +6193,7 @@ fn run_app_process(
             external_wall_time_ns: 0,
             timed_out: false,
             spawn_error: Some("failed to create attempt stdout/stderr".to_owned()),
+            progress_failure_reason: None,
         };
     };
     let mut command = Command::new(app_binary);
@@ -6171,6 +6222,7 @@ fn run_app_process(
         )
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    progress_launch.apply_to_command(&mut command);
     let started = Instant::now();
     let child = command.spawn();
     let Ok(mut child) = child else {
@@ -6180,18 +6232,26 @@ fn run_app_process(
             external_wall_time_ns: elapsed_ns(started),
             timed_out: false,
             spawn_error: Some("failed to spawn supplied viewer app binary".to_owned()),
+            progress_failure_reason: None,
         };
     };
     let deadline = started + timeout;
+    let mut progress_monitor = progress_launch.monitor(progress_plan, started);
+    let mut next_progress_poll = started;
     loop {
+        let now = Instant::now();
         match child.try_wait() {
             Ok(Some(status)) => {
+                let progress_failure_reason = progress_monitor
+                    .finalize_at_exit(now)
+                    .map(|failure| failure.reason_code());
                 return ProcessObservation {
                     launch_attempted: true,
                     status: Some(status),
                     external_wall_time_ns: elapsed_ns(started),
                     timed_out: false,
                     spawn_error: None,
+                    progress_failure_reason,
                 };
             }
             Ok(None) => {}
@@ -6203,10 +6263,39 @@ fn run_app_process(
                     external_wall_time_ns: elapsed_ns(started),
                     timed_out: false,
                     spawn_error: Some("failed to poll supplied viewer app binary".to_owned()),
+                    progress_failure_reason: None,
                 };
             }
         }
-        if Instant::now() >= deadline {
+        if now >= next_progress_poll {
+            match progress_monitor.poll_at(now) {
+                ProgressMonitorAction::Continue => {}
+                ProgressMonitorAction::Emit(snapshot) => {
+                    let line = safe_progress_line(
+                        usize::try_from(sample_index).expect("the bounded sample index fits usize"),
+                        scenario,
+                        role.directory_name(),
+                        &snapshot,
+                    )
+                    .expect("validated viewer progress context is safe to print");
+                    eprintln!("{line}");
+                }
+                ProgressMonitorAction::Terminate(failure) => {
+                    terminate_process_group(&mut child);
+                    let status = child.wait().ok();
+                    return ProcessObservation {
+                        launch_attempted: true,
+                        status,
+                        external_wall_time_ns: elapsed_ns(started),
+                        timed_out: false,
+                        spawn_error: None,
+                        progress_failure_reason: Some(failure.reason_code()),
+                    };
+                }
+            }
+            next_progress_poll = now + FILE_POLL_INTERVAL;
+        }
+        if now >= deadline {
             terminate_process_group(&mut child);
             let status = child.wait().ok();
             return ProcessObservation {
@@ -6215,6 +6304,7 @@ fn run_app_process(
                 external_wall_time_ns: elapsed_ns(started),
                 timed_out: true,
                 spawn_error: None,
+                progress_failure_reason: None,
             };
         }
         thread::sleep(PROCESS_POLL_INTERVAL);
@@ -8387,13 +8477,13 @@ fn prepublication_import_start_is_exact(details: &Value) -> bool {
             ])
             && token.get("kind").and_then(Value::as_str) == Some("Import")
             && ["operation_id", "task_id", "source_session_generation"]
-            .iter()
-            .all(|field| {
-                token
-                    .get(*field)
-                    .and_then(Value::as_u64)
-                    .is_some_and(|value| value > 0)
-            })
+                .iter()
+                .all(|field| {
+                    token
+                        .get(*field)
+                        .and_then(Value::as_u64)
+                        .is_some_and(|value| value > 0)
+                })
             && token
                 .get("currentness_generation")
                 .and_then(Value::as_u64)
@@ -9066,8 +9156,8 @@ fn validate_import_receipt_binding(
     let token_fields_present = receipt_token.is_some_and(|token| {
         token.get("kind").and_then(Value::as_str) == Some("Import")
             && ["operation_id", "task_id", "source_session_generation"]
-            .iter()
-            .all(|field| import_u64(token, field).is_some_and(|value| value > 0))
+                .iter()
+                .all(|field| import_u64(token, field).is_some_and(|value| value > 0))
             && import_u64(token, "currentness_generation").is_some()
     });
     let start_details = unique_passed_event_details(report, "start_reviewed_import");
@@ -13103,6 +13193,7 @@ mod tests {
                 external_wall_time_ns: 1,
                 timed_out: false,
                 spawn_error: None,
+                progress_failure_reason: None,
             },
             automation_report: None,
             automation_report_sha256: Some("33".repeat(32)),
@@ -13506,12 +13597,20 @@ mod tests {
     fn output_setup_failure_is_not_counted_as_a_process_launch() {
         let role_root = tempfile::tempdir().unwrap();
         fs::write(role_root.path().join("stdout.log"), b"already owned").unwrap();
+        let progress_plan =
+            ProductAutomationProgressPlan::from_commands(&[json!({ "command": "quit" })]).unwrap();
+        let progress_launch = ProductAutomationProgressLaunch::new(role_root.path()).unwrap();
 
         let process = run_app_process(
             &role_root.path().join("must-not-run"),
             &role_root.path().join("unused-dataset"),
             role_root.path(),
             Duration::ZERO,
+            progress_plan,
+            progress_launch,
+            1,
+            "RZ",
+            AttemptRole::Instrumented,
         );
 
         assert!(!process.launch_attempted);
@@ -15212,8 +15311,8 @@ mod tests {
         }
 
         let mut initial_currentness = prepublication_import_workflow_report(true);
-        initial_currentness["events"][0]["details"]["operation_token"]
-            ["currentness_generation"] = json!(0);
+        initial_currentness["events"][0]["details"]["operation_token"]["currentness_generation"] =
+            json!(0);
         let reasons = import_workflow_gate_reasons_with_outcome(
             &initial_currentness,
             &test_import_gate(),
@@ -15246,10 +15345,9 @@ mod tests {
     #[test]
     fn published_import_receipt_accepts_the_authentic_initial_currentness_generation() {
         let mut report = valid_import_workflow_report();
-        report["events"][0]["details"]["operation_token"]["currentness_generation"] =
+        report["events"][0]["details"]["operation_token"]["currentness_generation"] = json!(0);
+        report["import_workflow_evidence"]["last_successful_receipt"]["operation_token"]["currentness_generation"] =
             json!(0);
-        report["import_workflow_evidence"]["last_successful_receipt"]["operation_token"]
-            ["currentness_generation"] = json!(0);
         let reasons = import_workflow_gate_reasons(&report);
         assert!(reasons.is_empty(), "{reasons:?}");
     }
@@ -18094,6 +18192,33 @@ mod tests {
         assert!(
             validate_automation_template("RZ", &after_quit, true, &["rz-start", "rz-end"]).is_err()
         );
+    }
+
+    #[test]
+    fn viewer_progress_plan_uses_the_maximum_gate_batch_deadline() {
+        let mut batch = observe_gate_batch_command(
+            "RZ.batch.000",
+            "resident_cross_section_zoom.checkpoint.000",
+            json!({ "kind": "command_completed", "command_index": 0 }),
+            &[(
+                "RZ.acceptance.000.runtime_idle",
+                "runtime_idle",
+                "maximum_current_presentation_gap_plus_poll_grace",
+                1_000_000_000,
+            )],
+        );
+        let mut second = batch["observations"][0].clone();
+        second["gate_id"] = json!("RZ.acceptance.001.settled");
+        second["target"]["condition"] = json!("coordinated_presentation_settled");
+        second["deadline_after_origin_ns"] = json!(2_000_000_000_u64);
+        batch["observations"].as_array_mut().unwrap().push(second);
+        let plan = viewer_progress_plan(&[
+            json!({ "command": "sleep_frames", "frames": 1 }),
+            batch,
+            json!({ "command": "quit" }),
+        ])
+        .unwrap();
+        assert_eq!(plan.command_budget(1), Some(Duration::from_secs(2)));
     }
 
     #[test]

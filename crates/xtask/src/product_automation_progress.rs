@@ -76,6 +76,11 @@ impl ProductAutomationProgressPlan {
     pub(crate) fn command_count(&self) -> usize {
         self.commands.len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn command_budget(&self, index: usize) -> Option<Duration> {
+        self.commands.get(index).and_then(|command| command.budget)
+    }
 }
 
 fn parse_command_plan(index: usize, value: &Value) -> anyhow::Result<CommandPlan> {
