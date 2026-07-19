@@ -26,6 +26,7 @@ const HEARTBEAT_STALE_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_GRACE: Duration = Duration::from_millis(500);
 const CLOSEOUT_TIMEOUT: Duration = Duration::from_secs(10);
 const SAFE_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_COMMAND_BUDGET: Duration = Duration::from_secs(30);
 const SEQUENCE_BASE_BUDGET: Duration = Duration::from_secs(1);
 const MAX_SEQUENCE_DURATION_MS: u64 = 120_000;
 const MAX_SLEEP_FRAMES: u64 = 600;
@@ -133,7 +134,12 @@ fn parse_command_plan(index: usize, value: &Value) -> anyhow::Result<CommandPlan
             Some(Duration::from_secs(30))
         }
         "observe_gate_batch" | "hold_for_external_kill" => None,
-        _ => None,
+        // Commands without a script-declared duration are still bounded. A
+        // live heartbeat proves that the event loop is running; it does not
+        // prove that one semantic command is making progress. Leaving these
+        // commands unbounded would therefore recreate the static-window
+        // failure that this protocol exists to stop.
+        _ => Some(DEFAULT_COMMAND_BUDGET),
     };
 
     for reserved in ["timeout_ms", "duration_ms", "frames"] {
@@ -890,7 +896,12 @@ mod tests {
     }
 
     #[test]
-    fn budgets_cover_sleep_sequences_grace_and_unbounded_hold() {
+    fn budgets_cover_instant_sleep_sequences_grace_and_unbounded_hold() {
+        let instant_plan = plan(vec![json!({ "command": "open_dataset" })]);
+        assert_eq!(
+            instant_plan.commands[0].budget,
+            Some(DEFAULT_COMMAND_BUDGET)
+        );
         assert!(
             ProductAutomationProgressPlan::from_commands(&[json!({
                 "command": "sleep_frames",
