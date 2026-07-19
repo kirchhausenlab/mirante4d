@@ -45,7 +45,12 @@ use crate::{
         qualification_build_provenance_evidence, qualification_build_reason_codes,
         repository_identity,
     },
-    process::cargo_command,
+    process::{cargo_command, isolate_process_tree, terminate_process_tree},
+    product_automation_progress::{
+        FILE_POLL_INTERVAL, ProductAutomationProgressLaunch, ProductAutomationProgressMonitor,
+        ProductAutomationProgressPlan, ProgressFailure, ProgressMonitorAction,
+        SafeProgressSnapshot, safe_automation_progress_line,
+    },
     product_validate::{
         IMPORT_OPEN_READY_COMPLETE_STATUS, PRODUCT_AUTOMATION_SCRIPT_SCHEMA, SCRIPT_SCHEMA_VERSION,
         canonical_product_automation_hard_safety_limits,
@@ -55,6 +60,8 @@ use crate::{
     target_fixture::extract_target_u16_fixture,
 };
 
+#[cfg(test)]
+use crate::product_automation_progress::SafeProgressState;
 #[cfg(test)]
 use crate::product_validate::{
     PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS, PRODUCT_AUTOMATION_REPORT_SCHEMA,
@@ -2426,6 +2433,10 @@ fn run_sample(
         &output_parent,
         &destination,
     )?;
+    let progress_plan = ProductAutomationProgressPlan::from_script(&script)
+        .context("T5 automation progress plan is invalid")?;
+    let progress_launch = ProductAutomationProgressLaunch::new(&sample_root)
+        .context("T5 automation progress launch is invalid")?;
     write_new_synced_json(&script_path, &script)?;
 
     let observation = run_app_process(
@@ -2449,6 +2460,8 @@ fn run_sample(
                     .and_then(|seconds| seconds.checked_add(POST_PRIMARY_TIMEOUT_SECONDS))
                     .context("T5 process timeout overflowed")?,
             ),
+            progress_plan,
+            progress_launch,
         },
         cancelled,
     )?;
@@ -2926,6 +2939,8 @@ struct AppRun<'a> {
     state_home: &'a Path,
     temp_home: &'a Path,
     timeout: Duration,
+    progress_plan: ProductAutomationProgressPlan,
+    progress_launch: ProductAutomationProgressLaunch,
 }
 
 struct ProcessObservation {
@@ -2960,7 +2975,8 @@ fn run_app_process(run: AppRun<'_>, cancelled: &AtomicBool) -> anyhow::Result<Pr
         .create_new(true)
         .mode(0o600)
         .open(run.stderr)?;
-    let mut child = Command::new(run.executable)
+    let mut command = Command::new(run.executable);
+    command
         .env("MIRANTE4D_DEV_DATASET", run.startup_package)
         .env("MIRANTE4D_ENABLE_AUTOMATION", "1")
         .env("MIRANTE4D_AUTOMATION_SCRIPT", run.script)
@@ -2974,25 +2990,48 @@ fn run_app_process(run: AppRun<'_>, cancelled: &AtomicBool) -> anyhow::Result<Pr
         .env("MESA_SHADER_CACHE_DIR", run.cache_home.join("mesa"))
         .env("__GL_SHADER_DISK_CACHE_PATH", run.cache_home.join("nvidia"))
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
+        .stderr(Stdio::from(stderr));
+    isolate_process_tree(&mut command);
+    run.progress_launch.apply_to_command(&mut command);
+    let started = Instant::now();
+    let mut child = command
         .spawn()
         .context("failed to spawn release Mirante4D app for T5")?;
     let pid = child.id();
-    let deadline = Instant::now() + run.timeout;
+    let deadline = started + run.timeout;
+    let mut progress_monitor = run.progress_launch.monitor(run.progress_plan, started);
+    let mut next_progress_poll = started;
     let mut rss_samples = Vec::new();
     let mut mapped_window = None;
-    let mut next_geometry_probe = Instant::now();
+    let mut next_geometry_probe = started;
     loop {
         if cancelled.load(Ordering::Acquire) {
             terminate_t5_child(&mut child);
             bail!("T5 command cancelled by SIGINT or SIGTERM while the app child was active");
         }
         if let Some(status) = try_wait_t5_child(&mut child)? {
-            return Ok(ProcessObservation {
-                exit_success: status.success(),
+            return finish_t5_process_observation(
+                &mut child,
+                status,
                 rss_samples,
                 mapped_window,
-            });
+                &mut progress_monitor,
+                Instant::now(),
+            );
+        }
+        let now = Instant::now();
+        if now >= next_progress_poll {
+            match progress_monitor.poll_at(now) {
+                ProgressMonitorAction::Continue => {}
+                ProgressMonitorAction::Emit(snapshot) => {
+                    eprintln!("{}", t5_safe_progress_line(&snapshot));
+                }
+                ProgressMonitorAction::Terminate(failure) => {
+                    terminate_t5_child(&mut child);
+                    return Err(t5_progress_failure(failure));
+                }
+            }
+            next_progress_poll = now + FILE_POLL_INTERVAL;
         }
         let rss_result = read_process_rss_bytes(pid);
         let exit_status = try_wait_t5_child(&mut child)?;
@@ -3005,11 +3044,14 @@ fn run_app_process(run: AppRun<'_>, cancelled: &AtomicBool) -> anyhow::Result<Pr
         };
         match rss_poll {
             ProcessRssPoll::Exited(status) => {
-                return Ok(ProcessObservation {
-                    exit_success: status.success(),
+                return finish_t5_process_observation(
+                    &mut child,
+                    status,
                     rss_samples,
                     mapped_window,
-                });
+                    &mut progress_monitor,
+                    Instant::now(),
+                );
             }
             ProcessRssPoll::Sample(rss_bytes) => rss_samples.push(RssSample {
                 epoch_ms: epoch_ms(),
@@ -3043,11 +3085,14 @@ fn run_app_process(run: AppRun<'_>, cancelled: &AtomicBool) -> anyhow::Result<Pr
                         return Err(error);
                     }
                 };
-                return Ok(ProcessObservation {
-                    exit_success: status.success(),
+                return finish_t5_process_observation(
+                    &mut child,
+                    status,
                     rss_samples,
                     mapped_window,
-                });
+                    &mut progress_monitor,
+                    Instant::now(),
+                );
             }
         }
         if mapped_window.is_none() && Instant::now() >= next_geometry_probe {
@@ -3058,14 +3103,17 @@ fn run_app_process(run: AppRun<'_>, cancelled: &AtomicBool) -> anyhow::Result<Pr
                     return Err(error);
                 }
             };
-            next_geometry_probe = Instant::now() + Duration::from_millis(100);
+            next_geometry_probe = Instant::now() + FILE_POLL_INTERVAL;
         }
         if let Some(status) = try_wait_t5_child(&mut child)? {
-            return Ok(ProcessObservation {
-                exit_success: status.success(),
+            return finish_t5_process_observation(
+                &mut child,
+                status,
                 rss_samples,
                 mapped_window,
-            });
+                &mut progress_monitor,
+                Instant::now(),
+            );
         }
         if Instant::now() >= deadline {
             terminate_t5_child(&mut child);
@@ -3073,6 +3121,34 @@ fn run_app_process(run: AppRun<'_>, cancelled: &AtomicBool) -> anyhow::Result<Pr
         }
         thread::sleep(RSS_SAMPLE_INTERVAL);
     }
+}
+
+fn finish_t5_process_observation(
+    child: &mut Child,
+    status: ExitStatus,
+    rss_samples: Vec<RssSample>,
+    mapped_window: Option<Value>,
+    progress_monitor: &mut ProductAutomationProgressMonitor,
+    now: Instant,
+) -> anyhow::Result<ProcessObservation> {
+    if let Some(failure) = progress_monitor.finalize_at_exit(now) {
+        terminate_t5_child(child);
+        return Err(t5_progress_failure(failure));
+    }
+    Ok(ProcessObservation {
+        exit_success: status.success(),
+        rss_samples,
+        mapped_window,
+    })
+}
+
+fn t5_safe_progress_line(snapshot: &SafeProgressSnapshot) -> String {
+    safe_automation_progress_line("t5", "import_preprocessing", snapshot)
+        .expect("the static T5 automation progress context is a safe token")
+}
+
+fn t5_progress_failure(failure: ProgressFailure) -> anyhow::Error {
+    anyhow::Error::new(failure)
 }
 
 fn reconcile_process_rss_poll<T>(
@@ -3100,7 +3176,7 @@ fn try_wait_t5_child(child: &mut Child) -> anyhow::Result<Option<ExitStatus>> {
 }
 
 fn terminate_t5_child(child: &mut Child) {
-    let _ = child.kill();
+    terminate_process_tree(child);
     let _ = child.wait();
 }
 
@@ -4846,6 +4922,52 @@ mod tests {
         assert!(
             validate_product_automation_report_contract(&wrong_count, &script, &script_path)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn t5_app_run_binds_shared_progress_plan_safe_output_and_typed_failures() {
+        let config: T5Config =
+            serde_json::from_value(valid_config_json(Path::new("/private"))).unwrap();
+        let script = automation_script(
+            &config,
+            Path::new("/private/startup.m4d"),
+            Path::new("/private/source"),
+            Path::new("/private/output"),
+            Path::new("/private/output/source.m4d"),
+        )
+        .unwrap();
+        let plan = ProductAutomationProgressPlan::from_script(&script).unwrap();
+        assert_eq!(plan.command_count(), 21);
+        assert_eq!(
+            plan.command_budget(10),
+            Some(Duration::from_secs(config.primary_timeout_seconds))
+        );
+        assert_eq!(
+            plan.command_budget(7),
+            Some(Duration::from_secs(INSPECTION_TIMEOUT_SECONDS))
+        );
+
+        let line = t5_safe_progress_line(&SafeProgressSnapshot {
+            heartbeat_sequence: 7,
+            command_count: plan.command_count(),
+            state: SafeProgressState::Command {
+                index: 10,
+                command_kind: "wait_for_imported_open_ready",
+                elapsed_ms: 123,
+            },
+        });
+        assert_eq!(
+            line,
+            "automation_progress scope=t5 scenario=import_preprocessing heartbeat_sequence=7 command_count=21 state=command command_index=10 command_kind=wait_for_imported_open_ready elapsed_ms=123"
+        );
+        assert!(!line.contains("/private"));
+
+        let failure = t5_progress_failure(ProgressFailure::HeartbeatStale);
+        assert_eq!(failure.to_string(), "progress_heartbeat_stale");
+        assert_eq!(
+            failure.downcast_ref::<ProgressFailure>(),
+            Some(&ProgressFailure::HeartbeatStale)
         );
     }
 
