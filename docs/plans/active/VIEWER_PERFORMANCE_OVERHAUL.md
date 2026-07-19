@@ -1017,6 +1017,11 @@ role watchdog. Either exact variant is published as a distinct qualification
 checkpoint with the adjacent end diagnostic atomically within that UI
 callback; normal current-execution facts are not rewritten.
 
+An available active-view ticket proves only that execution's exact timing and
+may coexist with a noncurrent coordinated presentation. The independent
+presentation-currentness gate remains a product failure in that case; it does
+not invalidate the timing evidence.
+
 A captured but pending ticket still waits within the fixed ceiling, and an
 evicted captured interval, malformed or unlinked unavailable authority, or
 missing candidate without that exact adjacent settlement authority remains an

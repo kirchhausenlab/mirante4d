@@ -7461,7 +7461,6 @@ fn qualification_gpu_timing_await_wall_ns(
                     && execution_id.is_some_and(|value| value != 0)
                     && renderer_target.is_some_and(|value| value != 0)
                     && renderer_frame.is_some_and(|value| value != 0)
-                    && current_presentation_generation.and_then(Value::as_u64) == display_generation
                     && checkpoint
                         .and_then(|checkpoint| checkpoint.get("available"))
                         .and_then(Value::as_bool)
@@ -15450,7 +15449,7 @@ mod tests {
                 "details": details,
             })
         };
-        let report = json!({
+        let mut report = json!({
             "events": [
                 await_event(0, "three_d", "volume", 1, 2, 4, 3_500_000_000_u64, 3_500.0),
                 diagnostic_event(1, three_d_diagnostic.clone()),
@@ -15467,6 +15466,11 @@ mod tests {
             ],
             "diagnostics": [three_d_diagnostic, xy_diagnostic],
         });
+        report["events"][3]["details"]["current_presentation_generation"] = json!(2);
+        report["events"][4]["details"]["diagnostics"]["render"]["qualification_gpu_timing_checkpoint"]
+            ["current_presentation_generation"] = json!(2);
+        report["diagnostics"][1]["diagnostics"]["render"]["qualification_gpu_timing_checkpoint"]
+            ["current_presentation_generation"] = json!(2);
         let mut reasons = BTreeSet::new();
         assert_eq!(
             qualification_gpu_timing_await_wall_ns(Some(&report), &script, &mut reasons),

@@ -193,6 +193,10 @@ timing pass. Both variants are published as a distinct qualification
 checkpoint in the adjacent diagnostic during the same UI callback, and the
 normal current-execution facts remain unmodified.
 
+An available active-view ticket proves only that execution's exact timing. It
+may coexist with a noncurrent coordinated presentation, whose independent
+product gate remains failed rather than invalidating the timing evidence.
+
 A captured but still-pending exact interval continues to wait only within the
 fixed five-second ceiling. A captured interval that is evicted, a malformed or
 unlinked unavailable authority, or an absent candidate without that exact
