@@ -912,14 +912,26 @@ fn observe_gate_batch_latches_concurrently_and_completes_at_the_maximum_deadline
     let mut outcomes = vec![None; observations.len()];
 
     assert!(
-        !latch_product_gate_batch_observations(&observations, &[false, false], 9, &mut outcomes,)
-            .unwrap()
+        !latch_product_gate_batch_observations(
+            &observations,
+            &[false, false],
+            &[None, None],
+            9,
+            &mut outcomes,
+        )
+        .unwrap()
     );
     assert_eq!(outcomes, [None, None]);
 
     assert!(
-        !latch_product_gate_batch_observations(&observations, &[false, false], 10, &mut outcomes,)
-            .unwrap()
+        !latch_product_gate_batch_observations(
+            &observations,
+            &[false, false],
+            &[None, None],
+            10,
+            &mut outcomes,
+        )
+        .unwrap()
     );
     assert_eq!(
         outcomes[0],
@@ -933,8 +945,14 @@ fn observe_gate_batch_latches_concurrently_and_completes_at_the_maximum_deadline
     assert_eq!(outcomes[1], None);
 
     assert!(
-        latch_product_gate_batch_observations(&observations, &[true, true], 19, &mut outcomes,)
-            .unwrap()
+        latch_product_gate_batch_observations(
+            &observations,
+            &[true, true],
+            &[None, None],
+            19,
+            &mut outcomes,
+        )
+        .unwrap()
     );
     assert_eq!(outcomes[0].unwrap().observed_after_origin_ns, 10);
     assert_eq!(
@@ -964,7 +982,7 @@ fn observe_gate_batch_deadline_wins_at_equality_and_records_late_true() {
         },
     };
     assert_eq!(
-        latch_product_gate_observation(&observation, true, 99),
+        latch_product_gate_observation(&observation, true, 99, None),
         Some(LatchedProductGateObservation {
             outcome: ProductGateObservationOutcome::Passed,
             condition_met: true,
@@ -973,13 +991,90 @@ fn observe_gate_batch_deadline_wins_at_equality_and_records_late_true() {
         })
     );
     assert_eq!(
-        latch_product_gate_observation(&observation, true, 100),
+        latch_product_gate_observation(&observation, true, 100, None),
         Some(LatchedProductGateObservation {
             outcome: ProductGateObservationOutcome::Failed,
             condition_met: true,
             timed_out: true,
             observed_after_origin_ns: 100,
         })
+    );
+}
+
+#[test]
+fn terminal_prepublication_failure_latches_only_import_gates_before_the_deadline() {
+    let observations = vec![
+        ProductAutomationGateObservation {
+            gate_id: "IP.import-idle".to_owned(),
+            deadline_authority: ProductAutomationGateDeadlineAuthority::ImportPrimaryWall,
+            deadline_after_origin_ns: 100,
+            target: ProductAutomationGateTarget::Condition {
+                condition: ProductAutomationWaitCondition::ImportIdle,
+            },
+        },
+        ProductAutomationGateObservation {
+            gate_id: "IP.open-ready".to_owned(),
+            deadline_authority: ProductAutomationGateDeadlineAuthority::ImportPrimaryWall,
+            deadline_after_origin_ns: 100,
+            target: ProductAutomationGateTarget::ImportedOpenReady {
+                path: PathBuf::from("/tmp/imported.m4d"),
+            },
+        },
+        ProductAutomationGateObservation {
+            gate_id: "IP.runtime-idle".to_owned(),
+            deadline_authority: ProductAutomationGateDeadlineAuthority::ImportPrimaryWall,
+            deadline_after_origin_ns: 100,
+            target: ProductAutomationGateTarget::Condition {
+                condition: ProductAutomationWaitCondition::RuntimeIdle,
+            },
+        },
+    ];
+    let terminal_failures = observations
+        .iter()
+        .map(|observation| {
+            terminal_import_failure_for_target(
+                &observation.target,
+                Some(ImportPrepublicationState::TerminalWorkerFailure),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal_failures,
+        [
+            Some(ProductGateTerminalFailure::ImportWorkerFailedBeforePublication),
+            Some(ProductGateTerminalFailure::ImportWorkerFailedBeforePublication),
+            None,
+        ]
+    );
+
+    let mut outcomes = vec![None; observations.len()];
+    assert!(
+        latch_product_gate_batch_observations(
+            &observations,
+            &[false, false, true],
+            &terminal_failures,
+            9,
+            &mut outcomes,
+        )
+        .unwrap()
+    );
+    for outcome in outcomes[..2].iter().flatten() {
+        assert_eq!(outcome.outcome, ProductGateObservationOutcome::Failed);
+        assert!(!outcome.condition_met);
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.observed_after_origin_ns, 9);
+    }
+    assert_eq!(
+        outcomes[2].unwrap().outcome,
+        ProductGateObservationOutcome::Passed
+    );
+
+    assert_eq!(
+        latch_product_gate_observation(&observations[0], false, 100, terminal_failures[0],)
+            .unwrap()
+            .timed_out,
+        true,
+        "the declared deadline remains authoritative at equality"
     );
 }
 
@@ -1224,11 +1319,11 @@ fn imported_open_ready_batch_target_reports_typed_pass_and_timeout() {
         },
     };
     assert_eq!(
-        latch_product_gate_observation(&observation, false, 99),
+        latch_product_gate_observation(&observation, false, 99, None),
         None
     );
     assert_eq!(
-        latch_product_gate_observation(&observation, true, 99),
+        latch_product_gate_observation(&observation, true, 99, None),
         Some(LatchedProductGateObservation {
             outcome: ProductGateObservationOutcome::Passed,
             condition_met: true,
@@ -1237,7 +1332,7 @@ fn imported_open_ready_batch_target_reports_typed_pass_and_timeout() {
         })
     );
     assert_eq!(
-        latch_product_gate_observation(&observation, true, 100),
+        latch_product_gate_observation(&observation, true, 100, None),
         Some(LatchedProductGateObservation {
             outcome: ProductGateObservationOutcome::Failed,
             condition_met: true,
@@ -1246,7 +1341,7 @@ fn imported_open_ready_batch_target_reports_typed_pass_and_timeout() {
         })
     );
     assert_eq!(
-        latch_product_gate_observation(&observation, false, 100),
+        latch_product_gate_observation(&observation, false, 100, None),
         Some(LatchedProductGateObservation {
             outcome: ProductGateObservationOutcome::Failed,
             condition_met: false,
@@ -1267,15 +1362,16 @@ fn imported_open_ready_full_measurement_is_admitted_only_by_a_latched_pass() {
         },
     };
     assert_eq!(
-        latch_product_gate_observation(&observation, true, 99).map(|outcome| outcome.outcome),
+        latch_product_gate_observation(&observation, true, 99, None).map(|outcome| outcome.outcome),
         Some(ProductGateObservationOutcome::Passed)
     );
     assert_eq!(
-        latch_product_gate_observation(&observation, true, 100).map(|outcome| outcome.outcome),
+        latch_product_gate_observation(&observation, true, 100, None)
+            .map(|outcome| outcome.outcome),
         Some(ProductGateObservationOutcome::Failed)
     );
     assert_eq!(
-        latch_product_gate_observation(&observation, false, 99),
+        latch_product_gate_observation(&observation, false, 99, None),
         None
     );
 }
@@ -1322,6 +1418,107 @@ fn imported_open_ready_reuses_every_existing_readiness_fact() {
 }
 
 #[test]
+fn prepublication_state_requires_exact_bound_run_outcomes() {
+    let zero = ImportWorkerRunOutcomeCounters {
+        published_events: 0,
+        cancelled_runs: 0,
+        successful_runs: 0,
+        failed_runs: 0,
+    };
+    assert_eq!(
+        authentic_import_prepublication_state(
+            BoundImportWorkerActivity::Active,
+            false,
+            zero,
+            false,
+        ),
+        Some(ImportPrepublicationState::Active)
+    );
+    let terminal = ImportWorkerRunOutcomeCounters {
+        failed_runs: 1,
+        ..zero
+    };
+    assert_eq!(
+        authentic_import_prepublication_state(
+            BoundImportWorkerActivity::Idle,
+            true,
+            terminal,
+            false,
+        ),
+        Some(ImportPrepublicationState::TerminalWorkerFailure)
+    );
+
+    for (activity, workflow_failed, outcomes, receipt_present) in [
+        (BoundImportWorkerActivity::Other, true, terminal, false),
+        (BoundImportWorkerActivity::Idle, false, terminal, false),
+        (
+            BoundImportWorkerActivity::Idle,
+            true,
+            ImportWorkerRunOutcomeCounters {
+                published_events: 1,
+                ..terminal
+            },
+            false,
+        ),
+        (BoundImportWorkerActivity::Idle, true, terminal, true),
+    ] {
+        assert_eq!(
+            authentic_import_prepublication_state(
+                activity,
+                workflow_failed,
+                outcomes,
+                receipt_present,
+            ),
+            None
+        );
+    }
+    assert_eq!(
+        ImportWorkerRunOutcomeCounters {
+            published_events: 7,
+            cancelled_runs: 5,
+            successful_runs: 3,
+            failed_runs: 3,
+        }
+        .checked_delta(ImportWorkerRunOutcomeCounters {
+            published_events: 7,
+            cancelled_runs: 5,
+            successful_runs: 3,
+            failed_runs: 2,
+        }),
+        Some(terminal)
+    );
+}
+
+#[test]
+fn unavailable_transfer_is_admitted_only_for_authentic_prepublication_state() {
+    let unavailable = classify_failed_import_publication_capture(
+        Err("no publication transfer".to_owned()),
+        Some(ImportPrepublicationState::TerminalWorkerFailure),
+    )
+    .unwrap();
+    assert_eq!(
+        unavailable,
+        FailedImportPublicationCapture::UnavailableBeforeTransfer(
+            ImportPrepublicationState::TerminalWorkerFailure,
+        )
+    );
+    assert!(
+        classify_failed_import_publication_capture(
+            Err("missing postpublication evidence".to_owned()),
+            None,
+        )
+        .is_err()
+    );
+    assert!(
+        classify_failed_import_publication_capture(
+            Ok(test_import_publication_evidence_snapshot()),
+            Some(ImportPrepublicationState::TerminalWorkerFailure),
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn imported_open_ready_measurement_commit_preserves_all_side_effects() {
     let primary = ImportPrimaryMeasurement {
         started_at_epoch_ms: 11,
@@ -1330,35 +1527,25 @@ fn imported_open_ready_measurement_commit_preserves_all_side_effects() {
         process_cpu_time_ns: 31,
     };
     let mut active_origin = Some("exact-worker-origin");
+    let mut active_run_origin = Some("exact-run-origin");
     let mut active_verification_origin = Some("exact-verification-origin");
     let mut completed_primary = None;
-    let mut completed_publication = None;
-    let mut captured_publication_evidence = None;
+    let mut open_ready_outcome = None;
 
     ImportedOpenReadyCommitState {
         active_origin: &mut active_origin,
+        active_run_origin: &mut active_run_origin,
         active_verification_origin: &mut active_verification_origin,
         completed_primary: &mut completed_primary,
-        completed_publication: &mut completed_publication,
-        captured_publication_evidence: &mut captured_publication_evidence,
+        open_ready_outcome: &mut open_ready_outcome,
     }
-    .commit(
-        primary,
-        "publication-to-open-ready-measurement",
-        "publication-currentness-and-verifier-evidence",
-    );
+    .commit(primary, "complete-open-ready-outcome");
 
     assert!(active_origin.is_none());
+    assert!(active_run_origin.is_none());
     assert!(active_verification_origin.is_none());
     assert_eq!(completed_primary, Some(primary));
-    assert_eq!(
-        completed_publication,
-        Some("publication-to-open-ready-measurement")
-    );
-    assert_eq!(
-        captured_publication_evidence,
-        Some("publication-currentness-and-verifier-evidence")
-    );
+    assert_eq!(open_ready_outcome, Some("complete-open-ready-outcome"));
 }
 
 fn test_import_publication_evidence_snapshot() -> ImportPublicationEvidenceSnapshot {
@@ -1380,19 +1567,77 @@ fn test_import_publication_evidence_snapshot() -> ImportPublicationEvidenceSnaps
     }
 }
 
+fn test_unavailable_import_open_ready_evidence() -> ImportOpenReadyUnavailableEvidence {
+    ImportOpenReadyUnavailableEvidence {
+        reason: ImportOpenReadyUnavailableReason::TerminalWorkerFailureBeforePublication,
+        readiness: ImportedOpenReadyReadiness {
+            selected_matches: false,
+            verified: true,
+            import_idle: true,
+            problem_absent: false,
+        },
+        verification: ImportVerificationEvidenceSnapshot {
+            source_verification_started_runs: 0,
+            source_verification_progress_updates: 0,
+            source_verification_cancelled_runs: 0,
+            source_verification_failed_runs: 0,
+            source_verification_successes: 0,
+        },
+        source_open_worker_active: false,
+        pending_source_install: false,
+        dataset_open_operation_count: 0,
+        source_open_worker_bound_to_dataset_open_operation: false,
+        pending_source_install_bound_to_dataset_open_operation: false,
+    }
+}
+
 #[test]
 fn failed_imported_open_ready_serializes_only_authentic_currentness_and_verifier_evidence() {
     let evidence = test_import_publication_evidence_snapshot();
 
     assert_eq!(
-        import_publication_to_open_ready_measurement_json(None, None),
+        import_publication_to_open_ready_measurement_json(None),
         Value::Null
     );
-    let partial = import_publication_to_open_ready_measurement_json(None, Some(evidence));
+    assert_eq!(
+        import_publication_to_open_ready_measurement_json(Some(
+            ImportedOpenReadyOutcome::DeadlineFailedBeforeTransfer {
+                evidence: test_unavailable_import_open_ready_evidence(),
+            },
+        )),
+        json!({
+            "status": "open_ready_deadline_failed_before_transfer",
+            "unavailable_reason": "import_worker_terminal_failure_before_publication",
+            "readiness": {
+                "selected_matches": false,
+                "verified": true,
+                "import_idle": true,
+                "problem_absent": false,
+            },
+            "source_verification_deltas": {
+                "started_runs": 0,
+                "progress_updates": 0,
+                "cancelled_runs": 0,
+                "failed_runs": 0,
+                "successes": 0,
+            },
+            "source_open_state": {
+                "worker_active": false,
+                "pending_install": false,
+                "active_dataset_open_operations": 0,
+                "worker_bound_to_dataset_open_operation": false,
+                "pending_install_bound_to_dataset_open_operation": false,
+            },
+        })
+    );
+    let partial = import_publication_to_open_ready_measurement_json(Some(
+        ImportedOpenReadyOutcome::DeadlineFailedAfterTransfer { evidence },
+    ));
 
     assert_eq!(
         partial,
         json!({
+            "status": "open_ready_deadline_failed_after_transfer",
             "publication_currentness_execution": {
                 "contract_id": "test-publication-currentness",
                 "expected_snapshot_object_reads": 1,
@@ -1409,7 +1654,7 @@ fn failed_imported_open_ready_serializes_only_authentic_currentness_and_verifier
             "source_verification_successes": 10,
         })
     );
-    assert_eq!(partial.as_object().map(serde_json::Map::len), Some(6));
+    assert_eq!(partial.as_object().map(serde_json::Map::len), Some(7));
     for pass_only in [
         "start_boundary",
         "end_boundary",
@@ -1436,11 +1681,17 @@ fn passed_imported_open_ready_adds_full_clocks_to_the_same_publication_evidence(
         process_cpu_time_ns: 14,
     };
 
-    let full = import_publication_to_open_ready_measurement_json(Some(timing), Some(evidence));
+    let full = import_publication_to_open_ready_measurement_json(Some(
+        ImportedOpenReadyOutcome::Complete {
+            measurement: timing,
+            evidence,
+        },
+    ));
 
     assert_eq!(
         full,
         json!({
+            "status": "open_ready_complete",
             "start_boundary": "import_worker_published_event",
             "end_boundary": "published_destination_verified_and_open_ready_for_normal_product_use",
             "wall_clock": "std_instant_monotonic",
@@ -1467,7 +1718,7 @@ fn passed_imported_open_ready_adds_full_clocks_to_the_same_publication_evidence(
             "source_verification_successes": 10,
         })
     );
-    assert_eq!(full.as_object().map(serde_json::Map::len), Some(16));
+    assert_eq!(full.as_object().map(serde_json::Map::len), Some(17));
 }
 
 #[test]
@@ -1508,7 +1759,7 @@ fn failed_imported_open_ready_batch_continues_without_serializing_path() {
         ProductAutomationCommand::ObserveGateBatch { observations, .. } => observations.clone(),
         _ => panic!("test script must begin with its imported-open-ready batch"),
     };
-    let outcome = latch_product_gate_observation(&observations[0], false, 10)
+    let outcome = latch_product_gate_observation(&observations[0], false, 10, None)
         .expect("the imported-open-ready deadline must latch a failed outcome");
     let details = product_gate_batch_details_value(
         "IP.primary",
@@ -1523,18 +1774,21 @@ fn failed_imported_open_ready_batch_continues_without_serializing_path() {
     assert_eq!(details["observations"][0]["timed_out"], true);
     assert_eq!(import_primary_measurement_json(None), Value::Null);
     assert_eq!(
-        import_publication_to_open_ready_measurement_json(None, None),
+        import_publication_to_open_ready_measurement_json(None),
         Value::Null
     );
-    assert!(
-        authentic_failed_import_publication_evidence(Err("not published".to_owned())).is_none()
-    );
-    let partial = authentic_failed_import_publication_evidence(Ok(
-        test_import_publication_evidence_snapshot(),
-    ))
+    let partial = classify_failed_import_publication_capture(
+        Ok(test_import_publication_evidence_snapshot()),
+        None,
+    )
     .expect("authentic currentness evidence must remain available on a failed deadline");
-    let partial = import_publication_to_open_ready_measurement_json(None, Some(partial));
-    assert_eq!(partial.as_object().map(serde_json::Map::len), Some(6));
+    let FailedImportPublicationCapture::Available(partial) = partial else {
+        panic!("a captured transfer must remain available");
+    };
+    let partial = import_publication_to_open_ready_measurement_json(Some(
+        ImportedOpenReadyOutcome::DeadlineFailedAfterTransfer { evidence: partial },
+    ));
+    assert_eq!(partial.as_object().map(serde_json::Map::len), Some(7));
 
     controller.record_successful_command(
         0,

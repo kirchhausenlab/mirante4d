@@ -650,6 +650,7 @@ fn import_preprocessing_evidence_requires_named_progress_resume_and_open_ready()
             "maximum_elapsed_ms": 2,
             "maximum_projected_elapsed_ms": 1,
             "publication_to_open_ready_clock": {
+                "status": IMPORT_OPEN_READY_COMPLETE_STATUS,
                 "transfer_mode": "staged_verified_capability",
                 "included_in_primary_clock": true,
                 "publication_currentness_execution": {
@@ -678,6 +679,12 @@ fn import_preprocessing_evidence_requires_named_progress_resume_and_open_ready()
         }]
     });
     assert!(import_preprocessing_evidence(Some(&report)).is_ok());
+
+    let mut unavailable_transfer = report.clone();
+    unavailable_transfer["import_workflow_evidence"]["publication_to_open_ready_clock"] = json!({
+        "status": "open_ready_deadline_failed_before_transfer",
+    });
+    assert!(import_preprocessing_evidence(Some(&unavailable_transfer)).is_err());
 
     let mut unexpected_verifier = report.clone();
     unexpected_verifier["import_workflow_evidence"]["publication_to_open_ready_clock"]["source_verification_successes"] =

@@ -14,7 +14,7 @@ use mirante4d_domain::IntensityDType;
 pub(crate) use mirante4d_import_pipeline::deterministic_tiff_destination as tiff_destination;
 use mirante4d_import_pipeline::{
     ImportEvent, ImportOptions, ImportStage, NoDataPolicy, SourceLayout, SpatialCalibration,
-    TiffInspection, TiffSource, deterministic_tiff_destination, select_supported_profile,
+    TiffInspection, TiffSource, select_supported_profile,
 };
 use mirante4d_storage::ProfileKind;
 
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn shared_destination_keeps_its_checkpoint_as_a_sibling() {
         let source = TiffSource::auto("/source/My Cells.ome.tiff");
-        let destination = deterministic_tiff_destination(&source, Path::new("/output"));
+        let destination = tiff_destination(&source, Path::new("/output"));
 
         assert_eq!(destination, Path::new("/output/my-cells-ome.m4d"));
         assert_eq!(

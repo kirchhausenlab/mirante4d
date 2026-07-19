@@ -9,8 +9,8 @@ use std::{
 use eframe::egui;
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationSnapshot, CommandEffect, CrossSectionPanelId,
-    OperationToken, PresentationSlot, ProjectStoreLifecycle, SourceVerificationSnapshot,
-    WorkspaceSnapshot,
+    OperationKind, OperationToken, PresentationSlot, ProjectStoreLifecycle,
+    SourceVerificationSnapshot, WorkspaceSnapshot,
     import_workflow::{
         ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportWorkflowSnapshot,
     },
@@ -44,7 +44,7 @@ use serde_json::{Value, json};
 use crate::{
     DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
     MiranteWorkbenchApp, application_view,
-    import_worker_service::ImportWorkerTimingOrigin,
+    import_worker_service::{ImportWorkerDiagnostics, ImportWorkerTimingOrigin},
     native_presentation::{
         PresentedFrameIntervalSample, ProductGpuExecutionIdentity, ProductGpuExecutionTiming,
     },
@@ -727,6 +727,27 @@ struct LatchedProductGateObservation {
     observed_after_origin_ns: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProductGateTerminalFailure {
+    ImportWorkerFailedBeforePublication,
+}
+
+fn terminal_import_failure_for_target(
+    target: &ProductAutomationGateTarget,
+    prepublication: Option<ImportPrepublicationState>,
+) -> Option<ProductGateTerminalFailure> {
+    if prepublication != Some(ImportPrepublicationState::TerminalWorkerFailure) {
+        return None;
+    }
+    matches!(
+        target,
+        ProductAutomationGateTarget::Condition {
+            condition: ProductAutomationWaitCondition::ImportIdle,
+        } | ProductAutomationGateTarget::ImportedOpenReady { .. }
+    )
+    .then_some(ProductGateTerminalFailure::ImportWorkerFailedBeforePublication)
+}
+
 #[derive(Debug, Serialize)]
 struct ProductGateBatchObservationDetails<'a> {
     observation_index: usize,
@@ -891,12 +912,22 @@ fn latch_product_gate_observation(
     observation: &ProductAutomationGateObservation,
     condition_met: bool,
     observed_after_origin_ns: u64,
+    terminal_failure: Option<ProductGateTerminalFailure>,
 ) -> Option<LatchedProductGateObservation> {
     if observed_after_origin_ns >= observation.deadline_after_origin_ns {
         return Some(LatchedProductGateObservation {
             outcome: ProductGateObservationOutcome::Failed,
             condition_met,
             timed_out: true,
+            observed_after_origin_ns,
+        });
+    }
+    if terminal_failure.is_some() {
+        debug_assert!(!condition_met);
+        return Some(LatchedProductGateObservation {
+            outcome: ProductGateObservationOutcome::Failed,
+            condition_met: false,
+            timed_out: false,
             observed_after_origin_ns,
         });
     }
@@ -911,15 +942,20 @@ fn latch_product_gate_observation(
 fn latch_product_gate_batch_observations(
     observations: &[ProductAutomationGateObservation],
     condition_states: &[bool],
+    terminal_failures: &[Option<ProductGateTerminalFailure>],
     observed_after_origin_ns: u64,
     outcomes: &mut [Option<LatchedProductGateObservation>],
 ) -> Result<bool, String> {
-    if observations.len() != condition_states.len() || observations.len() != outcomes.len() {
+    if observations.len() != condition_states.len()
+        || observations.len() != terminal_failures.len()
+        || observations.len() != outcomes.len()
+    {
         return Err("product gate batch state length does not match its command".to_owned());
     }
-    for ((observation, condition_met), outcome) in observations
+    for (((observation, condition_met), terminal_failure), outcome) in observations
         .iter()
         .zip(condition_states.iter().copied())
+        .zip(terminal_failures.iter().copied())
         .zip(outcomes.iter_mut())
     {
         if outcome.is_none() {
@@ -927,6 +963,7 @@ fn latch_product_gate_batch_observations(
                 observation,
                 condition_met,
                 observed_after_origin_ns,
+                terminal_failure,
             );
         }
     }
@@ -1077,12 +1114,11 @@ pub(crate) struct ProductAutomationController {
     active_import_pre_start_origin: Option<ImportPreStartOrigin>,
     completed_import_pre_start_measurement: Option<ImportPreStartMeasurement>,
     active_import_timing_origin: Option<ImportWorkerTimingOrigin>,
+    active_import_run_outcomes_origin: Option<ImportWorkerRunOutcomeCounters>,
     active_import_verification_diagnostics_origin:
         Option<crate::current_source_verification_service::CurrentSourceVerificationDiagnostics>,
     completed_import_primary_measurement: Option<ImportPrimaryMeasurement>,
-    completed_publication_to_open_ready_measurement:
-        Option<ImportPublicationToOpenReadyMeasurement>,
-    captured_import_publication_evidence: Option<ImportPublicationEvidenceSnapshot>,
+    imported_open_ready_outcome: Option<ImportedOpenReadyOutcome>,
     startup_bootstrap_evidence: Option<Value>,
     qualification_only_ui_overhead_ns: u64,
     report_written: bool,
@@ -1293,10 +1329,182 @@ struct ImportPublicationEvidenceSnapshot {
     source_verification_successes: u64,
 }
 
-fn authentic_failed_import_publication_evidence(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImportVerificationEvidenceSnapshot {
+    source_verification_started_runs: u64,
+    source_verification_progress_updates: u64,
+    source_verification_cancelled_runs: u64,
+    source_verification_failed_runs: u64,
+    source_verification_successes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImportOpenReadyUnavailableReason {
+    ActiveBeforePublicationDeadline,
+    TerminalWorkerFailureBeforePublication,
+}
+
+impl ImportOpenReadyUnavailableReason {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::ActiveBeforePublicationDeadline => {
+                "import_worker_active_before_publication_deadline"
+            }
+            Self::TerminalWorkerFailureBeforePublication => {
+                "import_worker_terminal_failure_before_publication"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImportOpenReadyUnavailableEvidence {
+    reason: ImportOpenReadyUnavailableReason,
+    readiness: ImportedOpenReadyReadiness,
+    verification: ImportVerificationEvidenceSnapshot,
+    source_open_worker_active: bool,
+    pending_source_install: bool,
+    dataset_open_operation_count: u64,
+    source_open_worker_bound_to_dataset_open_operation: bool,
+    pending_source_install_bound_to_dataset_open_operation: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImportWorkerRunOutcomeCounters {
+    published_events: u64,
+    cancelled_runs: u64,
+    successful_runs: u64,
+    failed_runs: u64,
+}
+
+impl ImportWorkerRunOutcomeCounters {
+    fn from_diagnostics(diagnostics: &ImportWorkerDiagnostics) -> Self {
+        Self {
+            published_events: diagnostics.published_events,
+            cancelled_runs: diagnostics.cancelled_runs,
+            successful_runs: diagnostics.successful_runs,
+            failed_runs: diagnostics.failed_runs,
+        }
+    }
+
+    fn checked_delta(self, origin: Self) -> Option<Self> {
+        Some(Self {
+            published_events: self.published_events.checked_sub(origin.published_events)?,
+            cancelled_runs: self.cancelled_runs.checked_sub(origin.cancelled_runs)?,
+            successful_runs: self.successful_runs.checked_sub(origin.successful_runs)?,
+            failed_runs: self.failed_runs.checked_sub(origin.failed_runs)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImportPrepublicationState {
+    Active,
+    TerminalWorkerFailure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundImportWorkerActivity {
+    Active,
+    Idle,
+    Other,
+}
+
+fn authentic_import_prepublication_state(
+    activity: BoundImportWorkerActivity,
+    workflow_failed: bool,
+    run_outcomes: ImportWorkerRunOutcomeCounters,
+    successful_receipt_present: bool,
+) -> Option<ImportPrepublicationState> {
+    if successful_receipt_present {
+        return None;
+    }
+    match (activity, workflow_failed, run_outcomes) {
+        (
+            BoundImportWorkerActivity::Active,
+            false,
+            ImportWorkerRunOutcomeCounters {
+                published_events: 0,
+                cancelled_runs: 0,
+                successful_runs: 0,
+                failed_runs: 0,
+            },
+        ) => Some(ImportPrepublicationState::Active),
+        (
+            BoundImportWorkerActivity::Idle,
+            true,
+            ImportWorkerRunOutcomeCounters {
+                published_events: 0,
+                cancelled_runs: 0,
+                successful_runs: 0,
+                failed_runs: 1,
+            },
+        ) => Some(ImportPrepublicationState::TerminalWorkerFailure),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailedImportPublicationCapture {
+    Available(ImportPublicationEvidenceSnapshot),
+    UnavailableBeforeTransfer(ImportPrepublicationState),
+}
+
+fn classify_failed_import_publication_capture(
     captured: Result<ImportPublicationEvidenceSnapshot, String>,
-) -> Option<ImportPublicationEvidenceSnapshot> {
-    captured.ok()
+    prepublication: Option<ImportPrepublicationState>,
+) -> Result<FailedImportPublicationCapture, String> {
+    match (captured, prepublication) {
+        (Ok(evidence), None) => Ok(FailedImportPublicationCapture::Available(evidence)),
+        (Err(_), Some(state)) => Ok(FailedImportPublicationCapture::UnavailableBeforeTransfer(
+            state,
+        )),
+        (Ok(_), Some(_)) => Err(
+            "prepublication import state unexpectedly exposed publication-transfer evidence"
+                .to_owned(),
+        ),
+        (Err(error), None) => Err(error),
+    }
+}
+
+fn import_worker_timing_origins_match(
+    left: &ImportWorkerTimingOrigin,
+    right: &ImportWorkerTimingOrigin,
+) -> bool {
+    left.started_at == right.started_at
+        && left.started_at_epoch_ms == right.started_at_epoch_ms
+        && left.process_cpu_time_ns == right.process_cpu_time_ns
+        && left.review_id == right.review_id
+        && left.token == right.token
+        && normalize_path(&left.destination) == normalize_path(&right.destination)
+        && left.source_fingerprint == right.source_fingerprint
+        && left.reviewed_source_bytes == right.reviewed_source_bytes
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImportedOpenReadyOutcome {
+    Complete {
+        measurement: ImportPublicationToOpenReadyMeasurement,
+        evidence: ImportPublicationEvidenceSnapshot,
+    },
+    DeadlineFailedAfterTransfer {
+        evidence: ImportPublicationEvidenceSnapshot,
+    },
+    DeadlineFailedBeforeTransfer {
+        evidence: ImportOpenReadyUnavailableEvidence,
+    },
+}
+
+impl ImportedOpenReadyOutcome {
+    const fn status(self) -> &'static str {
+        match self {
+            Self::Complete { .. } => "open_ready_complete",
+            Self::DeadlineFailedAfterTransfer { .. } => "open_ready_deadline_failed_after_transfer",
+            Self::DeadlineFailedBeforeTransfer { .. } => {
+                "open_ready_deadline_failed_before_transfer"
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1330,27 +1538,22 @@ fn imported_open_ready_readiness(
     }
 }
 
-struct ImportedOpenReadyCommitState<'a, Origin, VerificationOrigin, Publication, Evidence> {
+struct ImportedOpenReadyCommitState<'a, Origin, RunOrigin, VerificationOrigin, Outcome> {
     active_origin: &'a mut Option<Origin>,
+    active_run_origin: &'a mut Option<RunOrigin>,
     active_verification_origin: &'a mut Option<VerificationOrigin>,
     completed_primary: &'a mut Option<ImportPrimaryMeasurement>,
-    completed_publication: &'a mut Option<Publication>,
-    captured_publication_evidence: &'a mut Option<Evidence>,
+    open_ready_outcome: &'a mut Option<Outcome>,
 }
 
-impl<Origin, VerificationOrigin, Publication, Evidence>
-    ImportedOpenReadyCommitState<'_, Origin, VerificationOrigin, Publication, Evidence>
+impl<Origin, RunOrigin, VerificationOrigin, Outcome>
+    ImportedOpenReadyCommitState<'_, Origin, RunOrigin, VerificationOrigin, Outcome>
 {
-    fn commit(
-        self,
-        primary: ImportPrimaryMeasurement,
-        publication: Publication,
-        publication_evidence: Evidence,
-    ) {
-        *self.captured_publication_evidence = Some(publication_evidence);
-        *self.completed_publication = Some(publication);
+    fn commit(self, primary: ImportPrimaryMeasurement, outcome: Outcome) {
+        *self.open_ready_outcome = Some(outcome);
         *self.completed_primary = Some(primary);
         *self.active_verification_origin = None;
+        *self.active_run_origin = None;
         *self.active_origin = None;
     }
 }
@@ -1484,10 +1687,10 @@ impl ProductAutomationController {
             active_import_pre_start_origin: None,
             completed_import_pre_start_measurement: None,
             active_import_timing_origin: None,
+            active_import_run_outcomes_origin: None,
             active_import_verification_diagnostics_origin: None,
             completed_import_primary_measurement: None,
-            completed_publication_to_open_ready_measurement: None,
-            captured_import_publication_evidence: None,
+            imported_open_ready_outcome: None,
             startup_bootstrap_evidence: None,
             qualification_only_ui_overhead_ns: 0,
             report_written: false,
@@ -2505,6 +2708,91 @@ impl ProductAutomationController {
         }
     }
 
+    fn import_prepublication_state(
+        &self,
+        app: &MiranteWorkbenchApp,
+    ) -> Option<ImportPrepublicationState> {
+        if self.imported_open_ready_outcome.is_some() {
+            return None;
+        }
+        let origin = self.active_import_run_outcomes_origin?;
+        let bound_timing_origin = self.active_import_timing_origin.as_ref()?;
+        let diagnostics = app.import.workers.diagnostics();
+        let run_outcomes =
+            ImportWorkerRunOutcomeCounters::from_diagnostics(&diagnostics).checked_delta(origin)?;
+        let worker_status = app.import.workers.status();
+        let activity = if worker_status.is_importing() {
+            if app
+                .import
+                .workers
+                .active_import_timing_origin()
+                .as_ref()
+                .is_some_and(|active| {
+                    import_worker_timing_origins_match(active, bound_timing_origin)
+                })
+            {
+                BoundImportWorkerActivity::Active
+            } else {
+                BoundImportWorkerActivity::Other
+            }
+        } else if worker_status.is_active() {
+            BoundImportWorkerActivity::Other
+        } else {
+            BoundImportWorkerActivity::Idle
+        };
+        authentic_import_prepublication_state(
+            activity,
+            matches!(app.import.snapshot(), ImportWorkflowSnapshot::Failed(_)),
+            run_outcomes,
+            diagnostics.last_successful_import.is_some(),
+        )
+    }
+
+    fn capture_import_verification_evidence(
+        &self,
+        app: &MiranteWorkbenchApp,
+    ) -> Result<ImportVerificationEvidenceSnapshot, String> {
+        let verification_origin = self
+            .active_import_verification_diagnostics_origin
+            .as_ref()
+            .ok_or_else(|| {
+                "import publication has no source-verification diagnostics origin".to_owned()
+            })?;
+        let verification_current = app
+            .source_verification_service
+            .as_ref()
+            .ok_or_else(|| "import publication has no source-verification diagnostics".to_owned())?
+            .diagnostics();
+        let source_verification_started_runs = verification_current
+            .started_runs
+            .checked_sub(verification_origin.started_runs)
+            .ok_or_else(|| "source-verification started-run counter regressed".to_owned())?;
+        let source_verification_progress_updates = verification_current
+            .accepted_progress_updates
+            .checked_sub(verification_origin.accepted_progress_updates)
+            .ok_or_else(|| "source-verification progress counter regressed".to_owned())?;
+        let source_verification_cancelled_runs = verification_current
+            .cancelled_runs
+            .checked_sub(verification_origin.cancelled_runs)
+            .ok_or_else(|| "source-verification cancellation counter regressed".to_owned())?;
+        let source_verification_failed_runs = verification_current
+            .failed_runs
+            .checked_sub(verification_origin.failed_runs)
+            .ok_or_else(|| "source-verification failed-run counter regressed".to_owned())?;
+        let source_verification_successes = verification_current
+            .accepted_successes
+            .checked_sub(verification_origin.accepted_successes)
+            .ok_or_else(|| "source-verification success counter regressed".to_owned())?;
+
+        Ok(ImportVerificationEvidenceSnapshot {
+            source_verification_started_runs,
+            source_verification_progress_updates,
+            source_verification_cancelled_runs,
+            source_verification_failed_runs,
+            source_verification_successes,
+        })
+    }
+
     fn capture_bound_import_publication_evidence(
         &self,
         app: &MiranteWorkbenchApp,
@@ -2541,45 +2829,97 @@ impl ProductAutomationController {
                 "storage publication-transfer evidence is bound to another destination".to_owned(),
             );
         }
-        let verification_origin = self
-            .active_import_verification_diagnostics_origin
-            .as_ref()
-            .ok_or_else(|| {
-                "import publication has no source-verification diagnostics origin".to_owned()
-            })?;
-        let verification_current = app
-            .source_verification_service
-            .as_ref()
-            .ok_or_else(|| "import publication has no source-verification diagnostics".to_owned())?
-            .diagnostics();
-        let source_verification_started_runs = verification_current
-            .started_runs
-            .checked_sub(verification_origin.started_runs)
-            .ok_or_else(|| "source-verification started-run counter regressed".to_owned())?;
-        let source_verification_progress_updates = verification_current
-            .accepted_progress_updates
-            .checked_sub(verification_origin.accepted_progress_updates)
-            .ok_or_else(|| "source-verification progress counter regressed".to_owned())?;
-        let source_verification_cancelled_runs = verification_current
-            .cancelled_runs
-            .checked_sub(verification_origin.cancelled_runs)
-            .ok_or_else(|| "source-verification cancellation counter regressed".to_owned())?;
-        let source_verification_failed_runs = verification_current
-            .failed_runs
-            .checked_sub(verification_origin.failed_runs)
-            .ok_or_else(|| "source-verification failed-run counter regressed".to_owned())?;
-        let source_verification_successes = verification_current
-            .accepted_successes
-            .checked_sub(verification_origin.accepted_successes)
-            .ok_or_else(|| "source-verification success counter regressed".to_owned())?;
+        let verification = self.capture_import_verification_evidence(app)?;
 
         Ok(ImportPublicationEvidenceSnapshot {
             publication_currentness: publication_transfer.execution().into(),
-            source_verification_started_runs,
-            source_verification_progress_updates,
-            source_verification_cancelled_runs,
-            source_verification_failed_runs,
-            source_verification_successes,
+            source_verification_started_runs: verification.source_verification_started_runs,
+            source_verification_progress_updates: verification.source_verification_progress_updates,
+            source_verification_cancelled_runs: verification.source_verification_cancelled_runs,
+            source_verification_failed_runs: verification.source_verification_failed_runs,
+            source_verification_successes: verification.source_verification_successes,
+        })
+    }
+
+    fn capture_unavailable_import_open_ready_evidence(
+        &self,
+        app: &MiranteWorkbenchApp,
+        snapshot: &ApplicationSnapshot,
+        path: &Path,
+        state: ImportPrepublicationState,
+    ) -> Result<ImportOpenReadyUnavailableEvidence, String> {
+        let verification = self.capture_import_verification_evidence(app)?;
+        if verification
+            != (ImportVerificationEvidenceSnapshot {
+                source_verification_started_runs: 0,
+                source_verification_progress_updates: 0,
+                source_verification_cancelled_runs: 0,
+                source_verification_failed_runs: 0,
+                source_verification_successes: 0,
+            })
+        {
+            return Err(
+                "prepublication import failure overlapped ordinary source verification".to_owned(),
+            );
+        }
+        let readiness = imported_open_ready_readiness(app, snapshot, path);
+        let readiness_is_authentic = !readiness.selected_matches
+            && match state {
+                ImportPrepublicationState::Active => {
+                    !readiness.import_idle && readiness.problem_absent
+                }
+                ImportPrepublicationState::TerminalWorkerFailure => {
+                    readiness.import_idle && !readiness.problem_absent
+                }
+            };
+        if !readiness_is_authentic {
+            return Err("prepublication import failure has incoherent open-ready facts".to_owned());
+        }
+
+        let source_open_token = app
+            .source_open_service
+            .as_ref()
+            .and_then(|service| service.active_token());
+        let pending_install_token = app
+            .pending_source_install
+            .as_ref()
+            .map(|pending| &pending.token);
+        let dataset_open_operations = snapshot
+            .active_operations()
+            .iter()
+            .filter(|token| token.kind() == OperationKind::DatasetOpen)
+            .collect::<Vec<_>>();
+        let dataset_open_operation_count = u64::try_from(dataset_open_operations.len())
+            .map_err(|_| "dataset-open operation count overflowed u64".to_owned())?;
+        let source_open_worker_bound_to_dataset_open_operation =
+            source_open_token.is_some_and(|token| dataset_open_operations.contains(&token));
+        let pending_source_install_bound_to_dataset_open_operation =
+            pending_install_token.is_some_and(|token| dataset_open_operations.contains(&token));
+        if source_open_token.is_some()
+            || pending_install_token.is_some()
+            || dataset_open_operation_count != 0
+        {
+            return Err(
+                "prepublication import failure unexpectedly has dataset-open work".to_owned(),
+            );
+        }
+
+        Ok(ImportOpenReadyUnavailableEvidence {
+            reason: match state {
+                ImportPrepublicationState::Active => {
+                    ImportOpenReadyUnavailableReason::ActiveBeforePublicationDeadline
+                }
+                ImportPrepublicationState::TerminalWorkerFailure => {
+                    ImportOpenReadyUnavailableReason::TerminalWorkerFailureBeforePublication
+                }
+            },
+            readiness,
+            verification,
+            source_open_worker_active: source_open_token.is_some(),
+            pending_source_install: pending_install_token.is_some(),
+            dataset_open_operation_count,
+            source_open_worker_bound_to_dataset_open_operation,
+            pending_source_install_bound_to_dataset_open_operation,
         })
     }
 
@@ -2655,12 +2995,18 @@ impl ProductAutomationController {
         };
         ImportedOpenReadyCommitState {
             active_origin: &mut self.active_import_timing_origin,
+            active_run_origin: &mut self.active_import_run_outcomes_origin,
             active_verification_origin: &mut self.active_import_verification_diagnostics_origin,
             completed_primary: &mut self.completed_import_primary_measurement,
-            completed_publication: &mut self.completed_publication_to_open_ready_measurement,
-            captured_publication_evidence: &mut self.captured_import_publication_evidence,
+            open_ready_outcome: &mut self.imported_open_ready_outcome,
         }
-        .commit(measurement, publication_measurement, publication_evidence);
+        .commit(
+            measurement,
+            ImportedOpenReadyOutcome::Complete {
+                measurement: publication_measurement,
+                evidence: publication_evidence,
+            },
+        );
         Ok(measurement)
     }
 
@@ -2725,6 +3071,13 @@ impl ProductAutomationController {
             .iter()
             .map(|observation| self.product_gate_target_met(app, &snapshot, &observation.target))
             .collect::<Vec<_>>();
+        let import_prepublication = self.import_prepublication_state(app);
+        let terminal_failures = observations
+            .iter()
+            .map(|observation| {
+                terminal_import_failure_for_target(&observation.target, import_prepublication)
+            })
+            .collect::<Vec<_>>();
         // Timestamp after the bounded predicate snapshot so a sample whose
         // collection crosses its deadline cannot receive an early pass.
         let now = Instant::now();
@@ -2749,6 +3102,7 @@ impl ProductAutomationController {
             latch_product_gate_batch_observations(
                 observations,
                 &condition_states,
+                &terminal_failures,
                 observed_after_origin_ns,
                 &mut active.outcomes,
             )?
@@ -2777,12 +3131,26 @@ impl ProductAutomationController {
                     self.complete_imported_open_ready_measurement_at(app, path, now)?;
                 }
                 ProductGateObservationOutcome::Failed => {
-                    if let Some(publication_evidence) = authentic_failed_import_publication_evidence(
-                        self.capture_bound_import_publication_evidence(app, path),
-                    ) {
-                        self.captured_import_publication_evidence = Some(publication_evidence);
-                        self.active_import_verification_diagnostics_origin = None;
-                    }
+                    self.imported_open_ready_outcome = Some(
+                        match classify_failed_import_publication_capture(
+                            self.capture_bound_import_publication_evidence(app, path),
+                            import_prepublication,
+                        )? {
+                            FailedImportPublicationCapture::Available(evidence) => {
+                                ImportedOpenReadyOutcome::DeadlineFailedAfterTransfer { evidence }
+                            }
+                            FailedImportPublicationCapture::UnavailableBeforeTransfer(state) => {
+                                ImportedOpenReadyOutcome::DeadlineFailedBeforeTransfer {
+                                    evidence: self.capture_unavailable_import_open_ready_evidence(
+                                        app, &snapshot, path, state,
+                                    )?,
+                                }
+                            }
+                        },
+                    );
+                    self.active_import_timing_origin = None;
+                    self.active_import_run_outcomes_origin = None;
+                    self.active_import_verification_diagnostics_origin = None;
                 }
             }
         }
@@ -3125,6 +3493,9 @@ impl ProductAutomationController {
                         "reviewed TIFF import has no source-verification service".to_owned()
                     })?
                     .diagnostics();
+                let import_run_outcomes_origin = ImportWorkerRunOutcomeCounters::from_diagnostics(
+                    &app.import.workers.diagnostics(),
+                );
                 app.apply_import_command(
                     ImportCommand::Start {
                         review_id: review.review_id,
@@ -3146,11 +3517,11 @@ impl ProductAutomationController {
                         "reviewed TIFF import has no exact worker timing origin".to_owned()
                     })?;
                 self.active_import_timing_origin = Some(timing_origin.clone());
+                self.active_import_run_outcomes_origin = Some(import_run_outcomes_origin);
                 self.active_import_verification_diagnostics_origin =
                     Some(verification_diagnostics_origin);
                 self.completed_import_primary_measurement = None;
-                self.completed_publication_to_open_ready_measurement = None;
-                self.captured_import_publication_evidence = None;
+                self.imported_open_ready_outcome = None;
                 self.completed_import_pre_start_measurement = Some(pre_start_measurement);
                 self.active_import_pre_start_origin = None;
                 Ok(CommandProgress::Done(json!({
@@ -5030,8 +5401,7 @@ impl ProductAutomationController {
             "inspection_and_review_clock": import_pre_start_measurement_json(self.completed_import_pre_start_measurement),
             "primary_clock": import_primary_measurement_json(self.completed_import_primary_measurement),
             "publication_to_open_ready_clock": import_publication_to_open_ready_measurement_json(
-                self.completed_publication_to_open_ready_measurement,
-                self.captured_import_publication_evidence,
+                self.imported_open_ready_outcome,
             ),
             "last_successful_receipt": diagnostics
                 .last_successful_import
@@ -5400,15 +5770,48 @@ fn import_pre_start_measurement_json(measurement: Option<ImportPreStartMeasureme
 }
 
 fn import_publication_to_open_ready_measurement_json(
-    measurement: Option<ImportPublicationToOpenReadyMeasurement>,
-    evidence: Option<ImportPublicationEvidenceSnapshot>,
+    outcome: Option<ImportedOpenReadyOutcome>,
 ) -> Value {
-    let Some(evidence) = evidence else {
-        debug_assert!(measurement.is_none());
+    let Some(outcome) = outcome else {
         return Value::Null;
+    };
+    if let ImportedOpenReadyOutcome::DeadlineFailedBeforeTransfer { evidence } = outcome {
+        return json!({
+            "status": outcome.status(),
+            "unavailable_reason": evidence.reason.name(),
+            "readiness": {
+                "selected_matches": evidence.readiness.selected_matches,
+                "verified": evidence.readiness.verified,
+                "import_idle": evidence.readiness.import_idle,
+                "problem_absent": evidence.readiness.problem_absent,
+            },
+            "source_verification_deltas": {
+                "started_runs": evidence.verification.source_verification_started_runs,
+                "progress_updates": evidence.verification.source_verification_progress_updates,
+                "cancelled_runs": evidence.verification.source_verification_cancelled_runs,
+                "failed_runs": evidence.verification.source_verification_failed_runs,
+                "successes": evidence.verification.source_verification_successes,
+            },
+            "source_open_state": {
+                "worker_active": evidence.source_open_worker_active,
+                "pending_install": evidence.pending_source_install,
+                "active_dataset_open_operations": evidence.dataset_open_operation_count,
+                "worker_bound_to_dataset_open_operation": evidence.source_open_worker_bound_to_dataset_open_operation,
+                "pending_install_bound_to_dataset_open_operation": evidence.pending_source_install_bound_to_dataset_open_operation,
+            },
+        });
+    }
+    let (measurement, evidence) = match outcome {
+        ImportedOpenReadyOutcome::Complete {
+            measurement,
+            evidence,
+        } => (Some(measurement), evidence),
+        ImportedOpenReadyOutcome::DeadlineFailedAfterTransfer { evidence } => (None, evidence),
+        ImportedOpenReadyOutcome::DeadlineFailedBeforeTransfer { .. } => unreachable!(),
     };
     let currentness = evidence.publication_currentness;
     let mut result = json!({
+        "status": outcome.status(),
         "publication_currentness_execution": {
             "contract_id": currentness.contract_id,
             "expected_snapshot_object_reads": currentness.expected_snapshot_object_reads,

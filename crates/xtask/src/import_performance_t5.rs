@@ -47,7 +47,7 @@ use crate::{
     },
     process::cargo_command,
     product_validate::{
-        PRODUCT_AUTOMATION_SCRIPT_SCHEMA, SCRIPT_SCHEMA_VERSION,
+        IMPORT_OPEN_READY_COMPLETE_STATUS, PRODUCT_AUTOMATION_SCRIPT_SCHEMA, SCRIPT_SCHEMA_VERSION,
         canonical_product_automation_hard_safety_limits,
         validate_product_automation_report_contract,
     },
@@ -2380,6 +2380,16 @@ fn source_inventory(root: &Path, cancelled: &AtomicBool) -> anyhow::Result<Inven
     })
 }
 
+fn successful_publication_to_open_ready_clock(report: &Value) -> anyhow::Result<&Value> {
+    let clock = report
+        .pointer("/import_workflow_evidence/publication_to_open_ready_clock")
+        .context("T5 automation report lacks publication-to-open-ready clock evidence")?;
+    if clock.get("status").and_then(Value::as_str) != Some(IMPORT_OPEN_READY_COMPLETE_STATUS) {
+        bail!("T5 successful workflow does not carry complete open-ready transfer evidence");
+    }
+    Ok(clock)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_sample(
     sample_index: usize,
@@ -2512,9 +2522,7 @@ fn run_sample(
     let inspection_and_review = automation_report
         .pointer("/import_workflow_evidence/inspection_and_review_clock")
         .context("T5 automation report lacks separate inspection/review-clock evidence")?;
-    let publication_to_open_ready = automation_report
-        .pointer("/import_workflow_evidence/publication_to_open_ready_clock")
-        .context("T5 automation report lacks publication-to-open-ready clock evidence")?;
+    let publication_to_open_ready = successful_publication_to_open_ready_clock(&automation_report)?;
     if inspection_and_review
         .get("start_boundary")
         .and_then(Value::as_str)
@@ -2613,7 +2621,12 @@ fn run_sample(
         .pointer("/import_workflow_evidence/last_successful_receipt")
         .context("T5 automation report lacks the full successful receipt")?;
     let (reviewed_source_fingerprint_sha256, reviewed_source_bytes) =
-        validate_successful_receipt_binding(&automation_report, receipt, &destination)?;
+        validate_successful_receipt_binding(
+            &automation_report,
+            publication_to_open_ready,
+            receipt,
+            &destination,
+        )?;
     let receipt_package_id = receipt
         .get("package_id")
         .and_then(Value::as_str)
@@ -3365,6 +3378,7 @@ fn validate_navigation_evidence(report: &Value) -> anyhow::Result<()> {
 
 fn validate_successful_receipt_binding(
     report: &Value,
+    open_ready_clock: &Value,
     receipt: &Value,
     destination: &Path,
 ) -> anyhow::Result<(String, u64)> {
@@ -3388,9 +3402,6 @@ fn validate_successful_receipt_binding(
         .context("T5 successful receipt lacks its Published-event timing")?;
     let published_epoch_ms = required_u64(published_event, "published_at_epoch_ms")?;
     required_u64(published_event, "process_cpu_time_ns")?;
-    let open_ready_clock = report
-        .pointer("/import_workflow_evidence/publication_to_open_ready_clock")
-        .context("T5 successful receipt lacks its publication-to-open-ready clock")?;
     if required_u64(open_ready_clock, "published_at_epoch_ms")? != published_epoch_ms {
         bail!("T5 receipt Published event differs from its open-ready-clock origin");
     }
@@ -5535,6 +5546,7 @@ mod tests {
         let report = json!({
             "import_workflow_evidence": {
                 "publication_to_open_ready_clock": {
+                    "status": IMPORT_OPEN_READY_COMPLETE_STATUS,
                     "published_at_epoch_ms": 20,
                 },
             },
@@ -5557,14 +5569,24 @@ mod tests {
                 }
             ],
         });
+        let open_ready = successful_publication_to_open_ready_clock(&report).unwrap();
         assert_eq!(
-            validate_successful_receipt_binding(&report, &receipt, destination).unwrap(),
+            validate_successful_receipt_binding(&report, open_ready, &receipt, destination)
+                .unwrap(),
             (source_fingerprint.clone(), source_bytes),
         );
 
+        let mut unavailable = report.clone();
+        unavailable["import_workflow_evidence"]["publication_to_open_ready_clock"] = json!({
+            "status": "open_ready_deadline_failed_before_transfer",
+        });
+        assert!(successful_publication_to_open_ready_clock(&unavailable).is_err());
+
         let mut stale = receipt.clone();
         stale["operation_token"]["task_id"] = json!(99);
-        assert!(validate_successful_receipt_binding(&report, &stale, destination).is_err());
+        assert!(
+            validate_successful_receipt_binding(&report, open_ready, &stale, destination).is_err()
+        );
     }
 
     #[test]

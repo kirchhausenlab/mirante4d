@@ -25,6 +25,7 @@ pub(crate) const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-aut
 pub(crate) const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
 pub(crate) const SCRIPT_SCHEMA_VERSION: u32 = 5;
 pub(crate) const REPORT_SCHEMA_VERSION: u32 = 6;
+pub(crate) const IMPORT_OPEN_READY_COMPLETE_STATUS: &str = "open_ready_complete";
 pub(crate) const PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS: [&str; 12] = [
     "max_cpu_total_bytes",
     "max_cpu_decoded_residency_bytes",
@@ -1481,7 +1482,9 @@ fn import_preprocessing_evidence(automation_report: Option<&Value>) -> Result<Va
         .ok_or_else(|| {
             "import scenario is missing publication-to-open-ready transfer evidence".to_owned()
         })?;
-    if transfer.get("transfer_mode").and_then(Value::as_str) != Some("staged_verified_capability")
+    if transfer.get("status").and_then(Value::as_str) != Some(IMPORT_OPEN_READY_COMPLETE_STATUS)
+        || transfer.get("transfer_mode").and_then(Value::as_str)
+            != Some("staged_verified_capability")
         || transfer
             .get("included_in_primary_clock")
             .and_then(Value::as_bool)
