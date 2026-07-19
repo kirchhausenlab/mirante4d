@@ -18,6 +18,7 @@ mod import_performance;
 mod import_performance_t5;
 mod package;
 mod process;
+mod product_automation_progress;
 mod product_validate;
 mod reports;
 mod t5_sentinel_oracle;

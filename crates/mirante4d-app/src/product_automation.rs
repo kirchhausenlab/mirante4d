@@ -55,6 +55,7 @@ use crate::{
 mod capture;
 mod diagnostics;
 mod model;
+mod progress;
 
 use capture::{
     ProductAutomationArtifact, ProductAutomationImageStats, capture_color_image,
@@ -66,6 +67,7 @@ use diagnostics::{
     local_dataset_source_diagnostics_json, local_package_read_diagnostics_json,
 };
 use model::*;
+use progress::ProductAutomationProgressPublisher;
 
 const ENABLE_AUTOMATION_ENV: &str = "MIRANTE4D_ENABLE_AUTOMATION";
 const AUTOMATION_SCRIPT_ENV: &str = "MIRANTE4D_AUTOMATION_SCRIPT";
@@ -1046,6 +1048,7 @@ pub(crate) struct ProductAutomationController {
     script: ProductAutomationScript,
     script_path: PathBuf,
     report_path: PathBuf,
+    progress: Option<ProductAutomationProgressPublisher>,
     command_index: usize,
     command_completed_at: Vec<Option<Instant>>,
     active_dataset_switch: Option<ActiveDatasetSwitch>,
@@ -1380,7 +1383,8 @@ impl ProductAutomationController {
     }
 
     /// Drives one automation step and returns the exactly measured interval
-    /// spent producing qualification-only diagnostic evidence in this UI
+    /// spent producing qualification-only diagnostic and liveness-control
+    /// evidence in this UI
     /// callback. The caller subtracts this sequential interval from the
     /// claim-bearing active UI-update sample; semantic automation commands and
     /// ordinary product work remain inside that sample.
@@ -1393,7 +1397,10 @@ impl ProductAutomationController {
             .set_display_diagnostic_counters_enabled(
                 automation.script.requires_diagnostic_counters(),
             );
-        let status = automation.step(app, ctx);
+        let status = match automation.publish_progress_if_due() {
+            Ok(()) => automation.step(app, ctx),
+            Err(reason) => AutomationStatus::Failed(reason),
+        };
         // Automation submits through the same one-pending/one-latest native
         // pick queue as interactive UI input. The normal pump ran before the
         // automation command in this frame, so pump once more to submit a new
@@ -1404,14 +1411,21 @@ impl ProductAutomationController {
                 ctx.request_repaint();
             }
             AutomationStatus::Waiting { repaint_after } => {
-                if let Some(delay) = repaint_after {
+                if let Some(delay) = automation.progress_repaint_after(repaint_after) {
                     ctx.request_repaint_after(delay);
                 }
             }
-            AutomationStatus::Finished => {
-                automation.write_report_and_close(app, ctx, "passed", None);
-            }
-            AutomationStatus::Failed(reason) => {
+            AutomationStatus::Finished => match automation.publish_progress_closeout() {
+                Ok(()) => automation.write_report_and_close(app, ctx, "passed", None),
+                Err(reason) => {
+                    automation.write_report_and_close(app, ctx, "failed", Some(reason));
+                }
+            },
+            AutomationStatus::Failed(mut reason) => {
+                if let Err(progress_reason) = automation.publish_progress_closeout() {
+                    reason.push_str("; ");
+                    reason.push_str(&progress_reason);
+                }
                 automation.write_report_and_close(app, ctx, "failed", Some(reason));
             }
         }
@@ -1432,7 +1446,8 @@ impl ProductAutomationController {
         let script: ProductAutomationScript = serde_json::from_str(&raw)
             .map_err(|err| anyhow::anyhow!("failed to parse {}: {err}", script_path.display()))?;
         script.validate()?;
-        Ok(Self::new(script, script_path, report_path))
+        let progress = ProductAutomationProgressPublisher::from_env()?;
+        Ok(Self::new(script, script_path, report_path).with_progress(progress))
     }
 
     fn new(script: ProductAutomationScript, script_path: PathBuf, report_path: PathBuf) -> Self {
@@ -1441,6 +1456,7 @@ impl ProductAutomationController {
             script,
             script_path,
             report_path,
+            progress: None,
             command_index: 0,
             command_completed_at: vec![None; command_count],
             active_dataset_switch: None,
@@ -1475,6 +1491,57 @@ impl ProductAutomationController {
             startup_bootstrap_evidence: None,
             qualification_only_ui_overhead_ns: 0,
             report_written: false,
+        }
+    }
+
+    fn with_progress(mut self, progress: Option<ProductAutomationProgressPublisher>) -> Self {
+        self.progress = progress;
+        self
+    }
+
+    fn publish_progress_if_due(&mut self) -> Result<(), String> {
+        let Some(command) = self.script.commands.get(self.command_index) else {
+            return Ok(());
+        };
+        let command_count = self.script.commands.len();
+        let command_index = self.command_index;
+        let command_kind = command.name();
+        let now = Instant::now();
+        let qualification_started = Instant::now();
+        let result = self.progress.as_mut().map_or(Ok(false), |progress| {
+            progress.publish_command_if_due(command_count, command_index, command_kind, now)
+        });
+        self.add_progress_overhead(qualification_started.elapsed());
+        result
+            .map(|_| ())
+            .map_err(|_| "product automation progress publication failed".to_owned())
+    }
+
+    fn publish_progress_closeout(&mut self) -> Result<(), String> {
+        let command_count = self.script.commands.len();
+        let now = Instant::now();
+        let qualification_started = Instant::now();
+        let result = self.progress.as_mut().map_or(Ok(()), |progress| {
+            progress.publish_closeout(command_count, now)
+        });
+        self.add_progress_overhead(qualification_started.elapsed());
+        result.map_err(|_| "product automation progress closeout publication failed".to_owned())
+    }
+
+    fn progress_repaint_after(&mut self, requested: Option<Duration>) -> Option<Duration> {
+        let qualification_started = Instant::now();
+        let repaint_after = self.progress.as_ref().map_or(requested, |progress| {
+            progress.clamp_repaint_after(requested, Instant::now())
+        });
+        self.add_progress_overhead(qualification_started.elapsed());
+        repaint_after
+    }
+
+    fn add_progress_overhead(&mut self, elapsed: Duration) {
+        if self.progress.is_some() {
+            self.qualification_only_ui_overhead_ns = self
+                .qualification_only_ui_overhead_ns
+                .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
         }
     }
 
@@ -2303,6 +2370,11 @@ impl ProductAutomationController {
         if self.command_index == command_index {
             self.command_index += 1;
         }
+        let qualification_started = Instant::now();
+        if let Some(progress) = self.progress.as_mut() {
+            progress.observe_command(self.command_index, completed_at);
+        }
+        self.add_progress_overhead(qualification_started.elapsed());
     }
 
     fn cancel_active_dataset_switch(&mut self, app: &mut MiranteWorkbenchApp) -> Option<String> {

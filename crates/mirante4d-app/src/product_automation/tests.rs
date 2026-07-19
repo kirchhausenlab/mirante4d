@@ -2644,6 +2644,31 @@ fn automation_script_rejects_removed_model_inputs() {
 }
 
 #[test]
+fn automation_script_bounds_sleep_frames_for_supervisor_budgeting() {
+    for frames in [0, MAX_SLEEP_FRAMES + 1] {
+        let script: ProductAutomationScript = serde_json::from_value(json!({
+            "schema": AUTOMATION_SCRIPT_SCHEMA,
+            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "hard_safety_limits": {},
+            "scenario": "bounded_sleep_frames",
+            "commands": [{ "command": "sleep_frames", "frames": frames }]
+        }))
+        .unwrap();
+        assert!(script.validate().is_err(), "frames={frames}");
+    }
+
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "bounded_sleep_frames",
+        "commands": [{ "command": "sleep_frames", "frames": MAX_SLEEP_FRAMES }]
+    }))
+    .unwrap();
+    script.validate().unwrap();
+}
+
+#[test]
 fn automation_script_rejects_wrong_schema_version() {
     let script = ProductAutomationScript {
         schema: AUTOMATION_SCRIPT_SCHEMA.to_owned(),

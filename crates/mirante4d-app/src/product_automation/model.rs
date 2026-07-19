@@ -14,6 +14,7 @@ use super::{AUTOMATION_SCHEMA_VERSION, AUTOMATION_SCRIPT_SCHEMA};
 
 pub(super) const MAX_INPUT_SEQUENCE_SAMPLES: u32 = 4_096;
 pub(super) const MAX_INPUT_SEQUENCE_DURATION_MS: u64 = 120_000;
+pub(super) const MAX_SLEEP_FRAMES: u32 = 600;
 pub(super) const MAX_GATE_BATCH_OBSERVATIONS: usize = 64;
 pub(super) const MAX_GATE_DEADLINE_AFTER_ORIGIN_NS: u64 = 7_200_000_000_000;
 pub(super) const MAX_GPU_TIMING_AWAIT_TIMEOUT_MS: u64 = 30_000;
@@ -903,6 +904,11 @@ impl ProductAutomationCommand {
             anyhow::bail!(
                 "await_active_view_gpu_timing timeout_ms must be in 1..={MAX_GPU_TIMING_AWAIT_TIMEOUT_MS}"
             );
+        }
+        if let Self::SleepFrames { frames } = self
+            && !(1..=MAX_SLEEP_FRAMES).contains(frames)
+        {
+            anyhow::bail!("sleep_frames frames must be in 1..={MAX_SLEEP_FRAMES}");
         }
         if let Self::ObserveGateBatch {
             batch_id,

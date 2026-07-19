@@ -543,7 +543,11 @@ fn require_nonsymlink_components(path: &Path, label: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-fn read_bounded_regular_file(path: &Path, max_bytes: u64, label: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn read_bounded_regular_file(
+    path: &Path,
+    max_bytes: u64,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("{label} is unavailable or unreadable"))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
