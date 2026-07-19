@@ -5414,9 +5414,55 @@ fn execute_sample(
     result_root: &Path,
     immutability: &RunImmutabilityBinding,
 ) -> SampleEvidence {
+    execute_sample_with_role_executor(
+        profile,
+        numerical_contract,
+        sample_index,
+        scenario,
+        oracle,
+        result_root,
+        |role, template| {
+            execute_role(
+                profile,
+                (scenario.id == "IP").then_some(import_source),
+                sample_index,
+                scenario,
+                oracle,
+                template,
+                role,
+                app_binary,
+                result_root,
+                immutability,
+            )
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_sample_with_role_executor<F>(
+    profile: &ViewerQualificationProfile,
+    numerical_contract: &NumericalContract,
+    sample_index: u32,
+    scenario: &ScriptScenario,
+    oracle: &OracleScenario,
+    result_root: &Path,
+    mut role_executor: F,
+) -> SampleEvidence
+where
+    F: FnMut(AttemptRole, &AutomationScriptTemplate) -> RoleEvidence,
+{
     let mut instrumented = None;
     let mut control = None;
+    let mut instrumented_phases = None;
     let mut role_launch_order = Vec::with_capacity(2);
+    let expected_manifest = oracle
+        .phases
+        .iter()
+        .find_map(|phase| phase.expected_imported_root_manifest_sha256.as_deref());
+    let import_gate = oracle
+        .phases
+        .iter()
+        .find_map(|phase| phase.import_gate.as_ref());
     let scenario_ordinal = REQUIRED_SCENARIOS
         .iter()
         .position(|id| *id == scenario.id)
@@ -5427,29 +5473,46 @@ fn execute_sample(
             AttemptRole::Instrumented => Some(&scenario.instrumented_script),
             AttemptRole::InstrumentationControl => scenario.instrumentation_control_script.as_ref(),
         };
-        let evidence = template.map_or_else(
+        let mut evidence = template.map_or_else(
             || missing_control_evidence(result_root, sample_index, &scenario.id),
-            |template| {
-                execute_role(
-                    profile,
-                    (scenario.id == "IP").then_some(import_source),
-                    sample_index,
-                    scenario,
-                    oracle,
-                    template,
-                    role,
-                    app_binary,
-                    result_root,
-                    immutability,
-                )
-            },
+            |template| role_executor(role, template),
         );
-        let integrity_failed = has_integrity_reasons(&evidence.reasons);
+        if let Some(expected_manifest) = expected_manifest {
+            validate_imported_manifest_identity(&mut evidence, expected_manifest);
+        }
+        if role == AttemptRole::InstrumentationControl
+            && let Some(import_gate) = import_gate
+        {
+            match evidence.automation_report.as_ref() {
+                Some(report) => validate_import_workflow_gate(
+                    report,
+                    import_gate,
+                    imported_open_ready_outcome(&evidence.product_gate_outcomes),
+                    &mut evidence.reasons,
+                ),
+                None => {
+                    evidence
+                        .reasons
+                        .insert("import_workflow_evidence_missing".to_owned());
+                }
+            }
+        }
+        let phases = (role == AttemptRole::Instrumented)
+            .then(|| evaluate_phases(profile, numerical_contract, scenario, oracle, &evidence));
+        let integrity_failed = has_integrity_reasons(&evidence.reasons)
+            || phases.as_ref().is_some_and(|phases| {
+                phases
+                    .iter()
+                    .any(|phase| has_integrity_reasons(&phase.reasons))
+            });
         if evidence.process.launch_attempted {
             role_launch_order.push(role);
         }
         match role {
-            AttemptRole::Instrumented => instrumented = Some(evidence),
+            AttemptRole::Instrumented => {
+                instrumented = Some(evidence);
+                instrumented_phases = phases;
+            }
             AttemptRole::InstrumentationControl => control = Some(evidence),
         }
         if integrity_failed {
@@ -5472,37 +5535,9 @@ fn execute_sample(
             AttemptRole::InstrumentationControl,
         ));
     }
-    if let Some(expected_manifest) = oracle
-        .phases
-        .iter()
-        .find_map(|phase| phase.expected_imported_root_manifest_sha256.as_deref())
-    {
-        validate_imported_manifest_identity(&mut instrumented, expected_manifest);
-        if let Some(control) = control.as_mut() {
-            validate_imported_manifest_identity(control, expected_manifest);
-        }
-    }
-    if let Some(import_gate) = oracle
-        .phases
-        .iter()
-        .find_map(|phase| phase.import_gate.as_ref())
-        && let Some(control) = control.as_mut()
-    {
-        match control.automation_report.as_ref() {
-            Some(report) => validate_import_workflow_gate(
-                report,
-                import_gate,
-                imported_open_ready_outcome(&control.product_gate_outcomes),
-                &mut control.reasons,
-            ),
-            None => {
-                control
-                    .reasons
-                    .insert("import_workflow_evidence_missing".to_owned());
-            }
-        }
-    }
-    let phases = evaluate_phases(profile, numerical_contract, scenario, oracle, &instrumented);
+    let phases = instrumented_phases.unwrap_or_else(|| {
+        evaluate_phases(profile, numerical_contract, scenario, oracle, &instrumented)
+    });
     let mut reasons = BTreeSet::new();
     let instrumented_qualification_wait_wall_ns = qualification_gpu_timing_await_wall_ns(
         instrumented.automation_report.as_ref(),
@@ -8351,12 +8386,7 @@ fn prepublication_import_start_is_exact(details: &Value) -> bool {
                 "currentness_generation",
             ])
             && token.get("kind").and_then(Value::as_str) == Some("Import")
-            && [
-                "operation_id",
-                "task_id",
-                "source_session_generation",
-                "currentness_generation",
-            ]
+            && ["operation_id", "task_id", "source_session_generation"]
             .iter()
             .all(|field| {
                 token
@@ -8364,6 +8394,10 @@ fn prepublication_import_start_is_exact(details: &Value) -> bool {
                     .and_then(Value::as_u64)
                     .is_some_and(|value| value > 0)
             })
+            && token
+                .get("currentness_generation")
+                .and_then(Value::as_u64)
+                .is_some()
     });
     exact_fields
         && import_u64(&Value::Object(details.clone()), "review_id").is_some_and(|value| value > 0)
@@ -9031,14 +9065,10 @@ fn validate_import_receipt_binding(
         .filter(|value| value.is_object());
     let token_fields_present = receipt_token.is_some_and(|token| {
         token.get("kind").and_then(Value::as_str) == Some("Import")
-            && [
-                "operation_id",
-                "task_id",
-                "source_session_generation",
-                "currentness_generation",
-            ]
+            && ["operation_id", "task_id", "source_session_generation"]
             .iter()
             .all(|field| import_u64(token, field).is_some_and(|value| value > 0))
+            && import_u64(token, "currentness_generation").is_some()
     });
     let start_details = unique_passed_event_details(report, "start_reviewed_import");
     let open_ready_details = unique_imported_open_ready_observation(report);
@@ -13197,6 +13227,112 @@ mod tests {
             .collect()
     }
 
+    fn population_oracle_scenario(scenario: &ScriptScenario) -> OracleScenario {
+        OracleScenario {
+            id: scenario.id.clone(),
+            phases: scenario
+                .phases
+                .iter()
+                .map(|phase| {
+                    let mut oracle = matrix_phase(&scenario.id, "resident_3d_zoom");
+                    oracle.name = phase.name.clone();
+                    oracle
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn role_integrity_stops_the_balanced_mate_without_suppressing_product_failures() {
+        let profile = profile();
+        let numerical = numerical_contract();
+        let scenario = population_scripts()
+            .scenarios
+            .into_iter()
+            .find(|scenario| scenario.id == "RZ")
+            .unwrap();
+        let oracle = population_oracle_scenario(&scenario);
+        let result_root = Path::new("/private/result");
+
+        let mut control_first_calls = Vec::new();
+        let control_first = execute_sample_with_role_executor(
+            &profile,
+            &numerical,
+            1,
+            &scenario,
+            &oracle,
+            result_root,
+            |role, _| {
+                control_first_calls.push(role);
+                let mut evidence = population_role(role, "RZ", 8);
+                evidence
+                    .reasons
+                    .insert("automation_report_missing_or_invalid".to_owned());
+                evidence
+            },
+        );
+        assert_eq!(
+            control_first_calls,
+            vec![AttemptRole::InstrumentationControl]
+        );
+        assert!(
+            control_first
+                .instrumented
+                .reasons
+                .contains("population_aborted_after_integrity_failure")
+        );
+
+        let mut instrumented_first_calls = Vec::new();
+        let instrumented_first = execute_sample_with_role_executor(
+            &profile,
+            &numerical,
+            2,
+            &scenario,
+            &oracle,
+            result_root,
+            |role, _| {
+                instrumented_first_calls.push(role);
+                population_role(role, "RZ", 8)
+            },
+        );
+        assert_eq!(instrumented_first_calls, vec![AttemptRole::Instrumented]);
+        assert!(
+            instrumented_first
+                .control
+                .as_ref()
+                .unwrap()
+                .reasons
+                .contains("population_aborted_after_integrity_failure")
+        );
+
+        let mut product_failure_calls = Vec::new();
+        execute_sample_with_role_executor(
+            &profile,
+            &numerical,
+            1,
+            &scenario,
+            &oracle,
+            result_root,
+            |role, _| {
+                product_failure_calls.push(role);
+                let mut evidence = population_role(role, "RZ", 8);
+                if role == AttemptRole::InstrumentationControl {
+                    evidence
+                        .reasons
+                        .insert("main_loop_gap_gate_exceeded".to_owned());
+                }
+                evidence
+            },
+        );
+        assert_eq!(
+            product_failure_calls,
+            vec![
+                AttemptRole::InstrumentationControl,
+                AttemptRole::Instrumented
+            ]
+        );
+    }
+
     #[test]
     fn import_source_inventory_accepts_the_exact_workload_binding() {
         let source_root = tempfile::tempdir().unwrap();
@@ -15075,6 +15211,16 @@ mod tests {
             assert!(reasons.is_empty(), "{terminal_failure}: {reasons:?}");
         }
 
+        let mut initial_currentness = prepublication_import_workflow_report(true);
+        initial_currentness["events"][0]["details"]["operation_token"]
+            ["currentness_generation"] = json!(0);
+        let reasons = import_workflow_gate_reasons_with_outcome(
+            &initial_currentness,
+            &test_import_gate(),
+            ProductGateStatus::Failed,
+        );
+        assert!(reasons.is_empty(), "{reasons:?}");
+
         let mut mixed = prepublication_import_workflow_report(true);
         mixed["import_workflow_evidence"]["failed_runs"] = json!(0);
         let reasons = import_workflow_gate_reasons_with_outcome(
@@ -15095,6 +15241,17 @@ mod tests {
             )
             .contains("prepublication_import_failure_evidence_shape_invalid")
         );
+    }
+
+    #[test]
+    fn published_import_receipt_accepts_the_authentic_initial_currentness_generation() {
+        let mut report = valid_import_workflow_report();
+        report["events"][0]["details"]["operation_token"]["currentness_generation"] =
+            json!(0);
+        report["import_workflow_evidence"]["last_successful_receipt"]["operation_token"]
+            ["currentness_generation"] = json!(0);
+        let reasons = import_workflow_gate_reasons(&report);
+        assert!(reasons.is_empty(), "{reasons:?}");
     }
 
     #[test]
