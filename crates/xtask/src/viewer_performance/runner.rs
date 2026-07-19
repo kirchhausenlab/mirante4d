@@ -18083,6 +18083,32 @@ mod tests {
         assert!(reasons.contains("product_gate_observation_population_mismatch"));
         assert!(reasons.contains("product_gate_observation_identity_mismatch"));
 
+        let mut duplicate_gate = complete_population_samples();
+        let duplicated = duplicate_gate[0].instrumented.product_gate_outcomes[0].clone();
+        duplicate_gate[0]
+            .instrumented
+            .product_gate_outcomes
+            .push(duplicated);
+        let mut reasons = BTreeSet::new();
+        validate_attempt_population(&profile, &scripts, &duplicate_gate, &mut reasons);
+        assert!(reasons.contains("product_gate_observation_population_mismatch"));
+        assert!(reasons.contains("product_gate_observation_identity_mismatch"));
+
+        let mut reordered_gates = complete_population_samples();
+        reordered_gates[0]
+            .instrumented
+            .product_gate_outcomes
+            .swap(0, 1);
+        let mut reasons = BTreeSet::new();
+        validate_attempt_population(&profile, &scripts, &reordered_gates, &mut reasons);
+        assert!(reasons.contains("product_gate_observation_identity_mismatch"));
+
+        let mut incoherent_gate = complete_population_samples();
+        incoherent_gate[0].instrumented.product_gate_outcomes[0].condition_met = false;
+        let mut reasons = BTreeSet::new();
+        validate_attempt_population(&profile, &scripts, &incoherent_gate, &mut reasons);
+        assert!(reasons.contains("product_gate_observation_identity_mismatch"));
+
         let mut duplicate_identity = complete_population_samples();
         duplicate_identity[29].sample_index = duplicate_identity[0].sample_index;
         duplicate_identity[29].scenario = duplicate_identity[0].scenario.clone();
