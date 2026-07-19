@@ -65,6 +65,12 @@ const PROCESS_CLOSEOUT_GRACE_NS: u64 = 10_000_000_000;
 const SOURCE_VERIFICATION_QUIESCENCE_TIMEOUT_MS: u64 = 5_000;
 const GPU_TIMING_AWAIT_TIMEOUT_MS: u64 = 5_000;
 const CONFORMANCE_TIMEOUT: Duration = Duration::from_secs(30);
+// The product-gate deadline governs the scientific observation. Once that
+// deadline is reached, the app still has to finalize all rows, append the
+// event, publish a heartbeat, and return to the command loop. Keep that
+// reporting tail separately bounded so it cannot change the gate result or
+// race healthy real-display closeout.
+const PRODUCT_GATE_PROGRESS_CLOSEOUT_BUDGET: Duration = Duration::from_secs(5);
 const ATTEMPT_ROOT_PLACEHOLDER: &str = "${ATTEMPT_ROOT}";
 const WORKLOAD_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const SCRIPT_BUNDLE_MAX_BYTES: u64 = 32 * 1024 * 1024;
@@ -4321,7 +4327,10 @@ fn viewer_progress_plan(commands: &[Value]) -> anyhow::Result<ProductAutomationP
             .map(|observation| observation.deadline_after_origin_ns)
             .max()
             .context("validated product-gate batch is empty")?;
-        plan.set_command_budget(batch.command_index, Duration::from_nanos(maximum))?;
+        plan.set_command_budget(
+            batch.command_index,
+            Duration::from_nanos(maximum).saturating_add(PRODUCT_GATE_PROGRESS_CLOSEOUT_BUDGET),
+        )?;
     }
     Ok(plan)
 }
@@ -19344,7 +19353,7 @@ mod tests {
             json!({ "command": "quit" }),
         ])
         .unwrap();
-        assert_eq!(plan.command_budget(1), Some(Duration::from_secs(2)));
+        assert_eq!(plan.command_budget(1), Some(Duration::from_secs(7)));
     }
 
     #[test]
