@@ -1193,6 +1193,13 @@ path has a measured negligible cost. Keep both classes small and asynchronous:
 - peak accounted queues, handles, CPU bytes, upload bytes, and GPU bytes; and
 - durable project/view commits during each interaction gesture.
 
+For the bounded active-input gap populations, an exactly present, reconciled,
+empty ring records a maximum gap of zero: every admitted generation became
+current before another main-loop heartbeat. A missing, malformed, or
+overwritten ring remains an evidence-integrity failure; an exactly empty
+admitted-generation completion population remains a negative latency-gate
+result rather than a missing metric.
+
 The canonical gesture-end authority is the application snapshot currentness
 generation, which exists for both provisional unbound viewing and bound
 projects. Project revision and undo/history counters corroborate that authority

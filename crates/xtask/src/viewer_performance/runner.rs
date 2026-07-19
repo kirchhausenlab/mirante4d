@@ -9687,13 +9687,9 @@ fn validate_interaction_metrics(
     check_max_gate(
         admitted_latency
             .as_deref()
-            .and_then(|samples| samples.iter().copied().max())
+            .map(phase_maximum_or_zero)
             .into_iter()
-            .chain(
-                presentation_gap
-                    .as_deref()
-                    .and_then(|samples| samples.iter().copied().max()),
-            )
+            .chain(presentation_gap.as_deref().map(phase_maximum_or_zero))
             .max(),
         profile.absolute_gates.maximum_current_presentation_gap_ns,
         "presentation_gap_metric_missing",
@@ -9701,9 +9697,7 @@ fn validate_interaction_metrics(
         reasons,
     );
     check_max_gate(
-        main_loop_gap
-            .as_deref()
-            .and_then(|samples| samples.iter().copied().max()),
+        main_loop_gap.as_deref().map(phase_maximum_or_zero),
         profile.absolute_gates.maximum_main_loop_heartbeat_gap_ns,
         "main_loop_gap_metric_missing",
         "main_loop_gap_gate_exceeded",
@@ -9751,6 +9745,14 @@ fn validate_interaction_metrics(
                 .insert("ui_update_qualification_automation_exclusion_contract_missing".to_owned());
         }
     }
+}
+
+/// An exact empty active-gap population means that every admitted generation
+/// became current before another main-loop heartbeat was observed. The
+/// maximum active gap is therefore zero; only an absent, malformed, or
+/// overwritten ring is missing evidence.
+fn phase_maximum_or_zero(samples: &[u64]) -> u64 {
+    samples.iter().copied().max().unwrap_or(0)
 }
 
 /// Returns only the samples recorded after the start checkpoint. Ring
@@ -16021,6 +16023,20 @@ mod tests {
         );
         assert!(reasons.contains("resident_input_latency_gate_exceeded"));
         assert!(!reasons.contains("resident_input_latency_metric_missing"));
+
+        let mut exact_empty_active_gap_populations = valid.clone();
+        exact_empty_active_gap_populations["render"]["display_coordination"]["active_input_presentation_gap_ns"]
+            ["samples"] = timing_ring(0, &[]);
+        exact_empty_active_gap_populations["render"]["display_coordination"]["active_input_main_loop_gap_ns"]
+            ["samples"] = timing_ring(0, &[]);
+        reasons.clear();
+        validate_interaction_metrics(
+            &start,
+            &exact_empty_active_gap_populations,
+            &profile,
+            &mut reasons,
+        );
+        assert!(reasons.is_empty());
 
         let mut semantic_only = valid;
         semantic_only["render"]["display_coordination"]["active_ui_update_duration"] = Value::Null;
