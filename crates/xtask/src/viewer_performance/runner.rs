@@ -7701,7 +7701,6 @@ fn evaluate_phase(
                         .phase_start_target_residency
                         .as_ref()
                         .expect("nonresident oracle validation requires a residency partition"),
-                    &oracle.unique_work.target_union,
                     &mut reasons,
                 );
             }
@@ -9721,16 +9720,25 @@ fn validate_current_complete(diagnostics: &Value, reasons: &mut BTreeSet<String>
 
 fn validate_scale(diagnostics: &Value, expected: u32, reasons: &mut BTreeSet<String>) {
     let expected = u64::from(expected);
-    let target = diagnostics
-        .pointer("/render/frame_fidelity/target_scale_level")
-        .and_then(Value::as_u64);
-    let displayed = diagnostics
-        .pointer("/render/frame_fidelity/displayed_scale_level")
-        .and_then(Value::as_u64);
-    if target.is_none() || displayed.is_none() {
-        reasons.insert("target_or_displayed_scale_mismatch_or_missing".to_owned());
-    } else if target != Some(expected) || displayed != Some(expected) {
-        reasons.insert("product_gate_target_or_displayed_scale_mismatch".to_owned());
+    let optional_scale = |pointer| match diagnostics.pointer(pointer) {
+        Some(value) if value.is_null() => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or(()),
+        None => Err(()),
+    };
+    match (
+        optional_scale("/render/frame_fidelity/target_scale_level"),
+        optional_scale("/render/frame_fidelity/displayed_scale_level"),
+    ) {
+        (Ok(Some(target)), Ok(Some(displayed))) if target == expected && displayed == expected => {}
+        (Ok(_), Ok(_)) => {
+            // These are Option<u32> product facts. Explicit null means that
+            // the requested scale did not reach presentation; absence or a
+            // non-Option-shaped value remains invalid evidence below.
+            reasons.insert("product_gate_target_or_displayed_scale_mismatch".to_owned());
+        }
+        _ => {
+            reasons.insert("target_or_displayed_scale_mismatch_or_missing".to_owned());
+        }
     }
 }
 
@@ -10036,8 +10044,8 @@ fn validate_settlement_gate(
         reasons.insert("coordinated_milestone_scope_or_generation_mismatch".to_owned());
     }
     for (field, maximum) in checks {
-        check_max_gate(
-            milestone_ns(milestones.and_then(|value| value.get(*field))),
+        check_settlement_gate(
+            milestones.and_then(|value| value.get(*field)),
             *maximum,
             "coordinated_settlement_milestone_missing",
             "coordinated_settlement_gate_exceeded",
@@ -10081,8 +10089,8 @@ fn validate_settlement_gate(
             continue;
         };
         for (field, maximum) in checks {
-            check_max_gate(
-                milestone_ns(panel.get(*field)),
+            check_settlement_gate(
+                panel.get(*field),
                 *maximum,
                 "visible_panel_settlement_milestone_missing",
                 "visible_panel_settlement_gate_exceeded",
@@ -10112,8 +10120,8 @@ fn validate_settlement_gate(
         }
         for layer in layers {
             for (field, maximum) in checks {
-                check_max_gate(
-                    milestone_ns(layer.get(*field)),
+                check_settlement_gate(
+                    layer.get(*field),
                     *maximum,
                     "visible_layer_settlement_milestone_missing",
                     "visible_layer_settlement_gate_exceeded",
@@ -10122,6 +10130,29 @@ fn validate_settlement_gate(
             }
         }
     }
+}
+
+fn check_settlement_gate(
+    observed: Option<&Value>,
+    maximum: u64,
+    missing_reason: &str,
+    exceeded_reason: &str,
+    reasons: &mut BTreeSet<String>,
+) {
+    if observed.is_some_and(Value::is_null) {
+        // Milestones are Option<f64> facts. An explicit null is an
+        // authoritative statement that the product never reached the
+        // milestone, so it is a failed gate rather than missing evidence.
+        reasons.insert(exceeded_reason.to_owned());
+        return;
+    }
+    check_max_gate(
+        milestone_ns(observed),
+        maximum,
+        missing_reason,
+        exceeded_reason,
+        reasons,
+    );
 }
 
 fn milestone_ns(value: Option<&Value>) -> Option<u64> {
@@ -10595,7 +10626,6 @@ fn validate_nonresident_target_residency(
     end_checkpoint: &Value,
     start_label: &str,
     expected: &PhaseStartTargetResidencyExpectation,
-    target: &ExactResourceUnion,
     reasons: &mut BTreeSet<String>,
 ) {
     let start_residency = start_checkpoint.pointer("/resource_accounting/exact_gpu_resident_union");
@@ -10628,6 +10658,14 @@ fn validate_nonresident_target_residency(
         reasons.insert("phase_start_exact_gpu_resident_union_authority_missing".to_owned());
     }
     let proof = end_checkpoint.pointer("/resource_accounting/target_residency_at_phase_start");
+    let observed_target_sha256 = end_checkpoint
+        .pointer("/resource_accounting/exact_cross_scope_union/canonical_entries_sha256")
+        .and_then(Value::as_str)
+        .filter(|digest| require_sha256(digest, "observed endpoint target union").is_ok());
+    let proof_target_sha256 = proof
+        .and_then(|value| value.get("target_union_sha256"))
+        .and_then(Value::as_str)
+        .filter(|digest| require_sha256(digest, "nonresident target union proof").is_ok());
     if proof
         .and_then(|value| value.get("available"))
         .and_then(Value::as_bool)
@@ -10640,10 +10678,8 @@ fn validate_nonresident_target_residency(
             .and_then(|value| value.get("phase_start_resident_union_sha256"))
             .and_then(Value::as_str)
             != start_residency_sha256
-        || proof
-            .and_then(|value| value.get("target_union_sha256"))
-            .and_then(Value::as_str)
-            != Some(target.canonical_entries_sha256.as_str())
+        || proof_target_sha256.is_none()
+        || proof_target_sha256 != observed_target_sha256
         || proof
             .and_then(|value| value.get("partitions_pairwise_disjoint"))
             .and_then(Value::as_bool)
@@ -10682,7 +10718,8 @@ fn validate_nonresident_target_residency(
         let observed = proof.and_then(|value| value.get(partition));
         let observed_digest = observed
             .and_then(|value| value.get("canonical_entries_sha256"))
-            .and_then(Value::as_str);
+            .and_then(Value::as_str)
+            .filter(|digest| require_sha256(digest, "nonresident target partition proof").is_ok());
         let observed_keys = observed
             .and_then(|value| value.get("unique_keys"))
             .and_then(Value::as_u64);
@@ -10959,11 +10996,16 @@ fn per_target_counter_sum(diagnostics: &Value, field: &str) -> Option<u64> {
     let visible_total = targets.iter().try_fold(0_u64, |total, target| {
         total.checked_add(target.get(field)?.as_u64()?)
     })?;
-    let staging = detailed.get("staging_3d_renderer_facts")?;
-    if staging.get("purpose").and_then(Value::as_str) != Some("hidden_staging_3d_fallback_target") {
-        return None;
+    match detailed.get("staging_3d_renderer_facts")? {
+        Value::Null => Some(visible_total),
+        staging
+            if staging.get("purpose").and_then(Value::as_str)
+                == Some("hidden_staging_3d_fallback_target") =>
+        {
+            visible_total.checked_add(staging.get(field)?.as_u64()?)
+        }
+        _ => None,
     }
-    visible_total.checked_add(staging.get(field)?.as_u64()?)
 }
 
 fn check_pointer_delta(
@@ -15243,10 +15285,27 @@ mod tests {
         validate_interaction_metrics(&json!({}), &json!({}), &profile, &mut reasons);
         assert!(reasons.contains("interaction_metrics_missing"));
 
+        let mut diagnostics = complete_milestones();
+        diagnostics["render"]["performance_milestones"]["target_settled_ms"] = Value::Null;
         reasons.clear();
         validate_settlement_gate(
-            &json!({ "render": { "performance_milestones": { "target_settled_ms": null } } }),
-            SettlementGate::ColdTarget,
+            &diagnostics,
+            SettlementGate::NonresidentTarget,
+            &phase_state(),
+            &profile,
+            &mut reasons,
+        );
+        assert!(reasons.contains("coordinated_settlement_gate_exceeded"));
+        assert!(!reasons.contains("coordinated_settlement_milestone_missing"));
+
+        diagnostics["render"]["performance_milestones"]
+            .as_object_mut()
+            .unwrap()
+            .remove("target_settled_ms");
+        reasons.clear();
+        validate_settlement_gate(
+            &diagnostics,
+            SettlementGate::NonresidentTarget,
             &phase_state(),
             &profile,
             &mut reasons,
@@ -15284,6 +15343,51 @@ mod tests {
         reasons.clear();
         validate_current_complete(&diagnostics, &mut reasons);
         assert!(reasons.contains("current_presentation_generation_mismatch_or_missing"));
+    }
+
+    #[test]
+    fn explicit_absent_scale_is_a_product_failure_but_malformed_scale_is_integrity() {
+        let diagnostics = |target: Value, displayed: Value| {
+            json!({ "render": { "frame_fidelity": {
+                "target_scale_level": target,
+                "displayed_scale_level": displayed,
+            }}})
+        };
+        let mut reasons = BTreeSet::new();
+        validate_scale(&diagnostics(json!(3), json!(3)), 3, &mut reasons);
+        assert!(reasons.is_empty());
+
+        validate_scale(&diagnostics(json!(3), Value::Null), 3, &mut reasons);
+        assert_eq!(
+            reasons,
+            BTreeSet::from(["product_gate_target_or_displayed_scale_mismatch".to_owned()])
+        );
+
+        reasons.clear();
+        validate_scale(&diagnostics(json!(2), json!(3)), 3, &mut reasons);
+        assert_eq!(
+            reasons,
+            BTreeSet::from(["product_gate_target_or_displayed_scale_mismatch".to_owned()])
+        );
+
+        let mut missing = diagnostics(json!(3), json!(3));
+        missing["render"]["frame_fidelity"]
+            .as_object_mut()
+            .unwrap()
+            .remove("displayed_scale_level");
+        reasons.clear();
+        validate_scale(&missing, 3, &mut reasons);
+        assert_eq!(
+            reasons,
+            BTreeSet::from(["target_or_displayed_scale_mismatch_or_missing".to_owned()])
+        );
+
+        reasons.clear();
+        validate_scale(&diagnostics(Value::Null, json!("3")), 3, &mut reasons);
+        assert_eq!(
+            reasons,
+            BTreeSet::from(["target_or_displayed_scale_mismatch_or_missing".to_owned()])
+        );
     }
 
     #[test]
@@ -15586,17 +15690,73 @@ mod tests {
         assert!(reasons.contains("product_gate_visible_panel_milestone_set_mismatch"));
 
         let mut diagnostics = complete_milestones();
+        diagnostics["render"]["performance_milestones"]["target_settled_ms"] = Value::Null;
+        reasons.clear();
+        validate_settlement_gate(
+            &diagnostics,
+            SettlementGate::NonresidentTarget,
+            &state,
+            &profile,
+            &mut reasons,
+        );
+        assert!(reasons.contains("coordinated_settlement_gate_exceeded"));
+        assert!(!reasons.contains("coordinated_settlement_milestone_missing"));
+
+        let mut diagnostics = complete_milestones();
+        diagnostics["render"]["performance_milestones"]["visible_panels"][0]["target_settled_ms"] =
+            Value::Null;
+        reasons.clear();
+        validate_settlement_gate(
+            &diagnostics,
+            SettlementGate::NonresidentTarget,
+            &state,
+            &profile,
+            &mut reasons,
+        );
+        assert!(reasons.contains("visible_panel_settlement_gate_exceeded"));
+        assert!(!reasons.contains("visible_panel_settlement_milestone_missing"));
+
+        let mut diagnostics = complete_milestones();
         diagnostics["render"]["performance_milestones"]["visible_panels"][0]["visible_layers"][0]
             ["target_settled_ms"] = Value::Null;
         reasons.clear();
         validate_settlement_gate(
             &diagnostics,
-            SettlementGate::ColdTarget,
+            SettlementGate::NonresidentTarget,
+            &state,
+            &profile,
+            &mut reasons,
+        );
+        assert!(reasons.contains("visible_layer_settlement_gate_exceeded"));
+        assert!(!reasons.contains("visible_layer_settlement_milestone_missing"));
+
+        diagnostics["render"]["performance_milestones"]["visible_panels"][0]["visible_layers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("target_settled_ms");
+        reasons.clear();
+        validate_settlement_gate(
+            &diagnostics,
+            SettlementGate::NonresidentTarget,
             &state,
             &profile,
             &mut reasons,
         );
         assert!(reasons.contains("visible_layer_settlement_milestone_missing"));
+        assert!(!reasons.contains("visible_layer_settlement_gate_exceeded"));
+
+        let mut malformed = complete_milestones();
+        malformed["render"]["performance_milestones"]["target_settled_ms"] = json!(-1.0);
+        reasons.clear();
+        validate_settlement_gate(
+            &malformed,
+            SettlementGate::NonresidentTarget,
+            &state,
+            &profile,
+            &mut reasons,
+        );
+        assert!(reasons.contains("coordinated_settlement_milestone_missing"));
+        assert!(!reasons.contains("coordinated_settlement_gate_exceeded"));
     }
 
     fn canonical_state_diagnostics(state: &PhaseStateBinding) -> Value {
@@ -15960,6 +16120,44 @@ mod tests {
             &mut reasons,
         );
         assert!(reasons.contains("structural_completion_notifications_fact_missing"));
+
+        let mut start_without_staging = structural_diagnostics(0);
+        let mut end_without_staging = structural_diagnostics(1);
+        start_without_staging["render"]["display_coordination"]["detailed_counters"]["staging_3d_renderer_facts"] =
+            Value::Null;
+        end_without_staging["render"]["display_coordination"]["detailed_counters"]["staging_3d_renderer_facts"] =
+            Value::Null;
+        reasons.clear();
+        validate_structural_ceilings(
+            &start_without_staging,
+            &end_without_staging,
+            DisplayBatchAuthority::CoordinatedDisplayBatch,
+            CancellationWasteAuthority::GenerationBoundSharedBrick,
+            &ceilings,
+            &mut reasons,
+        );
+        assert!(reasons.is_empty());
+
+        end_without_staging["render"]["display_coordination"]["detailed_counters"]
+            .as_object_mut()
+            .unwrap()
+            .remove("staging_3d_renderer_facts");
+        validate_structural_ceilings(
+            &start_without_staging,
+            &end_without_staging,
+            DisplayBatchAuthority::CoordinatedDisplayBatch,
+            CancellationWasteAuthority::GenerationBoundSharedBrick,
+            &ceilings,
+            &mut reasons,
+        );
+        assert_eq!(
+            reasons,
+            BTreeSet::from([
+                "structural_backpressure_deferrals_fact_missing".to_owned(),
+                "structural_command_encoders_fact_missing".to_owned(),
+                "structural_renderer_submissions_fact_missing".to_owned(),
+            ])
+        );
     }
 
     #[test]
@@ -16194,47 +16392,68 @@ mod tests {
             }},
         });
         let mut end = json!({
-            "resource_accounting": { "target_residency_at_phase_start": {
-                "available": true,
-                "phase_start_label": "start",
-                "phase_start_resident_union_sha256": "aa".repeat(32),
-                "target_union_sha256": "22".repeat(32),
-                "resident_target_intersection": {
-                    "canonical_entries_sha256": "cc".repeat(32),
-                    "unique_keys": 0,
-                    "unique_payload_bytes": 0,
+            "resource_accounting": {
+                "exact_cross_scope_union": {
+                    "canonical_entries_sha256": "22".repeat(32),
                 },
-                "nonresident_target_difference": {
-                    "canonical_entries_sha256": "dd".repeat(32),
-                    "unique_keys": 1,
-                    "unique_payload_bytes": 1,
+                "target_residency_at_phase_start": {
+                    "available": true,
+                    "phase_start_label": "start",
+                    "phase_start_resident_union_sha256": "aa".repeat(32),
+                    "target_union_sha256": "22".repeat(32),
+                    "resident_target_intersection": {
+                        "canonical_entries_sha256": "cc".repeat(32),
+                        "unique_keys": 0,
+                        "unique_payload_bytes": 0,
+                    },
+                    "nonresident_target_difference": {
+                        "canonical_entries_sha256": "dd".repeat(32),
+                        "unique_keys": 1,
+                        "unique_payload_bytes": 1,
+                    },
+                    "partitions_pairwise_disjoint": true,
+                    "target_union_reconciles": true,
+                    "derivation": "sorted_target_union_partition_by_phase_start_gpu_residency",
                 },
-                "partitions_pairwise_disjoint": true,
-                "target_union_reconciles": true,
-                "derivation": "sorted_target_union_partition_by_phase_start_gpu_residency",
-            }},
+            },
         });
         let mut reasons = BTreeSet::new();
-        validate_nonresident_target_residency(
-            &start,
-            &end,
-            "start",
-            &expected,
-            &demand.target_union,
-            &mut reasons,
-        );
+        validate_nonresident_target_residency(&start, &end, "start", &expected, &mut reasons);
         assert!(reasons.is_empty());
 
+        end["resource_accounting"]["exact_cross_scope_union"]["canonical_entries_sha256"] =
+            json!("44".repeat(32));
+        end["resource_accounting"]["target_residency_at_phase_start"]["target_union_sha256"] =
+            json!("44".repeat(32));
+        end["resource_accounting"]["target_residency_at_phase_start"]["resident_target_intersection"]
+            ["canonical_entries_sha256"] = json!("ee".repeat(32));
+        end["resource_accounting"]["target_residency_at_phase_start"]["nonresident_target_difference"]
+            ["canonical_entries_sha256"] = json!("ff".repeat(32));
+        reasons.clear();
+        validate_nonresident_target_residency(&start, &end, "start", &expected, &mut reasons);
+        assert!(!reasons.contains("nonresident_target_phase_start_residency_authority_missing"));
+        assert!(
+            reasons
+                .contains("product_gate_nonresident_target_resident_target_intersection_mismatch")
+        );
+        assert!(
+            reasons
+                .contains("product_gate_nonresident_target_nonresident_target_difference_mismatch")
+        );
+        assert_eq!(evidence_status(&reasons), "valid_complete");
+
+        end["resource_accounting"]["target_residency_at_phase_start"]["target_union_sha256"] =
+            json!("55".repeat(32));
+        reasons.clear();
+        validate_nonresident_target_residency(&start, &end, "start", &expected, &mut reasons);
+        assert!(reasons.contains("nonresident_target_phase_start_residency_authority_missing"));
+
+        end["resource_accounting"]["target_residency_at_phase_start"]["target_union_sha256"] =
+            json!("44".repeat(32));
         end["resource_accounting"]["target_residency_at_phase_start"]["phase_start_resident_union_sha256"] =
             json!("bb".repeat(32));
-        validate_nonresident_target_residency(
-            &start,
-            &end,
-            "start",
-            &expected,
-            &demand.target_union,
-            &mut reasons,
-        );
+        reasons.clear();
+        validate_nonresident_target_residency(&start, &end, "start", &expected, &mut reasons);
         assert!(reasons.contains("nonresident_target_phase_start_residency_authority_missing"));
     }
 

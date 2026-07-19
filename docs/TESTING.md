@@ -161,11 +161,14 @@ process, hard-safety, or evidence-integrity failure instead stops the launch
 immediately and preserves the exact partial lineage; later roles are not run
 after the evidence envelope has become unusable.
 
-An explicitly null current-presentation generation and a present, reconciled,
-exactly empty admitted-generation latency population are authoritative product
-failures when interaction occurred; they mean no generation reached current
-presentation. An absent field, malformed value, missing ring, or unreconciled
-population remains an evidence-integrity failure.
+An explicitly null current-presentation generation, displayed scale, or
+settlement milestone and a present, reconciled, exactly empty
+admitted-generation latency population are authoritative product failures;
+they mean the corresponding presentation state was never reached. An absent
+field, malformed value, missing ring, or unreconciled population remains an
+evidence-integrity failure. The optional hidden staging-renderer fact follows
+the same typed boundary: explicit null authoritatively contributes zero to the
+per-target structural sum, while an omitted or malformed fact is invalid.
 
 Every checkpoint acceptance batch resolves before its phase-end diagnostic.
 It is followed by one bounded, nonblocking
