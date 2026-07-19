@@ -27,7 +27,12 @@ const COMMAND_GRACE: Duration = Duration::from_millis(500);
 const CLOSEOUT_TIMEOUT: Duration = Duration::from_secs(10);
 const SAFE_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_COMMAND_BUDGET: Duration = Duration::from_secs(30);
-const SEQUENCE_BASE_BUDGET: Duration = Duration::from_secs(1);
+// A scripted gesture's declared duration covers its input sampling interval,
+// while product command completion also includes bounded admission, final
+// frame settlement, and one heartbeat publication. Real-display evidence has
+// demonstrated more than one second of that non-sampling work. Keep it
+// tightly bounded without racing a healthy gesture at the deadline edge.
+const SEQUENCE_BASE_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SEQUENCE_DURATION_MS: u64 = 120_000;
 const MAX_SLEEP_FRAMES: u64 = 600;
 
@@ -956,6 +961,14 @@ mod tests {
         assert_eq!(
             instant_plan.commands[0].budget,
             Some(DEFAULT_COMMAND_BUDGET)
+        );
+        let sequence_plan = plan(vec![json!({
+            "command": "cross_section_rotate_sequence",
+            "duration_ms": 2_000
+        })]);
+        assert_eq!(
+            sequence_plan.commands[0].budget,
+            Some(Duration::from_secs(7))
         );
         assert!(
             ProductAutomationProgressPlan::from_commands(&[json!({
