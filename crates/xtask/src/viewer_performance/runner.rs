@@ -4916,6 +4916,44 @@ fn create_attempt_tree(
     Ok(role_root)
 }
 
+/// Creates only the declared parent of an attempt-local imported package.
+/// The package itself remains create-new product output, and every component
+/// is kept beneath the freshly created private role root.
+fn prepare_attempt_import_parent(role_root: &Path, cleanup: &AttemptCleanup) -> anyhow::Result<()> {
+    if !cleanup.enabled {
+        return Ok(());
+    }
+    let relative = cleanup
+        .imported_package_relative_path
+        .as_deref()
+        .context("enabled cleanup lacks its package path")?;
+    validate_relative_attempt_path(relative, "attempt-local imported package")?;
+    let Some(parent) = relative
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    let mut cursor = role_root.to_path_buf();
+    for component in parent.components() {
+        let Component::Normal(component) = component else {
+            bail!("attempt-local import parent contains a non-normal component")
+        };
+        cursor.push(component);
+        match fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => bail!("attempt-local import parent is not a private directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                create_private_directory(&cursor)?;
+            }
+            Err(error) => {
+                return Err(error).context("attempt-local import parent is unavailable");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn write_resource_settings(
     role_root: &Path,
     profile: &ViewerQualificationProfile,
@@ -5754,6 +5792,7 @@ fn execute_role_with_prelaunch_check(
     }
     let setup = (|| -> anyhow::Result<(PathBuf, String, String)> {
         let role_root = create_attempt_tree(result_root, sample_index, &scenario.id, role)?;
+        prepare_attempt_import_parent(&role_root, &scenario.cleanup)?;
         write_resource_settings(&role_root, profile)?;
         let template_value = serde_json::to_value(template)?;
         let template_bytes = serde_json::to_vec(&template_value)?;
@@ -15006,6 +15045,9 @@ mod tests {
             enabled: true,
             imported_package_relative_path: Some(PathBuf::from("output/imported.m4d")),
         };
+        prepare_attempt_import_parent(role_root.path(), &cleanup).unwrap();
+        assert!(role_root.path().join("output").is_dir());
+        assert!(!role_root.path().join("output/imported.m4d").exists());
         assert_eq!(
             cleanup_attempt_package(role_root.path(), &cleanup).unwrap(),
             None

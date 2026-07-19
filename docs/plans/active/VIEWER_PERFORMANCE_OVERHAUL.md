@@ -1005,6 +1005,9 @@ stays in the typed gate and phase-evaluation surfaces so it cannot invalidate
 an otherwise complete automation report. PT also binds its projection through
 an explicit semantic command after switching to the supporting package; an
 observed camera default is not substituted for that script authority.
+For IP, the runner creates only the validated private parent directory of the
+attempt-local package before launch. The package target itself remains absent
+and create-new, and cleanup remains restricted to that exact declared target.
 
 Every GPU-gated phase resolves its concurrent acceptance checkpoint before
 the end diagnostic, then uses one five-second-bounded nonblocking
