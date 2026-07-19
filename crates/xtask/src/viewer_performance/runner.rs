@@ -8466,6 +8466,7 @@ fn evaluate_phase(
     imported_open_ready_outcome: Option<ProductGateStatus>,
 ) -> PhaseEvaluation {
     let mut reasons = BTreeSet::new();
+    let is_preprocessing_phase = oracle.import_gate.is_some();
     let end = checkpoints
         .get(script_phase.end_diagnostic_label.as_str())
         .copied();
@@ -8507,14 +8508,17 @@ fn evaluate_phase(
         template,
         script_phase,
         &oracle.phase_state,
+        !is_preprocessing_phase,
         &mut reasons,
     );
-    validate_phase_state_facts(
-        end_diagnostics,
-        &oracle.phase_state,
-        numerical_contract,
-        &mut reasons,
-    );
+    if !is_preprocessing_phase {
+        validate_phase_state_facts(
+            end_diagnostics,
+            &oracle.phase_state,
+            numerical_contract,
+            &mut reasons,
+        );
+    }
     if oracle.require_current_complete {
         validate_current_complete(end_diagnostics, &mut reasons);
     }
@@ -8580,6 +8584,13 @@ fn evaluate_phase(
                         checkpoints.get(baseline.checkpoint_label.as_str()).copied()
                     }),
                 &oracle.unique_work,
+                if is_preprocessing_phase
+                    && imported_open_ready_outcome == Some(ProductGateStatus::Passed)
+                {
+                    DatasetCounterEpoch::ReplacedAtEnd
+                } else {
+                    DatasetCounterEpoch::Continuous
+                },
                 &mut reasons,
             );
             if let Some(gate) = &oracle.verification_gate {
@@ -9980,6 +9991,11 @@ fn validate_import_receipt_binding(
     let open_ready_matches = open_ready_details.is_some_and(|details| {
         imported_open_ready_details_match(details, expected_outcome, import_primary_wall_ns)
     });
+    let opened_destination_matches = !require_open_ready
+        || report
+            .pointer("/final_diagnostics/dataset/path")
+            .and_then(Value::as_str)
+            == destination;
     let published_event = receipt
         .get("published_event")
         .filter(|value| value.is_object());
@@ -10007,6 +10023,7 @@ fn validate_import_receipt_binding(
         || !token_fields_present
         || !start_matches
         || !open_ready_matches
+        || !opened_destination_matches
         || !publication_matches
     {
         reasons.insert("import_receipt_start_or_open_ready_binding_mismatch".to_owned());
@@ -10299,6 +10316,7 @@ fn validate_phase_script_binding(
     template: &AutomationScriptTemplate,
     phase: &ScriptPhase,
     expected: &PhaseStateBinding,
+    require_viewer_state: bool,
     reasons: &mut BTreeSet<String>,
 ) {
     let Some(end_index) = diagnostic_command_index(&template.commands, &phase.end_diagnostic_label)
@@ -10349,47 +10367,50 @@ fn validate_phase_script_binding(
     }) {
         reasons.insert("phase_render_extent_script_binding_mismatch".to_owned());
     }
-    if latest("set_viewer_layout")
-        .and_then(|(_, command)| command.get("layout"))
-        .and_then(Value::as_str)
-        != Some(match expected.layout {
-            ExpectedViewerLayout::Single3d => "single3d",
-            ExpectedViewerLayout::FourPanel => "four_panel",
-        })
-    {
-        reasons.insert("phase_layout_script_binding_mismatch".to_owned());
-    }
-    let scripted_time_index = latest("set_time_index")
-        .and_then(|(_, command)| command.get("time_index"))
-        .and_then(Value::as_u64);
-    if scripted_time_index.is_some() && scripted_time_index != Some(u64::from(expected.time_index))
-        || scripted_time_index.is_none() && expected.time_index != 0
-    {
-        reasons.insert("phase_time_index_script_binding_mismatch".to_owned());
-    }
-    if latest("set_projection")
-        .or_else(|| latest("set_camera_view"))
-        .and_then(|(_, command)| command.get("projection"))
-        .and_then(Value::as_str)
-        != Some(match expected.camera.projection {
-            ExpectedProjection::Orthographic => "orthographic",
-            ExpectedProjection::Perspective => "perspective",
-        })
-    {
-        reasons.insert("phase_projection_script_binding_mismatch".to_owned());
-    }
-    if expected.active_view != ViewerPanel::ThreeD
-        && latest("set_active_cross_section_panel")
-            .and_then(|(_, command)| command.get("panel"))
+    if require_viewer_state {
+        if latest("set_viewer_layout")
+            .and_then(|(_, command)| command.get("layout"))
             .and_then(Value::as_str)
-            != Some(match expected.active_view {
-                ViewerPanel::Xy => "xy",
-                ViewerPanel::Xz => "xz",
-                ViewerPanel::Yz => "yz",
-                ViewerPanel::ThreeD => unreachable!("3D has no cross-section panel command"),
+            != Some(match expected.layout {
+                ExpectedViewerLayout::Single3d => "single3d",
+                ExpectedViewerLayout::FourPanel => "four_panel",
             })
-    {
-        reasons.insert("phase_active_view_script_binding_mismatch".to_owned());
+        {
+            reasons.insert("phase_layout_script_binding_mismatch".to_owned());
+        }
+        let scripted_time_index = latest("set_time_index")
+            .and_then(|(_, command)| command.get("time_index"))
+            .and_then(Value::as_u64);
+        if scripted_time_index.is_some()
+            && scripted_time_index != Some(u64::from(expected.time_index))
+            || scripted_time_index.is_none() && expected.time_index != 0
+        {
+            reasons.insert("phase_time_index_script_binding_mismatch".to_owned());
+        }
+        if latest("set_projection")
+            .or_else(|| latest("set_camera_view"))
+            .and_then(|(_, command)| command.get("projection"))
+            .and_then(Value::as_str)
+            != Some(match expected.camera.projection {
+                ExpectedProjection::Orthographic => "orthographic",
+                ExpectedProjection::Perspective => "perspective",
+            })
+        {
+            reasons.insert("phase_projection_script_binding_mismatch".to_owned());
+        }
+        if expected.active_view != ViewerPanel::ThreeD
+            && latest("set_active_cross_section_panel")
+                .and_then(|(_, command)| command.get("panel"))
+                .and_then(Value::as_str)
+                != Some(match expected.active_view {
+                    ViewerPanel::Xy => "xy",
+                    ViewerPanel::Xz => "xz",
+                    ViewerPanel::Yz => "yz",
+                    ViewerPanel::ThreeD => unreachable!("3D has no cross-section panel command"),
+                })
+        {
+            reasons.insert("phase_active_view_script_binding_mismatch".to_owned());
+        }
     }
     if let Some((mapped_index, _)) = mapped {
         let later_commands = mapped_index.map_or(&template.commands[..], |index| {
@@ -11697,6 +11718,7 @@ fn validate_unique_work(
     end_label: &str,
     residency_baseline_checkpoint: Option<&Value>,
     expected: &UniqueWorkExpectation,
+    dataset_counter_epoch: DatasetCounterEpoch,
     reasons: &mut BTreeSet<String>,
 ) {
     let start_union = validate_observed_exact_resource_union(
@@ -11903,6 +11925,17 @@ fn validate_unique_work(
             &expected.runtime_decoded_output_bytes,
             "runtime_decoded_output_bytes",
         ),
+    ] {
+        check_counter_delta_range(
+            start.pointer(pointer).and_then(Value::as_u64),
+            end.pointer(pointer).and_then(Value::as_u64),
+            range,
+            label,
+            dataset_counter_epoch,
+            reasons,
+        );
+    }
+    for (pointer, range, label) in [
         (
             "/gpu_adapter/uploads/resources",
             &expected.gpu_uploaded_resources,
@@ -11934,9 +11967,16 @@ fn validate_unique_work(
             end.pointer(pointer).and_then(Value::as_u64),
             range,
             label,
+            DatasetCounterEpoch::Continuous,
             reasons,
         );
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DatasetCounterEpoch {
+    Continuous,
+    ReplacedAtEnd,
 }
 
 fn check_counter_delta_range(
@@ -11944,11 +11984,21 @@ fn check_counter_delta_range(
     end: Option<u64>,
     expected: &InclusiveU64Range,
     label: &str,
+    epoch: DatasetCounterEpoch,
     reasons: &mut BTreeSet<String>,
 ) {
     match (start, end) {
-        (Some(start), Some(end)) if end >= start => {
-            let delta = end - start;
+        (Some(start), Some(end)) if epoch == DatasetCounterEpoch::ReplacedAtEnd || end >= start => {
+            // Dataset-runtime and source-reader counters are owned by the
+            // active dataset generation. A successful import replaces that
+            // generation, so its end checkpoint is already a zero-based
+            // counter epoch. GPU counters remain process-scoped and always
+            // use an ordinary monotonic subtraction.
+            let delta = if epoch == DatasetCounterEpoch::ReplacedAtEnd {
+                end
+            } else {
+                end - start
+            };
             if !(expected.minimum..=expected.maximum).contains(&delta) {
                 reasons.insert(format!("unique_work_{label}_delta_outside_oracle"));
             }
@@ -12069,6 +12119,7 @@ fn validate_verification_evidence(
                     .and_then(Value::as_u64),
                 range,
                 &format!("verification_reader_{field}"),
+                DatasetCounterEpoch::Continuous,
                 reasons,
             );
         }
@@ -15880,6 +15931,11 @@ mod tests {
                 ),
             ],
             "import_workflow_evidence": workflow,
+            "final_diagnostics": {
+                "dataset": {
+                    "path": "/private/attempt/imported.m4d",
+                },
+            },
         })
     }
 
@@ -16487,6 +16543,13 @@ mod tests {
 
         let mut report = valid_import_workflow_report();
         report["events"][1]["details"]["observations"][1]["condition"] = json!("wrong");
+        assert!(
+            import_workflow_gate_reasons(&report)
+                .contains("import_receipt_start_or_open_ready_binding_mismatch")
+        );
+
+        let mut report = valid_import_workflow_report();
+        report["final_diagnostics"]["dataset"]["path"] = json!("/private/attempt/unrelated.m4d");
         assert!(
             import_workflow_gate_reasons(&report)
                 .contains("import_receipt_start_or_open_ready_binding_mismatch")
@@ -18032,7 +18095,7 @@ mod tests {
             "height": 720,
         }}});
         let mut reasons = BTreeSet::new();
-        validate_phase_script_binding(&report, &template, &phase, &state, &mut reasons);
+        validate_phase_script_binding(&report, &template, &phase, &state, true, &mut reasons);
         assert!(reasons.is_empty());
 
         let mut canonical_zero_default = template.clone();
@@ -18042,13 +18105,44 @@ mod tests {
             &canonical_zero_default,
             &phase,
             &state,
+            true,
             &mut reasons,
         );
         assert!(reasons.is_empty());
 
         template.commands[3]["time_index"] = json!(1);
-        validate_phase_script_binding(&report, &template, &phase, &state, &mut reasons);
+        validate_phase_script_binding(&report, &template, &phase, &state, true, &mut reasons);
         assert!(reasons.contains("phase_time_index_script_binding_mismatch"));
+    }
+
+    #[test]
+    fn preprocessing_phase_binds_extents_without_inventing_viewer_state_commands() {
+        let state = phase_state();
+        let template = template(
+            true,
+            vec![
+                json!({ "command": "set_mapped_client_pixels", "width": 1280, "height": 720 }),
+                json!({ "command": "set_render_target_size", "width": 1280, "height": 720 }),
+                json!({ "command": "sample_diagnostics", "label": "ip-end" }),
+                json!({ "command": "quit" }),
+            ],
+        );
+        let phase = ScriptPhase {
+            name: "preprocess_publish".to_owned(),
+            start_diagnostic_label: Some("ip-start".to_owned()),
+            end_diagnostic_label: "ip-end".to_owned(),
+        };
+        let report = json!({ "viewport_evidence": { "requested_mapped_client_pixels": {
+            "width": 1280,
+            "height": 720,
+        }}});
+        let mut reasons = BTreeSet::new();
+        validate_phase_script_binding(&report, &template, &phase, &state, false, &mut reasons);
+        assert!(reasons.is_empty(), "{reasons:?}");
+
+        validate_phase_script_binding(&report, &template, &phase, &state, true, &mut reasons);
+        assert!(reasons.contains("phase_layout_script_binding_mismatch"));
+        assert!(reasons.contains("phase_projection_script_binding_mismatch"));
     }
 
     #[test]
@@ -18091,7 +18185,7 @@ mod tests {
             "height": 720,
         }}});
         let mut reasons = BTreeSet::new();
-        validate_phase_script_binding(&report, &template, &phase, &state, &mut reasons);
+        validate_phase_script_binding(&report, &template, &phase, &state, true, &mut reasons);
         assert!(reasons.is_empty());
     }
 
@@ -18472,7 +18566,16 @@ mod tests {
         });
         let expected = unique_work_expectation(1);
         let mut reasons = BTreeSet::new();
-        validate_unique_work(&start, &end, "start", "end", None, &expected, &mut reasons);
+        validate_unique_work(
+            &start,
+            &end,
+            "start",
+            "end",
+            None,
+            &expected,
+            DatasetCounterEpoch::Continuous,
+            &mut reasons,
+        );
         assert!(reasons.is_empty());
 
         let mut different_oracle_unions = expected.clone();
@@ -18488,6 +18591,7 @@ mod tests {
             "end",
             None,
             &different_oracle_unions,
+            DatasetCounterEpoch::Continuous,
             &mut reasons,
         );
         assert!(reasons.contains(
@@ -18516,6 +18620,7 @@ mod tests {
             "end",
             None,
             &expected,
+            DatasetCounterEpoch::Continuous,
             &mut reasons,
         );
         assert!(
@@ -18536,6 +18641,7 @@ mod tests {
             "end",
             None,
             &expected,
+            DatasetCounterEpoch::Continuous,
             &mut reasons,
         );
         assert!(reasons.contains(
@@ -18549,7 +18655,16 @@ mod tests {
         end["diagnostics"]["dataset_source_io"]["reader"]["physical_encoded_bytes_read"] =
             json!(12);
         reasons.clear();
-        validate_unique_work(&start, &end, "start", "end", None, &expected, &mut reasons);
+        validate_unique_work(
+            &start,
+            &end,
+            "start",
+            "end",
+            None,
+            &expected,
+            DatasetCounterEpoch::Continuous,
+            &mut reasons,
+        );
         assert!(reasons.contains("unique_work_physical_encoded_bytes_read_delta_outside_oracle"));
 
         let mut incoherent = unique_work_expectation(1);
@@ -18558,6 +18673,46 @@ mod tests {
         let mut unauthorised_range = unique_work_expectation(1);
         unauthorised_range.physical_encoded_bytes_read.maximum = 2;
         assert!(validate_unique_work_expectation(&unauthorised_range).is_err());
+    }
+
+    #[test]
+    fn replaced_dataset_counters_use_the_new_zero_based_epoch() {
+        let expected_one = unique_work_expectation(1).physical_range_read_operations;
+        let mut reasons = BTreeSet::new();
+        check_counter_delta_range(
+            Some(10),
+            Some(1),
+            &expected_one,
+            "physical_range_read_operations",
+            DatasetCounterEpoch::ReplacedAtEnd,
+            &mut reasons,
+        );
+        assert!(reasons.is_empty());
+
+        check_counter_delta_range(
+            Some(10),
+            Some(1),
+            &expected_one,
+            "physical_range_read_operations",
+            DatasetCounterEpoch::Continuous,
+            &mut reasons,
+        );
+        assert!(reasons.contains("unique_work_physical_range_read_operations_counter_regressed"));
+
+        reasons.clear();
+        let expected_zero = unique_work_expectation(0).physical_range_read_operations;
+        check_counter_delta_range(
+            Some(10),
+            Some(1),
+            &expected_zero,
+            "physical_range_read_operations",
+            DatasetCounterEpoch::ReplacedAtEnd,
+            &mut reasons,
+        );
+        assert!(
+            reasons.contains("unique_work_physical_range_read_operations_delta_outside_oracle")
+        );
+        assert_eq!(evidence_status(&reasons), "valid_complete");
     }
 
     #[test]
