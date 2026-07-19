@@ -1045,6 +1045,10 @@ controlled cancelled setup run and one full measured verification request with
 the existing active-throughout and typed completion evidence. This preserves
 provisional-viewing semantics and scientific fail-closed behavior without
 serializing every fresh process, or VV twice, through a package-scale scan.
+FC's captured pre-demand startup checkpoint is the conceptual command prefix
+of its cold phase. A present, exactly empty per-target renderer array plus an
+explicit-null hidden staging fact is the authoritative zero-work baseline;
+missing or malformed facts remain evidence-integrity failures.
 
 Preflight and execution also share one exact clean-release executable gate.
 The invoking `xtask` must embed the profile-bound revision, compiler, release

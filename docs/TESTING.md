@@ -173,6 +173,10 @@ field, malformed value, missing ring, or unreconciled population remains an
 evidence-integrity failure. The optional hidden staging-renderer fact follows
 the same typed boundary: explicit null authoritatively contributes zero to the
 per-target structural sum, while an omitted or malformed fact is invalid.
+For FC, the captured pre-demand startup checkpoint is the conceptual command
+prefix of the cold phase. Its present, exactly empty per-target renderer array
+plus explicit-null hidden staging fact contributes zero renderer work; a
+missing or malformed collection remains invalid.
 
 Every checkpoint acceptance batch resolves before its phase-end diagnostic.
 It is followed by one bounded, nonblocking

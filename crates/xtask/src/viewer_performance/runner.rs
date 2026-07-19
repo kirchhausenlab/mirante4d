@@ -11346,9 +11346,6 @@ fn per_target_counter_sum(diagnostics: &Value, field: &str) -> Option<u64> {
     let targets = detailed
         .get("per_target_renderer_facts")
         .and_then(Value::as_array)?;
-    if targets.is_empty() {
-        return None;
-    }
     let visible_total = targets.iter().try_fold(0_u64, |total, target| {
         total.checked_add(target.get(field)?.as_u64()?)
     })?;
@@ -11434,16 +11431,27 @@ fn validate_sequence_commit_events(
     };
     let start_index = diagnostic_command_index(&template.commands, start_label);
     let end_index = diagnostic_command_index(&template.commands, &phase.end_diagnostic_label);
-    let (Some(start_index), Some(end_index)) = (start_index, end_index) else {
+    let startup_bootstrap_start = template
+        .startup_bootstrap
+        .as_ref()
+        .is_some_and(|bootstrap| {
+            bootstrap.capture_start_checkpoint
+                && bootstrap.start_diagnostic_label.as_deref() == Some(start_label)
+        });
+    let Some(end_index) = end_index else {
         reasons.insert("sequence_phase_command_bounds_missing".to_owned());
         return;
     };
+    if start_index.is_none() && !startup_bootstrap_start {
+        reasons.insert("sequence_phase_command_bounds_missing".to_owned());
+        return;
+    }
     let sequence_commands = template
         .commands
         .iter()
         .enumerate()
         .filter(|(index, command)| {
-            *index > start_index
+            start_index.is_none_or(|start_index| *index > start_index)
                 && *index < end_index
                 && command
                     .get("command")
@@ -16840,6 +16848,25 @@ mod tests {
         );
         assert!(reasons.is_empty());
 
+        let mut explicit_cold_start = structural_diagnostics(0);
+        explicit_cold_start["render"]["display_coordination"]["detailed_counters"]["per_target_renderer_facts"] =
+            json!([]);
+        explicit_cold_start["render"]["display_coordination"]["detailed_counters"]["staging_3d_renderer_facts"] =
+            Value::Null;
+        reasons.clear();
+        validate_structural_ceilings(
+            &explicit_cold_start,
+            &end_without_staging,
+            DisplayBatchAuthority::CoordinatedDisplayBatch,
+            CancellationWasteAuthority::GenerationBoundSharedBrick,
+            &ceilings,
+            &mut reasons,
+        );
+        assert!(
+            reasons.is_empty(),
+            "an explicit zero-target cold baseline contributes zero renderer work"
+        );
+
         end_without_staging["render"]["display_coordination"]["detailed_counters"]
             .as_object_mut()
             .unwrap()
@@ -17353,6 +17380,56 @@ mod tests {
             reasons
                 .contains("product_gate_gesture_sequence_durable_commit_or_sample_delta_mismatch")
         );
+    }
+
+    #[test]
+    fn cold_bootstrap_checkpoint_is_the_sequence_phase_prefix() {
+        let mut template = template(
+            true,
+            vec![
+                json!({ "command": "sample_diagnostics", "label": "cold-end" }),
+                json!({ "command": "quit" }),
+            ],
+        );
+        template.startup_bootstrap = Some(AutomationStartupBootstrap {
+            capture_start_checkpoint: true,
+            start_diagnostic_label: Some("cold-start".to_owned()),
+            commands: vec![json!({
+                "command": "set_viewer_layout",
+                "layout": "four_panel",
+            })],
+        });
+        let phase = ScriptPhase {
+            name: "blocking_target_settled".to_owned(),
+            start_diagnostic_label: Some("cold-start".to_owned()),
+            end_diagnostic_label: "cold-end".to_owned(),
+        };
+        let diagnostics = json!({
+            "render": { "display_coordination": { "durable_gesture_commits": 0 } },
+            "application_state": {
+                "currentness_generation": 7,
+                "currentness_derivation": "ApplicationSnapshot_currentness_generation",
+            },
+            "project_state": {
+                "bound": false,
+                "current_revision": null,
+                "saved_revision": null,
+                "revision_high_water_sequence": null,
+                "retained_history_entries": null,
+                "history_entry_high_water_sequence": null,
+            },
+        });
+        let mut reasons = BTreeSet::new();
+        validate_sequence_commit_events(
+            &json!({ "events": [] }),
+            &template,
+            &phase,
+            &diagnostics,
+            &diagnostics,
+            1,
+            &mut reasons,
+        );
+        assert!(reasons.is_empty());
     }
 
     fn gate_target(condition: &str) -> Value {
