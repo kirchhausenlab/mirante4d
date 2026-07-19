@@ -15,7 +15,11 @@ use serde_json::{Value, json};
 
 use crate::{
     host::benchmark_host_context,
-    process::run_cargo,
+    process::{isolate_process_tree, run_cargo, terminate_process_tree},
+    product_automation_progress::{
+        FILE_POLL_INTERVAL, ProductAutomationProgressLaunch, ProductAutomationProgressPlan,
+        ProgressMonitorAction, safe_automation_progress_line,
+    },
     reports::{read_json_file, write_json_file},
     target_fixture::extract_target_u16_fixture,
 };
@@ -431,6 +435,8 @@ fn product_validate_report_inner(
 
     binary.validate_for_launch()?;
     let timeout = Duration::from_secs(timeout_seconds);
+    let progress_root = fs::canonicalize(&output_dir)
+        .context("product validation output directory is unavailable for progress monitoring")?;
     let status = run_product_automation(ProductAutomationRun {
         binary: binary.path(),
         package: &package,
@@ -439,6 +445,9 @@ fn product_validate_report_inner(
         stdout_path: &stdout_path,
         stderr_path: &stderr_path,
         timeout,
+        scenario: scenario.name(),
+        progress_plan: ProductAutomationProgressPlan::from_script(&script)?,
+        progress_launch: ProductAutomationProgressLaunch::new_replacing_stale(&progress_root)?,
     })?;
     let source_closure_evidence = source_closure_before
         .as_ref()
@@ -450,6 +459,38 @@ fn product_validate_report_inner(
         .get("byte_identical")
         .and_then(Value::as_bool)
         == Some(false);
+
+    if let Some(progress_failure) = status.progress_failure_reason {
+        write_wrapper_report(WrapperReport {
+            path: &wrapper_report_path,
+            scenario_name: scenario.name(),
+            status: ProductValidationStatus::Failed,
+            failure_reason: Some(format!(
+                "native app automation progress protocol failed: {progress_failure}"
+            )),
+            started_at_epoch_ms,
+            duration_ms: duration_ms(started_at.elapsed()),
+            timeout_secs: timeout_seconds,
+            package: &package,
+            binary: binary.path(),
+            script: &script_path,
+            script_value: &script,
+            automation_report: &automation_report_path,
+            automation_report_value: None,
+            stdout: &stdout_path,
+            stderr: &stderr_path,
+            display,
+            preflight_only,
+            source_closure_evidence: source_closure_evidence.clone(),
+            automation_status: None,
+            exit_status: status.exit_status,
+            exit_success: status.exit_success,
+        })?;
+        return Ok(ProductValidationOutcome {
+            report_path: wrapper_report_path,
+            status: ProductValidationStatus::Failed,
+        });
+    }
 
     if status.timed_out {
         write_wrapper_report(WrapperReport {
@@ -2688,8 +2729,15 @@ fn run_b4_attempt(
     let source_before = SourceClosureSnapshot::capture(package);
     let started_at_epoch_ms = epoch_ms();
     let started_at = Instant::now();
-    let process_result = match &source_before {
-        Ok(_) => run_b4_product_process(B4ProductRun {
+    let progress = read_json_file(&script_path).and_then(|script| {
+        let progress_plan = ProductAutomationProgressPlan::from_script(&script)?;
+        let phase_root = fs::canonicalize(&phase_dir)
+            .context("B4 phase directory is unavailable for progress monitoring")?;
+        let progress_launch = ProductAutomationProgressLaunch::new_replacing_stale(&phase_root)?;
+        Ok((progress_plan, progress_launch))
+    });
+    let process_result = match (&source_before, progress) {
+        (Ok(_), Ok((progress_plan, progress_launch))) => run_b4_product_process(B4ProductRun {
             binary,
             package,
             script: &script_path,
@@ -2701,8 +2749,12 @@ fn run_b4_attempt(
             expected_client_width: spec.expected_client_width,
             expected_client_height: spec.expected_client_height,
             termination: spec.termination,
+            phase: spec.phase,
+            progress_plan,
+            progress_launch,
         }),
-        Err(err) => Err(anyhow::anyhow!(err.to_string())),
+        (Err(err), _) => Err(anyhow::anyhow!(err.to_string())),
+        (_, Err(err)) => Err(err),
     };
     let source_closure_evidence = source_before
         .as_ref()
@@ -2801,6 +2853,9 @@ struct B4ProductRun<'a> {
     expected_client_width: u32,
     expected_client_height: u32,
     termination: B4Termination<'a>,
+    phase: &'a str,
+    progress_plan: ProductAutomationProgressPlan,
+    progress_launch: ProductAutomationProgressLaunch,
 }
 
 fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStatus> {
@@ -2817,14 +2872,19 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
         .env("XDG_STATE_HOME", run.state_home)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    isolate_process_tree(&mut command);
+    run.progress_launch.apply_to_command(&mut command);
     println!("running B4 product validation phase: {:?}", command);
+    let started = Instant::now();
     let mut child = command.spawn().with_context(|| {
         format!(
             "failed to launch native app product validation binary {}",
             run.binary.display()
         )
     })?;
-    let deadline = Instant::now() + run.timeout;
+    let deadline = started + run.timeout;
+    let mut progress_monitor = run.progress_launch.monitor(run.progress_plan, started);
+    let mut next_progress_poll = started;
     let mut observed_client_area_pixels = None;
     let mut fullscreen_action = None;
     let mut checkpoint = None;
@@ -2842,6 +2902,9 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
                         .try_wait()
                         .context("failed to poll B4 product child after geometry failure")?
                     {
+                        let progress_failure = progress_monitor
+                            .finalize_at_exit(Instant::now())
+                            .map(|failure| failure.reason_code());
                         return Ok(b4_finished_process_status(
                             exit_status,
                             false,
@@ -2849,7 +2912,10 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
                             checkpoint,
                             observed_client_area_pixels,
                             fullscreen_action,
-                            Some(format!("external X11 geometry observation failed: {err}")),
+                            Some(progress_failure.map_or_else(
+                                || format!("external X11 geometry observation failed: {err}"),
+                                |failure| format!("automation progress protocol failed: {failure}"),
+                            )),
                         ));
                     }
                 }
@@ -2868,7 +2934,7 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
             {
                 Ok(value) => checkpoint = Some(value),
                 Err(err) => {
-                    let _ = child.kill();
+                    terminate_process_tree(&mut child);
                     let exit_status = child
                         .wait()
                         .context("failed to reap B4 child after invalid checkpoint")?;
@@ -2889,9 +2955,7 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
             && checkpoint.is_some()
             && observed_client_area_pixels.is_some()
         {
-            child
-                .kill()
-                .context("failed to send external SIGKILL to B4 product child")?;
+            terminate_process_tree(&mut child);
             let exit_status = child
                 .wait()
                 .context("failed to reap externally killed B4 product child")?;
@@ -2911,6 +2975,9 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
             .context("failed to poll B4 product validation child")?
         {
             let early_exit = matches!(run.termination, B4Termination::ExternalSigkill { .. });
+            let progress_failure = progress_monitor
+                .finalize_at_exit(Instant::now())
+                .map(|failure| failure.reason_code());
             return Ok(b4_finished_process_status(
                 exit_status,
                 false,
@@ -2918,13 +2985,48 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
                 checkpoint,
                 observed_client_area_pixels,
                 fullscreen_action,
-                early_exit.then(|| {
-                    "native app exited before the synced checkpoint and external SIGKILL".to_owned()
-                }),
+                progress_failure
+                    .map(|failure| format!("automation progress protocol failed: {failure}"))
+                    .or_else(|| {
+                        early_exit.then(|| {
+                            "native app exited before the synced checkpoint and external SIGKILL"
+                                .to_owned()
+                        })
+                    }),
             ));
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
+        let now = Instant::now();
+        if now >= next_progress_poll {
+            match progress_monitor.poll_at(now) {
+                ProgressMonitorAction::Continue => {}
+                ProgressMonitorAction::Emit(snapshot) => {
+                    let line =
+                        safe_automation_progress_line("product_validate_b4", run.phase, &snapshot)?;
+                    eprintln!("{line}");
+                }
+                ProgressMonitorAction::Terminate(failure) => {
+                    terminate_process_tree(&mut child);
+                    let exit_status = child
+                        .wait()
+                        .context("failed to reap B4 child after progress failure")?;
+                    return Ok(b4_finished_process_status(
+                        exit_status,
+                        false,
+                        false,
+                        checkpoint,
+                        observed_client_area_pixels,
+                        fullscreen_action,
+                        Some(format!(
+                            "automation progress protocol failed: {}",
+                            failure.reason_code()
+                        )),
+                    ));
+                }
+            }
+            next_progress_poll = now + FILE_POLL_INTERVAL;
+        }
+        if now >= deadline {
+            terminate_process_tree(&mut child);
             let exit_status = child
                 .wait()
                 .context("failed to reap timed-out B4 product child")?;
@@ -3283,6 +3385,9 @@ struct ProductAutomationRun<'a> {
     stdout_path: &'a Path,
     stderr_path: &'a Path,
     timeout: Duration,
+    scenario: &'a str,
+    progress_plan: ProductAutomationProgressPlan,
+    progress_launch: ProductAutomationProgressLaunch,
 }
 
 fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<ProductProcessStatus> {
@@ -3298,15 +3403,21 @@ fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<Produ
         .env("MIRANTE4D_AUTOMATION_REPORT", run.automation_report)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    isolate_process_tree(&mut command);
+    run.progress_launch.apply_to_command(&mut command);
     println!("running product validation: {:?}", command);
+    let started = Instant::now();
     let mut child = command.spawn().with_context(|| {
         format!(
             "failed to launch native app product validation binary {}",
             run.binary.display()
         )
     })?;
-    let deadline = Instant::now() + run.timeout;
+    let deadline = started + run.timeout;
+    let mut progress_monitor = run.progress_launch.monitor(run.progress_plan, started);
+    let mut next_progress_poll = started;
     loop {
+        let now = Instant::now();
         if let Some(exit_status) = child
             .try_wait()
             .context("failed to poll product validation child process")?
@@ -3315,15 +3426,40 @@ fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<Produ
                 timed_out: false,
                 exit_status: Some(exit_status.to_string()),
                 exit_success: Some(exit_status.success()),
+                progress_failure_reason: progress_monitor
+                    .finalize_at_exit(now)
+                    .map(|failure| failure.reason_code()),
             });
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
+        if now >= next_progress_poll {
+            match progress_monitor.poll_at(now) {
+                ProgressMonitorAction::Continue => {}
+                ProgressMonitorAction::Emit(snapshot) => {
+                    let line =
+                        safe_automation_progress_line("product_validate", run.scenario, &snapshot)?;
+                    eprintln!("{line}");
+                }
+                ProgressMonitorAction::Terminate(failure) => {
+                    terminate_process_tree(&mut child);
+                    let exit_status = child.wait().ok();
+                    return Ok(ProductProcessStatus {
+                        timed_out: false,
+                        exit_status: exit_status.map(|status| status.to_string()),
+                        exit_success: exit_status.map(|status| status.success()),
+                        progress_failure_reason: Some(failure.reason_code()),
+                    });
+                }
+            }
+            next_progress_poll = now + FILE_POLL_INTERVAL;
+        }
+        if now >= deadline {
+            terminate_process_tree(&mut child);
             let exit_status = child.wait().ok().map(|status| status.to_string());
             return Ok(ProductProcessStatus {
                 timed_out: true,
                 exit_status,
                 exit_success: None,
+                progress_failure_reason: None,
             });
         }
         thread::sleep(Duration::from_millis(100));
@@ -3335,6 +3471,7 @@ struct ProductProcessStatus {
     timed_out: bool,
     exit_status: Option<String>,
     exit_success: Option<bool>,
+    progress_failure_reason: Option<&'static str>,
 }
 
 struct WrapperReport<'a> {

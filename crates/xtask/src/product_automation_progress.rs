@@ -43,6 +43,14 @@ pub(crate) struct ProductAutomationProgressPlan {
 }
 
 impl ProductAutomationProgressPlan {
+    pub(crate) fn from_script(script: &Value) -> anyhow::Result<Self> {
+        let commands = script
+            .get("commands")
+            .and_then(Value::as_array)
+            .context("product automation script commands are unavailable")?;
+        Self::from_commands(commands)
+    }
+
     pub(crate) fn from_commands(commands: &[Value]) -> anyhow::Result<Self> {
         let commands = commands
             .iter()
@@ -263,6 +271,28 @@ impl ProductAutomationProgressLaunch {
             path,
             nonce: generate_nonce()?,
         })
+    }
+
+    pub(crate) fn new_replacing_stale(role_root: &Path) -> anyhow::Result<Self> {
+        if !role_root.is_absolute() {
+            bail!("product automation role root must be absolute");
+        }
+        let metadata = fs::symlink_metadata(role_root)
+            .context("product automation role root is unavailable")?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("product automation role root must be a nonsymlink directory");
+        }
+        let path = role_root.join(PROGRESS_FILE_NAME);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                fs::remove_file(&path)
+                    .context("failed to remove the prior automation progress sidecar")?;
+            }
+            Ok(_) => bail!("stale product automation progress sidecar is not a regular file"),
+            Err(_) => bail!("product automation progress sidecar could not be inspected"),
+        }
+        Self::new(role_root)
     }
 
     pub(crate) fn apply_to_command(&self, command: &mut Command) {
@@ -702,6 +732,31 @@ pub(crate) fn safe_progress_line(
     ))
 }
 
+pub(crate) fn safe_automation_progress_line(
+    scope: &str,
+    scenario: &str,
+    snapshot: &SafeProgressSnapshot,
+) -> anyhow::Result<String> {
+    validate_safe_token(scope, "scope")?;
+    validate_safe_token(scenario, "scenario")?;
+    let state = match &snapshot.state {
+        SafeProgressState::Command {
+            index,
+            command_kind,
+            elapsed_ms,
+        } => format!(
+            "state=command command_index={index} command_kind={command_kind} elapsed_ms={elapsed_ms}"
+        ),
+        SafeProgressState::Closeout { elapsed_ms } => {
+            format!("state=closeout elapsed_ms={elapsed_ms}")
+        }
+    };
+    Ok(format!(
+        "automation_progress scope={scope} scenario={scenario} heartbeat_sequence={} command_count={} {state}",
+        snapshot.heartbeat_sequence, snapshot.command_count,
+    ))
+}
+
 fn validate_safe_token(value: &str, label: &str) -> anyhow::Result<()> {
     if value.is_empty()
         || value.len() > 128
@@ -1007,5 +1062,25 @@ mod tests {
         assert!(!line.contains(NONCE));
         assert!(!line.contains('/'));
         assert!(safe_progress_line(3, "private scenario", "cold", &snapshot).is_err());
+        let suite_line =
+            safe_automation_progress_line("product_validate", "fixture", &snapshot).unwrap();
+        assert!(suite_line.starts_with("automation_progress scope=product_validate"));
+        assert!(!suite_line.contains(NONCE));
+        assert!(!suite_line.contains('/'));
+    }
+
+    #[test]
+    fn explicit_relaunch_replaces_only_a_regular_stale_sidecar() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(PROGRESS_FILE_NAME), b"stale").unwrap();
+        let launch = ProductAutomationProgressLaunch::new_replacing_stale(root.path()).unwrap();
+        assert_eq!(launch.path(), root.path().join(PROGRESS_FILE_NAME));
+        assert!(!launch.path().exists());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("missing", root.path().join(PROGRESS_FILE_NAME)).unwrap();
+            assert!(ProductAutomationProgressLaunch::new_replacing_stale(root.path()).is_err());
+        }
     }
 }
