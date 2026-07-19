@@ -5416,10 +5416,32 @@ fn product_gate_outcome_is_coherent(outcome: &ProductGateOutcome) -> bool {
                 && outcome.observed_after_origin_ns < outcome.deadline_after_origin_ns
         }
         ProductGateStatus::Failed => {
-            outcome.timed_out
-                && outcome.observed_after_origin_ns >= outcome.deadline_after_origin_ns
+            (outcome.timed_out
+                && outcome.observed_after_origin_ns >= outcome.deadline_after_origin_ns)
+                || terminal_prepublication_gate_outcome_is_structurally_exact(outcome)
         }
     }
+}
+
+fn terminal_prepublication_gate_outcome_is_structurally_exact(
+    outcome: &ProductGateOutcome,
+) -> bool {
+    let (observation_index, gate_id) = match outcome.condition.as_str() {
+        "import_idle" => (0, "IP.acceptance.000.import_idle"),
+        IMPORTED_OPEN_READY_CONDITION => (1, "IP.acceptance.001.imported_open_ready"),
+        _ => return false,
+    };
+    outcome.batch_id == "IP.batch.000"
+        && outcome.phase_id == "preprocess_publish.checkpoint.000"
+        && outcome.observation_index == observation_index
+        && outcome.gate_id == gate_id
+        && outcome.deadline_authority == "import_primary_wall"
+        && outcome.origin_kind == "import_primary_started"
+        && outcome.origin_command_index.is_none()
+        && outcome.outcome == ProductGateStatus::Failed
+        && !outcome.condition_met
+        && !outcome.timed_out
+        && outcome.observed_after_origin_ns < outcome.deadline_after_origin_ns
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5655,41 +5677,16 @@ fn validate_imported_manifest_identity(role: &mut RoleEvidence, expected: &str) 
 }
 
 fn prepublication_import_failure_is_exact(role: &RoleEvidence) -> bool {
-    let Some(workflow) = role
-        .automation_report
-        .as_ref()
-        .and_then(|report| report.get("import_workflow_evidence"))
-    else {
+    let Some(report) = role.automation_report.as_ref() else {
         return false;
     };
-    if workflow.get("primary_clock") != Some(&Value::Null)
-        || workflow.get("publication_to_open_ready_clock") != Some(&Value::Null)
-        || workflow.get("last_successful_receipt") != Some(&Value::Null)
-        || role_product_gate_status(role, IMPORTED_OPEN_READY_CONDITION)
-            != Some(ProductGateStatus::Failed)
-        || role_product_gate_status(role, "import_idle") != Some(ProductGateStatus::Failed)
-    {
+    let Some(workflow) = report.get("import_workflow_evidence") else {
         return false;
-    }
-    let run_counts = (
-        import_u64(workflow, "successful_runs"),
-        import_u64(workflow, "published_events"),
-        import_u64(workflow, "failed_runs"),
-        import_u64(workflow, "cancelled_runs"),
-    );
-    (run_counts == (Some(0), Some(0), Some(1), Some(0))
-        && role_product_gate_status(role, "runtime_idle") == Some(ProductGateStatus::Passed))
-        || (run_counts == (Some(0), Some(0), Some(0), Some(0))
-            && role_product_gate_status(role, "runtime_idle") == Some(ProductGateStatus::Failed))
-}
-
-fn role_product_gate_status(role: &RoleEvidence, condition: &str) -> Option<ProductGateStatus> {
-    let mut matches = role
-        .product_gate_outcomes
-        .iter()
-        .filter(|outcome| outcome.condition == condition);
-    let status = matches.next()?.outcome;
-    matches.next().is_none().then_some(status)
+    };
+    matches!(
+        import_open_ready_evidence_variant(workflow),
+        Some(ImportOpenReadyEvidenceVariant::DeadlineFailedBeforeTransfer(_))
+    ) && validate_import_product_gate_variant_binding(report, &role.product_gate_outcomes).is_ok()
 }
 
 fn capture_bound_import_source(
@@ -6662,16 +6659,7 @@ fn product_gate_outcomes_from_report(
             if observed_after_origin_ns > completed_after_origin_ns {
                 bail!("automation product-gate observation occurs after its batch completion")
             }
-            match outcome {
-                ProductGateStatus::Passed
-                    if condition_met
-                        && !timed_out
-                        && observed_after_origin_ns < deadline_after_origin_ns => {}
-                ProductGateStatus::Failed
-                    if timed_out && observed_after_origin_ns >= deadline_after_origin_ns => {}
-                _ => bail!("automation product-gate observation outcome flags are incoherent"),
-            }
-            outcomes.push(ProductGateOutcome {
+            let parsed = ProductGateOutcome {
                 command_index: expected_batch.command_index,
                 batch_id: expected_batch.batch_id.to_owned(),
                 phase_id: expected_batch.phase_id.to_owned(),
@@ -6686,9 +6674,14 @@ fn product_gate_outcomes_from_report(
                 condition_met,
                 timed_out,
                 observed_after_origin_ns,
-            });
+            };
+            if !product_gate_outcome_is_coherent(&parsed) {
+                bail!("automation product-gate observation outcome flags are incoherent")
+            }
+            outcomes.push(parsed);
         }
     }
+    validate_import_product_gate_variant_binding(report, &outcomes)?;
     Ok(outcomes)
 }
 
@@ -8194,7 +8187,8 @@ const IMPORT_PRIMARY_CLOCK_FIELDS: &[&str] = &[
     "inspection_and_human_review_excluded",
     "published_capability_transfer_and_runtime_open_included",
 ];
-const IMPORT_PUBLICATION_TO_OPEN_READY_CLOCK_FIELDS: &[&str] = &[
+const IMPORT_PUBLICATION_TO_OPEN_READY_COMPLETE_FIELDS: &[&str] = &[
+    "status",
     "start_boundary",
     "end_boundary",
     "wall_clock",
@@ -8212,6 +8206,42 @@ const IMPORT_PUBLICATION_TO_OPEN_READY_CLOCK_FIELDS: &[&str] = &[
     "source_verification_failed_runs",
     "source_verification_successes",
 ];
+const IMPORT_PUBLICATION_TO_OPEN_READY_AFTER_TRANSFER_FIELDS: &[&str] = &[
+    "status",
+    "publication_currentness_execution",
+    "source_verification_started_runs",
+    "source_verification_progress_updates",
+    "source_verification_cancelled_runs",
+    "source_verification_failed_runs",
+    "source_verification_successes",
+];
+const IMPORT_PUBLICATION_TO_OPEN_READY_BEFORE_TRANSFER_FIELDS: &[&str] = &[
+    "status",
+    "unavailable_reason",
+    "readiness",
+    "source_verification_deltas",
+    "source_open_state",
+];
+const IMPORT_OPEN_READY_READINESS_FIELDS: &[&str] = &[
+    "selected_matches",
+    "verified",
+    "import_idle",
+    "problem_absent",
+];
+const IMPORT_SOURCE_VERIFICATION_DELTA_FIELDS: &[&str] = &[
+    "started_runs",
+    "progress_updates",
+    "cancelled_runs",
+    "failed_runs",
+    "successes",
+];
+const IMPORT_SOURCE_OPEN_STATE_FIELDS: &[&str] = &[
+    "worker_active",
+    "pending_install",
+    "active_dataset_open_operations",
+    "worker_bound_to_dataset_open_operation",
+    "pending_install_bound_to_dataset_open_operation",
+];
 const IMPORT_PUBLICATION_CURRENTNESS_EXECUTION_FIELDS: &[&str] = &[
     "contract_id",
     "expected_snapshot_object_reads",
@@ -8222,13 +8252,251 @@ const IMPORT_PUBLICATION_CURRENTNESS_EXECUTION_FIELDS: &[&str] = &[
     "observed_codec_decode_calls",
 ];
 
-fn import_object_has_exact_non_null_fields(value: Option<&Value>, fields: &[&str]) -> bool {
+const IMPORT_OPEN_READY_COMPLETE_STATUS: &str = "open_ready_complete";
+const IMPORT_OPEN_READY_FAILED_AFTER_TRANSFER_STATUS: &str =
+    "open_ready_deadline_failed_after_transfer";
+const IMPORT_OPEN_READY_FAILED_BEFORE_TRANSFER_STATUS: &str =
+    "open_ready_deadline_failed_before_transfer";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImportOpenReadyEvidenceVariant {
+    Complete,
+    DeadlineFailedAfterTransfer,
+    DeadlineFailedBeforeTransfer(PrepublicationImportState),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrepublicationImportState {
+    ActiveAtDeadline,
+    TerminalWorkerFailure,
+}
+
+fn import_object_has_exact_fields(value: Option<&Value>, fields: &[&str]) -> bool {
     value.and_then(Value::as_object).is_some_and(|object| {
-        object.len() == fields.len()
-            && fields
+        object.keys().map(String::as_str).collect::<BTreeSet<_>>()
+            == fields.iter().copied().collect::<BTreeSet<_>>()
+    })
+}
+
+fn import_object_has_exact_non_null_fields(value: Option<&Value>, fields: &[&str]) -> bool {
+    import_object_has_exact_fields(value, fields)
+        && value.and_then(Value::as_object).is_some_and(|object| {
+            fields
                 .iter()
                 .all(|field| object.get(*field).is_some_and(|value| !value.is_null()))
-    })
+        })
+}
+
+fn import_open_ready_evidence_variant(workflow: &Value) -> Option<ImportOpenReadyEvidenceVariant> {
+    let publication_value = workflow.get("publication_to_open_ready_clock")?;
+    let publication = publication_value.as_object()?;
+    match publication.get("status").and_then(Value::as_str)? {
+        IMPORT_OPEN_READY_COMPLETE_STATUS
+            if import_object_has_exact_non_null_fields(
+                Some(publication_value),
+                IMPORT_PUBLICATION_TO_OPEN_READY_COMPLETE_FIELDS,
+            ) && import_object_has_exact_non_null_fields(
+                publication.get("publication_currentness_execution"),
+                IMPORT_PUBLICATION_CURRENTNESS_EXECUTION_FIELDS,
+            ) =>
+        {
+            Some(ImportOpenReadyEvidenceVariant::Complete)
+        }
+        IMPORT_OPEN_READY_FAILED_AFTER_TRANSFER_STATUS
+            if import_object_has_exact_non_null_fields(
+                Some(publication_value),
+                IMPORT_PUBLICATION_TO_OPEN_READY_AFTER_TRANSFER_FIELDS,
+            ) && import_object_has_exact_non_null_fields(
+                publication.get("publication_currentness_execution"),
+                IMPORT_PUBLICATION_CURRENTNESS_EXECUTION_FIELDS,
+            ) =>
+        {
+            Some(ImportOpenReadyEvidenceVariant::DeadlineFailedAfterTransfer)
+        }
+        IMPORT_OPEN_READY_FAILED_BEFORE_TRANSFER_STATUS
+            if import_object_has_exact_non_null_fields(
+                Some(publication_value),
+                IMPORT_PUBLICATION_TO_OPEN_READY_BEFORE_TRANSFER_FIELDS,
+            ) =>
+        {
+            exact_prepublication_payload_state(publication_value)
+                .map(ImportOpenReadyEvidenceVariant::DeadlineFailedBeforeTransfer)
+        }
+        _ => None,
+    }
+}
+
+fn exact_prepublication_payload_state(publication: &Value) -> Option<PrepublicationImportState> {
+    let readiness = publication.get("readiness")?;
+    let verification = publication.get("source_verification_deltas")?;
+    let source_open = publication.get("source_open_state")?;
+    if !import_object_has_exact_non_null_fields(Some(readiness), IMPORT_OPEN_READY_READINESS_FIELDS)
+        || !import_object_has_exact_non_null_fields(
+            Some(verification),
+            IMPORT_SOURCE_VERIFICATION_DELTA_FIELDS,
+        )
+        || !import_object_has_exact_non_null_fields(
+            Some(source_open),
+            IMPORT_SOURCE_OPEN_STATE_FIELDS,
+        )
+        || readiness.get("selected_matches").and_then(Value::as_bool) != Some(false)
+        || readiness.get("verified").and_then(Value::as_bool).is_none()
+        || IMPORT_SOURCE_VERIFICATION_DELTA_FIELDS
+            .iter()
+            .any(|field| import_u64(verification, field) != Some(0))
+        || source_open.get("worker_active").and_then(Value::as_bool) != Some(false)
+        || source_open.get("pending_install").and_then(Value::as_bool) != Some(false)
+        || import_u64(source_open, "active_dataset_open_operations") != Some(0)
+        || source_open
+            .get("worker_bound_to_dataset_open_operation")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || source_open
+            .get("pending_install_bound_to_dataset_open_operation")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return None;
+    }
+    match publication
+        .get("unavailable_reason")
+        .and_then(Value::as_str)
+    {
+        Some("import_worker_active_before_publication_deadline")
+            if readiness.get("import_idle").and_then(Value::as_bool) == Some(false)
+                && readiness.get("problem_absent").and_then(Value::as_bool) == Some(true) =>
+        {
+            Some(PrepublicationImportState::ActiveAtDeadline)
+        }
+        Some("import_worker_terminal_failure_before_publication")
+            if readiness.get("import_idle").and_then(Value::as_bool) == Some(true)
+                && readiness.get("problem_absent").and_then(Value::as_bool) == Some(false) =>
+        {
+            Some(PrepublicationImportState::TerminalWorkerFailure)
+        }
+        _ => None,
+    }
+}
+
+fn validate_import_product_gate_variant_binding(
+    report: &Value,
+    outcomes: &[ProductGateOutcome],
+) -> anyhow::Result<()> {
+    let import_conditions = ["import_idle", IMPORTED_OPEN_READY_CONDITION, "runtime_idle"];
+    if !outcomes
+        .iter()
+        .any(|outcome| outcome.condition == IMPORTED_OPEN_READY_CONDITION)
+    {
+        return Ok(());
+    }
+    let rows = outcomes
+        .iter()
+        .filter(|outcome| import_conditions.contains(&outcome.condition.as_str()))
+        .collect::<Vec<_>>();
+    let expected_rows = [
+        (0, "IP.acceptance.000.import_idle", "import_idle"),
+        (
+            1,
+            "IP.acceptance.001.imported_open_ready",
+            IMPORTED_OPEN_READY_CONDITION,
+        ),
+        (2, "IP.acceptance.002.runtime_idle", "runtime_idle"),
+    ];
+    if rows.len() != expected_rows.len()
+        || rows
+            .iter()
+            .zip(expected_rows)
+            .any(|(row, (observation_index, gate_id, condition))| {
+                row.batch_id != "IP.batch.000"
+                    || row.phase_id != "preprocess_publish.checkpoint.000"
+                    || row.observation_index != observation_index
+                    || row.gate_id != gate_id
+                    || row.condition != condition
+                    || row.deadline_authority != "import_primary_wall"
+                    || row.origin_kind != "import_primary_started"
+                    || row.origin_command_index.is_some()
+            })
+        || rows[1..].iter().any(|row| {
+            row.command_index != rows[0].command_index
+                || row.deadline_after_origin_ns != rows[0].deadline_after_origin_ns
+        })
+    {
+        bail!("IP product-gate rows do not have the exact frozen identity")
+    }
+
+    let workflow = report
+        .get("import_workflow_evidence")
+        .filter(|value| value.is_object())
+        .context("IP import-workflow evidence is unavailable")?;
+    let variant = import_open_ready_evidence_variant(workflow)
+        .context("IP open-ready evidence variant has an invalid exact shape")?;
+    let run_counts = (
+        import_u64(workflow, "successful_runs"),
+        import_u64(workflow, "published_events"),
+        import_u64(workflow, "failed_runs"),
+        import_u64(workflow, "cancelled_runs"),
+    );
+    let successful_publication = matches!(run_counts, (Some(successful), Some(published), Some(0), Some(0)) if successful > 0 && published >= successful);
+    let primary_is_complete = import_object_has_exact_non_null_fields(
+        workflow.get("primary_clock"),
+        IMPORT_PRIMARY_CLOCK_FIELDS,
+    );
+    let primary_is_null = workflow.get("primary_clock") == Some(&Value::Null);
+    let receipt_is_present = workflow
+        .get("last_successful_receipt")
+        .and_then(Value::as_object)
+        .is_some_and(|receipt| !receipt.is_empty());
+    let receipt_is_null = workflow.get("last_successful_receipt") == Some(&Value::Null);
+    let exact_deadline_failure = |outcome: &ProductGateOutcome| {
+        outcome.outcome == ProductGateStatus::Failed
+            && outcome.timed_out
+            && outcome.observed_after_origin_ns >= outcome.deadline_after_origin_ns
+    };
+    let exact_pass = |outcome: &ProductGateOutcome| {
+        outcome.outcome == ProductGateStatus::Passed
+            && outcome.condition_met
+            && !outcome.timed_out
+            && outcome.observed_after_origin_ns < outcome.deadline_after_origin_ns
+    };
+
+    let binding_matches = match variant {
+        ImportOpenReadyEvidenceVariant::Complete => {
+            successful_publication
+                && primary_is_complete
+                && receipt_is_present
+                && rows.iter().all(|row| exact_pass(row))
+        }
+        ImportOpenReadyEvidenceVariant::DeadlineFailedAfterTransfer => {
+            successful_publication
+                && primary_is_null
+                && receipt_is_present
+                && exact_deadline_failure(rows[1])
+        }
+        ImportOpenReadyEvidenceVariant::DeadlineFailedBeforeTransfer(
+            PrepublicationImportState::TerminalWorkerFailure,
+        ) => {
+            run_counts == (Some(0), Some(0), Some(1), Some(0))
+                && primary_is_null
+                && receipt_is_null
+                && terminal_prepublication_gate_outcome_is_structurally_exact(rows[0])
+                && terminal_prepublication_gate_outcome_is_structurally_exact(rows[1])
+                && exact_pass(rows[2])
+        }
+        ImportOpenReadyEvidenceVariant::DeadlineFailedBeforeTransfer(
+            PrepublicationImportState::ActiveAtDeadline,
+        ) => {
+            run_counts == (Some(0), Some(0), Some(0), Some(0))
+                && primary_is_null
+                && receipt_is_null
+                && rows
+                    .iter()
+                    .all(|row| !row.condition_met && exact_deadline_failure(row))
+        }
+    };
+    if !binding_matches {
+        bail!("IP open-ready evidence variant is inconsistent with gate rows or run facts")
+    }
+    Ok(())
 }
 
 fn validate_import_workflow_gate(
@@ -8237,14 +8505,6 @@ fn validate_import_workflow_gate(
     imported_open_ready_outcome: Option<ProductGateStatus>,
     reasons: &mut BTreeSet<String>,
 ) {
-    let require_open_ready = match imported_open_ready_outcome {
-        Some(ProductGateStatus::Passed) => true,
-        Some(ProductGateStatus::Failed) => false,
-        None => {
-            reasons.insert("imported_open_ready_observation_missing".to_owned());
-            true
-        }
-    };
     let Some(workflow) = report
         .get("import_workflow_evidence")
         .filter(|value| value.is_object())
@@ -8252,14 +8512,36 @@ fn validate_import_workflow_gate(
         reasons.insert("import_workflow_evidence_missing".to_owned());
         return;
     };
-    if !require_open_ready
-        && workflow.get("primary_clock") == Some(&Value::Null)
-        && workflow.get("publication_to_open_ready_clock") == Some(&Value::Null)
-        && workflow.get("last_successful_receipt") == Some(&Value::Null)
-    {
-        validate_prepublication_import_failure(report, workflow, gate, reasons);
-        return;
-    }
+    let variant = import_open_ready_evidence_variant(workflow);
+    let require_open_ready = match (imported_open_ready_outcome, variant) {
+        (Some(ProductGateStatus::Passed), Some(ImportOpenReadyEvidenceVariant::Complete)) => true,
+        (
+            Some(ProductGateStatus::Failed),
+            Some(ImportOpenReadyEvidenceVariant::DeadlineFailedAfterTransfer),
+        ) => false,
+        (
+            Some(ProductGateStatus::Failed),
+            Some(ImportOpenReadyEvidenceVariant::DeadlineFailedBeforeTransfer(state)),
+        ) => {
+            validate_prepublication_import_failure(report, workflow, gate, state, reasons);
+            return;
+        }
+        (None, Some(ImportOpenReadyEvidenceVariant::Complete)) => {
+            reasons.insert("imported_open_ready_observation_missing".to_owned());
+            true
+        }
+        (Some(ProductGateStatus::Passed), _) | (None, _) => {
+            if imported_open_ready_outcome.is_none() {
+                reasons.insert("imported_open_ready_observation_missing".to_owned());
+            }
+            reasons.insert("import_clock_evidence_shape_invalid".to_owned());
+            return;
+        }
+        (Some(ProductGateStatus::Failed), _) => {
+            validate_failed_import_open_ready_evidence_shape(workflow, reasons);
+            return;
+        }
+    };
     let expected = &gate.expected;
     let run_facts = (
         import_u64(workflow, "successful_runs"),
@@ -8391,6 +8673,7 @@ fn validate_prepublication_import_failure(
     report: &Value,
     workflow: &Value,
     gate: &ImportGate,
+    expected_state: PrepublicationImportState,
     reasons: &mut BTreeSet<String>,
 ) {
     let inspection = validate_import_inspection_clock_evidence(workflow, reasons);
@@ -8401,28 +8684,20 @@ fn validate_prepublication_import_failure(
         .is_some_and(|((inspection_started, start_command), primary_started)| {
             inspection_started <= start_command && start_command <= primary_started
         });
-    let imported_open_ready_matches =
-        unique_imported_open_ready_observation(report).is_some_and(|details| {
-            imported_open_ready_details_match(
-                details,
-                ProductGateStatus::Failed,
-                gate.limits.maximum_app_primary_wall_time_ns,
-            )
-        });
-    let import_idle = unique_import_batch_observation_status(report, "import_idle");
-    let runtime_idle = unique_import_batch_observation_status(report, "runtime_idle");
     let run_counts = (
         import_u64(workflow, "successful_runs"),
         import_u64(workflow, "published_events"),
         import_u64(workflow, "failed_runs"),
         import_u64(workflow, "cancelled_runs"),
     );
-    let terminal_worker_failure = run_counts == (Some(0), Some(0), Some(1), Some(0))
-        && import_idle == Some(ProductGateStatus::Failed)
-        && runtime_idle == Some(ProductGateStatus::Passed);
-    let active_at_deadline = run_counts == (Some(0), Some(0), Some(0), Some(0))
-        && import_idle == Some(ProductGateStatus::Failed)
-        && runtime_idle == Some(ProductGateStatus::Failed);
+    let state_matches_run_counts = match expected_state {
+        PrepublicationImportState::TerminalWorkerFailure => {
+            run_counts == (Some(0), Some(0), Some(1), Some(0))
+        }
+        PrepublicationImportState::ActiveAtDeadline => {
+            run_counts == (Some(0), Some(0), Some(0), Some(0))
+        }
+    };
     let exact_fields = workflow.as_object().is_some_and(|object| {
         object.keys().map(String::as_str).collect::<BTreeSet<_>>()
             == IMPORT_WORKFLOW_EVIDENCE_FIELDS
@@ -8433,8 +8708,9 @@ fn validate_prepublication_import_failure(
     if !exact_fields
         || !prepublication_progress_shape_is_exact(workflow)
         || workflow.get("primary_clock") != Some(&Value::Null)
-        || workflow.get("publication_to_open_ready_clock") != Some(&Value::Null)
         || workflow.get("last_successful_receipt") != Some(&Value::Null)
+        || import_open_ready_evidence_variant(workflow)
+            != Some(ImportOpenReadyEvidenceVariant::DeadlineFailedBeforeTransfer(expected_state))
         || import_u64(workflow, "maximum_resumed_work_units") != Some(0)
         || workflow
             .get("fabricated_global_percentage_or_eta_observed")
@@ -8442,8 +8718,12 @@ fn validate_prepublication_import_failure(
             != Some(false)
         || !start_shape_is_exact
         || !start_time_reconciles
-        || !imported_open_ready_matches
-        || (!terminal_worker_failure && !active_at_deadline)
+        || !prepublication_import_gate_batch_is_exact(
+            report,
+            expected_state,
+            gate.limits.maximum_app_primary_wall_time_ns,
+        )
+        || !state_matches_run_counts
     {
         reasons.insert("prepublication_import_failure_evidence_shape_invalid".to_owned());
     }
@@ -8599,36 +8879,15 @@ fn validate_failed_import_open_ready_evidence_shape(
 
     let primary_is_exact_null = workflow.get("primary_clock") == Some(&Value::Null);
     let publication_has_exact_partial_shape = publication.is_some_and(|publication| {
-        publication
-            .keys()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>()
-            == BTreeSet::from([
-                "publication_currentness_execution",
-                "source_verification_started_runs",
-                "source_verification_progress_updates",
-                "source_verification_cancelled_runs",
-                "source_verification_failed_runs",
-                "source_verification_successes",
-            ])
-            && publication
-                .get("publication_currentness_execution")
-                .and_then(Value::as_object)
-                .is_some_and(|currentness| {
-                    currentness
-                        .keys()
-                        .map(String::as_str)
-                        .collect::<BTreeSet<_>>()
-                        == BTreeSet::from([
-                            "contract_id",
-                            "expected_snapshot_object_reads",
-                            "first_inventory_object_reads",
-                            "observed_snapshot_object_reads",
-                            "second_inventory_object_reads",
-                            "observed_total_object_reads",
-                            "observed_codec_decode_calls",
-                        ])
-                })
+        import_object_has_exact_non_null_fields(
+            workflow.get("publication_to_open_ready_clock"),
+            IMPORT_PUBLICATION_TO_OPEN_READY_AFTER_TRANSFER_FIELDS,
+        ) && publication.get("status").and_then(Value::as_str)
+            == Some(IMPORT_OPEN_READY_FAILED_AFTER_TRANSFER_STATUS)
+            && import_object_has_exact_non_null_fields(
+                publication.get("publication_currentness_execution"),
+                IMPORT_PUBLICATION_CURRENTNESS_EXECUTION_FIELDS,
+            )
     });
     if !primary_is_exact_null || !publication_has_exact_partial_shape {
         reasons.insert("failed_imported_open_ready_evidence_shape_invalid".to_owned());
@@ -8681,7 +8940,7 @@ fn validate_import_clock_evidence(
     if !import_object_has_exact_non_null_fields(primary_value, IMPORT_PRIMARY_CLOCK_FIELDS)
         || !import_object_has_exact_non_null_fields(
             publication_value,
-            IMPORT_PUBLICATION_TO_OPEN_READY_CLOCK_FIELDS,
+            IMPORT_PUBLICATION_TO_OPEN_READY_COMPLETE_FIELDS,
         )
         || !import_object_has_exact_non_null_fields(
             publication_value
@@ -8722,8 +8981,10 @@ fn validate_import_clock_evidence(
         return None;
     };
 
-    let boundaries_match = primary.get("start_boundary").and_then(Value::as_str)
-        == Some("accepted_start_import_command_immediately_before_worker_spawn")
+    let boundaries_match = publication.get("status").and_then(Value::as_str)
+        == Some(IMPORT_OPEN_READY_COMPLETE_STATUS)
+        && primary.get("start_boundary").and_then(Value::as_str)
+            == Some("accepted_start_import_command_immediately_before_worker_spawn")
         && primary.get("end_boundary").and_then(Value::as_str)
             == Some("published_destination_verified_and_open_ready_for_normal_product_use")
         && primary.get("clock").and_then(Value::as_str) == Some("std_instant_monotonic")
@@ -9229,6 +9490,140 @@ fn validate_import_receipt_binding(
     }
 }
 
+fn prepublication_import_gate_batch_is_exact(
+    report: &Value,
+    state: PrepublicationImportState,
+    import_primary_wall_ns: u64,
+) -> bool {
+    let Some(events) = report.get("events").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut batches = events
+        .iter()
+        .filter(|event| event.get("command").and_then(Value::as_str) == Some("observe_gate_batch"));
+    let Some(event) = batches.next() else {
+        return false;
+    };
+    if batches.next().is_some()
+        || !import_object_has_exact_non_null_fields(
+            Some(event),
+            &[
+                "command_index",
+                "command",
+                "status",
+                "event_epoch_ms",
+                "duration_ms",
+                "details",
+            ],
+        )
+        || event.get("status").and_then(Value::as_str) != Some("passed")
+        || event.get("command_index").and_then(Value::as_u64).is_none()
+        || event
+            .get("event_epoch_ms")
+            .and_then(Value::as_u64)
+            .is_none()
+        || !event
+            .get("duration_ms")
+            .and_then(Value::as_f64)
+            .is_some_and(|duration| duration.is_finite() && duration >= 0.0)
+    {
+        return false;
+    }
+    let Some(details) = event.get("details") else {
+        return false;
+    };
+    if !import_object_has_exact_non_null_fields(
+        Some(details),
+        &[
+            "schema",
+            "batch_id",
+            "phase_id",
+            "origin",
+            "completed_after_origin_ns",
+            "observations",
+        ],
+    ) || details.get("schema").and_then(Value::as_str) != Some(PRODUCT_GATE_OBSERVATION_SCHEMA)
+        || details.get("batch_id").and_then(Value::as_str) != Some("IP.batch.000")
+        || details.get("phase_id").and_then(Value::as_str)
+            != Some("preprocess_publish.checkpoint.000")
+        || !import_object_has_exact_non_null_fields(details.get("origin"), &["kind"])
+        || details.pointer("/origin/kind").and_then(Value::as_str) != Some("import_primary_started")
+    {
+        return false;
+    }
+    let Some(observations) = details.get("observations").and_then(Value::as_array) else {
+        return false;
+    };
+    let expected = [
+        (0, "IP.acceptance.000.import_idle", "import_idle"),
+        (
+            1,
+            "IP.acceptance.001.imported_open_ready",
+            IMPORTED_OPEN_READY_CONDITION,
+        ),
+        (2, "IP.acceptance.002.runtime_idle", "runtime_idle"),
+    ];
+    if observations.len() != expected.len() {
+        return false;
+    }
+    let rows_match = observations.iter().zip(expected).all(
+        |(observation, (observation_index, gate_id, condition))| {
+            if !import_object_has_exact_non_null_fields(
+                Some(observation),
+                &[
+                    "observation_index",
+                    "gate_id",
+                    "condition",
+                    "deadline_authority",
+                    "deadline_after_origin_ns",
+                    "outcome",
+                    "condition_met",
+                    "timed_out",
+                    "observed_after_origin_ns",
+                ],
+            ) || observation.get("observation_index").and_then(Value::as_u64)
+                != Some(observation_index)
+                || observation.get("gate_id").and_then(Value::as_str) != Some(gate_id)
+                || observation.get("condition").and_then(Value::as_str) != Some(condition)
+                || observation
+                    .get("deadline_authority")
+                    .and_then(Value::as_str)
+                    != Some("import_primary_wall")
+                || import_u64(observation, "deadline_after_origin_ns")
+                    != Some(import_primary_wall_ns)
+            {
+                return false;
+            }
+            let observed = import_u64(observation, "observed_after_origin_ns");
+            match state {
+                PrepublicationImportState::TerminalWorkerFailure if observation_index < 2 => {
+                    observation.get("outcome").and_then(Value::as_str) == Some("failed")
+                        && observation.get("condition_met").and_then(Value::as_bool) == Some(false)
+                        && observation.get("timed_out").and_then(Value::as_bool) == Some(false)
+                        && observed.is_some_and(|observed| observed < import_primary_wall_ns)
+                }
+                PrepublicationImportState::TerminalWorkerFailure => {
+                    observation.get("outcome").and_then(Value::as_str) == Some("passed")
+                        && observation.get("condition_met").and_then(Value::as_bool) == Some(true)
+                        && observation.get("timed_out").and_then(Value::as_bool) == Some(false)
+                        && observed.is_some_and(|observed| observed < import_primary_wall_ns)
+                }
+                PrepublicationImportState::ActiveAtDeadline => {
+                    observation.get("outcome").and_then(Value::as_str) == Some("failed")
+                        && observation.get("condition_met").and_then(Value::as_bool) == Some(false)
+                        && observation.get("timed_out").and_then(Value::as_bool) == Some(true)
+                        && observed.is_some_and(|observed| observed >= import_primary_wall_ns)
+                }
+            }
+        },
+    );
+    let maximum_observed = observations
+        .iter()
+        .filter_map(|observation| import_u64(observation, "observed_after_origin_ns"))
+        .max();
+    rows_match && import_u64(details, "completed_after_origin_ns") == maximum_observed
+}
+
 fn imported_open_ready_details_match(
     details: &Value,
     outcome: ProductGateStatus,
@@ -9315,20 +9710,6 @@ fn unique_import_batch_observation<'a>(report: &'a Value, condition: &str) -> Op
         });
     let observation = matches.next()?;
     (matches.next().is_none()).then_some(observation)
-}
-
-fn unique_import_batch_observation_status(
-    report: &Value,
-    condition: &str,
-) -> Option<ProductGateStatus> {
-    match unique_import_batch_observation(report, condition)?
-        .get("outcome")?
-        .as_str()?
-    {
-        "passed" => Some(ProductGateStatus::Passed),
-        "failed" => Some(ProductGateStatus::Failed),
-        _ => None,
-    }
 }
 
 fn unique_passed_event_details<'a>(report: &'a Value, command: &str) -> Option<&'a Value> {
@@ -14845,6 +15226,7 @@ mod tests {
             "human_review_interval_included_when_present": true,
         });
         let publication_clock = json!({
+            "status": IMPORT_OPEN_READY_COMPLETE_STATUS,
             "start_boundary": "import_worker_published_event",
             "end_boundary": "published_destination_verified_and_open_ready_for_normal_product_use",
             "wall_clock": "std_instant_monotonic",
@@ -14894,14 +15276,28 @@ mod tests {
         });
         let open_ready_command = observe_gate_batch_command(
             "IP.batch.000",
-            "IP-preprocess.checkpoint.000",
+            "preprocess_publish.checkpoint.000",
             json!({ "kind": "import_primary_started" }),
-            &[(
-                "IP.imported_open_ready",
-                IMPORTED_OPEN_READY_CONDITION,
-                "import_primary_wall",
-                1_200_000_000_000,
-            )],
+            &[
+                (
+                    "IP.acceptance.000.import_idle",
+                    "import_idle",
+                    "import_primary_wall",
+                    1_200_000_000_000,
+                ),
+                (
+                    "IP.acceptance.001.imported_open_ready",
+                    IMPORTED_OPEN_READY_CONDITION,
+                    "import_primary_wall",
+                    1_200_000_000_000,
+                ),
+                (
+                    "IP.acceptance.002.runtime_idle",
+                    "runtime_idle",
+                    "import_primary_wall",
+                    1_200_000_000_000,
+                ),
+            ],
         );
         json!({
             "events": [
@@ -14923,7 +15319,11 @@ mod tests {
                 observe_gate_batch_event(
                     1,
                     &open_ready_command,
-                    &[ProductGateStatus::Passed],
+                    &[
+                        ProductGateStatus::Passed,
+                        ProductGateStatus::Passed,
+                        ProductGateStatus::Passed,
+                    ],
                 ),
             ],
             "import_workflow_evidence": workflow,
@@ -14937,7 +15337,34 @@ mod tests {
         workflow["published_events"] = json!(0);
         workflow["failed_runs"] = json!(u64::from(terminal_failure));
         workflow["primary_clock"] = Value::Null;
-        workflow["publication_to_open_ready_clock"] = Value::Null;
+        workflow["publication_to_open_ready_clock"] = json!({
+            "status": IMPORT_OPEN_READY_FAILED_BEFORE_TRANSFER_STATUS,
+            "unavailable_reason": if terminal_failure {
+                "import_worker_terminal_failure_before_publication"
+            } else {
+                "import_worker_active_before_publication_deadline"
+            },
+            "readiness": {
+                "selected_matches": false,
+                "verified": true,
+                "import_idle": terminal_failure,
+                "problem_absent": !terminal_failure,
+            },
+            "source_verification_deltas": {
+                "started_runs": 0,
+                "progress_updates": 0,
+                "cancelled_runs": 0,
+                "failed_runs": 0,
+                "successes": 0,
+            },
+            "source_open_state": {
+                "worker_active": false,
+                "pending_install": false,
+                "active_dataset_open_operations": 0,
+                "worker_bound_to_dataset_open_operation": false,
+                "pending_install_bound_to_dataset_open_operation": false,
+            },
+        });
         workflow["last_successful_receipt"] = Value::Null;
         let command = observe_gate_batch_command(
             "IP.batch.000",
@@ -14977,6 +15404,17 @@ mod tests {
                 },
             ],
         );
+        if terminal_failure {
+            let observations = report["events"][1]["details"]["observations"]
+                .as_array_mut()
+                .unwrap();
+            for observation in observations {
+                observation["observed_after_origin_ns"] = json!(100_u64);
+            }
+            report["events"][1]["details"]["observations"][0]["timed_out"] = json!(false);
+            report["events"][1]["details"]["observations"][1]["timed_out"] = json!(false);
+            report["events"][1]["details"]["completed_after_origin_ns"] = json!(100_u64);
+        }
         report
     }
 
@@ -15175,7 +15613,7 @@ mod tests {
     #[test]
     fn imported_open_ready_failure_skips_only_pass_dependent_clock_evidence() {
         let mut report = valid_import_workflow_report();
-        let observation = &mut report["events"][1]["details"]["observations"][0];
+        let observation = &mut report["events"][1]["details"]["observations"][1];
         observation["outcome"] = json!("failed");
         observation["condition_met"] = json!(false);
         observation["timed_out"] = json!(true);
@@ -15207,6 +15645,8 @@ mod tests {
                 .unwrap()
                 .remove(field);
         }
+        report["import_workflow_evidence"]["publication_to_open_ready_clock"]["status"] =
+            json!(IMPORT_OPEN_READY_FAILED_AFTER_TRANSFER_STATUS);
         assert!(
             import_workflow_gate_reasons_with_outcome(
                 &report,
@@ -15217,6 +15657,18 @@ mod tests {
         );
 
         let authentic_failed_report = report.clone();
+
+        let mut mixed_complete_status = authentic_failed_report.clone();
+        mixed_complete_status["import_workflow_evidence"]["publication_to_open_ready_clock"]["status"] =
+            json!(IMPORT_OPEN_READY_COMPLETE_STATUS);
+        assert!(
+            import_workflow_gate_reasons_with_outcome(
+                &mixed_complete_status,
+                &test_import_gate(),
+                ProductGateStatus::Failed,
+            )
+            .contains("failed_imported_open_ready_evidence_shape_invalid")
+        );
 
         let mut missing_primary_clock = authentic_failed_report.clone();
         missing_primary_clock["import_workflow_evidence"]
@@ -15294,12 +15746,21 @@ mod tests {
                 &test_import_gate(),
                 ProductGateStatus::Failed,
             )
-            .contains("import_publication_currentness_evidence_mismatch")
+            .contains("failed_imported_open_ready_evidence_shape_invalid")
         );
     }
 
     #[test]
-    fn prepublication_import_timeout_accepts_only_the_two_coherent_worker_states() {
+    fn prepublication_import_failure_accepts_only_exact_active_and_terminal_states() {
+        let assert_invalid = |report: &Value| {
+            let reasons = import_workflow_gate_reasons_with_outcome(
+                report,
+                &test_import_gate(),
+                ProductGateStatus::Failed,
+            );
+            assert!(!reasons.is_empty(), "mutation was accepted");
+            assert!(has_integrity_reasons(&reasons), "{reasons:?}");
+        };
         for terminal_failure in [true, false] {
             let report = prepublication_import_workflow_report(terminal_failure);
             let reasons = import_workflow_gate_reasons_with_outcome(
@@ -15340,6 +15801,50 @@ mod tests {
             )
             .contains("prepublication_import_failure_evidence_shape_invalid")
         );
+
+        let mut terminal_waited_for_deadline = prepublication_import_workflow_report(true);
+        for index in 0..2 {
+            let row =
+                &mut terminal_waited_for_deadline["events"][1]["details"]["observations"][index];
+            row["timed_out"] = json!(true);
+            row["observed_after_origin_ns"] = json!(1_200_000_000_000_u64);
+        }
+        terminal_waited_for_deadline["events"][1]["details"]["completed_after_origin_ns"] =
+            json!(1_200_000_000_000_u64);
+        assert_invalid(&terminal_waited_for_deadline);
+
+        let mut active_failed_early = prepublication_import_workflow_report(false);
+        for index in 0..2 {
+            let row = &mut active_failed_early["events"][1]["details"]["observations"][index];
+            row["timed_out"] = json!(false);
+            row["observed_after_origin_ns"] = json!(100_u64);
+        }
+        assert_invalid(&active_failed_early);
+
+        let mut wrong_reason = prepublication_import_workflow_report(true);
+        wrong_reason["import_workflow_evidence"]["publication_to_open_ready_clock"]["unavailable_reason"] =
+            json!("import_worker_active_before_publication_deadline");
+        assert_invalid(&wrong_reason);
+
+        let mut verifier_activity = prepublication_import_workflow_report(true);
+        verifier_activity["import_workflow_evidence"]["publication_to_open_ready_clock"]["source_verification_deltas"]
+            ["successes"] = json!(1);
+        assert_invalid(&verifier_activity);
+
+        let mut source_open_active = prepublication_import_workflow_report(true);
+        source_open_active["import_workflow_evidence"]["publication_to_open_ready_clock"]["source_open_state"]
+            ["worker_active"] = json!(true);
+        assert_invalid(&source_open_active);
+
+        let mut extra_payload_key = prepublication_import_workflow_report(true);
+        extra_payload_key["import_workflow_evidence"]["publication_to_open_ready_clock"]["unexpected"] =
+            json!(true);
+        assert_invalid(&extra_payload_key);
+
+        let mut removed_v6_payload = prepublication_import_workflow_report(true);
+        removed_v6_payload["import_workflow_evidence"]["publication_to_open_ready_clock"] =
+            Value::Null;
+        assert_invalid(&removed_v6_payload);
     }
 
     #[test]
@@ -15428,7 +15933,7 @@ mod tests {
         );
 
         let mut report = valid_import_workflow_report();
-        report["events"][1]["details"]["observations"][0]["condition"] = json!("wrong");
+        report["events"][1]["details"]["observations"][1]["condition"] = json!("wrong");
         assert!(
             import_workflow_gate_reasons(&report)
                 .contains("import_receipt_start_or_open_ready_binding_mismatch")
@@ -18134,6 +18639,83 @@ mod tests {
         let mut bad_schema = report.clone();
         bad_schema["events"][0]["details"]["schema"] = json!("legacy");
         assert!(product_gate_outcomes_from_report(&bad_schema, &template).is_err());
+    }
+
+    #[test]
+    fn v6_import_gate_parser_accepts_only_the_exact_prepublication_terminal_pair() {
+        let command = observe_gate_batch_command(
+            "IP.batch.000",
+            "preprocess_publish.checkpoint.000",
+            json!({ "kind": "import_primary_started" }),
+            &[
+                (
+                    "IP.acceptance.000.import_idle",
+                    "import_idle",
+                    "import_primary_wall",
+                    1_200_000_000_000,
+                ),
+                (
+                    "IP.acceptance.001.imported_open_ready",
+                    IMPORTED_OPEN_READY_CONDITION,
+                    "import_primary_wall",
+                    1_200_000_000_000,
+                ),
+                (
+                    "IP.acceptance.002.runtime_idle",
+                    "runtime_idle",
+                    "import_primary_wall",
+                    1_200_000_000_000,
+                ),
+            ],
+        );
+        let template = template(
+            false,
+            vec![
+                json!({ "command": "start_reviewed_import" }),
+                command.clone(),
+            ],
+        );
+
+        for report in [
+            valid_import_workflow_report(),
+            prepublication_import_workflow_report(false),
+            prepublication_import_workflow_report(true),
+        ] {
+            assert!(product_gate_outcomes_from_report(&report, &template).is_ok());
+        }
+
+        let mut terminal_deadline_mix = prepublication_import_workflow_report(true);
+        let row = &mut terminal_deadline_mix["events"][1]["details"]["observations"][0];
+        row["timed_out"] = json!(true);
+        row["observed_after_origin_ns"] = json!(1_200_000_000_000_u64);
+        terminal_deadline_mix["events"][1]["details"]["completed_after_origin_ns"] =
+            json!(1_200_000_000_000_u64);
+        assert!(product_gate_outcomes_from_report(&terminal_deadline_mix, &template).is_err());
+
+        let mut active_early_mix = prepublication_import_workflow_report(false);
+        for index in 0..2 {
+            let row = &mut active_early_mix["events"][1]["details"]["observations"][index];
+            row["timed_out"] = json!(false);
+            row["observed_after_origin_ns"] = json!(100_u64);
+        }
+        assert!(product_gate_outcomes_from_report(&active_early_mix, &template).is_err());
+
+        let mut pair_only_template = template.clone();
+        pair_only_template.commands[1]["observations"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        let mut pair_only_report = prepublication_import_workflow_report(true);
+        pair_only_report["events"][1]["details"]["observations"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(product_gate_outcomes_from_report(&pair_only_report, &pair_only_template).is_err());
+
+        let mut removed_v6_payload = prepublication_import_workflow_report(true);
+        removed_v6_payload["import_workflow_evidence"]["publication_to_open_ready_clock"] =
+            Value::Null;
+        assert!(product_gate_outcomes_from_report(&removed_v6_payload, &template).is_err());
     }
 
     #[test]
