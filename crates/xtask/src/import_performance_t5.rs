@@ -46,7 +46,7 @@ use crate::{
     },
     process::cargo_command,
     product_validate::{
-        PRODUCT_AUTOMATION_SCHEMA_VERSION, PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        PRODUCT_AUTOMATION_SCRIPT_SCHEMA, SCRIPT_SCHEMA_VERSION,
         canonical_product_automation_hard_safety_limits,
         validate_product_automation_report_contract,
     },
@@ -57,6 +57,7 @@ use crate::{
 #[cfg(test)]
 use crate::product_validate::{
     PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS, PRODUCT_AUTOMATION_REPORT_SCHEMA,
+    REPORT_SCHEMA_VERSION,
 };
 
 const CONFIG_SCHEMA: &str = "mirante4d-private-import-performance-t5-2";
@@ -2906,7 +2907,7 @@ fn automation_script(
     }))?;
     Ok(json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "import_performance_t5_private",
         "hard_safety_limits": hard_safety_limits,
         "commands": [
@@ -4836,7 +4837,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(script["schema"], PRODUCT_AUTOMATION_SCRIPT_SCHEMA);
-        assert_eq!(PRODUCT_AUTOMATION_SCHEMA_VERSION, 5);
+        assert_eq!(SCRIPT_SCHEMA_VERSION, 5);
         assert_eq!(script["schema_version"], 5);
         assert!(script.get("limits").is_none());
         let hard_safety_limits = script["hard_safety_limits"].as_object().unwrap();
@@ -4864,7 +4865,7 @@ mod tests {
         write_new_synced_json(&script_path, &script).unwrap();
         let report = json!({
             "schema": PRODUCT_AUTOMATION_REPORT_SCHEMA,
-            "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+            "schema_version": REPORT_SCHEMA_VERSION,
             "status": "passed",
             "failure_reason": null,
             "script": {

@@ -1,7 +1,7 @@
 # Viewer Performance Overhaul Plan
 
 Status: ACTIVE — EP-00 WORKLOAD, FIDELITY, AND COST-TRUTH BINDING IN
-PROGRESS; BOUNDED V5 DEVELOPMENT PROTOCOL IMPLEMENTED
+PROGRESS; BOUNDED V5-INPUT/V6-REPORT DEVELOPMENT PROTOCOL IMPLEMENTED
 Planning authorization: OWNER REQUESTED 2026-07-17
 Implementation authorization: OWNER GRANTED 2026-07-17
 Last reviewed: 2026-07-18
@@ -972,41 +972,56 @@ the visible application static for minutes while their times accumulated.
 That partial evidence is retained as interrupted lineage, never reused, and
 does not establish a sample or performance claim.
 
-The replacement v5 development protocol is an authorized bounded hard cut,
-not a relaxation of any product gate. It runs exactly three ordered samples of
+The replacement development protocol is an authorized bounded hard cut, not a
+relaxation of any product gate. Automation input scripts remain schema 5 and
+application automation reports use schema 6. The EP-00 private raw report and
+sanitized development receipt each use schema 5. This report hard cut changes
+neither the schema-5 viewer interaction-script bundle nor the existing EP-01
+trace-geometry authority. The protocol runs exactly three ordered samples of
 the ten scenarios, with one fresh instrumented role and one fresh matched
 control role for each scenario and sample: 60 role attempts total, balanced
 role order, zero retries, and no substitution or post-hoc filtering. Product
-observations belonging to one contiguous acceptance checkpoint run concurrently
-from one shared declared origin, so the checkpoint wait is bounded by the
-maximum applicable deadline rather
-than the sum of independent timers. Deadline classes are fixed exactly by the
-validated profile, oracle, or protocol, use short explicit viewer ceilings, and share
-the import-primary origin for the import observations. Fatal setup waits,
-exact hard-safety termination, evidence integrity, and typed product failures
-remain separate. Every non-import prerequisite is fixed by the validated
-profile or protocol and is at most 30 seconds; no script-authored multi-minute
-viewer prerequisite remains. Typed
-product-gate misses continue through the complete population for attribution,
-but the first fatal setup, process, hard-safety, or evidence-integrity failure
-stops immediately and preserves the exact partial lineage. The role-process
-timeout is derived from the validated action, prerequisite, and concurrent-
-batch schedule plus a fixed 30-second startup-admission grace and 10-second
-closeout grace, with the IP import wall counted once; there is no caller-
-authored timeout. This three-sample population is development evidence under
-the existing progression rule and cannot establish a performance claim.
+observations belonging to one contiguous acceptance checkpoint run
+concurrently from one shared declared origin, so the checkpoint wait is
+bounded by the maximum applicable deadline rather than the sum of independent
+timers. Deadline classes are fixed exactly by the validated profile, oracle,
+or protocol, use short explicit viewer ceilings, and share the import-primary
+origin for the import observations. Fatal setup waits, exact hard-safety
+termination, evidence integrity, and typed product failures remain separate.
+Every non-import prerequisite is fixed by the validated profile or protocol
+and is at most 30 seconds; no script-authored multi-minute viewer prerequisite
+remains. Typed product-gate misses continue through the complete population
+for attribution, but the first fatal setup, process, hard-safety, or evidence-
+integrity failure stops immediately and preserves the exact partial lineage.
+The role-process timeout is derived from the validated action, prerequisite,
+and concurrent-batch schedule plus a fixed 30-second startup-admission grace
+and 10-second closeout grace, with the IP import wall counted once; there is no
+caller-authored timeout. This three-sample population is development evidence
+under the existing progression rule and cannot establish a performance claim.
 
 Every GPU-gated phase resolves its concurrent acceptance checkpoint before
 the end diagnostic, then uses one five-second-bounded nonblocking
-active-target timing await. That await accepts only the exact current
-execution ticket after its matching presented-interval record exists, freezes
-that identity once, and completes that same record even if normal rendering
-installs a newer execution. It drives normal asynchronous polling and never
-uses a fixed sleep or synchronous device wait. Its declared ceiling is counted
-in the role watchdog; normal completion is ordinarily the next UI tick. On
-success, the exact completed ticket is published as a distinct qualification
+active-target timing await. A valid schema-6 outcome is exactly one of two
+variants. The available variant freezes the exact current execution ticket
+after its matching presented-interval record exists and completes that same
+record even if normal rendering installs a newer execution. The unavailable
+variant is admitted only when no identity was captured, it is bound to the
+unique failed, timed-out `coordinated_presentation_settled` row in the
+immediately preceding gate batch, and the current-presentation generation is
+explicitly noncurrent for the awaited display generation. It completes
+immediately after that already-terminal gate result, possibly with zero
+additional wait, and remains a product failure with no numeric GPU sample or
+timing pass. The await drives normal asynchronous polling and never uses a
+fixed sleep or synchronous device wait. Its declared ceiling is counted in the
+role watchdog. Either exact variant is published as a distinct qualification
 checkpoint with the adjacent end diagnostic atomically within that UI
 callback; normal current-execution facts are not rewritten.
+
+A captured but pending ticket still waits within the fixed ceiling, and an
+evicted captured interval, malformed or unlinked unavailable authority, or
+missing candidate without that exact adjacent settlement authority remains an
+evidence-integrity failure. Plain null or incomplete timing facts cannot stand
+in for the typed unavailable variant.
 
 The allocation-free claim-bearing timing histories retain 4,096 samples. That
 bound covers the frozen 480-sample maximum interaction, the 30-second
@@ -1183,11 +1198,15 @@ balanced samples per scenario. Raw pair observations remain visible, but the
 accepted bound is evaluated only from the summed clocks of the complete exact
 three-pair scenario population; no noisy pair is retried, filtered, or used as
 a fail-fast threshold. The wall operand excludes only the checked integer
-lifetime of successful qualification-only GPU-timing awaits whose event and
-frozen identity match the immediately adjacent diagnostic checkpoint. Raw
-wall minus that exact wait sum must equal adjusted wall. CPU clocks are not
-adjusted. Missing, inconsistent, overflowed, incomplete, or reordered facts
-fail evidence integrity.
+lifetime of structurally completed qualification-only GPU-timing awaits. The
+exact wait is subtracted for either a valid available ticket bound to its
+frozen identity or valid unavailable evidence bound to the immediately
+preceding terminal settlement authority and adjacent diagnostic checkpoint; a
+valid zero wait subtracts zero. Raw wall minus that exact wait sum must equal
+adjusted wall. CPU clocks are not adjusted. Automation-command completion
+means the evidence was collected, not that an unavailable product gate passed.
+Missing, inconsistent, overflowed, incomplete, or reordered facts fail
+evidence integrity.
 
 During EP-00, EP-01, and EP-04 development, temporary work-normalized kernel
 evidence includes GPU time per output pixel and executed sample, descriptor

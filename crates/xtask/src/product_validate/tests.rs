@@ -1,7 +1,8 @@
 use super::*;
 
 fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_resources: u64) {
-    assert_eq!(PRODUCT_AUTOMATION_SCHEMA_VERSION, 5);
+    assert_eq!(SCRIPT_SCHEMA_VERSION, 5);
+    assert_eq!(REPORT_SCHEMA_VERSION, 6);
     assert_eq!(script["schema_version"], 5);
     assert_eq!(
         script["hard_safety_limits"]["max_cpu_total_bytes"],
@@ -37,7 +38,7 @@ fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_reso
 
 fn bind_report_to_script(report: &mut Value, script: &Value, script_path: &Path) {
     report["schema"] = json!(PRODUCT_AUTOMATION_REPORT_SCHEMA);
-    report["schema_version"] = json!(PRODUCT_AUTOMATION_SCHEMA_VERSION);
+    report["schema_version"] = json!(REPORT_SCHEMA_VERSION);
     report["status"] = json!("passed");
     report["failure_reason"] = Value::Null;
     report["script"] = json!({
@@ -624,7 +625,7 @@ fn import_preprocessing_script_uses_normal_cancel_resume_open_ready_path() {
 fn import_preprocessing_evidence_requires_named_progress_resume_and_open_ready() {
     let report = json!({
         "schema": PRODUCT_AUTOMATION_REPORT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": REPORT_SCHEMA_VERSION,
         "import_workflow_evidence": {
             "worker_emitted_stage_names": [
                 "planning-and-preflight",
@@ -1001,7 +1002,7 @@ fn product_validation_output_dirs_are_scenario_scoped() {
 fn fixed_product_automation_script_validation_rejects_wrong_schema() {
     let script = json!({
         "schema": "wrong",
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "unit",
         "commands": [
             { "command": "open_dataset", "path": "/tmp/demo.m4d" },
@@ -1036,7 +1037,7 @@ fn fixed_product_automation_script_validation_rejects_wrong_schema() {
 fn fixed_product_automation_script_validation_requires_open_dataset_and_quit() {
     let missing_open = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "unit",
         "commands": [
             { "command": "quit" }
@@ -1044,7 +1045,7 @@ fn fixed_product_automation_script_validation_requires_open_dataset_and_quit() {
     });
     let missing_quit = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "unit",
         "commands": [
             { "command": "open_dataset", "path": "/tmp/demo.m4d" }
@@ -1069,7 +1070,7 @@ fn fixed_product_automation_script_validation_requires_open_dataset_and_quit() {
 fn fixed_product_automation_script_validation_rejects_bad_hard_safety_limits() {
     let missing = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "unit",
         "commands": [
             { "command": "open_dataset", "path": "/tmp/demo.m4d" },
@@ -1078,7 +1079,7 @@ fn fixed_product_automation_script_validation_rejects_bad_hard_safety_limits() {
     });
     let unknown = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "unit",
         "hard_safety_limits": {
             "max_surprise_bytes": 1
@@ -1090,7 +1091,7 @@ fn fixed_product_automation_script_validation_rejects_bad_hard_safety_limits() {
     });
     let non_integer = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "unit",
         "hard_safety_limits": {
             "max_cpu_total_bytes": "lots"
@@ -1125,7 +1126,7 @@ fn fixed_product_automation_script_validation_rejects_bad_hard_safety_limits() {
 fn product_automation_script_shape_rejects_legacy_and_unknown_top_level_fields() {
     let valid = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "unit",
         "hard_safety_limits": {
             "max_cpu_total_bytes": 1024,
@@ -1157,7 +1158,7 @@ fn product_automation_script_shape_rejects_legacy_and_unknown_top_level_fields()
 }
 
 #[test]
-fn product_automation_report_contract_rejects_every_v5_binding_mutation() {
+fn product_automation_report_contract_requires_v6_with_a_v5_script_binding() {
     let report = json!({
         "status": "passed",
         "artifacts": []
@@ -1166,7 +1167,7 @@ fn product_automation_report_contract_rejects_every_v5_binding_mutation() {
     validate_product_automation_report_contract(&report, &script, &script_path).unwrap();
 
     let mut old_schema = report.clone();
-    old_schema["schema_version"] = json!(4);
+    old_schema["schema_version"] = json!(SCRIPT_SCHEMA_VERSION);
     assert!(
         validate_product_automation_report_contract(&old_schema, &script, &script_path).is_err()
     );

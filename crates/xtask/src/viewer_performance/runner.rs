@@ -34,12 +34,16 @@ use crate::process::cargo_command;
 const WORKLOAD_SCHEMA: &str = "mirante4d-viewer-performance-workload-bundle-4";
 const SCRIPT_BUNDLE_SCHEMA: &str = "mirante4d-viewer-performance-script-bundle-5";
 const ORACLE_SCHEMA: &str = "mirante4d-viewer-performance-oracle-bundle-3";
-const RAW_REPORT_SCHEMA: &str = "mirante4d-viewer-performance-raw-private-report-4";
-const RECEIPT_SCHEMA: &str = "mirante4d-viewer-performance-development-receipt-4";
+const RAW_REPORT_SCHEMA: &str = "mirante4d-viewer-performance-raw-private-report-5";
+const RECEIPT_SCHEMA: &str = "mirante4d-viewer-performance-development-receipt-5";
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-const AUTOMATION_SCHEMA_VERSION: u64 = 5;
+const AUTOMATION_SCRIPT_SCHEMA_VERSION: u64 = 5;
+const AUTOMATION_REPORT_SCHEMA_VERSION: u64 = 6;
 const PRODUCT_GATE_OBSERVATION_SCHEMA: &str = "mirante4d-product-gate-batch-observation-1";
+const GPU_TIMING_UNAVAILABLE_REASON: &str =
+    "terminal_coordinated_presentation_settled_failure_without_exact_current_presented_interval";
+const GPU_TIMING_UNAVAILABLE_DERIVATION: &str = "terminal_coordinated_presentation_settled_failure_bound_to_adjacent_unavailable_gpu_timing_checkpoint";
 const IMPORTED_OPEN_READY_CONDITION: &str = "imported_open_ready";
 const PRODUCT_GATE_ID_MAX_BYTES: usize = 128;
 const PRODUCT_GATE_CONDITION_MAX_BYTES: usize = 128;
@@ -3703,7 +3707,7 @@ fn validate_automation_template(
     expected_labels: &[&str],
 ) -> anyhow::Result<()> {
     if script.schema != AUTOMATION_SCRIPT_SCHEMA
-        || script.schema_version != AUTOMATION_SCHEMA_VERSION
+        || script.schema_version != AUTOMATION_SCRIPT_SCHEMA_VERSION
     {
         bail!("viewer scenario {id} uses an unsupported product automation schema")
     }
@@ -6158,7 +6162,8 @@ fn validate_basic_automation_report(
     reasons: &mut BTreeSet<String>,
 ) {
     if report.get("schema").and_then(Value::as_str) != Some(AUTOMATION_REPORT_SCHEMA)
-        || report.get("schema_version").and_then(Value::as_u64) != Some(AUTOMATION_SCHEMA_VERSION)
+        || report.get("schema_version").and_then(Value::as_u64)
+            != Some(AUTOMATION_REPORT_SCHEMA_VERSION)
     {
         reasons.insert("automation_report_schema_mismatch".to_owned());
     }
@@ -6199,7 +6204,7 @@ fn validate_basic_automation_report(
         || report
             .pointer("/script/schema_version")
             .and_then(Value::as_u64)
-            != Some(AUTOMATION_SCHEMA_VERSION)
+            != Some(AUTOMATION_SCRIPT_SCHEMA_VERSION)
         || report.pointer("/script/scenario").and_then(Value::as_str)
             != Some(template.scenario.as_str())
         || report
@@ -7191,6 +7196,15 @@ fn duration_ms_to_ns(value: Option<&Value>) -> Option<u64> {
     (nanoseconds.is_finite() && nanoseconds <= u64::MAX as f64).then(|| nanoseconds.round() as u64)
 }
 
+fn nonnegative_duration_ms_to_ns(value: Option<&Value>) -> Option<u64> {
+    let milliseconds = value?.as_f64()?;
+    if !milliseconds.is_finite() || milliseconds < 0.0 {
+        return None;
+    }
+    let nanoseconds = milliseconds * 1_000_000.0;
+    (nanoseconds.is_finite() && nanoseconds <= u64::MAX as f64).then(|| nanoseconds.round() as u64)
+}
+
 fn paired_overhead_basis_points(
     instrumented: Option<u64>,
     control: Option<u64>,
@@ -7243,6 +7257,7 @@ fn qualification_gpu_timing_await_wall_ns(
         reasons.insert("qualification_gpu_timing_await_evidence_missing_or_invalid".to_owned());
         return None;
     }
+    let parsed_gate_outcomes = product_gate_outcomes_from_report(report?, template).ok();
     let mut total = 0_u64;
     for (command_index, command) in expected {
         let mut matching_events = events.iter().filter(|event| {
@@ -7262,6 +7277,9 @@ fn qualification_gpu_timing_await_wall_ns(
         let detail_keys = details
             .and_then(Value::as_object)
             .map(|object| object.keys().map(String::as_str).collect::<BTreeSet<_>>());
+        let available = details
+            .and_then(|details| details.get("available"))
+            .and_then(Value::as_bool);
         let waited_ns = details
             .and_then(|details| details.get("waited_ns"))
             .and_then(Value::as_u64);
@@ -7314,7 +7332,15 @@ fn qualification_gpu_timing_await_wall_ns(
         let checkpoint = adjacent_details.and_then(|details| {
             details.pointer("/diagnostics/render/qualification_gpu_timing_checkpoint")
         });
-        let valid = event_keys
+        let checkpoint_keys = checkpoint
+            .and_then(Value::as_object)
+            .map(|object| object.keys().map(String::as_str).collect::<BTreeSet<_>>());
+        let display_generation = details
+            .and_then(|details| details.get("display_generation"))
+            .and_then(Value::as_u64);
+        let current_presentation_generation =
+            details.and_then(|details| details.get("current_presentation_generation"));
+        let common_valid = event_keys
             == Some(BTreeSet::from([
                 "command_index",
                 "command",
@@ -7325,16 +7351,41 @@ fn qualification_gpu_timing_await_wall_ns(
             ]))
             && detail_keys
                 == Some(BTreeSet::from([
+                    "available",
+                    "unavailable_reason",
                     "target",
                     "pass_kind",
+                    "display_generation",
+                    "current_presentation_generation",
                     "execution_id",
                     "renderer_target",
-                    "display_generation",
                     "renderer_frame",
                     "identity_frozen_before_completion",
                     "exact_presented_interval_timing_complete",
+                    "unavailable_authority",
                     "waited_ns",
                     "waited_ms",
+                ]))
+            && checkpoint_keys
+                == Some(BTreeSet::from([
+                    "available",
+                    "derivation",
+                    "reason",
+                    "presented_interval_sequence",
+                    "panel",
+                    "execution_id",
+                    "target",
+                    "display_generation",
+                    "current_presentation_generation",
+                    "renderer_frame",
+                    "pass_kind",
+                    "gpu_batch_envelope_ns",
+                    "gpu_payload_copy_ns",
+                    "gpu_render_pass_ns",
+                    "identity_frozen_before_completion",
+                    "exact_presented_interval_timing_complete",
+                    "unavailable_authority",
+                    "waited_ns",
                 ]))
             && event.get("command").and_then(Value::as_str) == Some("await_active_view_gpu_timing")
             && event.get("status").and_then(Value::as_str) == Some("passed")
@@ -7354,54 +7405,18 @@ fn qualification_gpu_timing_await_wall_ns(
                 .and_then(|details| details.get("pass_kind"))
                 .and_then(Value::as_str)
                 == pass_kind
-            && details
-                .and_then(|details| details.get("identity_frozen_before_completion"))
-                .and_then(Value::as_bool)
-                == Some(true)
-            && details
-                .and_then(|details| details.get("exact_presented_interval_timing_complete"))
-                .and_then(Value::as_bool)
-                == Some(true)
-            && details
-                .and_then(|details| details.get("execution_id"))
-                .and_then(Value::as_u64)
-                .is_some_and(|value| value != 0)
-            && details
-                .and_then(|details| details.get("renderer_target"))
-                .and_then(Value::as_u64)
-                .is_some_and(|value| value != 0)
-            && details
-                .and_then(|details| details.get("display_generation"))
-                .and_then(Value::as_u64)
-                .is_some()
-            && details
-                .and_then(|details| details.get("renderer_frame"))
-                .and_then(Value::as_u64)
-                .is_some_and(|value| value != 0)
+            && display_generation.is_some()
+            && current_presentation_generation
+                .is_some_and(|generation| generation.is_null() || generation.as_u64().is_some())
             && waited_ns.is_some_and(|waited_ns| {
-                waited_ns != 0
-                    && timeout_ns.is_some_and(|timeout_ns| waited_ns <= timeout_ns)
-                    && duration_ms_to_ns(waited_ms) == Some(waited_ns)
+                timeout_ns.is_some_and(|timeout_ns| waited_ns <= timeout_ns)
+                    && nonnegative_duration_ms_to_ns(waited_ms) == Some(waited_ns)
             })
             && adjacent_event
                 .and_then(|event| event.get("status"))
                 .and_then(Value::as_str)
                 == Some("passed")
             && adjacent_details.is_some_and(|details| Some(details) == matching_diagnostic)
-            && checkpoint
-                .and_then(|checkpoint| checkpoint.get("available"))
-                .and_then(Value::as_bool)
-                == Some(true)
-            && checkpoint
-                .and_then(|checkpoint| checkpoint.get("derivation"))
-                .and_then(Value::as_str)
-                == Some(
-                    "identity_frozen_from_current_execution_then_completed_by_exact_presented_interval_ticket",
-                )
-            && checkpoint
-                .and_then(|checkpoint| checkpoint.get("exact_presented_interval_timing_complete"))
-                .and_then(Value::as_bool)
-                == Some(true)
             && checkpoint
                 .and_then(|checkpoint| checkpoint.get("panel"))
                 .and_then(Value::as_str)
@@ -7410,31 +7425,160 @@ fn qualification_gpu_timing_await_wall_ns(
                 .and_then(|checkpoint| checkpoint.get("pass_kind"))
                 .and_then(Value::as_str)
                 == expected_checkpoint_pass
+            && checkpoint.and_then(|checkpoint| checkpoint.get("display_generation"))
+                == details.and_then(|details| details.get("display_generation"))
+            && checkpoint.and_then(|checkpoint| checkpoint.get("current_presentation_generation"))
+                == current_presentation_generation
             && checkpoint
-                .and_then(|checkpoint| checkpoint.get("execution_id"))
+                .and_then(|checkpoint| checkpoint.get("waited_ns"))
                 .and_then(Value::as_u64)
-                == details
+                == waited_ns;
+        let variant_valid = match available {
+            Some(true) => {
+                let execution_id = details
                     .and_then(|details| details.get("execution_id"))
-                    .and_then(Value::as_u64)
-            && checkpoint
-                .and_then(|checkpoint| checkpoint.get("target"))
-                .and_then(Value::as_u64)
-                == details
+                    .and_then(Value::as_u64);
+                let renderer_target = details
                     .and_then(|details| details.get("renderer_target"))
-                    .and_then(Value::as_u64)
-            && checkpoint
-                .and_then(|checkpoint| checkpoint.get("display_generation"))
-                .and_then(Value::as_u64)
-                == details
-                    .and_then(|details| details.get("display_generation"))
-                    .and_then(Value::as_u64)
-            && checkpoint
-                .and_then(|checkpoint| checkpoint.get("renderer_frame"))
-                .and_then(Value::as_u64)
-                == details
+                    .and_then(Value::as_u64);
+                let renderer_frame = details
                     .and_then(|details| details.get("renderer_frame"))
                     .and_then(Value::as_u64);
-        let Some(waited_ns) = waited_ns.filter(|_| valid) else {
+                details
+                    .and_then(|details| details.get("unavailable_reason"))
+                    .is_some_and(Value::is_null)
+                    && details
+                        .and_then(|details| details.get("unavailable_authority"))
+                        .is_some_and(Value::is_null)
+                    && details
+                        .and_then(|details| details.get("identity_frozen_before_completion"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    && details
+                        .and_then(|details| details.get("exact_presented_interval_timing_complete"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    && execution_id.is_some_and(|value| value != 0)
+                    && renderer_target.is_some_and(|value| value != 0)
+                    && renderer_frame.is_some_and(|value| value != 0)
+                    && current_presentation_generation.and_then(Value::as_u64) == display_generation
+                    && checkpoint
+                        .and_then(|checkpoint| checkpoint.get("available"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    && checkpoint
+                        .and_then(|checkpoint| checkpoint.get("derivation"))
+                        .and_then(Value::as_str)
+                        == Some(
+                            "identity_frozen_from_current_execution_then_completed_by_exact_presented_interval_ticket",
+                        )
+                    && checkpoint
+                        .and_then(|checkpoint| checkpoint.get("reason"))
+                        .is_some_and(Value::is_null)
+                    && checkpoint
+                        .and_then(|checkpoint| checkpoint.get("presented_interval_sequence"))
+                        .and_then(Value::as_u64)
+                        .is_some()
+                    && checkpoint
+                        .and_then(|checkpoint| checkpoint.get("execution_id"))
+                        .and_then(Value::as_u64)
+                        == execution_id
+                    && checkpoint
+                        .and_then(|checkpoint| checkpoint.get("target"))
+                        .and_then(Value::as_u64)
+                        == renderer_target
+                    && checkpoint
+                        .and_then(|checkpoint| checkpoint.get("renderer_frame"))
+                        .and_then(Value::as_u64)
+                        == renderer_frame
+                    && checkpoint
+                        .and_then(|checkpoint| checkpoint.get("identity_frozen_before_completion"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    && checkpoint
+                        .and_then(|checkpoint| {
+                            checkpoint.get("exact_presented_interval_timing_complete")
+                        })
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    && checkpoint
+                        .and_then(|checkpoint| checkpoint.get("unavailable_authority"))
+                        .is_some_and(Value::is_null)
+            }
+            Some(false) => {
+                let authority = parsed_gate_outcomes.as_deref().and_then(|outcomes| {
+                    exact_unavailable_gpu_timing_authority(outcomes, command_index)
+                });
+                let current_is_not_expected = current_presentation_generation
+                    .is_some_and(|value| value.is_null() || value.as_u64() != display_generation);
+                details
+                    .and_then(|details| details.get("unavailable_reason"))
+                    .and_then(Value::as_str)
+                    == Some(GPU_TIMING_UNAVAILABLE_REASON)
+                    && details
+                        .and_then(|details| details.get("execution_id"))
+                        .is_some_and(Value::is_null)
+                    && details
+                        .and_then(|details| details.get("renderer_target"))
+                        .is_some_and(Value::is_null)
+                    && details
+                        .and_then(|details| details.get("renderer_frame"))
+                        .is_some_and(Value::is_null)
+                    && details
+                        .and_then(|details| details.get("identity_frozen_before_completion"))
+                        .and_then(Value::as_bool)
+                        == Some(false)
+                    && details
+                        .and_then(|details| details.get("exact_presented_interval_timing_complete"))
+                        .and_then(Value::as_bool)
+                        == Some(false)
+                    && authority.is_some()
+                    && details.and_then(|details| details.get("unavailable_authority"))
+                        == authority.as_ref()
+                    && current_is_not_expected
+                    && checkpoint
+                        .and_then(|checkpoint| checkpoint.get("available"))
+                        .and_then(Value::as_bool)
+                        == Some(false)
+                    && checkpoint
+                        .and_then(|checkpoint| checkpoint.get("derivation"))
+                        .and_then(Value::as_str)
+                        == Some(GPU_TIMING_UNAVAILABLE_DERIVATION)
+                    && checkpoint
+                        .and_then(|checkpoint| checkpoint.get("reason"))
+                        .and_then(Value::as_str)
+                        == Some(GPU_TIMING_UNAVAILABLE_REASON)
+                    && [
+                        "presented_interval_sequence",
+                        "execution_id",
+                        "target",
+                        "renderer_frame",
+                        "gpu_batch_envelope_ns",
+                        "gpu_payload_copy_ns",
+                        "gpu_render_pass_ns",
+                    ]
+                    .into_iter()
+                    .all(|field| {
+                        checkpoint
+                            .and_then(|checkpoint| checkpoint.get(field))
+                            .is_some_and(Value::is_null)
+                    })
+                    && checkpoint
+                        .and_then(|checkpoint| checkpoint.get("identity_frozen_before_completion"))
+                        .and_then(Value::as_bool)
+                        == Some(false)
+                    && checkpoint
+                        .and_then(|checkpoint| {
+                            checkpoint.get("exact_presented_interval_timing_complete")
+                        })
+                        .and_then(Value::as_bool)
+                        == Some(false)
+                    && checkpoint.and_then(|checkpoint| checkpoint.get("unavailable_authority"))
+                        == authority.as_ref()
+            }
+            None => false,
+        };
+        let Some(waited_ns) = waited_ns.filter(|_| common_valid && variant_valid) else {
             reasons.insert("qualification_gpu_timing_await_evidence_missing_or_invalid".to_owned());
             return None;
         };
@@ -7445,6 +7589,37 @@ fn qualification_gpu_timing_await_wall_ns(
         total = next;
     }
     Some(total)
+}
+
+fn exact_unavailable_gpu_timing_authority(
+    outcomes: &[ProductGateOutcome],
+    await_command_index: usize,
+) -> Option<Value> {
+    let preceding_command_index = await_command_index.checked_sub(1)?;
+    let mut coordinated = outcomes.iter().filter(|outcome| {
+        outcome.command_index == preceding_command_index
+            && outcome.condition == "coordinated_presentation_settled"
+    });
+    let outcome = coordinated
+        .next()
+        .filter(|_| coordinated.next().is_none())?;
+    if outcome.outcome != ProductGateStatus::Failed || outcome.condition_met || !outcome.timed_out {
+        return None;
+    }
+    Some(json!({
+        "command_index": outcome.command_index,
+        "batch_id": outcome.batch_id,
+        "phase_id": outcome.phase_id,
+        "observation_index": outcome.observation_index,
+        "gate_id": outcome.gate_id,
+        "condition": outcome.condition,
+        "deadline_authority": outcome.deadline_authority,
+        "deadline_after_origin_ns": outcome.deadline_after_origin_ns,
+        "outcome": outcome.outcome.report_label(),
+        "condition_met": outcome.condition_met,
+        "timed_out": outcome.timed_out,
+        "observed_after_origin_ns": outcome.observed_after_origin_ns,
+    }))
 }
 
 fn cleanup_attempt_package(
@@ -7542,6 +7717,7 @@ fn evaluate_phases(
                 &script.instrumented_script,
                 report,
                 &checkpoints,
+                &instrumented.product_gate_outcomes,
                 imported_open_ready_outcome(&instrumented.product_gate_outcomes),
             )
         })
@@ -7574,6 +7750,7 @@ fn evaluate_phase(
     template: &AutomationScriptTemplate,
     report: &Value,
     checkpoints: &BTreeMap<&str, &Value>,
+    product_gate_outcomes: &[ProductGateOutcome],
     imported_open_ready_outcome: Option<ProductGateStatus>,
 ) -> PhaseEvaluation {
     let mut reasons = BTreeSet::new();
@@ -7648,11 +7825,18 @@ fn evaluate_phase(
         &mut reasons,
     );
     if let Some(gpu_gate) = oracle.gpu_gate {
+        let exact_unavailable_authority =
+            diagnostic_command_index(&template.commands, &script_phase.end_diagnostic_label)
+                .and_then(|end_index| end_index.checked_sub(1))
+                .and_then(|await_index| {
+                    exact_unavailable_gpu_timing_authority(product_gate_outcomes, await_index)
+                });
         validate_gpu_gate(
             end_diagnostics,
             gpu_gate,
             oracle.phase_state.active_view,
             profile,
+            exact_unavailable_authority.as_ref(),
             &mut reasons,
         );
     }
@@ -9804,6 +9988,7 @@ fn validate_gpu_gate(
     gate: GpuGate,
     expected_panel: ViewerPanel,
     profile: &ViewerQualificationProfile,
+    expected_unavailable_authority: Option<&Value>,
     reasons: &mut BTreeSet<String>,
 ) {
     let expected_pass_kind = match gate {
@@ -9813,6 +9998,22 @@ fn validate_gpu_gate(
     let expected_generation = diagnostics
         .pointer("/render/display_coordination/input_generation")
         .and_then(Value::as_u64);
+    if let Some(valid_unavailable) = validate_unavailable_gpu_timing_checkpoint(
+        diagnostics,
+        expected_panel,
+        expected_pass_kind,
+        expected_generation,
+        expected_unavailable_authority,
+        reasons,
+    ) {
+        if valid_unavailable {
+            reasons.insert(
+                "product_gate_gpu_timing_unavailable_without_expected_current_presentation"
+                    .to_owned(),
+            );
+        }
+        return;
+    }
     let target_fact = diagnostics
         .pointer("/render/display_coordination/detailed_counters/per_target_renderer_facts")
         .and_then(Value::as_array)
@@ -9996,6 +10197,162 @@ fn validate_gpu_gate(
     if !matches!(gate, GpuGate::Plane) && expected_panel != ViewerPanel::ThreeD {
         reasons.insert("volume_gpu_gate_panel_mismatch".to_owned());
     }
+}
+
+fn validate_unavailable_gpu_timing_checkpoint(
+    diagnostics: &Value,
+    expected_panel: ViewerPanel,
+    expected_pass_kind: &str,
+    expected_generation: Option<u64>,
+    expected_unavailable_authority: Option<&Value>,
+    reasons: &mut BTreeSet<String>,
+) -> Option<bool> {
+    let checkpoint = diagnostics.pointer("/render/qualification_gpu_timing_checkpoint")?;
+    if checkpoint.get("available").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let fields = checkpoint
+        .as_object()
+        .map(|object| object.keys().map(String::as_str).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let authority = checkpoint.get("unavailable_authority");
+    let authority_fields = authority
+        .and_then(Value::as_object)
+        .map(|object| object.keys().map(String::as_str).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let current_presentation =
+        diagnostics.pointer("/render/display_coordination/current_presentation_generation");
+    let current_is_valid_noncurrent = expected_generation.is_some_and(|expected| {
+        current_presentation.is_some_and(|value| {
+            value.is_null() || value.as_u64().is_some_and(|current| current != expected)
+        })
+    });
+    let valid = fields
+        == BTreeSet::from([
+            "available",
+            "derivation",
+            "reason",
+            "presented_interval_sequence",
+            "panel",
+            "execution_id",
+            "target",
+            "display_generation",
+            "current_presentation_generation",
+            "renderer_frame",
+            "pass_kind",
+            "gpu_batch_envelope_ns",
+            "gpu_payload_copy_ns",
+            "gpu_render_pass_ns",
+            "identity_frozen_before_completion",
+            "exact_presented_interval_timing_complete",
+            "unavailable_authority",
+            "waited_ns",
+        ])
+        && checkpoint.get("derivation").and_then(Value::as_str)
+            == Some(GPU_TIMING_UNAVAILABLE_DERIVATION)
+        && checkpoint.get("reason").and_then(Value::as_str) == Some(GPU_TIMING_UNAVAILABLE_REASON)
+        && checkpoint.get("panel").and_then(Value::as_str) == Some(expected_panel.report_label())
+        && checkpoint.get("pass_kind").and_then(Value::as_str) == Some(expected_pass_kind)
+        && checkpoint.get("display_generation").and_then(Value::as_u64) == expected_generation
+        && checkpoint.get("current_presentation_generation") == current_presentation
+        && current_is_valid_noncurrent
+        && [
+            "presented_interval_sequence",
+            "execution_id",
+            "target",
+            "renderer_frame",
+            "gpu_batch_envelope_ns",
+            "gpu_payload_copy_ns",
+            "gpu_render_pass_ns",
+        ]
+        .into_iter()
+        .all(|field| checkpoint.get(field).is_some_and(Value::is_null))
+        && checkpoint
+            .get("identity_frozen_before_completion")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && checkpoint
+            .get("exact_presented_interval_timing_complete")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && checkpoint
+            .get("waited_ns")
+            .and_then(Value::as_u64)
+            .is_some_and(|waited| waited <= GPU_TIMING_AWAIT_TIMEOUT_MS * 1_000_000)
+        && expected_unavailable_authority.is_some()
+        && authority == expected_unavailable_authority
+        && authority_fields
+            == BTreeSet::from([
+                "command_index",
+                "batch_id",
+                "phase_id",
+                "observation_index",
+                "gate_id",
+                "condition",
+                "deadline_authority",
+                "deadline_after_origin_ns",
+                "outcome",
+                "condition_met",
+                "timed_out",
+                "observed_after_origin_ns",
+            ])
+        && authority
+            .and_then(|authority| authority.get("command_index"))
+            .and_then(Value::as_u64)
+            .is_some()
+        && authority
+            .and_then(|authority| authority.get("observation_index"))
+            .and_then(Value::as_u64)
+            .is_some()
+        && authority
+            .and_then(|authority| authority.get("batch_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| validate_product_gate_id(value).is_ok())
+        && authority
+            .and_then(|authority| authority.get("phase_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| validate_product_gate_id(value).is_ok())
+        && authority
+            .and_then(|authority| authority.get("gate_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| validate_product_gate_id(value).is_ok())
+        && authority
+            .and_then(|authority| authority.get("condition"))
+            .and_then(Value::as_str)
+            == Some("coordinated_presentation_settled")
+        && authority
+            .and_then(|authority| authority.get("deadline_authority"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| validate_deadline_authority(value).is_ok())
+        && authority
+            .and_then(|authority| authority.get("deadline_after_origin_ns"))
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > 0 && value <= PRODUCT_GATE_DEADLINE_MAX_NS)
+        && authority
+            .and_then(|authority| authority.get("outcome"))
+            .and_then(Value::as_str)
+            == Some("failed")
+        && authority
+            .and_then(|authority| authority.get("condition_met"))
+            .and_then(Value::as_bool)
+            == Some(false)
+        && authority
+            .and_then(|authority| authority.get("timed_out"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        && authority
+            .and_then(|authority| authority.get("observed_after_origin_ns"))
+            .and_then(Value::as_u64)
+            .zip(
+                authority
+                    .and_then(|authority| authority.get("deadline_after_origin_ns"))
+                    .and_then(Value::as_u64),
+            )
+            .is_some_and(|(observed, deadline)| observed >= deadline);
+    if !valid {
+        reasons.insert("qualification_gpu_timing_checkpoint_missing_or_invalid".to_owned());
+    }
+    Some(valid)
 }
 
 fn validate_settlement_gate(
@@ -11653,6 +12010,7 @@ fn is_known_product_gate_reason(reason: &str) -> bool {
             | "product_gate_current_presentation_generation_mismatch"
             | "product_gate_current_complete_fidelity_false"
             | "product_gate_target_or_displayed_scale_mismatch"
+            | "product_gate_gpu_timing_unavailable_without_expected_current_presentation"
             | "product_gate_cross_section_layer_scale_or_coverage_mismatch"
             | "product_gate_gpu_render_mode_mismatch"
             | "product_gate_visible_panel_milestone_set_mismatch"
@@ -12443,7 +12801,7 @@ mod tests {
     fn template(instrumented: bool, commands: Vec<Value>) -> AutomationScriptTemplate {
         AutomationScriptTemplate {
             schema: AUTOMATION_SCRIPT_SCHEMA.to_owned(),
-            schema_version: AUTOMATION_SCHEMA_VERSION,
+            schema_version: AUTOMATION_SCRIPT_SCHEMA_VERSION,
             scenario: "RZ".to_owned(),
             gpu_timing: instrumented,
             diagnostic_counters: instrumented,
@@ -14991,7 +15349,7 @@ mod tests {
     }
 
     #[test]
-    fn qualification_gpu_timing_await_wall_uses_only_exact_successful_events() {
+    fn qualification_gpu_timing_await_wall_uses_only_exact_completed_variants() {
         let script = template(
             true,
             vec![
@@ -15012,7 +15370,13 @@ mod tests {
                 json!({ "command": "sample_diagnostics", "label": "xy-end" }),
             ],
         );
-        let diagnostic = |label, panel, pass_kind, execution_id, renderer_target, frame| {
+        let diagnostic = |label,
+                          panel,
+                          pass_kind,
+                          execution_id,
+                          renderer_target,
+                          frame,
+                          waited_ns| {
             json!({
                 "label": label,
                 "diagnostics": {
@@ -15020,20 +15384,30 @@ mod tests {
                         "qualification_gpu_timing_checkpoint": {
                             "available": true,
                             "derivation": "identity_frozen_from_current_execution_then_completed_by_exact_presented_interval_ticket",
+                            "reason": null,
+                            "presented_interval_sequence": 1,
                             "panel": panel,
                             "execution_id": execution_id,
                             "target": renderer_target,
                             "display_generation": 3,
+                            "current_presentation_generation": 3,
                             "renderer_frame": frame,
                             "pass_kind": pass_kind,
+                            "gpu_batch_envelope_ns": 100,
+                            "gpu_payload_copy_ns": null,
+                            "gpu_render_pass_ns": 80,
+                            "identity_frozen_before_completion": true,
                             "exact_presented_interval_timing_complete": true,
+                            "unavailable_authority": null,
+                            "waited_ns": waited_ns,
                         },
                     },
                 },
             })
         };
-        let three_d_diagnostic = diagnostic("three-d-end", "3D", "Volume", 1, 2, 4);
-        let xy_diagnostic = diagnostic("xy-end", "XY", "Plane", 5, 6, 7);
+        let three_d_diagnostic =
+            diagnostic("three-d-end", "3D", "Volume", 1, 2, 4, 3_500_000_000_u64);
+        let xy_diagnostic = diagnostic("xy-end", "XY", "Plane", 5, 6, 7, 7_u64);
         let await_event = |command_index,
                            target,
                            pass_kind,
@@ -15049,14 +15423,18 @@ mod tests {
                 "event_epoch_ms": 1,
                 "duration_ms": 0.01,
                 "details": {
+                    "available": true,
+                    "unavailable_reason": null,
                     "target": target,
                     "pass_kind": pass_kind,
+                    "display_generation": 3,
+                    "current_presentation_generation": 3,
                     "execution_id": execution_id,
                     "renderer_target": renderer_target,
-                    "display_generation": 3,
                     "renderer_frame": frame,
                     "identity_frozen_before_completion": true,
                     "exact_presented_interval_timing_complete": true,
+                    "unavailable_authority": null,
                     "waited_ns": waited_ns,
                     "waited_ms": waited_ms,
                 },
@@ -15100,6 +15478,193 @@ mod tests {
         malformed["events"][3]["details"]["waited_ns"] = Value::Null;
         assert_eq!(
             qualification_gpu_timing_await_wall_ns(Some(&malformed), &script, &mut reasons),
+            None
+        );
+        assert!(reasons.contains("qualification_gpu_timing_await_evidence_missing_or_invalid"));
+    }
+
+    #[test]
+    fn qualification_gpu_timing_await_accepts_exact_terminal_unavailable_evidence() {
+        let gate = json!({
+            "command": "observe_gate_batch",
+            "batch_id": "NO.batch.001",
+            "phase_id": "nonresident_rotation_pan.checkpoint.000",
+            "origin": { "kind": "automation_started" },
+            "observations": [{
+                "gate_id": "NO.acceptance.002.coordinated_presentation_settled",
+                "deadline_authority": "cold_target_settlement",
+                "deadline_after_origin_ns": 100,
+                "target": {
+                    "kind": "condition",
+                    "condition": "coordinated_presentation_settled",
+                },
+            }],
+        });
+        let script = template(
+            true,
+            vec![
+                gate,
+                json!({
+                    "command": "await_active_view_gpu_timing",
+                    "target": "xy",
+                    "pass_kind": "plane",
+                    "timeout_ms": GPU_TIMING_AWAIT_TIMEOUT_MS,
+                }),
+                json!({ "command": "sample_diagnostics", "label": "no-end" }),
+            ],
+        );
+        let authority = json!({
+            "command_index": 0,
+            "batch_id": "NO.batch.001",
+            "phase_id": "nonresident_rotation_pan.checkpoint.000",
+            "observation_index": 0,
+            "gate_id": "NO.acceptance.002.coordinated_presentation_settled",
+            "condition": "coordinated_presentation_settled",
+            "deadline_authority": "cold_target_settlement",
+            "deadline_after_origin_ns": 100,
+            "outcome": "failed",
+            "condition_met": false,
+            "timed_out": true,
+            "observed_after_origin_ns": 100,
+        });
+        let diagnostic = json!({
+            "label": "no-end",
+            "diagnostics": { "render": {
+                "display_coordination": {
+                    "input_generation": 7,
+                    "current_presentation_generation": null,
+                },
+                "qualification_gpu_timing_checkpoint": {
+                    "available": false,
+                    "derivation": GPU_TIMING_UNAVAILABLE_DERIVATION,
+                    "reason": GPU_TIMING_UNAVAILABLE_REASON,
+                    "presented_interval_sequence": null,
+                    "panel": "XY",
+                    "execution_id": null,
+                    "target": null,
+                    "display_generation": 7,
+                    "current_presentation_generation": null,
+                    "renderer_frame": null,
+                    "pass_kind": "Plane",
+                    "gpu_batch_envelope_ns": null,
+                    "gpu_payload_copy_ns": null,
+                    "gpu_render_pass_ns": null,
+                    "identity_frozen_before_completion": false,
+                    "exact_presented_interval_timing_complete": false,
+                    "unavailable_authority": authority.clone(),
+                    "waited_ns": 0,
+                },
+            }},
+        });
+        let mut report = json!({
+            "events": [{
+                "command_index": 0,
+                "command": "observe_gate_batch",
+                "status": "passed",
+                "event_epoch_ms": 1,
+                "duration_ms": 0.0,
+                "details": {
+                    "schema": PRODUCT_GATE_OBSERVATION_SCHEMA,
+                    "batch_id": "NO.batch.001",
+                    "phase_id": "nonresident_rotation_pan.checkpoint.000",
+                    "origin": { "kind": "automation_started" },
+                    "completed_after_origin_ns": 100,
+                    "observations": [{
+                        "observation_index": 0,
+                        "gate_id": "NO.acceptance.002.coordinated_presentation_settled",
+                        "condition": "coordinated_presentation_settled",
+                        "deadline_authority": "cold_target_settlement",
+                        "deadline_after_origin_ns": 100,
+                        "outcome": "failed",
+                        "condition_met": false,
+                        "timed_out": true,
+                        "observed_after_origin_ns": 100,
+                    }],
+                },
+            }, {
+                "command_index": 1,
+                "command": "await_active_view_gpu_timing",
+                "status": "passed",
+                "event_epoch_ms": 1,
+                "duration_ms": 0.0,
+                "details": {
+                    "available": false,
+                    "unavailable_reason": GPU_TIMING_UNAVAILABLE_REASON,
+                    "target": "xy",
+                    "pass_kind": "plane",
+                    "display_generation": 7,
+                    "current_presentation_generation": null,
+                    "execution_id": null,
+                    "renderer_target": null,
+                    "renderer_frame": null,
+                    "identity_frozen_before_completion": false,
+                    "exact_presented_interval_timing_complete": false,
+                    "unavailable_authority": authority,
+                    "waited_ns": 0,
+                    "waited_ms": 0.0,
+                },
+            }, {
+                "command_index": 2,
+                "command": "sample_diagnostics",
+                "status": "passed",
+                "event_epoch_ms": 1,
+                "duration_ms": 0.0,
+                "details": diagnostic.clone(),
+            }],
+            "diagnostics": [diagnostic],
+        });
+        let mut reasons = BTreeSet::new();
+        assert_eq!(
+            qualification_gpu_timing_await_wall_ns(Some(&report), &script, &mut reasons),
+            Some(0)
+        );
+        assert!(reasons.is_empty());
+
+        let mut ambiguous_script = script.clone();
+        ambiguous_script.commands[0]["observations"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "gate_id": "NO.acceptance.003.second_coordinated_presentation",
+                "deadline_authority": "cold_target_settlement",
+                "deadline_after_origin_ns": 100,
+                "target": {
+                    "kind": "condition",
+                    "condition": "coordinated_presentation_settled",
+                },
+            }));
+        let mut ambiguous_report = report.clone();
+        ambiguous_report["events"][0]["details"]["observations"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "observation_index": 1,
+                "gate_id": "NO.acceptance.003.second_coordinated_presentation",
+                "condition": "coordinated_presentation_settled",
+                "deadline_authority": "cold_target_settlement",
+                "deadline_after_origin_ns": 100,
+                "outcome": "passed",
+                "condition_met": true,
+                "timed_out": false,
+                "observed_after_origin_ns": 50,
+            }));
+        let mut ambiguous_reasons = BTreeSet::new();
+        assert_eq!(
+            qualification_gpu_timing_await_wall_ns(
+                Some(&ambiguous_report),
+                &ambiguous_script,
+                &mut ambiguous_reasons,
+            ),
+            None
+        );
+        assert!(
+            ambiguous_reasons
+                .contains("qualification_gpu_timing_await_evidence_missing_or_invalid")
+        );
+
+        report["events"][1]["details"]["unavailable_authority"]["gate_id"] = json!("wrong");
+        assert_eq!(
+            qualification_gpu_timing_await_wall_ns(Some(&report), &script, &mut reasons),
             None
         );
         assert!(reasons.contains("qualification_gpu_timing_await_evidence_missing_or_invalid"));
@@ -15520,6 +16085,7 @@ mod tests {
             GpuGate::Mip,
             ViewerPanel::ThreeD,
             &profile,
+            None,
             &mut reasons,
         );
         assert!(reasons.is_empty());
@@ -15531,6 +16097,7 @@ mod tests {
             GpuGate::Mip,
             ViewerPanel::ThreeD,
             &profile,
+            None,
             &mut reasons,
         );
         assert!(reasons.contains("presented_interval_gpu_ticket_missing"));
@@ -15543,9 +16110,140 @@ mod tests {
             GpuGate::Mip,
             ViewerPanel::ThreeD,
             &profile,
+            None,
             &mut reasons,
         );
         assert!(reasons.contains("per_target_gpu_execution_fact_missing_for_current_generation"));
+    }
+
+    #[test]
+    fn gpu_gate_preserves_exact_unavailable_timing_as_a_product_failure() {
+        let authority = json!({
+            "command_index": 8,
+            "batch_id": "NO.batch.001",
+            "phase_id": "nonresident_rotation_pan.checkpoint.000",
+            "observation_index": 0,
+            "gate_id": "NO.acceptance.002.coordinated_presentation_settled",
+            "condition": "coordinated_presentation_settled",
+            "deadline_authority": "nonresident_target_settlement",
+            "deadline_after_origin_ns": 5_000_000_000_u64,
+            "outcome": "failed",
+            "condition_met": false,
+            "timed_out": true,
+            "observed_after_origin_ns": 5_000_000_000_u64,
+        });
+        let expected_authority = authority.clone();
+        let mut diagnostics = json!({
+            "render": {
+                "display_coordination": {
+                    "input_generation": 7,
+                    "current_presentation_generation": null,
+                },
+                "qualification_gpu_timing_checkpoint": {
+                    "available": false,
+                    "derivation": GPU_TIMING_UNAVAILABLE_DERIVATION,
+                    "reason": GPU_TIMING_UNAVAILABLE_REASON,
+                    "presented_interval_sequence": null,
+                    "panel": "XY",
+                    "execution_id": null,
+                    "target": null,
+                    "display_generation": 7,
+                    "current_presentation_generation": null,
+                    "renderer_frame": null,
+                    "pass_kind": "Plane",
+                    "gpu_batch_envelope_ns": null,
+                    "gpu_payload_copy_ns": null,
+                    "gpu_render_pass_ns": null,
+                    "identity_frozen_before_completion": false,
+                    "exact_presented_interval_timing_complete": false,
+                    "unavailable_authority": authority,
+                    "waited_ns": 0,
+                },
+            },
+        });
+        let mut reasons = BTreeSet::new();
+        validate_gpu_gate(
+            &diagnostics,
+            GpuGate::Plane,
+            ViewerPanel::Xy,
+            &profile(),
+            Some(&expected_authority),
+            &mut reasons,
+        );
+        assert_eq!(
+            reasons,
+            BTreeSet::from([
+                "product_gate_gpu_timing_unavailable_without_expected_current_presentation"
+                    .to_owned(),
+            ])
+        );
+
+        diagnostics["render"]["display_coordination"]["current_presentation_generation"] = json!(7);
+        reasons.clear();
+        validate_gpu_gate(
+            &diagnostics,
+            GpuGate::Plane,
+            ViewerPanel::Xy,
+            &profile(),
+            Some(&expected_authority),
+            &mut reasons,
+        );
+        assert_eq!(
+            reasons,
+            BTreeSet::from(["qualification_gpu_timing_checkpoint_missing_or_invalid".to_owned()])
+        );
+
+        diagnostics["render"]["display_coordination"]["current_presentation_generation"] =
+            Value::Null;
+        diagnostics["render"]["display_coordination"]["input_generation"] = Value::Null;
+        diagnostics["render"]["qualification_gpu_timing_checkpoint"]["display_generation"] =
+            Value::Null;
+        reasons.clear();
+        validate_gpu_gate(
+            &diagnostics,
+            GpuGate::Plane,
+            ViewerPanel::Xy,
+            &profile(),
+            Some(&expected_authority),
+            &mut reasons,
+        );
+        assert_eq!(
+            reasons,
+            BTreeSet::from(["qualification_gpu_timing_checkpoint_missing_or_invalid".to_owned()])
+        );
+
+        diagnostics["render"]["display_coordination"]["input_generation"] = json!(7);
+        diagnostics["render"]["qualification_gpu_timing_checkpoint"]["display_generation"] =
+            json!(7);
+        reasons.clear();
+        validate_gpu_gate(
+            &diagnostics,
+            GpuGate::Plane,
+            ViewerPanel::Xy,
+            &profile(),
+            None,
+            &mut reasons,
+        );
+        assert_eq!(
+            reasons,
+            BTreeSet::from(["qualification_gpu_timing_checkpoint_missing_or_invalid".to_owned()])
+        );
+
+        diagnostics["render"]["qualification_gpu_timing_checkpoint"]["unavailable_authority"]["gate_id"] =
+            json!("NO.acceptance.999.unlinked");
+        reasons.clear();
+        validate_gpu_gate(
+            &diagnostics,
+            GpuGate::Plane,
+            ViewerPanel::Xy,
+            &profile(),
+            Some(&expected_authority),
+            &mut reasons,
+        );
+        assert_eq!(
+            reasons,
+            BTreeSet::from(["qualification_gpu_timing_checkpoint_missing_or_invalid".to_owned()])
+        );
     }
 
     #[test]
@@ -17072,7 +17770,7 @@ mod tests {
         );
         let report = json!({
             "schema": AUTOMATION_REPORT_SCHEMA,
-            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "schema_version": AUTOMATION_REPORT_SCHEMA_VERSION,
             "status": "failed",
             "failure_reason": "timed out waiting for imported package open-ready",
             "events": [],
@@ -17196,6 +17894,7 @@ mod tests {
         assert!(require_valid_evidence(&BTreeSet::new()).is_ok());
         let valid_negative = BTreeSet::from([
             "product_gate_visible_panel_milestone_set_mismatch".to_owned(),
+            "product_gate_gpu_timing_unavailable_without_expected_current_presentation".to_owned(),
             "import_receipt_source_read_amplification_exceeded".to_owned(),
             "product_gate_exact_cross_scope_target_union_unique_keys_mismatch".to_owned(),
             "unique_work_gpu_uploaded_payload_bytes_delta_outside_oracle".to_owned(),

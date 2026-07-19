@@ -110,9 +110,13 @@ is correctness/component evidence; only the two named diagnostics emit timing
 observations.
 
 The EP-00 predecessor-development protocol is frozen through one external,
-owner-bound v5 profile plus strict workload, v5 script, and independent-oracle
-bundles. Build the release runner through its canonical builder, then invoke
-that exact executable for preflight and execution:
+owner-bound v5 profile plus strict workload, v5 interaction-script, and
+independent-oracle bundles. Individual automation input scripts remain schema
+5, while application automation reports use the schema-6 hard cut. The viewer
+interaction-script bundle remains schema 5, so this report change does not
+rotate the existing EP-01 trace-geometry authority. Build the release runner
+through its canonical builder, then invoke that exact executable for preflight
+and execution:
 
 ```bash
 cargo xtask viewer-performance-build-runner
@@ -173,14 +177,29 @@ per-target structural sum, while an omitted or malformed fact is invalid.
 Every checkpoint acceptance batch resolves before its phase-end diagnostic.
 It is followed by one bounded, nonblocking
 `await_active_view_gpu_timing` command for the oracle-bound active target and
-pass immediately before every GPU-gated end diagnostic. The command freezes
-the exact current execution identity only after its presented-interval record
-exists, then waits for completion of that same record even if normal rendering
-installs a newer current execution. A stale, execution-only, interval-only,
-adapter-global, or synchronous readback cannot satisfy it. The completed
-identity and timing are published as a distinct qualification checkpoint in
-the adjacent diagnostic during the same UI callback; the normal current-
-execution facts remain unmodified.
+pass immediately before every GPU-gated end diagnostic. A valid schema-6
+report has exactly one of two typed outcomes for that await. When an exact
+current presented-interval ticket exists, the command freezes its execution
+identity, waits for completion of that same record even if normal rendering
+installs a newer execution, and publishes the completed identity and timing.
+When no identity exists, exact unavailable evidence is permitted only when it
+is bound to the unique failed, timed-out
+`coordinated_presentation_settled` row in the immediately preceding gate batch
+and the current-presentation generation is explicitly noncurrent for the
+awaited display generation. That unavailable outcome completes immediately
+after the already-terminal gate observation, possibly with zero additional
+wait, and remains a product failure; it supplies no numeric GPU sample or
+timing pass. Both variants are published as a distinct qualification
+checkpoint in the adjacent diagnostic during the same UI callback, and the
+normal current-execution facts remain unmodified.
+
+A captured but still-pending exact interval continues to wait only within the
+fixed five-second ceiling. A captured interval that is evicted, a malformed or
+unlinked unavailable authority, or an absent candidate without that exact
+adjacent terminal settlement authority remains an evidence-integrity failure.
+A stale, execution-only, interval-only, adapter-global, or synchronous
+readback cannot satisfy the available variant, and plain null timing facts
+cannot satisfy the unavailable variant.
 The removed diagnostic-before-gate ordering and a callback boundary between
 readiness and capture are rejected. Phase diagnostics also bind the canonical
 current time index and application snapshot currentness.
@@ -194,16 +213,21 @@ balanced three-pair development population. Each pair retains the raw
 instrumented app wall clock, matched control wall clock, raw process CPU
 clocks, and an observation-only basis-point result. The runner subtracts from
 the instrumented wall clock only the checked sum of integer `waited_ns` values
-from successful qualification-only `await_active_view_gpu_timing` commands.
-Every subtracted event must have the exact v5 shape, agree with its `waited_ms`
-value and fixed five-second bound, and match the frozen execution identity in
-the immediately adjacent phase diagnostic. The adjusted wall sum must also
-reconcile exactly as raw wall minus that wait sum. Process CPU time is never
-adjusted. The 200-basis-point gate is applied to the summed adjusted-wall and
-raw-CPU operands for each exact three-pair scenario population, not to an
-individual pair. There are no retries, dropped pairs, outlier filters, or
-negative-overhead credits. Missing, inconsistent, overflowed, incomplete, or
-reordered operands make the evidence invalid rather than making the gate pass.
+from structurally completed qualification-only
+`await_active_view_gpu_timing` commands, for either the available or exact
+unavailable variant. Every subtracted event must have the exact schema-6
+shape, agree with its `waited_ms` value and fixed five-second bound, and match
+the adjacent diagnostic checkpoint: the frozen execution identity for an
+available ticket, or the exact preceding terminal-gate authority for an
+unavailable outcome. A valid zero wait is retained and subtracts zero. The
+adjusted wall sum must also reconcile exactly as raw wall minus that wait sum.
+Process CPU time is never adjusted. Automation-command completion means that
+the evidence was collected, not that an unavailable product gate passed. The
+200-basis-point gate is applied to the summed adjusted-wall and raw-CPU
+operands for each exact three-pair scenario population, not to an individual
+pair. There are no retries, dropped pairs, outlier filters, or negative-
+overhead credits. Missing, inconsistent, overflowed, incomplete, or reordered
+operands make the evidence invalid rather than making the gate pass.
 
 Claim-bearing timing histories retain 4,096 allocation-free samples. This is
 large enough for the frozen maximum 480-sample interaction plus the
@@ -227,9 +251,9 @@ waits after they left otherwise active product processes visibly static for
 minutes. It produced no complete sample and supports no performance claim.
 
 The ordinary product-validation scenarios and private T5 runner use the same
-v5 automation script/report envelope even when a script needs no acceptance
-batch. Automation v4 input or output is rejected; there is no compatibility
-reader.
+schema-5 automation input and schema-6 automation report envelope even when a
+script needs no acceptance batch. Earlier input or report versions are
+rejected; there is no compatibility reader.
 
 Qualification resource ceilings are not automation abort conditions. The app
 records their observed maxima and the runner evaluates them on the product-gate
@@ -241,19 +265,19 @@ ceiling. Crossing one of those wider fail-safe bounds is an evidence-integrity
 failure because the bounded attempt must stop; the removed `limits` spelling is
 not accepted.
 
-The raw report and sanitized receipt separate two axes. Evidence is complete
-only when bindings and executable conformance pass, all 60 role attempts and
-their reports close, every required checkpoint and timing/resource population
-is present and reconciled, source currentness and cleanup hold where
-applicable, instrumentation-control overhead is valid, and the repository and
-release executable remain unchanged. Product status is the ordered population
-of typed gate outcomes and may be failed for the predecessor. Missing or
-malformed reports, commands, gate rows, checkpoints, clocks, controls, or
-operands; derived role-process deadline expiry or abnormal process exit;
-binding/currentness drift; or any retry remains an evidence failure. Native
-command success means the
-evidence envelope is complete, not that the predecessor passed its product
-gates.
+The EP-00 private raw report and sanitized development receipt each use their
+schema-5 hard cut and separate two axes. Evidence is complete only when
+bindings and executable conformance pass, all 60 role attempts and their
+schema-6 automation reports close, every required checkpoint and timing/
+resource population is present and reconciled, source currentness and cleanup
+hold where applicable, instrumentation-control overhead is valid, and the
+repository and release executable remain unchanged. Product status is the
+ordered population of typed gate outcomes and may be failed for the
+predecessor. Missing or malformed reports, commands, gate rows, checkpoints,
+clocks, controls, or operands; derived role-process deadline expiry or
+abnormal process exit; binding/currentness drift; or any retry remains an
+evidence failure. Native command success means the evidence envelope is
+complete, not that the predecessor passed its product gates.
 
 This protocol establishes EP-00 baseline and later work-package evidence; it
 is not yet the final EP-07 qualification protocol. Before a performance pass

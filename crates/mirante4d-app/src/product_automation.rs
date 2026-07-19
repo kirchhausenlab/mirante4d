@@ -45,7 +45,9 @@ use crate::{
     DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
     MiranteWorkbenchApp, application_view,
     import_worker_service::ImportWorkerTimingOrigin,
-    native_presentation::{PresentedFrameIntervalSample, ProductGpuExecutionIdentity},
+    native_presentation::{
+        PresentedFrameIntervalSample, ProductGpuExecutionIdentity, ProductGpuExecutionTiming,
+    },
     set_render_viewport,
     viewer_layout::PanelId,
 };
@@ -263,6 +265,12 @@ const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
 const AUTOMATION_GATE_BATCH_OBSERVATION_SCHEMA: &str = "mirante4d-product-gate-batch-observation-1";
 const AUTOMATION_SCHEMA_VERSION: u32 = 5;
+const AUTOMATION_REPORT_SCHEMA_VERSION: u32 = 6;
+const GPU_TIMING_COMPLETE_DERIVATION: &str =
+    "identity_frozen_from_current_execution_then_completed_by_exact_presented_interval_ticket";
+const GPU_TIMING_UNAVAILABLE_REASON: &str =
+    "terminal_coordinated_presentation_settled_failure_without_exact_current_presented_interval";
+const GPU_TIMING_UNAVAILABLE_DERIVATION: &str = "terminal_coordinated_presentation_settled_failure_bound_to_adjacent_unavailable_gpu_timing_checkpoint";
 
 fn dispatch_application_command(
     app: &mut MiranteWorkbenchApp,
@@ -740,6 +748,143 @@ struct ProductGateBatchDetails<'a> {
     observations: Vec<ProductGateBatchObservationDetails<'a>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct TerminalCoordinatedPresentationFailureAuthority {
+    command_index: usize,
+    batch_id: String,
+    phase_id: String,
+    observation_index: usize,
+    gate_id: String,
+    condition: &'static str,
+    deadline_authority: ProductAutomationGateDeadlineAuthority,
+    deadline_after_origin_ns: u64,
+    outcome: ProductGateObservationOutcome,
+    condition_met: bool,
+    timed_out: bool,
+    observed_after_origin_ns: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CompletedGpuTimingCheckpoint {
+    Complete {
+        identity: ProductGpuExecutionIdentity,
+        waited_ns: u64,
+        current_presentation_generation: Option<u64>,
+    },
+    Unavailable {
+        target: ProductAutomationGpuTarget,
+        pass_kind: ProductAutomationGpuPassKind,
+        display_generation: u64,
+        current_presentation_generation: Option<u64>,
+        waited_ns: u64,
+        authority: TerminalCoordinatedPresentationFailureAuthority,
+    },
+}
+
+fn terminal_coordinated_presentation_failure_authority(
+    command_index: usize,
+    batch_id: &str,
+    phase_id: &str,
+    observations: &[ProductAutomationGateObservation],
+    outcomes: &[Option<LatchedProductGateObservation>],
+) -> Option<TerminalCoordinatedPresentationFailureAuthority> {
+    let mut coordinated = observations
+        .iter()
+        .zip(outcomes.iter().copied())
+        .enumerate()
+        .filter(|(_, (observation, _))| {
+            observation.target.condition_name() == "coordinated_presentation_settled"
+        });
+    let (observation_index, (observation, outcome)) = coordinated.next()?;
+    if coordinated.next().is_some() {
+        return None;
+    }
+    let outcome = outcome?;
+    (outcome.outcome == ProductGateObservationOutcome::Failed
+        && !outcome.condition_met
+        && outcome.timed_out
+        && outcome.observed_after_origin_ns >= observation.deadline_after_origin_ns)
+        .then(|| TerminalCoordinatedPresentationFailureAuthority {
+            command_index,
+            batch_id: batch_id.to_owned(),
+            phase_id: phase_id.to_owned(),
+            observation_index,
+            gate_id: observation.gate_id.clone(),
+            condition: observation.target.condition_name(),
+            deadline_authority: observation.deadline_authority,
+            deadline_after_origin_ns: observation.deadline_after_origin_ns,
+            outcome: outcome.outcome,
+            condition_met: outcome.condition_met,
+            timed_out: outcome.timed_out,
+            observed_after_origin_ns: outcome.observed_after_origin_ns,
+        })
+}
+
+fn gpu_timing_await_event_details(
+    checkpoint: &CompletedGpuTimingCheckpoint,
+    command_target: ProductAutomationGpuTarget,
+    command_pass_kind: ProductAutomationGpuPassKind,
+) -> Value {
+    match checkpoint {
+        CompletedGpuTimingCheckpoint::Complete {
+            identity,
+            waited_ns,
+            current_presentation_generation,
+        } => json!({
+            "available": true,
+            "unavailable_reason": Value::Null,
+            "target": command_target.name(),
+            "pass_kind": command_pass_kind.name(),
+            "display_generation": identity.display_generation,
+            "current_presentation_generation": current_presentation_generation,
+            "execution_id": identity.execution_id,
+            "renderer_target": identity.target.get(),
+            "renderer_frame": identity.renderer_frame.get(),
+            "identity_frozen_before_completion": true,
+            "exact_presented_interval_timing_complete": true,
+            "unavailable_authority": Value::Null,
+            "waited_ns": waited_ns,
+            "waited_ms": duration_ms(Duration::from_nanos(*waited_ns)),
+        }),
+        CompletedGpuTimingCheckpoint::Unavailable {
+            target,
+            pass_kind,
+            display_generation,
+            current_presentation_generation,
+            waited_ns,
+            authority,
+        } => {
+            debug_assert_eq!(*target, command_target);
+            debug_assert_eq!(*pass_kind, command_pass_kind);
+            json!({
+                "available": false,
+                "unavailable_reason": GPU_TIMING_UNAVAILABLE_REASON,
+                "target": target.name(),
+                "pass_kind": pass_kind.name(),
+                "display_generation": display_generation,
+                "current_presentation_generation": current_presentation_generation,
+                "execution_id": Value::Null,
+                "renderer_target": Value::Null,
+                "renderer_frame": Value::Null,
+                "identity_frozen_before_completion": false,
+                "exact_presented_interval_timing_complete": false,
+                "unavailable_authority": authority,
+                "waited_ns": waited_ns,
+                "waited_ms": duration_ms(Duration::from_nanos(*waited_ns)),
+            })
+        }
+    }
+}
+
+fn adjacent_gpu_timing_unavailable_authority(
+    current_command_index: usize,
+    authority: Option<&TerminalCoordinatedPresentationFailureAuthority>,
+) -> Option<TerminalCoordinatedPresentationFailureAuthority> {
+    authority
+        .filter(|authority| authority.command_index.checked_add(1) == Some(current_command_index))
+        .cloned()
+}
+
 fn latch_product_gate_observation(
     observation: &ProductAutomationGateObservation,
     condition_met: bool,
@@ -905,9 +1050,11 @@ pub(crate) struct ProductAutomationController {
     command_completed_at: Vec<Option<Instant>>,
     active_dataset_switch: Option<ActiveDatasetSwitch>,
     active_gate_batch: Option<ActiveProductGateBatch>,
+    completed_gate_batch_gpu_timing_unavailable_authority:
+        Option<TerminalCoordinatedPresentationFailureAuthority>,
     active_wait_started: Option<Instant>,
     active_gpu_timing_await_identity: Option<ProductGpuExecutionIdentity>,
-    completed_gpu_timing_checkpoint: Option<ProductGpuExecutionIdentity>,
+    completed_gpu_timing_checkpoint: Option<CompletedGpuTimingCheckpoint>,
     sleep_frames_remaining: Option<u32>,
     active_input_sequence: Option<ActiveInputSequence>,
     previous_labeled_resource_union: Option<LabeledDiagnosticResourceUnion>,
@@ -1298,6 +1445,7 @@ impl ProductAutomationController {
             command_completed_at: vec![None; command_count],
             active_dataset_switch: None,
             active_gate_batch: None,
+            completed_gate_batch_gpu_timing_unavailable_authority: None,
             active_wait_started: None,
             active_gpu_timing_await_identity: None,
             completed_gpu_timing_checkpoint: None,
@@ -1964,6 +2112,12 @@ impl ProductAutomationController {
 
         let command = self.script.commands[self.command_index].clone();
         let command_index = self.command_index;
+        if !matches!(
+            &command,
+            ProductAutomationCommand::AwaitActiveViewGpuTiming { .. }
+        ) {
+            self.completed_gate_batch_gpu_timing_unavailable_authority = None;
+        }
         if self
             .active_input_sequence
             .is_some_and(|sequence| sequence.command_index != command_index)
@@ -2108,6 +2262,8 @@ impl ProductAutomationController {
         // failed command event is reportable; incomplete product outcomes are
         // never promoted or synthesized during closeout.
         self.active_gate_batch = None;
+        self.completed_gate_batch_gpu_timing_unavailable_authority = None;
+        self.completed_gpu_timing_checkpoint = None;
         self.events.push(ProductAutomationEvent::failed(
             command_index,
             command,
@@ -2135,6 +2291,9 @@ impl ProductAutomationController {
             *slot = Some(completed_at);
         }
         self.active_gate_batch = None;
+        if command != "observe_gate_batch" {
+            self.completed_gate_batch_gpu_timing_unavailable_authority = None;
+        }
         self.active_wait_started = None;
         self.active_gpu_timing_await_identity = None;
         if command != "await_active_view_gpu_timing" {
@@ -2589,6 +2748,14 @@ impl ProductAutomationController {
             .active_gate_batch
             .take()
             .expect("a complete product gate batch retains its outcomes");
+        self.completed_gate_batch_gpu_timing_unavailable_authority =
+            terminal_coordinated_presentation_failure_authority(
+                active.command_index,
+                batch_id,
+                phase_id,
+                observations,
+                &active.outcomes,
+            );
         let details = product_gate_batch_details_value(
             batch_id,
             phase_id,
@@ -3022,29 +3189,35 @@ impl ProductAutomationController {
             } => {
                 let qualification_started = Instant::now();
                 let started = *self.active_wait_started.get_or_insert_with(Instant::now);
+                let adjacent_unavailable_authority = adjacent_gpu_timing_unavailable_authority(
+                    self.command_index,
+                    self.completed_gate_batch_gpu_timing_unavailable_authority
+                        .as_ref(),
+                );
                 let identity = self.active_gpu_timing_await_identity.or_else(|| {
                     let identity = active_view_gpu_timing_candidate(app, *target, *pass_kind)?;
                     self.active_gpu_timing_await_identity = Some(identity);
                     Some(identity)
                 });
+                let generation = app.render_coordination.display_generation();
                 let result = match identity {
                     Some(identity) => {
                         match active_view_captured_gpu_timing_complete(app, *target, identity) {
                             Some(true) => {
-                                self.completed_gpu_timing_checkpoint = Some(identity);
                                 let waited = started.elapsed();
-                                Ok(CommandProgress::Done(json!({
-                                    "target": target.name(),
-                                    "pass_kind": pass_kind.name(),
-                                    "execution_id": identity.execution_id,
-                                    "renderer_target": identity.target.get(),
-                                    "display_generation": identity.display_generation,
-                                    "renderer_frame": identity.renderer_frame.get(),
-                                    "identity_frozen_before_completion": true,
-                                    "exact_presented_interval_timing_complete": true,
-                                    "waited_ns": u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX),
-                                    "waited_ms": duration_ms(waited),
-                                })))
+                                let checkpoint = CompletedGpuTimingCheckpoint::Complete {
+                                    identity,
+                                    waited_ns: u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX),
+                                    current_presentation_generation: generation
+                                        .current_presentation_generation,
+                                };
+                                let details = gpu_timing_await_event_details(
+                                    &checkpoint,
+                                    *target,
+                                    *pass_kind,
+                                );
+                                self.completed_gpu_timing_checkpoint = Some(checkpoint);
+                                Ok(CommandProgress::Done(details))
                             }
                             Some(false)
                                 if started.elapsed() < Duration::from_millis(*timeout_ms) =>
@@ -3062,6 +3235,26 @@ impl ProductAutomationController {
                                 pass_kind.name(),
                             )),
                         }
+                    }
+                    None if adjacent_unavailable_authority.is_some()
+                        && generation.current_presentation_generation
+                            != Some(generation.input_generation) =>
+                    {
+                        let waited = started.elapsed();
+                        let checkpoint = CompletedGpuTimingCheckpoint::Unavailable {
+                            target: *target,
+                            pass_kind: *pass_kind,
+                            display_generation: generation.input_generation,
+                            current_presentation_generation: generation
+                                .current_presentation_generation,
+                            waited_ns: u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX),
+                            authority: adjacent_unavailable_authority
+                                .expect("the unavailable branch checked its exact authority"),
+                        };
+                        let details =
+                            gpu_timing_await_event_details(&checkpoint, *target, *pass_kind);
+                        self.completed_gpu_timing_checkpoint = Some(checkpoint);
+                        Ok(CommandProgress::Done(details))
                     }
                     None if started.elapsed() >= Duration::from_millis(*timeout_ms) => {
                         Err(format!(
@@ -4876,7 +5069,7 @@ impl ProductAutomationController {
                 })),
                 "qualification_gpu_timing_checkpoint": qualification_gpu_timing_checkpoint_json(
                     app,
-                    self.completed_gpu_timing_checkpoint,
+                    self.completed_gpu_timing_checkpoint.as_ref(),
                 ),
                 "performance_milestones": display_performance_milestones_json(app),
                 "display_coordination": display_coordination_diagnostics_json(
@@ -4996,7 +5189,7 @@ impl ProductAutomationController {
         };
         let report = json!({
             "schema": AUTOMATION_REPORT_SCHEMA,
-            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "schema_version": AUTOMATION_REPORT_SCHEMA_VERSION,
             "status": status,
             "failure_reason": failure_reason,
             "viewport_evidence": {
@@ -5503,12 +5696,101 @@ fn timing_samples_json(samples: &mirante4d_application::DisplayTimingSamples) ->
     })
 }
 
+fn complete_gpu_timing_checkpoint_json(
+    identity: ProductGpuExecutionIdentity,
+    current_presentation_generation: Option<u64>,
+    waited_ns: u64,
+    sample: &PresentedFrameIntervalSample,
+    timing: ProductGpuExecutionTiming,
+) -> Value {
+    json!({
+        "available": true,
+        "derivation": GPU_TIMING_COMPLETE_DERIVATION,
+        "reason": Value::Null,
+        "presented_interval_sequence": sample.sequence,
+        "panel": sample.panel.label(),
+        "execution_id": identity.execution_id,
+        "target": identity.target.get(),
+        "display_generation": identity.display_generation,
+        "current_presentation_generation": current_presentation_generation,
+        "renderer_frame": identity.renderer_frame.get(),
+        "pass_kind": format!("{:?}", identity.pass_kind),
+        "gpu_batch_envelope_ns": timing.batch_gpu_envelope_ns,
+        "gpu_payload_copy_ns": timing.payload_copy_ns,
+        "gpu_render_pass_ns": timing.render_pass_ns,
+        "identity_frozen_before_completion": true,
+        "exact_presented_interval_timing_complete": true,
+        "unavailable_authority": Value::Null,
+        "waited_ns": waited_ns,
+    })
+}
+
+fn unavailable_gpu_timing_checkpoint_json(
+    target: ProductAutomationGpuTarget,
+    pass_kind: ProductAutomationGpuPassKind,
+    display_generation: u64,
+    current_presentation_generation: Option<u64>,
+    waited_ns: u64,
+    authority: &TerminalCoordinatedPresentationFailureAuthority,
+) -> Value {
+    let pass_kind = match pass_kind {
+        ProductAutomationGpuPassKind::Plane => "Plane",
+        ProductAutomationGpuPassKind::Volume => "Volume",
+    };
+    json!({
+        "available": false,
+        "derivation": GPU_TIMING_UNAVAILABLE_DERIVATION,
+        "reason": GPU_TIMING_UNAVAILABLE_REASON,
+        "presented_interval_sequence": Value::Null,
+        "panel": PanelId::from(target).label(),
+        "execution_id": Value::Null,
+        "target": Value::Null,
+        "display_generation": display_generation,
+        "current_presentation_generation": current_presentation_generation,
+        "renderer_frame": Value::Null,
+        "pass_kind": pass_kind,
+        "gpu_batch_envelope_ns": Value::Null,
+        "gpu_payload_copy_ns": Value::Null,
+        "gpu_render_pass_ns": Value::Null,
+        "identity_frozen_before_completion": false,
+        "exact_presented_interval_timing_complete": false,
+        "unavailable_authority": authority,
+        "waited_ns": waited_ns,
+    })
+}
+
 fn qualification_gpu_timing_checkpoint_json(
     app: &MiranteWorkbenchApp,
-    identity: Option<ProductGpuExecutionIdentity>,
+    checkpoint: Option<&CompletedGpuTimingCheckpoint>,
 ) -> Value {
-    let Some(identity) = identity else {
+    let Some(checkpoint) = checkpoint else {
         return Value::Null;
+    };
+    if let CompletedGpuTimingCheckpoint::Unavailable {
+        target,
+        pass_kind,
+        display_generation,
+        current_presentation_generation,
+        waited_ns,
+        authority,
+    } = checkpoint
+    {
+        return unavailable_gpu_timing_checkpoint_json(
+            *target,
+            *pass_kind,
+            *display_generation,
+            *current_presentation_generation,
+            *waited_ns,
+            authority,
+        );
+    }
+    let CompletedGpuTimingCheckpoint::Complete {
+        identity,
+        waited_ns,
+        current_presentation_generation,
+    } = checkpoint
+    else {
+        unreachable!("the unavailable checkpoint returned above")
     };
     let sample = app
         .native_presentation
@@ -5519,35 +5801,59 @@ fn qualification_gpu_timing_checkpoint_json(
                 .presented_frame_interval_samples()
                 .iter()
                 .rev()
-                .find(|sample| sample.gpu_execution == Some(identity))
+                .find(|sample| sample.gpu_execution == Some(*identity))
         });
     let Some(sample) = sample else {
         return json!({
             "available": false,
+            "derivation": GPU_TIMING_COMPLETE_DERIVATION,
             "reason": "captured_presented_interval_not_retained",
+            "presented_interval_sequence": Value::Null,
+            "panel": Value::Null,
+            "execution_id": identity.execution_id,
+            "target": identity.target.get(),
+            "display_generation": identity.display_generation,
+            "current_presentation_generation": current_presentation_generation,
+            "renderer_frame": identity.renderer_frame.get(),
+            "pass_kind": format!("{:?}", identity.pass_kind),
+            "gpu_batch_envelope_ns": Value::Null,
+            "gpu_payload_copy_ns": Value::Null,
+            "gpu_render_pass_ns": Value::Null,
+            "identity_frozen_before_completion": true,
+            "exact_presented_interval_timing_complete": false,
+            "unavailable_authority": Value::Null,
+            "waited_ns": waited_ns,
         });
     };
     let Some(timing) = sample.gpu_timing else {
         return json!({
             "available": false,
+            "derivation": GPU_TIMING_COMPLETE_DERIVATION,
             "reason": "captured_presented_interval_timing_incomplete",
+            "presented_interval_sequence": sample.sequence,
+            "panel": sample.panel.label(),
+            "execution_id": identity.execution_id,
+            "target": identity.target.get(),
+            "display_generation": identity.display_generation,
+            "current_presentation_generation": current_presentation_generation,
+            "renderer_frame": identity.renderer_frame.get(),
+            "pass_kind": format!("{:?}", identity.pass_kind),
+            "gpu_batch_envelope_ns": Value::Null,
+            "gpu_payload_copy_ns": Value::Null,
+            "gpu_render_pass_ns": Value::Null,
+            "identity_frozen_before_completion": true,
+            "exact_presented_interval_timing_complete": false,
+            "unavailable_authority": Value::Null,
+            "waited_ns": waited_ns,
         });
     };
-    json!({
-        "available": true,
-        "derivation": "identity_frozen_from_current_execution_then_completed_by_exact_presented_interval_ticket",
-        "presented_interval_sequence": sample.sequence,
-        "panel": sample.panel.label(),
-        "execution_id": identity.execution_id,
-        "target": identity.target.get(),
-        "display_generation": identity.display_generation,
-        "renderer_frame": identity.renderer_frame.get(),
-        "pass_kind": format!("{:?}", identity.pass_kind),
-        "gpu_batch_envelope_ns": timing.batch_gpu_envelope_ns,
-        "gpu_payload_copy_ns": timing.payload_copy_ns,
-        "gpu_render_pass_ns": timing.render_pass_ns,
-        "exact_presented_interval_timing_complete": true,
-    })
+    complete_gpu_timing_checkpoint_json(
+        *identity,
+        *current_presentation_generation,
+        *waited_ns,
+        sample,
+        timing,
+    )
 }
 
 fn display_performance_milestones_json(app: &MiranteWorkbenchApp) -> Value {

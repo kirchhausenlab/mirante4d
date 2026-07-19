@@ -22,7 +22,8 @@ use crate::{
 const PRODUCT_VALIDATION_SCHEMA: &str = "mirante4d-product-validation-report";
 pub(crate) const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 pub(crate) const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-pub(crate) const PRODUCT_AUTOMATION_SCHEMA_VERSION: u32 = 5;
+pub(crate) const SCRIPT_SCHEMA_VERSION: u32 = 5;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 6;
 pub(crate) const PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS: [&str; 12] = [
     "max_cpu_total_bytes",
     "max_cpu_decoded_residency_bytes",
@@ -1374,7 +1375,7 @@ fn import_preprocessing_evidence(automation_report: Option<&Value>) -> Result<Va
         .ok_or_else(|| "import scenario is missing its automation report".to_owned())?;
     if report.get("schema").and_then(Value::as_str) != Some(PRODUCT_AUTOMATION_REPORT_SCHEMA)
         || report.get("schema_version").and_then(Value::as_u64)
-            != Some(u64::from(PRODUCT_AUTOMATION_SCHEMA_VERSION))
+            != Some(u64::from(REPORT_SCHEMA_VERSION))
     {
         return Err("import scenario used an unsupported automation report schema".to_owned());
     }
@@ -2008,7 +2009,7 @@ fn default_target_fixture() -> anyhow::Result<PathBuf> {
 fn target_fixture_camera_smoke_script(package: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": GENERATED_FIXTURE_SCENARIO,
         "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
@@ -2040,7 +2041,7 @@ fn target_fixture_camera_smoke_script(package: &Path) -> Value {
 fn target_fixture_resident_navigation_script(package: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": GENERATED_RESIDENT_NAVIGATION_SCENARIO,
         "gpu_timing": true,
         "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 64),
@@ -2075,7 +2076,7 @@ fn target_fixture_resident_navigation_script(package: &Path) -> Value {
 fn target_fixture_render_modes_script(package: &Path) -> Value {
     let mut script = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": GENERATED_RENDER_MODES_SCENARIO,
         "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 192),
         "commands": [
@@ -2215,7 +2216,7 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
 fn target_source_verification_script(package: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": B3_SOURCE_VERIFICATION_SCENARIO,
         "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
@@ -2280,7 +2281,7 @@ fn import_preprocessing_script(
     hard_safety_limits["max_cpu_import_working_set_bytes"] = json!(IMPORT_WORKING_MEMORY_BYTES);
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": IMPORT_PREPROCESSING_SCENARIO,
         "hard_safety_limits": hard_safety_limits,
         "commands": [
@@ -2349,7 +2350,7 @@ fn import_preprocessing_script(
 fn b4_launch_one_script(package: &Path, project: &Path, checkpoint: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "b4_project_persistence_launch_1",
         "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
@@ -2392,7 +2393,7 @@ fn b4_launch_one_script(package: &Path, project: &Path, checkpoint: &Path) -> Va
 fn b4_launch_two_script(package: &Path, original: &Path, save_as: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "b4_project_persistence_launch_2",
         "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
@@ -2438,7 +2439,7 @@ fn b4_launch_two_script(package: &Path, original: &Path, save_as: &Path) -> Valu
 fn b4_launch_three_script(package: &Path, save_as: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "b4_project_persistence_launch_3",
         "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
@@ -2491,10 +2492,8 @@ pub(crate) fn validate_product_automation_script(script: &Value) -> anyhow::Resu
     if script.get("schema").and_then(Value::as_str) != Some(PRODUCT_AUTOMATION_SCRIPT_SCHEMA) {
         bail!("automation script schema must be {PRODUCT_AUTOMATION_SCRIPT_SCHEMA}");
     }
-    if script.get("schema_version").and_then(Value::as_u64)
-        != Some(PRODUCT_AUTOMATION_SCHEMA_VERSION as u64)
-    {
-        bail!("automation script schema_version must be {PRODUCT_AUTOMATION_SCHEMA_VERSION}");
+    if script.get("schema_version").and_then(Value::as_u64) != Some(SCRIPT_SCHEMA_VERSION as u64) {
+        bail!("automation script schema_version must be {SCRIPT_SCHEMA_VERSION}");
     }
     let scenario = script
         .get("scenario")
@@ -2571,7 +2570,7 @@ pub(crate) fn validate_product_automation_report_contract(
     validate_product_automation_script(script)?;
     if report.get("schema").and_then(Value::as_str) != Some(PRODUCT_AUTOMATION_REPORT_SCHEMA)
         || report.get("schema_version").and_then(Value::as_u64)
-            != Some(u64::from(PRODUCT_AUTOMATION_SCHEMA_VERSION))
+            != Some(u64::from(REPORT_SCHEMA_VERSION))
         || report.get("status").and_then(Value::as_str) != Some("passed")
         || report.get("failure_reason") != Some(&Value::Null)
     {

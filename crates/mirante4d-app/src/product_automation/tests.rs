@@ -8,6 +8,25 @@ use std::{collections::VecDeque, fs, path::PathBuf};
 
 use mirante4d_dataset_runtime::{DatasetRuntimeConfig, DatasetRuntimeDiagnostics};
 
+fn terminal_gpu_timing_authority(
+    command_index: usize,
+) -> TerminalCoordinatedPresentationFailureAuthority {
+    TerminalCoordinatedPresentationFailureAuthority {
+        command_index,
+        batch_id: "RZ.xy".to_owned(),
+        phase_id: "xy".to_owned(),
+        observation_index: 2,
+        gate_id: "RZ.xy-settled".to_owned(),
+        condition: "coordinated_presentation_settled",
+        deadline_authority: ProductAutomationGateDeadlineAuthority::NonresidentTargetSettlement,
+        deadline_after_origin_ns: 100,
+        outcome: ProductGateObservationOutcome::Failed,
+        condition_met: false,
+        timed_out: true,
+        observed_after_origin_ns: 100,
+    }
+}
+
 #[test]
 fn freshness_wait_never_certifies_a_stale_exact_frame() {
     let mut fidelity = crate::FrameFidelityStatus::new_with_presentation(
@@ -169,6 +188,302 @@ fn active_view_gpu_timing_await_is_strict_and_bounded() {
 }
 
 #[test]
+fn terminal_coordinated_presentation_failure_authority_is_exact_and_unique() {
+    let observations = vec![
+        ProductAutomationGateObservation {
+            gate_id: "runtime-idle".to_owned(),
+            deadline_authority:
+                ProductAutomationGateDeadlineAuthority::MaximumCurrentPresentationGapPlusPollGrace,
+            deadline_after_origin_ns: 50,
+            target: ProductAutomationGateTarget::Condition {
+                condition: ProductAutomationWaitCondition::RuntimeIdle,
+            },
+        },
+        ProductAutomationGateObservation {
+            gate_id: "RZ.xy-settled".to_owned(),
+            deadline_authority: ProductAutomationGateDeadlineAuthority::NonresidentTargetSettlement,
+            deadline_after_origin_ns: 100,
+            target: ProductAutomationGateTarget::Condition {
+                condition: ProductAutomationWaitCondition::CoordinatedPresentationSettled,
+            },
+        },
+    ];
+    let failed = LatchedProductGateObservation {
+        outcome: ProductGateObservationOutcome::Failed,
+        condition_met: false,
+        timed_out: true,
+        observed_after_origin_ns: 100,
+    };
+    let authority = terminal_coordinated_presentation_failure_authority(
+        4,
+        "RZ.xy",
+        "xy",
+        &observations,
+        &[
+            Some(LatchedProductGateObservation {
+                outcome: ProductGateObservationOutcome::Passed,
+                condition_met: true,
+                timed_out: false,
+                observed_after_origin_ns: 20,
+            }),
+            Some(failed),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&authority).unwrap(),
+        json!({
+            "command_index": 4,
+            "batch_id": "RZ.xy",
+            "phase_id": "xy",
+            "observation_index": 1,
+            "gate_id": "RZ.xy-settled",
+            "condition": "coordinated_presentation_settled",
+            "deadline_authority": "nonresident_target_settlement",
+            "deadline_after_origin_ns": 100,
+            "outcome": "failed",
+            "condition_met": false,
+            "timed_out": true,
+            "observed_after_origin_ns": 100,
+        })
+    );
+
+    for non_authoritative in [
+        LatchedProductGateObservation {
+            outcome: ProductGateObservationOutcome::Passed,
+            ..failed
+        },
+        LatchedProductGateObservation {
+            condition_met: true,
+            ..failed
+        },
+        LatchedProductGateObservation {
+            timed_out: false,
+            ..failed
+        },
+        LatchedProductGateObservation {
+            observed_after_origin_ns: 99,
+            ..failed
+        },
+    ] {
+        assert!(
+            terminal_coordinated_presentation_failure_authority(
+                4,
+                "RZ.xy",
+                "xy",
+                &observations[1..],
+                &[Some(non_authoritative)],
+            )
+            .is_none()
+        );
+    }
+
+    assert!(
+        terminal_coordinated_presentation_failure_authority(
+            4,
+            "RZ.xy",
+            "xy",
+            &[observations[1].clone(), observations[1].clone()],
+            &[Some(failed), Some(failed)],
+        )
+        .is_none(),
+        "ambiguous duplicate terminal authorities must not be promoted"
+    );
+    assert!(
+        terminal_coordinated_presentation_failure_authority(
+            4,
+            "RZ.xy",
+            "xy",
+            &[observations[1].clone(), observations[1].clone()],
+            &[
+                Some(failed),
+                Some(LatchedProductGateObservation {
+                    outcome: ProductGateObservationOutcome::Passed,
+                    condition_met: true,
+                    timed_out: false,
+                    observed_after_origin_ns: 20,
+                }),
+            ],
+        )
+        .is_none(),
+        "a second coordinated-settlement row is ambiguous even when it passed"
+    );
+}
+
+#[test]
+fn gpu_timing_checkpoint_event_details_have_one_exact_schema() {
+    let identity = ProductGpuExecutionIdentity {
+        execution_id: 17,
+        target: mirante4d_render_api::PresentationToken::new(3).unwrap(),
+        renderer_frame: mirante4d_render_api::FrameIdentity::new(11),
+        display_generation: 7,
+        pass_kind: RenderPassKind::Plane,
+    };
+    let complete = CompletedGpuTimingCheckpoint::Complete {
+        identity,
+        waited_ns: 2_000_000,
+        current_presentation_generation: Some(7),
+    };
+    assert_eq!(
+        gpu_timing_await_event_details(
+            &complete,
+            ProductAutomationGpuTarget::Xy,
+            ProductAutomationGpuPassKind::Plane,
+        ),
+        json!({
+            "available": true,
+            "unavailable_reason": Value::Null,
+            "target": "xy",
+            "pass_kind": "plane",
+            "display_generation": 7,
+            "current_presentation_generation": 7,
+            "execution_id": 17,
+            "renderer_target": 3,
+            "renderer_frame": 11,
+            "identity_frozen_before_completion": true,
+            "exact_presented_interval_timing_complete": true,
+            "unavailable_authority": Value::Null,
+            "waited_ns": 2_000_000,
+            "waited_ms": 2.0,
+        })
+    );
+
+    let authority = terminal_gpu_timing_authority(4);
+    let unavailable = CompletedGpuTimingCheckpoint::Unavailable {
+        target: ProductAutomationGpuTarget::Xy,
+        pass_kind: ProductAutomationGpuPassKind::Plane,
+        display_generation: 9,
+        current_presentation_generation: Some(8),
+        waited_ns: 3_000_000,
+        authority: authority.clone(),
+    };
+    assert_eq!(
+        gpu_timing_await_event_details(
+            &unavailable,
+            ProductAutomationGpuTarget::Xy,
+            ProductAutomationGpuPassKind::Plane,
+        ),
+        json!({
+            "available": false,
+            "unavailable_reason": GPU_TIMING_UNAVAILABLE_REASON,
+            "target": "xy",
+            "pass_kind": "plane",
+            "display_generation": 9,
+            "current_presentation_generation": 8,
+            "execution_id": Value::Null,
+            "renderer_target": Value::Null,
+            "renderer_frame": Value::Null,
+            "identity_frozen_before_completion": false,
+            "exact_presented_interval_timing_complete": false,
+            "unavailable_authority": authority,
+            "waited_ns": 3_000_000,
+            "waited_ms": 3.0,
+        })
+    );
+}
+
+#[test]
+fn unavailable_gpu_timing_report_checkpoint_has_exact_typed_evidence() {
+    let authority = terminal_gpu_timing_authority(4);
+    assert_eq!(
+        unavailable_gpu_timing_checkpoint_json(
+            ProductAutomationGpuTarget::Xy,
+            ProductAutomationGpuPassKind::Plane,
+            9,
+            Some(8),
+            3_000_000,
+            &authority,
+        ),
+        json!({
+            "available": false,
+            "derivation": GPU_TIMING_UNAVAILABLE_DERIVATION,
+            "reason": GPU_TIMING_UNAVAILABLE_REASON,
+            "presented_interval_sequence": Value::Null,
+            "panel": "XY",
+            "execution_id": Value::Null,
+            "target": Value::Null,
+            "display_generation": 9,
+            "current_presentation_generation": 8,
+            "renderer_frame": Value::Null,
+            "pass_kind": "Plane",
+            "gpu_batch_envelope_ns": Value::Null,
+            "gpu_payload_copy_ns": Value::Null,
+            "gpu_render_pass_ns": Value::Null,
+            "identity_frozen_before_completion": false,
+            "exact_presented_interval_timing_complete": false,
+            "unavailable_authority": authority,
+            "waited_ns": 3_000_000,
+        })
+    );
+}
+
+#[test]
+fn gpu_timing_unavailable_authority_is_adjacent_and_cleared_after_await() {
+    let authority = terminal_gpu_timing_authority(0);
+    assert_eq!(
+        adjacent_gpu_timing_unavailable_authority(1, Some(&authority)),
+        Some(authority.clone())
+    );
+    assert!(adjacent_gpu_timing_unavailable_authority(0, Some(&authority)).is_none());
+    assert!(adjacent_gpu_timing_unavailable_authority(2, Some(&authority)).is_none());
+
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "gpu-timing-authority-clearing",
+        "gpu_timing": true,
+        "commands": [
+            { "command": "quit" },
+            {
+                "command": "await_active_view_gpu_timing",
+                "target": "xy",
+                "pass_kind": "plane",
+                "timeout_ms": 5_000
+            },
+            { "command": "quit" }
+        ]
+    }))
+    .unwrap();
+    script.validate().unwrap();
+    let mut controller = ProductAutomationController::new(
+        script,
+        PathBuf::from("gpu-timing-authority-script.json"),
+        PathBuf::from("gpu-timing-authority-report.json"),
+    );
+    controller.command_index = 1;
+    controller.completed_gate_batch_gpu_timing_unavailable_authority = Some(authority.clone());
+    assert_eq!(
+        adjacent_gpu_timing_unavailable_authority(
+            controller.command_index,
+            controller
+                .completed_gate_batch_gpu_timing_unavailable_authority
+                .as_ref(),
+        ),
+        Some(authority)
+    );
+    assert!(
+        controller
+            .completed_gate_batch_gpu_timing_unavailable_authority
+            .is_some(),
+        "polling the adjacent await must retain the completed-batch authority"
+    );
+
+    controller.record_successful_command(
+        1,
+        "await_active_view_gpu_timing",
+        Duration::ZERO,
+        json!({}),
+    );
+    assert!(
+        controller
+            .completed_gate_batch_gpu_timing_unavailable_authority
+            .is_none(),
+        "the authority must be cleared as soon as the adjacent await completes"
+    );
+}
+
+#[test]
 fn schema_v5_strictly_parses_observe_gate_batch_and_rejects_v4_commands() {
     let raw = json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
@@ -198,6 +513,7 @@ fn schema_v5_strictly_parses_observe_gate_batch_and_rejects_v4_commands() {
     let script: ProductAutomationScript = serde_json::from_value(raw.clone()).unwrap();
     script.validate().unwrap();
     assert_eq!(AUTOMATION_SCHEMA_VERSION, 5);
+    assert_eq!(AUTOMATION_REPORT_SCHEMA_VERSION, 6);
     assert!(matches!(
         &script.commands[1],
         ProductAutomationCommand::ObserveGateBatch {
