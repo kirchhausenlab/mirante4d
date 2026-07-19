@@ -1211,6 +1211,7 @@ struct PopulationEvidence {
     sample_identities_exact: bool,
     sample_order_exact: bool,
     role_identities_exact: bool,
+    role_order_exact: bool,
     phase_identities_exact: bool,
     product_gate_bijections_exact: bool,
 }
@@ -1225,6 +1226,7 @@ struct PhaseEvaluation {
 struct SampleEvidence {
     sample_index: u32,
     scenario: String,
+    role_launch_order: Vec<AttemptRole>,
     instrumented: RoleEvidence,
     control: Option<RoleEvidence>,
     phases: Vec<PhaseEvaluation>,
@@ -5121,9 +5123,21 @@ fn validate_attempt_population(
     let mut observed_phase_evaluations = 0_usize;
     let mut observed_product_gate_observations = 0_usize;
     let mut role_identities_exact = true;
+    let mut role_order_exact = true;
     let mut phase_identities_exact = true;
     let mut product_gate_bijections_exact = true;
     for sample in samples {
+        let role_order_matches = REQUIRED_SCENARIOS
+            .iter()
+            .position(|id| *id == sample.scenario.as_str())
+            .is_some_and(|scenario_ordinal| {
+                sample.role_launch_order.as_slice()
+                    == balanced_role_order(sample.sample_index, scenario_ordinal).as_slice()
+            });
+        if !role_order_matches {
+            role_order_exact = false;
+            reasons.insert("role_attempt_order_mismatch".to_owned());
+        }
         observed_role_attempts = observed_role_attempts
             .saturating_add(usize::from(sample.instrumented.process.launch_attempted));
         completed_role_reports = completed_role_reports.saturating_add(usize::from(
@@ -5216,6 +5230,7 @@ fn validate_attempt_population(
         sample_identities_exact,
         sample_order_exact,
         role_identities_exact,
+        role_order_exact,
         phase_identities_exact,
         product_gate_bijections_exact,
     }
@@ -5401,23 +5416,12 @@ fn execute_sample(
 ) -> SampleEvidence {
     let mut instrumented = None;
     let mut control = None;
+    let mut role_launch_order = Vec::with_capacity(2);
     let scenario_ordinal = REQUIRED_SCENARIOS
         .iter()
         .position(|id| *id == scenario.id)
         .expect("validated scenario has a frozen ordinal");
-    let roles = if (usize::try_from(sample_index).unwrap_or_default() + scenario_ordinal)
-        .is_multiple_of(2)
-    {
-        [
-            AttemptRole::Instrumented,
-            AttemptRole::InstrumentationControl,
-        ]
-    } else {
-        [
-            AttemptRole::InstrumentationControl,
-            AttemptRole::Instrumented,
-        ]
-    };
+    let roles = balanced_role_order(sample_index, scenario_ordinal);
     for role in roles {
         let template = match role {
             AttemptRole::Instrumented => Some(&scenario.instrumented_script),
@@ -5441,6 +5445,9 @@ fn execute_sample(
             },
         );
         let integrity_failed = has_integrity_reasons(&evidence.reasons);
+        if evidence.process.launch_attempted {
+            role_launch_order.push(role);
+        }
         match role {
             AttemptRole::Instrumented => instrumented = Some(evidence),
             AttemptRole::InstrumentationControl => control = Some(evidence),
@@ -5540,6 +5547,7 @@ fn execute_sample(
     SampleEvidence {
         sample_index,
         scenario: scenario.id.clone(),
+        role_launch_order,
         instrumented,
         control,
         phases,
@@ -5548,6 +5556,25 @@ fn execute_sample(
         wall_overhead_basis_points,
         process_cpu_overhead_basis_points,
         reasons,
+    }
+}
+
+fn balanced_role_order(sample_index: u32, scenario_ordinal: usize) -> [AttemptRole; 2] {
+    if (usize::try_from(sample_index)
+        .unwrap_or_default()
+        .checked_add(scenario_ordinal)
+        .expect("the bounded sample and scenario ordinals fit usize"))
+    .is_multiple_of(2)
+    {
+        [
+            AttemptRole::Instrumented,
+            AttemptRole::InstrumentationControl,
+        ]
+    } else {
+        [
+            AttemptRole::InstrumentationControl,
+            AttemptRole::Instrumented,
+        ]
     }
 }
 
@@ -12499,6 +12526,7 @@ fn population_evidence_is_exact(population: PopulationEvidence) -> bool {
         && population.sample_identities_exact
         && population.sample_order_exact
         && population.role_identities_exact
+        && population.role_order_exact
         && population.phase_identities_exact
         && population.product_gate_bijections_exact
 }
@@ -13017,7 +13045,23 @@ mod tests {
         }
     }
 
-    fn population_role(role: AttemptRole, gate_id: &str) -> RoleEvidence {
+    fn production_population_contract(scenario: &str) -> (usize, usize) {
+        match scenario {
+            "RZ" => (2, 16),
+            "ZB" => (2, 24),
+            "RO" => (1, 16),
+            "ST" => (1, 8),
+            "NO" => (1, 8),
+            "FC" => (2, 12),
+            "VM" => (4, 32),
+            "PT" => (2, 12),
+            "VV" => (2, 14),
+            "IP" => (1, 6),
+            _ => panic!("unknown production viewer scenario"),
+        }
+    }
+
+    fn population_role(role: AttemptRole, scenario: &str, gate_count: usize) -> RoleEvidence {
         RoleEvidence {
             role,
             root: PathBuf::from("/private/secret/attempt"),
@@ -13042,7 +13086,16 @@ mod tests {
             source_inventory_after: None,
             cleanup_manifest_sha256: None,
             cleanup_completed: false,
-            product_gate_outcomes: vec![product_gate_outcome(gate_id, ProductGateStatus::Passed)],
+            product_gate_outcomes: (0..gate_count)
+                .map(|observation_index| {
+                    let mut outcome = product_gate_outcome(
+                        &format!("{scenario}.acceptance.{observation_index:03}.settled"),
+                        ProductGateStatus::Passed,
+                    );
+                    outcome.observation_index = observation_index;
+                    outcome
+                })
+                .collect(),
             reasons: BTreeSet::new(),
         }
     }
@@ -13053,21 +13106,26 @@ mod tests {
             scenarios: REQUIRED_SCENARIOS
                 .into_iter()
                 .map(|id| {
-                    let gate_id = format!("{id}.settled");
+                    let (phase_count, total_gate_count) = production_population_contract(id);
+                    let gate_count = total_gate_count / 2;
                     let gate_command = json!({
                         "command": "observe_gate_batch",
                         "batch_id": format!("{id}.batch.000"),
                         "phase_id": format!("{id}-phase.checkpoint.000"),
                         "origin": { "kind": "command_completed", "command_index": 0 },
-                        "observations": [{
-                            "gate_id": gate_id,
-                            "deadline_authority": "maximum_current_presentation_gap_plus_poll_grace",
-                            "deadline_after_origin_ns": 66_666_668_u64,
-                            "target": {
-                                "kind": "condition",
-                                "condition": "coordinated_presentation_settled",
-                            },
-                        }],
+                        "observations": (0..gate_count)
+                            .map(|observation_index| json!({
+                                "gate_id": format!(
+                                    "{id}.acceptance.{observation_index:03}.settled"
+                                ),
+                                "deadline_authority": "maximum_current_presentation_gap_plus_poll_grace",
+                                "deadline_after_origin_ns": 66_666_668_u64,
+                                "target": {
+                                    "kind": "condition",
+                                    "condition": "coordinated_presentation_settled",
+                                },
+                            }))
+                            .collect::<Vec<_>>(),
                     });
                     let predecessor = json!({ "command": "sleep_frames", "frames": 1 });
                     let mut instrumented =
@@ -13077,11 +13135,15 @@ mod tests {
                     control.scenario = id.to_owned();
                     ScriptScenario {
                         id: id.to_owned(),
-                        phases: vec![ScriptPhase {
-                            name: format!("{id}-phase"),
-                            start_diagnostic_label: Some(format!("{id}-start")),
-                            end_diagnostic_label: format!("{id}-end"),
-                        }],
+                        phases: (0..phase_count)
+                            .map(|phase_index| ScriptPhase {
+                                name: format!("{id}-phase-{phase_index}"),
+                                start_diagnostic_label: Some(format!(
+                                    "{id}-start-{phase_index}"
+                                )),
+                                end_diagnostic_label: format!("{id}-end-{phase_index}"),
+                            })
+                            .collect(),
                         instrumented_script: instrumented,
                         instrumentation_control_script: Some(control),
                         cleanup: AttemptCleanup::default(),
@@ -13095,19 +13157,35 @@ mod tests {
         (1..=3)
             .flat_map(|sample_index| {
                 REQUIRED_SCENARIOS.into_iter().map(move |id| {
-                    let gate_id = format!("{id}.settled");
+                    let (phase_count, total_gate_count) = production_population_contract(id);
+                    let role_gate_count = total_gate_count / 2;
                     SampleEvidence {
                         sample_index,
                         scenario: id.to_owned(),
-                        instrumented: population_role(AttemptRole::Instrumented, &gate_id),
+                        role_launch_order: balanced_role_order(
+                            sample_index,
+                            REQUIRED_SCENARIOS
+                                .iter()
+                                .position(|scenario| *scenario == id)
+                                .unwrap(),
+                        )
+                        .to_vec(),
+                        instrumented: population_role(
+                            AttemptRole::Instrumented,
+                            id,
+                            role_gate_count,
+                        ),
                         control: Some(population_role(
                             AttemptRole::InstrumentationControl,
-                            &gate_id,
+                            id,
+                            role_gate_count,
                         )),
-                        phases: vec![PhaseEvaluation {
-                            name: format!("{id}-phase"),
-                            reasons: BTreeSet::new(),
-                        }],
+                        phases: (0..phase_count)
+                            .map(|phase_index| PhaseEvaluation {
+                                name: format!("{id}-phase-{phase_index}"),
+                                reasons: BTreeSet::new(),
+                            })
+                            .collect(),
                         instrumented_qualification_wait_wall_ns: Some(0),
                         instrumented_adjusted_wall_time_ns: Some(1),
                         wall_overhead_basis_points: Some(0),
@@ -17961,11 +18039,30 @@ mod tests {
         assert_eq!(population.expected_role_attempts, 60);
         assert_eq!(population.observed_role_attempts, 60);
         assert_eq!(population.completed_role_reports, 60);
-        assert_eq!(population.expected_phase_evaluations, 30);
-        assert_eq!(population.observed_phase_evaluations, 30);
-        assert_eq!(population.expected_product_gate_observations, 60);
-        assert_eq!(population.observed_product_gate_observations, 60);
+        assert_eq!(population.expected_phase_evaluations, 54);
+        assert_eq!(population.observed_phase_evaluations, 54);
+        assert_eq!(population.expected_product_gate_observations, 444);
+        assert_eq!(population.observed_product_gate_observations, 444);
         assert!(population.sample_order_exact);
+        assert!(population.role_order_exact);
+        assert_eq!(
+            samples
+                .iter()
+                .filter(|sample| {
+                    sample.role_launch_order.first() == Some(&AttemptRole::Instrumented)
+                })
+                .count(),
+            15
+        );
+        assert_eq!(
+            samples
+                .iter()
+                .filter(|sample| {
+                    sample.role_launch_order.first() == Some(&AttemptRole::InstrumentationControl)
+                })
+                .count(),
+            15
+        );
         assert_eq!(population_json(population)["exact"], json!(true));
 
         let mut filtered = complete_population_samples();
@@ -18006,6 +18103,15 @@ mod tests {
         assert!(reasons.contains("sample_population_order_mismatch"));
         assert_eq!(population_json(population)["exact"], json!(false));
 
+        let mut wrong_role_order = complete_population_samples();
+        wrong_role_order[0].role_launch_order.reverse();
+        let mut reasons = BTreeSet::new();
+        let population =
+            validate_attempt_population(&profile, &scripts, &wrong_role_order, &mut reasons);
+        assert!(!population.role_order_exact);
+        assert!(reasons.contains("role_attempt_order_mismatch"));
+        assert_eq!(population_json(population)["exact"], json!(false));
+
         let mut unlaunched = complete_population_samples();
         unlaunched[0]
             .control
@@ -18041,7 +18147,7 @@ mod tests {
         wrong_gate[0].instrumented.product_gate_outcomes[0].command_index = 2;
         let mut reasons = BTreeSet::new();
         let population = validate_attempt_population(&profile, &scripts, &wrong_gate, &mut reasons);
-        assert_eq!(population.observed_product_gate_observations, 60);
+        assert_eq!(population.observed_product_gate_observations, 444);
         assert!(!population.product_gate_bijections_exact);
         assert_eq!(population_json(population)["exact"], json!(false));
     }
