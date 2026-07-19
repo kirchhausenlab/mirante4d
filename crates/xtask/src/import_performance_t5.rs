@@ -45,7 +45,10 @@ use crate::{
         qualification_build_provenance_evidence, qualification_build_reason_codes,
         repository_identity,
     },
-    process::{cargo_command, isolate_process_tree, terminate_process_tree},
+    process::{
+        BoundedOutputPolicy, cargo_command, isolate_process_tree, run_command_with_bounded_output,
+        terminate_process_tree,
+    },
     product_automation_progress::{
         FILE_POLL_INTERVAL, ProductAutomationProgressLaunch, ProductAutomationProgressMonitor,
         ProductAutomationProgressPlan, ProgressFailure, ProgressMonitorAction,
@@ -85,6 +88,14 @@ const CORRECTNESS_SAMPLES: usize = 1;
 const PERFORMANCE_SAMPLES: usize = 3;
 const T5_SCALE_COUNT: usize = 7;
 const RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
+const T5_X11_AUTOMATION_OUTPUT_POLICY: BoundedOutputPolicy = BoundedOutputPolicy {
+    scope: "t5_x11_automation",
+    inactivity_timeout: Duration::from_secs(2),
+    absolute_timeout: Duration::from_secs(3),
+    progress_interval: Duration::from_secs(1),
+    max_stdout_bytes: 64 * 1024,
+    max_stderr_bytes: 64 * 1024,
+};
 // Linux can tear down a process memory map before making its exit waitable.
 // Only a real exit observed within this small terminal window is accepted.
 const RSS_TERMINAL_EXIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
@@ -3266,9 +3277,9 @@ fn probe_x11_client_geometry(
     expected_width: u32,
     expected_height: u32,
 ) -> anyhow::Result<Option<Value>> {
-    let search = Command::new("xdotool")
-        .args(["search", "--onlyvisible", "--pid", &pid.to_string()])
-        .output()
+    let mut search = Command::new("xdotool");
+    search.args(["search", "--onlyvisible", "--pid", &pid.to_string()]);
+    let search = run_command_with_bounded_output(&mut search, T5_X11_AUTOMATION_OUTPUT_POLICY)
         .context("failed to run xdotool for T5 mapped-window proof")?;
     if !search.status.success() {
         return Ok(None);
@@ -3283,9 +3294,9 @@ fn probe_x11_client_geometry(
             continue;
         };
         let id_hex = format!("0x{window_id:x}");
-        let info = Command::new("xwininfo")
-            .args(["-id", &id_hex])
-            .output()
+        let mut info = Command::new("xwininfo");
+        info.args(["-id", &id_hex]);
+        let info = run_command_with_bounded_output(&mut info, T5_X11_AUTOMATION_OUTPUT_POLICY)
             .context("failed to run xwininfo for T5 mapped-window proof")?;
         if !info.status.success() {
             continue;
@@ -4969,6 +4980,28 @@ mod tests {
             failure.downcast_ref::<ProgressFailure>(),
             Some(&ProgressFailure::HeartbeatStale)
         );
+    }
+
+    #[test]
+    fn t5_x11_probes_have_short_silence_absolute_and_output_bounds() {
+        assert_eq!(
+            T5_X11_AUTOMATION_OUTPUT_POLICY.inactivity_timeout,
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            T5_X11_AUTOMATION_OUTPUT_POLICY.absolute_timeout,
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            T5_X11_AUTOMATION_OUTPUT_POLICY.progress_interval,
+            Duration::from_secs(1)
+        );
+        assert!(
+            T5_X11_AUTOMATION_OUTPUT_POLICY.inactivity_timeout
+                < T5_X11_AUTOMATION_OUTPUT_POLICY.absolute_timeout
+        );
+        assert_eq!(T5_X11_AUTOMATION_OUTPUT_POLICY.max_stdout_bytes, 64 * 1024);
+        assert_eq!(T5_X11_AUTOMATION_OUTPUT_POLICY.max_stderr_bytes, 64 * 1024);
     }
 
     #[test]
