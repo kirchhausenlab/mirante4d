@@ -165,7 +165,7 @@ fn tiff_import_setup_state_is_visible_immediately_after_output_selection() {
     fs::create_dir(&output_parent).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
     let tiff_source = TiffSource::auto(source.clone());
-    let destination = tiff_destination(&tiff_source, &output_parent);
+    let destination = deterministic_tiff_destination(&tiff_source, &output_parent);
 
     app.enter_tiff_import_setup_waiting_state(tiff_source, destination.clone())
         .unwrap();

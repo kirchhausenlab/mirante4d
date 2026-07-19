@@ -57,7 +57,7 @@ use fidelity::composite_fidelity_label;
 #[cfg(test)]
 use import_worker_service::ImportWorkerStatus;
 use import_worker_service::{ImportWorkerCompletion, ImportWorkerOutcome};
-use import_workflow::{ImportWorkflow, reset_checkpoint_directory, tiff_destination};
+use import_workflow::{ImportWorkflow, reset_checkpoint_directory};
 use mirante4d_application::LayerHistogramSummary;
 use mirante4d_application::{
     ApplicationCommand, ApplicationCommandKind, ApplicationEvent, ApplicationFault,
@@ -87,7 +87,9 @@ use mirante4d_domain::{IntensityDType, Shape3D, TimeIndex};
 use mirante4d_domain::{ScaleLevel, ViewerLayout as CanonicalViewerLayout};
 #[cfg(test)]
 use mirante4d_import_pipeline::ImportCancellation;
-use mirante4d_import_pipeline::{ImportError, ImportOptions, PublishedImport, TiffSource};
+use mirante4d_import_pipeline::{
+    ImportError, ImportOptions, PublishedImport, TiffSource, deterministic_tiff_destination,
+};
 use mirante4d_project_model::{ProjectId, ProjectRevisionId, ViewState};
 use mirante4d_project_store::{
     ProjectGenerationId, ProjectOpenMode, ProjectRecoveryCandidate, ProjectStoreConfig,

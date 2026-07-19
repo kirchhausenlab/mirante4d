@@ -11,9 +11,10 @@ use mirante4d_application::import_workflow::{
     ImportShapeSnapshot, ImportSourceDtype, ImportSourceLayout, ImportWorkflowSnapshot,
 };
 use mirante4d_domain::IntensityDType;
+pub(crate) use mirante4d_import_pipeline::deterministic_tiff_destination as tiff_destination;
 use mirante4d_import_pipeline::{
     ImportEvent, ImportOptions, ImportStage, NoDataPolicy, SourceLayout, SpatialCalibration,
-    TiffInspection, TiffSource, select_supported_profile,
+    TiffInspection, TiffSource, deterministic_tiff_destination, select_supported_profile,
 };
 use mirante4d_storage::ProfileKind;
 
@@ -62,33 +63,6 @@ impl PendingImportReview {
             destination,
         }
     }
-}
-
-pub(crate) fn tiff_destination(source: &TiffSource, output_parent: &Path) -> PathBuf {
-    let name = source
-        .path
-        .file_stem()
-        .or_else(|| source.path.file_name())
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("imported-dataset");
-    let slug = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let slug = slug.trim_matches('-');
-    let slug = if slug.is_empty() {
-        "imported-dataset"
-    } else {
-        slug
-    };
-    output_parent.join(format!("{slug}.m4d"))
 }
 
 pub(crate) fn reset_checkpoint_directory(path: &Path) -> anyhow::Result<()> {
@@ -420,9 +394,9 @@ mod tests {
     }
 
     #[test]
-    fn destination_is_a_create_only_package_name_under_the_selected_parent() {
+    fn shared_destination_keeps_its_checkpoint_as_a_sibling() {
         let source = TiffSource::auto("/source/My Cells.ome.tiff");
-        let destination = tiff_destination(&source, Path::new("/output"));
+        let destination = deterministic_tiff_destination(&source, Path::new("/output"));
 
         assert_eq!(destination, Path::new("/output/my-cells-ome.m4d"));
         assert_eq!(

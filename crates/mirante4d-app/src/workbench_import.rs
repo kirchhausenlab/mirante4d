@@ -56,7 +56,7 @@ impl MiranteWorkbenchApp {
         ctx: &egui::Context,
     ) {
         self.bind_import_worker_completion_repaint(ctx);
-        let destination = tiff_destination(&source, &output_parent);
+        let destination = deterministic_tiff_destination(&source, &output_parent);
         if let Err(error) = self.enter_tiff_import_setup_waiting_state(source, destination) {
             self.import.problem = Some(error.to_string());
             tracing::error!(%error, "TIFF inspection could not start");

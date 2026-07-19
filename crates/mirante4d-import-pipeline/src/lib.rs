@@ -28,7 +28,7 @@ pub use error::ImportError;
 pub use model::{
     ImportEvent, ImportOptions, ImportReceipt, ImportStage, ImportStageTiming, ImportStatistics,
     NoDataPolicy, PublishedImport, SourceFingerprint, SourceLayout, SpatialCalibration,
-    TiffInspection, TiffSource,
+    TiffInspection, TiffSource, deterministic_tiff_destination,
 };
 pub use pipeline::{import_tiff, inspect_tiff, inspect_tiff_cancellable, select_supported_profile};
 pub use worker::{spawn_tiff_import_worker, spawn_tiff_inspection_worker};

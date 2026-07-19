@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use mirante4d_import_pipeline::{TiffSource, deterministic_tiff_destination};
 use mirante4d_storage::{LocalPackageCatalog, PACKAGE_VALIDATION_WORKING_BYTES};
 use serde_json::{Value, json};
 
@@ -1971,7 +1972,7 @@ fn prepare_import_product_fixture(
     let output_parent = root.join("output");
     fs::create_dir(&output_parent)
         .with_context(|| format!("failed to create {}", output_parent.display()))?;
-    let destination = output_parent.join("public-full-strip-source.m4d");
+    let destination = deterministic_tiff_destination(&TiffSource::auto(&source), &output_parent);
     Ok(ImportProductFixture {
         source,
         output_parent,

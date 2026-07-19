@@ -21,6 +21,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use mirante4d_identity::{ScientificContentId, Sha256Digest, Sha256Hasher};
+use mirante4d_import_pipeline::{TiffSource, deterministic_tiff_destination};
 use mirante4d_storage::{
     LocalPackageCatalog, OmeLevelTransform, PackedIndexCoordinates, ProfileKind,
     ProfileValidityMode, ShardProfileKind,
@@ -2401,7 +2402,7 @@ fn run_sample(
     create_private_directory(&sample_root)?;
     let output_parent = sample_root.join("output");
     create_private_directory(&output_parent)?;
-    let destination = tiff_destination(source, &output_parent);
+    let destination = deterministic_tiff_destination(&TiffSource::auto(source), &output_parent);
     let checkpoint = checkpoint_directory(&destination)?;
     if destination.exists() || checkpoint.exists() {
         bail!("T5 sample destination or checkpoint was stale before launch");
@@ -4386,32 +4387,6 @@ fn ceil_div(value: u64, divisor: u64) -> anyhow::Result<u64> {
         / divisor)
 }
 
-fn tiff_destination(source: &Path, output_parent: &Path) -> PathBuf {
-    let name = source
-        .file_stem()
-        .or_else(|| source.file_name())
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("imported-dataset");
-    let slug = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let slug = slug.trim_matches('-');
-    let slug = if slug.is_empty() {
-        "imported-dataset"
-    } else {
-        slug
-    };
-    output_parent.join(format!("{slug}.m4d"))
-}
-
 fn checkpoint_directory(destination: &Path) -> anyhow::Result<PathBuf> {
     let parent = destination
         .parent()
@@ -5523,8 +5498,8 @@ mod tests {
 
     #[test]
     fn destination_and_checkpoint_match_the_normal_app_policy() {
-        let destination = tiff_destination(
-            Path::new("/private/My Cells.ome.tif"),
+        let destination = deterministic_tiff_destination(
+            &TiffSource::auto("/private/My Cells.ome.tif"),
             Path::new("/scratch/sample"),
         );
         assert_eq!(destination, Path::new("/scratch/sample/my-cells-ome.m4d"));

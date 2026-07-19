@@ -29,6 +29,35 @@ impl TiffSource {
     }
 }
 
+/// Derives the create-only package destination used by every TIFF import
+/// entry point.
+pub fn deterministic_tiff_destination(source: &TiffSource, output_parent: &Path) -> PathBuf {
+    let name = source
+        .path
+        .file_stem()
+        .or_else(|| source.path.file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("imported-dataset");
+    let slug = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() {
+        "imported-dataset"
+    } else {
+        slug
+    };
+    output_parent.join(format!("{slug}.m4d"))
+}
+
 /// Supported reviewed source layouts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceLayout {
@@ -317,5 +346,43 @@ impl fmt::Debug for PublishedImport {
             .field("receipt", &self.receipt)
             .field("destination", &self.destination())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_tiff_destinations_preserve_the_frozen_slug_policy() {
+        for (source, expected) in [
+            ("/source/My Cells.ome.tiff", "/output/my-cells-ome.m4d"),
+            ("/source/Cell_Stack-7.TIF", "/output/cell_stack-7.m4d"),
+            (
+                "/source/Nested Acquisition",
+                "/output/nested-acquisition.m4d",
+            ),
+            ("/source/---.tif", "/output/imported-dataset.m4d"),
+        ] {
+            assert_eq!(
+                deterministic_tiff_destination(&TiffSource::auto(source), Path::new("/output"),),
+                Path::new(expected),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_tiff_names_use_the_deterministic_fallback() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let source = Path::new("/source").join(OsString::from_vec(vec![
+            b'c', b'e', b'l', b'l', b's', 0xff, b'.', b't', b'i', b'f',
+        ]));
+
+        assert_eq!(
+            deterministic_tiff_destination(&TiffSource::auto(source), Path::new("/output")),
+            Path::new("/output/imported-dataset.m4d"),
+        );
     }
 }
