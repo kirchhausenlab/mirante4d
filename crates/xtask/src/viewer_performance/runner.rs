@@ -9474,15 +9474,34 @@ fn validate_interaction_metrics(
         "interaction_task",
         reasons,
     );
-    check_max_gate(
-        admitted_latency.as_deref().and_then(sample_p95),
-        profile
-            .absolute_gates
-            .resident_input_to_current_presentation_p95_ns,
-        "resident_input_latency_metric_missing",
-        "resident_input_latency_gate_exceeded",
-        reasons,
-    );
+    match admitted_latency.as_deref() {
+        Some([]) => {
+            // An exact empty completion population after a declared resident
+            // interaction is an authoritative negative product result: no
+            // admitted generation reached current presentation. It is not a
+            // missing metric when the bounded ring itself is present and
+            // reconciled.
+            reasons.insert("resident_input_latency_gate_exceeded".to_owned());
+        }
+        Some(samples) => check_max_gate(
+            sample_p95(samples),
+            profile
+                .absolute_gates
+                .resident_input_to_current_presentation_p95_ns,
+            "resident_input_latency_metric_missing",
+            "resident_input_latency_gate_exceeded",
+            reasons,
+        ),
+        None => check_max_gate(
+            None,
+            profile
+                .absolute_gates
+                .resident_input_to_current_presentation_p95_ns,
+            "resident_input_latency_metric_missing",
+            "resident_input_latency_gate_exceeded",
+            reasons,
+        ),
+    }
     check_max_gate(
         admitted_latency
             .as_deref()
@@ -9656,16 +9675,26 @@ fn check_max_gate(
 
 fn validate_current_complete(diagnostics: &Value, reasons: &mut BTreeSet<String>) {
     let display = diagnostics.pointer("/render/display_coordination");
-    let input_generation = display
-        .and_then(|value| value.get("input_generation"))
-        .and_then(Value::as_u64);
-    let presentation_generation = display
-        .and_then(|value| value.get("current_presentation_generation"))
-        .and_then(Value::as_u64);
-    if input_generation.is_none() || presentation_generation.is_none() {
-        reasons.insert("current_presentation_generation_mismatch_or_missing".to_owned());
-    } else if input_generation != presentation_generation {
-        reasons.insert("product_gate_current_presentation_generation_mismatch".to_owned());
+    let input_generation = display.and_then(|value| value.get("input_generation"));
+    let presentation_generation =
+        display.and_then(|value| value.get("current_presentation_generation"));
+    match (
+        input_generation.and_then(Value::as_u64),
+        presentation_generation,
+    ) {
+        (Some(_), Some(presentation)) if presentation.is_null() => {
+            // Explicit null is the product's truthful statement that no
+            // current presentation exists. Missing or malformed fields remain
+            // integrity failures below.
+            reasons.insert("product_gate_current_presentation_generation_mismatch".to_owned());
+        }
+        (Some(input), Some(presentation)) if presentation.as_u64() == Some(input) => {}
+        (Some(_), Some(presentation)) if presentation.as_u64().is_some() => {
+            reasons.insert("product_gate_current_presentation_generation_mismatch".to_owned());
+        }
+        _ => {
+            reasons.insert("current_presentation_generation_mismatch_or_missing".to_owned());
+        }
     }
     let completeness = diagnostics
         .pointer("/render/frame_fidelity/completeness")
@@ -15226,6 +15255,38 @@ mod tests {
     }
 
     #[test]
+    fn explicit_absent_current_presentation_is_a_product_failure_not_missing_evidence() {
+        let mut diagnostics = json!({
+            "render": {
+                "display_coordination": {
+                    "input_generation": 7,
+                    "current_presentation_generation": null,
+                },
+                "frame_fidelity": {
+                    "completeness": "Complete",
+                    "display_freshness": "Current",
+                    "last_failure_kind": null,
+                    "last_capacity_error": null,
+                },
+            },
+        });
+        let mut reasons = BTreeSet::new();
+        validate_current_complete(&diagnostics, &mut reasons);
+        assert_eq!(
+            reasons,
+            BTreeSet::from(["product_gate_current_presentation_generation_mismatch".to_owned()])
+        );
+
+        diagnostics["render"]["display_coordination"]
+            .as_object_mut()
+            .unwrap()
+            .remove("current_presentation_generation");
+        reasons.clear();
+        validate_current_complete(&diagnostics, &mut reasons);
+        assert!(reasons.contains("current_presentation_generation_mismatch_or_missing"));
+    }
+
+    #[test]
     fn interaction_gate_uses_only_the_claim_bearing_active_ui_update_metric() {
         let profile = profile();
         let start = json!({
@@ -15268,8 +15329,21 @@ mod tests {
         validate_interaction_metrics(&start, &valid, &profile, &mut reasons);
         assert!(reasons.is_empty());
 
+        let mut exact_empty_completion_population = valid.clone();
+        exact_empty_completion_population["render"]["display_coordination"]["admitted_generation_latency"] =
+            timing_ring(0, &[]);
+        validate_interaction_metrics(
+            &start,
+            &exact_empty_completion_population,
+            &profile,
+            &mut reasons,
+        );
+        assert!(reasons.contains("resident_input_latency_gate_exceeded"));
+        assert!(!reasons.contains("resident_input_latency_metric_missing"));
+
         let mut semantic_only = valid;
         semantic_only["render"]["display_coordination"]["active_ui_update_duration"] = Value::Null;
+        reasons.clear();
         validate_interaction_metrics(&start, &semantic_only, &profile, &mut reasons);
         assert!(reasons.contains("interaction_task_metric_missing"));
         assert!(reasons.contains("ui_update_gate_scope_missing"));

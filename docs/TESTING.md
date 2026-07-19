@@ -161,6 +161,12 @@ process, hard-safety, or evidence-integrity failure instead stops the launch
 immediately and preserves the exact partial lineage; later roles are not run
 after the evidence envelope has become unusable.
 
+An explicitly null current-presentation generation and a present, reconciled,
+exactly empty admitted-generation latency population are authoritative product
+failures when interaction occurred; they mean no generation reached current
+presentation. An absent field, malformed value, missing ring, or unreconciled
+population remains an evidence-integrity failure.
+
 Every checkpoint acceptance batch resolves before its phase-end diagnostic.
 It is followed by one bounded, nonblocking
 `await_active_view_gpu_timing` command for the oracle-bound active target and
