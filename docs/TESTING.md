@@ -122,6 +122,8 @@ and execution:
 cargo xtask viewer-performance-build-runner
 target/release/xtask viewer-performance-preflight --help
 target/release/xtask viewer-performance-run --help
+target/release/xtask viewer-performance-publish --help
+target/release/xtask viewer-performance-ep01-preflight --help
 ```
 
 Those inputs remain outside the repository because they bind private package
@@ -139,6 +141,49 @@ panic, codegen units, rpath, stripping, and the compiler host target.
 Execution builds and runs conformance from a detached clean worktree of the
 profile revision. The live repository, detached source, and app digest are
 rechecked before every role; drift stops before the next process launch.
+
+The run finalizes canonical `raw-private-report.json` first, then derives and
+durably syncs its fixed sibling `development-receipt.json`. Both files remain
+outside the repository in one private directory, are create-new mode `0600`
+single-link regular files, and are reread through no-symlink currentness
+checks. If a finalized schema-5 raw report predates receipt publication, replay
+only the projection with the same four external authorities; this does not
+launch the viewer or repeat conformance:
+
+```bash
+target/release/xtask viewer-performance-publish \
+  --qualification-profile /absolute/private/viewer-profile.json \
+  --workload-bundle /absolute/private/workload.json \
+  --interaction-script-bundle /absolute/private/scripts.json \
+  --independent-oracle /absolute/private/oracle.json \
+  --raw-report /absolute/private/evidence/raw-private-report.json
+```
+
+EP-01 must admit that durable pair before selection work begins:
+
+```bash
+target/release/xtask viewer-performance-ep01-preflight \
+  --qualification-profile /absolute/private/viewer-profile.json \
+  --workload-bundle /absolute/private/workload.json \
+  --interaction-script-bundle /absolute/private/scripts.json \
+  --independent-oracle /absolute/private/oracle.json \
+  --raw-report /absolute/private/evidence/raw-private-report.json \
+  --receipt /absolute/private/evidence/development-receipt.json
+```
+
+Admission reprojects the receipt from the finalized raw bytes, rechecks every
+external commitment and exact population bound, and requires empty integrity
+reasons. A complete authoritative `failed` product result is admitted just as
+a `passed` result is; an invalid or incomplete evidence envelope is rejected.
+Neither command accepts a compatibility schema or mutates an existing receipt.
+
+The schema-5 raw envelope retains the already-validated ordered gate rows, but
+not the discarded full automation reports. Replay therefore rechecks the exact
+paired IP terminal-prepublication failure shape and its coherent runtime-idle
+sibling, while the automation report's terminal counters remain an original-run
+validation bound transitively by the finalized raw digest. Independently
+recomputing those counters during replay would require a new raw-report schema
+hard cut; it is not supplied by a compatibility reader.
 
 The predecessor run is exactly three ordered samples of all ten frozen
 scenarios. Every scenario has one fresh instrumented process and one fresh

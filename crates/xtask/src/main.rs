@@ -17,6 +17,7 @@ mod host;
 mod import_performance;
 mod import_performance_t5;
 mod package;
+mod private_evidence;
 mod process;
 mod product_automation_progress;
 mod product_validate;
@@ -93,6 +94,8 @@ fn main() -> anyhow::Result<()> {
         }
         "viewer-performance-preflight" => viewer_performance::run(args.collect()),
         "viewer-performance-run" => viewer_performance::run_measurement(args.collect()),
+        "viewer-performance-publish" => viewer_performance::publish_receipt(args.collect()),
+        "viewer-performance-ep01-preflight" => viewer_performance::preflight_ep01(args.collect()),
         "viewer-performance-build-runner" => {
             viewer_performance::build_qualification_runner(args.collect())
         }
@@ -188,6 +191,8 @@ Mirante4D developer tasks
   cargo run --release -p xtask -- import-performance-t5-oracle-audit --config /absolute/private/config.json
   cargo run --release -p xtask -- viewer-performance-preflight --qualification-profile /absolute/private/viewer-profile.json --workload-bundle /absolute/private/workload.json --interaction-script-bundle /absolute/private/scripts.json --independent-oracle /absolute/private/oracle.json --cache-condition warm --competing-activity none --power-state balanced --compositor-scale-milli 1000
   cargo run --release -p xtask -- viewer-performance-run --help
+  cargo run --release -p xtask -- viewer-performance-publish --qualification-profile ABS --workload-bundle ABS --interaction-script-bundle ABS --independent-oracle ABS --raw-report ABS
+  cargo run --release -p xtask -- viewer-performance-ep01-preflight --qualification-profile ABS --workload-bundle ABS --interaction-script-bundle ABS --independent-oracle ABS --raw-report ABS --receipt ABS
   cargo xtask viewer-performance-build-runner
   cargo xtask docs-check
   cargo xtask run-dev

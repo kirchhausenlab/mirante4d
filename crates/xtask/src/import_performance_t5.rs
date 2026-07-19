@@ -896,59 +896,15 @@ fn read_finalized_raw_report(
     repository_root: &Path,
     maximum_bytes: u64,
 ) -> anyhow::Result<(Value, String)> {
-    if !path.is_absolute() {
-        bail!("T5 report publication requires an absolute --raw-report path");
-    }
-    let path_metadata = fs::symlink_metadata(path)?;
-    if path_metadata.file_type().is_symlink()
-        || !path_metadata.is_file()
-        || path_metadata.len() == 0
-        || path_metadata.len() > maximum_bytes
-        || path_metadata.permissions().mode() & 0o077 != 0
-    {
-        bail!("finalized T5 raw report must be one bounded private regular file");
-    }
-    let canonical = fs::canonicalize(path)?;
-    if canonical.starts_with(fs::canonicalize(repository_root)?) {
-        bail!("finalized private T5 raw report must remain outside the repository");
-    }
-    let parent = canonical
-        .parent()
-        .context("finalized T5 raw report has no parent")?;
-    let parent_metadata = fs::metadata(parent)?;
-    if !parent_metadata.is_dir() || parent_metadata.permissions().mode() & 0o077 != 0 {
-        bail!("finalized T5 raw report parent must remain private");
-    }
-
-    let mut file = File::open(&canonical)?;
-    let before = file.metadata()?;
-    if before.dev() != path_metadata.dev()
-        || before.ino() != path_metadata.ino()
-        || before.len() != path_metadata.len()
-    {
-        bail!("finalized T5 raw report path changed while opened");
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
-    Read::by_ref(&mut file)
-        .take(maximum_bytes + 1)
-        .read_to_end(&mut bytes)?;
-    let after = file.metadata()?;
-    let path_after = fs::symlink_metadata(&canonical)?;
-    if u64::try_from(bytes.len()).ok() != Some(before.len())
-        || before.dev() != after.dev()
-        || before.ino() != after.ino()
-        || before.len() != after.len()
-        || before.mtime() != after.mtime()
-        || before.mtime_nsec() != after.mtime_nsec()
-        || after.dev() != path_after.dev()
-        || after.ino() != path_after.ino()
-        || after.len() != path_after.len()
-    {
-        bail!("finalized T5 raw report changed while read");
-    }
-    let digest = sha256_bytes(&bytes);
-    let report = serde_json::from_slice(&bytes).context("finalized T5 raw report is malformed")?;
-    Ok((report, digest))
+    let finalized = crate::private_evidence::read_finalized_private_file(
+        path,
+        repository_root,
+        maximum_bytes,
+        "finalized T5 raw report",
+    )?;
+    let report =
+        serde_json::from_slice(&finalized.bytes).context("finalized T5 raw report is malformed")?;
+    Ok((report, finalized.sha256))
 }
 
 fn validate_raw_config_binding(

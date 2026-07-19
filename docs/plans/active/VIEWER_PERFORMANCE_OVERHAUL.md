@@ -999,6 +999,26 @@ and 10-second closeout grace, with the IP import wall counted once; there is no
 caller-authored timeout. This three-sample population is development evidence
 under the existing progression rule and cannot establish a performance claim.
 
+Schema 5 also fixes a durable publication boundary. The runner finalizes and
+syncs `raw-private-report.json` before deriving the path-free
+`development-receipt.json` sibling. A clean canonical release publisher may
+replay that raw-to-receipt projection without rerunning product or conformance
+work, but only after strict private-file currentness, external commitment,
+population, status, and privacy validation. EP-01 preflight independently
+rereads both finalized siblings and admits only the exact reprojection with a
+complete evidence envelope and no integrity reason. Product status may be
+either passed or failed; predecessor product failure does not invalidate
+authoritative evidence. Existing files are never overwritten, and neither
+command accepts a compatibility schema.
+
+The schema-5 raw envelope retains the ordered gate observations after the
+runner validates each full automation report, but it does not retain those
+discarded reports. Replay can consequently prove the exact paired IP
+terminal-prepublication outcome and its runtime-idle sibling from the raw
+lineage, while the report-only terminal counters remain original-run checks
+transitively committed by the finalized raw digest. Independent replay of
+those counters requires a future schema hard cut, not a permissive reader.
+
 Qualification scripts contain no fatal product-state assertions. Every
 expected negative product result, including a predecessor render failure,
 stays in the typed gate and phase-evaluation surfaces so it cannot invalidate

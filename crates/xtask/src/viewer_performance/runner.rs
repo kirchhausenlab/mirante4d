@@ -22,8 +22,13 @@ use super::{
     ViewerQualificationProfile, binding_reasons, commitment_fingerprint,
     conformance_receipt::{self, ConformanceEvidence},
     load_external_profile, observe, profile_contract_sha256, read_bounded_regular_file,
+    receipt::{
+        self, ExpectedAttemptAuthority, ExpectedGateAuthority, ExpectedRoleAuthority,
+        ReceiptBindings,
+    },
     require_exact_release_admission, require_nonsymlink_components, require_sha256, require_text,
     sanitized_report as preflight_report, validate_owner_accepted_profile,
+    validate_owner_accepted_profile_at_revision,
 };
 use crate::host::{
     QualificationBuildProvenance, RepositoryIdentity, qualification_build_provenance,
@@ -38,8 +43,9 @@ use crate::product_automation_progress::{
 const WORKLOAD_SCHEMA: &str = "mirante4d-viewer-performance-workload-bundle-4";
 const SCRIPT_BUNDLE_SCHEMA: &str = "mirante4d-viewer-performance-script-bundle-5";
 const ORACLE_SCHEMA: &str = "mirante4d-viewer-performance-oracle-bundle-3";
-const RAW_REPORT_SCHEMA: &str = "mirante4d-viewer-performance-raw-private-report-5";
-const RECEIPT_SCHEMA: &str = "mirante4d-viewer-performance-development-receipt-5";
+const RAW_REPORT_SCHEMA: &str = receipt::RAW_REPORT_SCHEMA;
+#[cfg(test)]
+const RECEIPT_SCHEMA: &str = receipt::RECEIPT_SCHEMA;
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
 const AUTOMATION_SCRIPT_SCHEMA_VERSION: u64 = 5;
@@ -85,6 +91,13 @@ viewer-performance-run --qualification-profile ABSOLUTE_EXTERNAL_PROFILE.json \
 --cache-condition warm|cold \
 --competing-activity DESCRIPTION --power-state DESCRIPTION \
 --compositor-scale-milli INTEGER";
+const PUBLISH_USAGE: &str = "usage: target/release/xtask viewer-performance-publish \
+--qualification-profile ABS --workload-bundle ABS \
+--interaction-script-bundle ABS --independent-oracle ABS --raw-report ABS";
+const EP01_PREFLIGHT_USAGE: &str = "usage: target/release/xtask viewer-performance-ep01-preflight \
+--qualification-profile ABS --workload-bundle ABS \
+--interaction-script-bundle ABS --independent-oracle ABS \
+--raw-report ABS --receipt ABS";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RunArgs {
@@ -94,6 +107,25 @@ struct RunArgs {
     oracle_bundle: PathBuf,
     result_directory: PathBuf,
     attestation: ProtocolAttestation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReceiptCliArgs {
+    profile: PathBuf,
+    workload_bundle: PathBuf,
+    script_bundle: PathBuf,
+    oracle_bundle: PathBuf,
+    raw_report: PathBuf,
+    receipt: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct LoadedReceiptAuthority {
+    repository_root: PathBuf,
+    profile: LoadedProfile,
+    workload: LoadedBundle<WorkloadBundle>,
+    scripts: LoadedBundle<ScriptBundle>,
+    oracle: LoadedBundle<OracleBundle>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1442,28 +1474,365 @@ pub(crate) fn run_measurement(arguments: Vec<String>) -> anyhow::Result<()> {
         &source_repository_end,
         &xtask_build,
     );
-    let raw_path = result_root.join("raw-private-report.json");
-    write_new_synced_json(&raw_path, &raw)?;
-    let raw_sha256 = digest_regular_file(&raw_path, "viewer raw private report")?;
-    let receipt = sanitized_receipt(
-        &profile,
-        &workload,
-        &scripts,
-        &oracle,
-        &app_binary_sha256,
-        &raw_sha256,
-        conformance.as_ref(),
-        &samples,
-        population,
-        &instrumentation_overhead_populations,
-        &all_reasons,
-    );
+    let raw_path = result_root.join(receipt::RAW_REPORT_FILE_NAME);
+    let raw_bytes = receipt::canonical_json_bytes(&raw)?;
+    crate::private_evidence::write_new_synced_private_file(
+        &raw_path,
+        &raw_bytes,
+        receipt::RAW_REPORT_MAX_BYTES,
+        "viewer raw private report",
+    )?;
+    let bindings = receipt_bindings(&profile, &workload, &scripts, &oracle, &repository_root)?;
+    let (_, receipt) =
+        receipt::publish_finalized_raw_report(&raw_path, &repository_root, &bindings)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&receipt)
             .context("failed to encode viewer development receipt")?
     );
     require_valid_evidence(&all_reasons)
+}
+
+pub(crate) fn publish_receipt(arguments: Vec<String>) -> anyhow::Result<()> {
+    if arguments.len() == 1 && matches!(arguments[0].as_str(), "help" | "--help" | "-h") {
+        println!("{PUBLISH_USAGE}");
+        return Ok(());
+    }
+    let args = parse_receipt_cli_args(arguments, false)?;
+    let authority = load_receipt_cli_authority(&args)?;
+    let bindings = receipt_bindings(
+        &authority.profile,
+        &authority.workload,
+        &authority.scripts,
+        &authority.oracle,
+        &authority.repository_root,
+    )?;
+    let (_, receipt) = receipt::publish_finalized_raw_report(
+        &args.raw_report,
+        &authority.repository_root,
+        &bindings,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "schema": "mirante4d-viewer-performance-publication-status-1",
+            "receipt_published": true,
+            "receipt_file_name": receipt::RECEIPT_FILE_NAME,
+            "evidence_status": receipt["evidence_status"],
+            "product_gate_status": receipt["product_gate_status"],
+            "private_raw_report_sha256": receipt["commitments"]["private_raw_report_sha256"],
+        }))
+        .context("failed to encode viewer receipt publication status")?
+    );
+    Ok(())
+}
+
+pub(crate) fn preflight_ep01(arguments: Vec<String>) -> anyhow::Result<()> {
+    if arguments.len() == 1 && matches!(arguments[0].as_str(), "help" | "--help" | "-h") {
+        println!("{EP01_PREFLIGHT_USAGE}");
+        return Ok(());
+    }
+    let args = parse_receipt_cli_args(arguments, true)?;
+    let authority = load_receipt_cli_authority(&args)?;
+    let bindings = receipt_bindings(
+        &authority.profile,
+        &authority.workload,
+        &authority.scripts,
+        &authority.oracle,
+        &authority.repository_root,
+    )?;
+    let report = receipt::admit_finalized_receipt(
+        &args.raw_report,
+        args.receipt
+            .as_deref()
+            .context("viewer EP-01 preflight requires --receipt")?,
+        &authority.repository_root,
+        &bindings,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .context("failed to encode viewer EP-01 preflight report")?
+    );
+    Ok(())
+}
+
+fn load_receipt_cli_authority(args: &ReceiptCliArgs) -> anyhow::Result<LoadedReceiptAuthority> {
+    let repository = repository_identity();
+    let repository_root = repository
+        .root
+        .as_deref()
+        .context("viewer receipt command could not identify the repository root")?;
+    let repository_root = fs::canonicalize(repository_root)
+        .context("viewer receipt command could not resolve the repository root")?;
+    require_reporting_release_admission(&repository, &repository_root)?;
+    let profile = load_external_profile(&args.profile, &repository_root)?;
+    validate_owner_accepted_profile_at_revision(&profile.profile, &repository_root)?;
+    let workload = load_external_json::<WorkloadBundle>(
+        &args.workload_bundle,
+        &repository_root,
+        WORKLOAD_MAX_BYTES,
+        "viewer workload bundle",
+    )?;
+    let scripts = load_external_json::<ScriptBundle>(
+        &args.script_bundle,
+        &repository_root,
+        SCRIPT_BUNDLE_MAX_BYTES,
+        "viewer interaction-script bundle",
+    )?;
+    let oracle = load_external_json::<OracleBundle>(
+        &args.oracle_bundle,
+        &repository_root,
+        ORACLE_MAX_BYTES,
+        "viewer independent-oracle bundle",
+    )?;
+    validate_bundles_for_receipt(
+        &profile.profile,
+        &workload,
+        &scripts,
+        &oracle,
+        &repository_root,
+    )?;
+    Ok(LoadedReceiptAuthority {
+        repository_root,
+        profile,
+        workload,
+        scripts,
+        oracle,
+    })
+}
+
+fn require_reporting_release_admission(
+    repository: &RepositoryIdentity,
+    repository_root: &Path,
+) -> anyhow::Result<()> {
+    let provenance = qualification_build_provenance();
+    let mut reasons = crate::host::qualification_build_reason_codes(&provenance, repository);
+    if cfg!(debug_assertions) {
+        reasons.push("publisher_build_not_release");
+    }
+    if repository.dirty_worktree != Some(false) {
+        reasons.push("publisher_repository_dirty_or_unavailable");
+    }
+    if !provenance.canonical_release_contract {
+        reasons.push("publisher_canonical_release_contract_missing");
+    }
+    reasons.sort_unstable();
+    reasons.dedup();
+    if !reasons.is_empty() {
+        bail!(
+            "viewer receipt command requires one clean canonical release publisher: {}",
+            reasons.join(", ")
+        );
+    }
+    crate::import_performance_t5::require_standard_app_build_environment(&provenance)?;
+    crate::import_performance_t5::require_no_external_cargo_configuration(repository_root)
+}
+
+fn receipt_bindings(
+    profile: &LoadedProfile,
+    workload: &LoadedBundle<WorkloadBundle>,
+    scripts: &LoadedBundle<ScriptBundle>,
+    oracle: &LoadedBundle<OracleBundle>,
+    repository_root: &Path,
+) -> anyhow::Result<ReceiptBindings> {
+    let oracle_cases = oracle
+        .value
+        .conformance_cases
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .context("failed to encode conformance authority for receipt replay")?;
+    let conformance_commitments = conformance_receipt::replay_commitment_authority(
+        repository_root,
+        &profile.profile.build.repository_revision,
+        &oracle_cases,
+    )?;
+    let development_samples = u64::from(profile.profile.protocol.development_samples);
+    let script_map = scripts
+        .value
+        .scenarios
+        .iter()
+        .map(|scenario| (scenario.id.as_str(), scenario))
+        .collect::<BTreeMap<_, _>>();
+    let oracle_map = oracle
+        .value
+        .scenarios
+        .iter()
+        .map(|scenario| (scenario.id.as_str(), scenario))
+        .collect::<BTreeMap<_, _>>();
+    let phases_per_sample = REQUIRED_SCENARIOS
+        .iter()
+        .map(|id| {
+            script_map
+                .get(id)
+                .with_context(|| format!("viewer receipt authority lacks scenario {id}"))
+                .and_then(|scenario| u64::try_from(scenario.phases.len()).map_err(Into::into))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .try_fold(0_u64, u64::checked_add)
+        .context("viewer receipt phase population overflowed")?;
+    let gates_per_sample = REQUIRED_SCENARIOS
+        .iter()
+        .map(|id| {
+            let scenario = script_map
+                .get(id)
+                .with_context(|| format!("viewer receipt authority lacks scenario {id}"))?;
+            let control = scenario
+                .instrumentation_control_script
+                .as_ref()
+                .with_context(|| format!("viewer receipt authority lacks {id} control"))?;
+            let instrumented =
+                expected_product_gate_observations(&scenario.instrumented_script.commands)?.len();
+            let control = expected_product_gate_observations(&control.commands)?.len();
+            u64::try_from(
+                instrumented
+                    .checked_add(control)
+                    .context("viewer receipt product-gate population overflowed")?,
+            )
+            .map_err(Into::into)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .try_fold(0_u64, u64::checked_add)
+        .context("viewer receipt product-gate population overflowed")?;
+    let expected_sample_records = development_samples
+        .checked_mul(u64::try_from(REQUIRED_SCENARIOS.len())?)
+        .context("viewer receipt sample population overflowed")?;
+    let expected_role_attempts = expected_sample_records
+        .checked_mul(2)
+        .context("viewer receipt role population overflowed")?;
+    let expected_attempts = (1..=profile.profile.protocol.development_samples)
+        .flat_map(|sample_index| {
+            REQUIRED_SCENARIOS
+                .into_iter()
+                .map(move |scenario| (sample_index, scenario))
+        })
+        .map(|(sample_index, scenario_id)| {
+            let scenario = script_map.get(scenario_id).with_context(|| {
+                format!("viewer receipt authority lacks scenario {scenario_id}")
+            })?;
+            let oracle_scenario = oracle_map.get(scenario_id).with_context(|| {
+                format!("viewer receipt authority lacks oracle scenario {scenario_id}")
+            })?;
+            let control = scenario
+                .instrumentation_control_script
+                .as_ref()
+                .with_context(|| format!("viewer receipt authority lacks {scenario_id} control"))?;
+            Ok(ExpectedAttemptAuthority {
+                sample_index: u64::from(sample_index),
+                scenario: scenario_id.to_owned(),
+                phases: scenario
+                    .phases
+                    .iter()
+                    .map(|phase| phase.name.clone())
+                    .collect(),
+                instrumented: expected_receipt_role_authority(
+                    scenario_id,
+                    "instrumented",
+                    &scenario.instrumented_script,
+                    &profile.profile,
+                    oracle_scenario,
+                )?,
+                instrumentation_control: expected_receipt_role_authority(
+                    scenario_id,
+                    "instrumentation-control",
+                    control,
+                    &profile.profile,
+                    oracle_scenario,
+                )?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(ReceiptBindings {
+        qualification_profile_sha256: profile.sha256.clone(),
+        owner_accepted_profile_contract_sha256: profile_contract_sha256(&profile.profile),
+        ep01_selection_authority_sha256: profile.profile.ep01_selection_authority_sha256.clone(),
+        workload_bundle_sha256: workload.sha256.clone(),
+        ep01_trace_geometry_sha256: ep01_trace_geometry_sha256(&workload.value.ep01_trace_geometry),
+        interaction_script_bundle_sha256: scripts.sha256.clone(),
+        independent_oracle_sha256: oracle.sha256.clone(),
+        representative_package_fingerprint_sha256: commitment_fingerprint(
+            "representative-package",
+            &profile
+                .profile
+                .workload
+                .representative_package
+                .root_manifest_sha256,
+        ),
+        supporting_temporal_package_fingerprint_sha256: commitment_fingerprint(
+            "supporting-temporal-package",
+            &workload
+                .value
+                .supporting_temporal_package_root_manifest_sha256,
+        ),
+        build_binding_fingerprint_sha256: super::build_binding_fingerprint(&profile.profile.build),
+        development_samples,
+        expected_sample_records,
+        expected_role_attempts,
+        expected_phase_evaluations: development_samples
+            .checked_mul(phases_per_sample)
+            .context("viewer receipt phase population overflowed")?,
+        expected_product_gate_observations: development_samples
+            .checked_mul(gates_per_sample)
+            .context("viewer receipt product-gate population overflowed")?,
+        maximum_overhead_basis_points: u64::from(
+            profile
+                .profile
+                .absolute_gates
+                .maximum_instrumentation_overhead_basis_points,
+        ),
+        expected_attempts,
+        conformance_commitments,
+        private_strings: vec![
+            workload.path.display().to_string(),
+            scripts.path.display().to_string(),
+            oracle.path.display().to_string(),
+            profile
+                .profile
+                .workload
+                .representative_package
+                .root
+                .display()
+                .to_string(),
+        ],
+    })
+}
+
+fn expected_receipt_role_authority(
+    scenario: &str,
+    role: &str,
+    script: &AutomationScriptTemplate,
+    profile: &ViewerQualificationProfile,
+    oracle: &OracleScenario,
+) -> anyhow::Result<ExpectedRoleAuthority> {
+    let schedule = role_schedule_bound(scenario, script, profile, oracle)?;
+    let product_gate_outcomes = expected_product_gate_observations(&script.commands)?
+        .into_iter()
+        .map(|gate| {
+            Ok(ExpectedGateAuthority {
+                command_index: u64::try_from(gate.command_index)?,
+                batch_id: gate.batch_id.to_owned(),
+                phase_id: gate.phase_id.to_owned(),
+                observation_index: u64::try_from(gate.observation_index)?,
+                gate_id: gate.gate_id.to_owned(),
+                condition: gate.condition.to_owned(),
+                deadline_authority: gate.deadline_authority.to_owned(),
+                deadline_after_origin_ns: gate.deadline_after_origin_ns,
+                origin_kind: gate.origin.kind_label().to_owned(),
+                origin_command_index: gate.origin.command_index().map(u64::try_from).transpose()?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(ExpectedRoleAuthority {
+        role: role.to_owned(),
+        gate_batch_count: u64::try_from(schedule.gate_batch_count)?,
+        gate_observation_count: u64::try_from(schedule.gate_observation_count)?,
+        static_wait_bound_ns: schedule.static_wait_bound_ns,
+        derived_process_timeout_ns: schedule.derived_process_timeout_ns,
+        product_gate_outcomes,
+    })
 }
 
 fn require_valid_evidence(reasons: &BTreeSet<String>) -> anyhow::Result<()> {
@@ -1497,6 +1866,40 @@ fn validate_oracle_source_commitments(
         let observed = digest_regular_file(&repository_root.join(relative), label)?;
         if observed != expected {
             bail!("{label} commitment does not match the clean repository source")
+        }
+    }
+    Ok(())
+}
+
+fn validate_oracle_source_commitments_at_revision(
+    oracle: &OracleBundle,
+    repository_root: &Path,
+    revision: &str,
+) -> anyhow::Result<()> {
+    for (relative, expected, label) in [
+        (
+            "crates/mirante4d-render-reference/src/lod_oracle.rs",
+            oracle.independent_sources.lod_oracle_source_sha256.as_str(),
+            "historical independent LOD oracle source",
+        ),
+        (
+            "crates/mirante4d-render-reference/src/numerical_oracle.rs",
+            oracle
+                .independent_sources
+                .numerical_oracle_source_sha256
+                .as_str(),
+            "historical independent numerical oracle source",
+        ),
+    ] {
+        let bytes = super::git_blob_at_revision(
+            repository_root,
+            revision,
+            relative,
+            4 * 1024 * 1024,
+            label,
+        )?;
+        if Sha256Hasher::digest(&bytes).to_string() != expected {
+            bail!("{label} commitment does not match the measurement revision");
         }
     }
     Ok(())
@@ -1553,6 +1956,68 @@ fn prelaunch_immutability_reason_codes(
         &source_repository,
         app_binary_sha256.as_deref(),
     )
+}
+
+fn parse_receipt_cli_args(
+    arguments: Vec<String>,
+    receipt_required: bool,
+) -> anyhow::Result<ReceiptCliArgs> {
+    let command = if receipt_required {
+        "viewer-performance-ep01-preflight"
+    } else {
+        "viewer-performance-publish"
+    };
+    let mut profile = None;
+    let mut workload_bundle = None;
+    let mut script_bundle = None;
+    let mut oracle_bundle = None;
+    let mut raw_report = None;
+    let mut receipt = None;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if matches!(argument.as_str(), "help" | "--help" | "-h") {
+            bail!(if receipt_required {
+                EP01_PREFLIGHT_USAGE
+            } else {
+                PUBLISH_USAGE
+            });
+        }
+        let slot = match argument.as_str() {
+            "--qualification-profile" => &mut profile,
+            "--workload-bundle" => &mut workload_bundle,
+            "--interaction-script-bundle" => &mut script_bundle,
+            "--independent-oracle" => &mut oracle_bundle,
+            "--raw-report" => &mut raw_report,
+            "--receipt" if receipt_required => &mut receipt,
+            option => bail!("unknown {command} option {option:?}"),
+        };
+        let value = PathBuf::from(
+            arguments
+                .next()
+                .with_context(|| format!("{argument} requires an absolute path"))?,
+        );
+        if !value.is_absolute() {
+            bail!("{command} requires an absolute {argument} path");
+        }
+        if slot.replace(value).is_some() {
+            bail!("{command} accepts {argument} exactly once");
+        }
+    }
+    Ok(ReceiptCliArgs {
+        profile: profile.with_context(|| format!("{command} requires --qualification-profile"))?,
+        workload_bundle: workload_bundle
+            .with_context(|| format!("{command} requires --workload-bundle"))?,
+        script_bundle: script_bundle
+            .with_context(|| format!("{command} requires --interaction-script-bundle"))?,
+        oracle_bundle: oracle_bundle
+            .with_context(|| format!("{command} requires --independent-oracle"))?,
+        raw_report: raw_report.with_context(|| format!("{command} requires --raw-report"))?,
+        receipt: if receipt_required {
+            Some(receipt.with_context(|| format!("{command} requires --receipt"))?)
+        } else {
+            None
+        },
+    })
 }
 
 fn parse_args(arguments: Vec<String>) -> anyhow::Result<RunArgs> {
@@ -1639,6 +2104,34 @@ fn validate_bundles(
     oracle: &LoadedBundle<OracleBundle>,
     repository_root: &Path,
 ) -> anyhow::Result<()> {
+    validate_bundles_with_source(profile, workload, scripts, oracle, repository_root, None)
+}
+
+fn validate_bundles_for_receipt(
+    profile: &ViewerQualificationProfile,
+    workload: &LoadedBundle<WorkloadBundle>,
+    scripts: &LoadedBundle<ScriptBundle>,
+    oracle: &LoadedBundle<OracleBundle>,
+    repository_root: &Path,
+) -> anyhow::Result<()> {
+    validate_bundles_with_source(
+        profile,
+        workload,
+        scripts,
+        oracle,
+        repository_root,
+        Some(profile.build.repository_revision.as_str()),
+    )
+}
+
+fn validate_bundles_with_source(
+    profile: &ViewerQualificationProfile,
+    workload: &LoadedBundle<WorkloadBundle>,
+    scripts: &LoadedBundle<ScriptBundle>,
+    oracle: &LoadedBundle<OracleBundle>,
+    repository_root: &Path,
+    historical_revision: Option<&str>,
+) -> anyhow::Result<()> {
     if workload.sha256 != profile.workload.workload_bundle_sha256 {
         bail!("viewer workload bundle does not match its qualification-profile commitment")
     }
@@ -1656,7 +2149,11 @@ fn validate_bundles(
         bail!("viewer oracle bundle schema must be {ORACLE_SCHEMA:?}")
     }
     validate_oracle_contract(&oracle.value)?;
-    validate_oracle_source_commitments(&oracle.value, repository_root)?;
+    if let Some(revision) = historical_revision {
+        validate_oracle_source_commitments_at_revision(&oracle.value, repository_root, revision)?;
+    } else {
+        validate_oracle_source_commitments(&oracle.value, repository_root)?;
+    }
     require_sha256(
         &workload.value.representative_package_root_manifest_sha256,
         "workload representative-package manifest commitment",
@@ -1682,7 +2179,11 @@ fn validate_bundles(
         .get("IP")
         .expect("exact scenario coverage includes IP");
     let import_source = sole_ip_source_path(&ip_script.instrumented_script.commands)?;
-    validate_import_source_path(import_source, repository_root)?;
+    if historical_revision.is_some() {
+        validate_import_source_replay_path(import_source, repository_root)?;
+    } else {
+        validate_import_source_path(import_source, repository_root)?;
+    }
     let mut product_gate_ids = BTreeSet::new();
     for id in REQUIRED_SCENARIOS {
         let workload_scenario = workload_map
@@ -2291,6 +2792,18 @@ fn validate_import_source_path(source: &Path, repository_root: &Path) -> anyhow:
         .context("IP import source is unavailable or unreadable")?;
     if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
         bail!("IP import source must be a nonsymlink regular file or directory")
+    }
+    Ok(())
+}
+
+fn validate_import_source_replay_path(source: &Path, repository_root: &Path) -> anyhow::Result<()> {
+    if !source.is_absolute()
+        || source
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        || source.starts_with(repository_root)
+    {
+        bail!("historical IP import source is not one normalized external absolute path");
     }
     Ok(())
 }
@@ -6170,6 +6683,7 @@ fn expand_value(value: &mut Value, root: &str) -> anyhow::Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_app_process(
     app_binary: &Path,
     startup_package: &Path,
@@ -12618,44 +13132,7 @@ fn is_known_product_gate_reason(reason: &str) -> bool {
 }
 
 fn is_known_conformance_product_reason(reason: &str) -> bool {
-    if matches!(
-        reason,
-        "conformance_primary_numerical_result_not_passed"
-            | "conformance_dvr_frozen_world_distance_oracle_failed"
-            | "conformance_dvr_observed_coverage_mismatch"
-            | "conformance_dvr_observed_validity_mismatch"
-    ) {
-        return true;
-    }
-    const CASES: [&str; 6] = [
-        "plane_smooth_valid",
-        "plane_smooth_invalid",
-        "perspective_mip",
-        "perspective_dvr_world_distance",
-        "perspective_iso",
-        "perspective_iso_depth_order",
-    ];
-    const OBSERVATIONS: [&str; 13] = [
-        "pixel_mismatch",
-        "rgba8_mismatch",
-        "premultiplied_rgba_mismatch",
-        "coverage_mismatch",
-        "validity_mismatch",
-        "authored_order_mismatch",
-        "source_order_mismatch",
-        "hit_depth_mismatch",
-        "pick_kind_mismatch",
-        "pick_completeness_mismatch",
-        "pick_value_mismatch",
-        "pick_world_mismatch",
-        "pick_distance_mismatch",
-    ];
-    CASES.iter().any(|case| {
-        let prefix = format!("conformance_{case}_");
-        reason
-            .strip_prefix(&prefix)
-            .is_some_and(|suffix| OBSERVATIONS.contains(&suffix))
-    })
+    conformance_receipt::is_known_product_reason(reason)
 }
 
 fn is_known_canonical_plane_product_reason(reason: &str) -> bool {
@@ -12904,6 +13381,7 @@ fn raw_product_gate_outcome_rows(samples: &[SampleEvidence]) -> Vec<Value> {
     rows
 }
 
+#[cfg(test)]
 fn sanitized_product_gate_outcome_rows(samples: &[SampleEvidence]) -> Vec<Value> {
     let mut rows = Vec::new();
     for sample in samples {
@@ -12928,6 +13406,7 @@ fn sanitized_product_gate_outcome_rows(samples: &[SampleEvidence]) -> Vec<Value>
     rows
 }
 
+#[cfg(test)]
 fn sanitized_role_schedule_rows(samples: &[SampleEvidence]) -> Vec<Value> {
     let mut rows = Vec::new();
     for sample in samples {
@@ -13091,6 +13570,7 @@ fn import_source_inventory_json(facts: &super::source_inventory::InventoryFacts)
     })
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn sanitized_receipt(
     profile: &LoadedProfile,
@@ -13563,6 +14043,12 @@ mod tests {
     }
 
     fn population_role(role: AttemptRole, scenario: &str, gate_count: usize) -> RoleEvidence {
+        let import = scenario == "IP";
+        let static_wait_bound_ns = if import {
+            1_200_000_000_000
+        } else {
+            66_666_668
+        };
         RoleEvidence {
             role,
             root: PathBuf::from("/private/secret/attempt"),
@@ -13570,7 +14056,7 @@ mod tests {
             template_script_sha256: "22".repeat(32),
             process: ProcessObservation {
                 launch_attempted: true,
-                status: None,
+                status: Some(ExitStatus::from_raw(0)),
                 external_wall_time_ns: 1,
                 timed_out: false,
                 spawn_error: None,
@@ -13580,10 +14066,13 @@ mod tests {
             automation_report_sha256: Some("33".repeat(32)),
             app_wall_time_ns: Some(1),
             process_cpu_time_ns: Some(1),
-            derived_process_timeout_ns: 10_066_666_668,
-            static_wait_bound_ns: 66_666_668,
+            derived_process_timeout_ns: static_wait_bound_ns
+                + 33_333_334
+                + PROCESS_STARTUP_ADMISSION_GRACE_NS
+                + PROCESS_CLOSEOUT_GRACE_NS,
+            static_wait_bound_ns,
             gate_batch_count: 1,
-            gate_observation_count: 1,
+            gate_observation_count: gate_count,
             source_inventory_before: None,
             source_inventory_after: None,
             cleanup_manifest_sha256: None,
@@ -13595,6 +14084,21 @@ mod tests {
                         ProductGateStatus::Passed,
                     );
                     outcome.observation_index = observation_index;
+                    if import {
+                        outcome.phase_id = "preprocess_publish.checkpoint.000".to_owned();
+                        outcome.gate_id = format!(
+                            "IP.acceptance.{observation_index:03}.{}",
+                            ["import_idle", "imported_open_ready", "runtime_idle"]
+                                [observation_index]
+                        );
+                        outcome.condition = ["import_idle", "imported_open_ready", "runtime_idle"]
+                            [observation_index]
+                            .to_owned();
+                        outcome.deadline_authority = "import_primary_wall".to_owned();
+                        outcome.deadline_after_origin_ns = 1_200_000_000_000;
+                        outcome.origin_kind = "import_primary_started".to_owned();
+                        outcome.origin_command_index = None;
+                    }
                     outcome
                 })
                 .collect(),
@@ -13610,21 +14114,49 @@ mod tests {
                 .map(|id| {
                     let (phase_count, total_gate_count) = production_population_contract(id);
                     let gate_count = total_gate_count / 2;
+                    let import = id == "IP";
                     let gate_command = json!({
                         "command": "observe_gate_batch",
                         "batch_id": format!("{id}.batch.000"),
-                        "phase_id": format!("{id}-phase.checkpoint.000"),
-                        "origin": { "kind": "command_completed", "command_index": 0 },
+                        "phase_id": if import {
+                            "preprocess_publish.checkpoint.000".to_owned()
+                        } else {
+                            format!("{id}-phase.checkpoint.000")
+                        },
+                        "origin": if import {
+                            json!({ "kind": "import_primary_started" })
+                        } else {
+                            json!({ "kind": "command_completed", "command_index": 0 })
+                        },
                         "observations": (0..gate_count)
                             .map(|observation_index| json!({
-                                "gate_id": format!(
-                                    "{id}.acceptance.{observation_index:03}.settled"
-                                ),
-                                "deadline_authority": "maximum_current_presentation_gap_plus_poll_grace",
-                                "deadline_after_origin_ns": 66_666_668_u64,
+                                "gate_id": if import {
+                                    format!(
+                                        "IP.acceptance.{observation_index:03}.{}",
+                                        ["import_idle", "imported_open_ready", "runtime_idle"]
+                                            [observation_index]
+                                    )
+                                } else {
+                                    format!("{id}.acceptance.{observation_index:03}.settled")
+                                },
+                                "deadline_authority": if import {
+                                    "import_primary_wall"
+                                } else {
+                                    "maximum_current_presentation_gap_plus_poll_grace"
+                                },
+                                "deadline_after_origin_ns": if import {
+                                    1_200_000_000_000_u64
+                                } else {
+                                    66_666_668_u64
+                                },
                                 "target": {
                                     "kind": "condition",
-                                    "condition": "coordinated_presentation_settled",
+                                    "condition": if import {
+                                        ["import_idle", "imported_open_ready", "runtime_idle"]
+                                            [observation_index]
+                                    } else {
+                                        "coordinated_presentation_settled"
+                                    },
                                 },
                             }))
                             .collect::<Vec<_>>(),
@@ -13640,9 +14172,7 @@ mod tests {
                         phases: (0..phase_count)
                             .map(|phase_index| ScriptPhase {
                                 name: format!("{id}-phase-{phase_index}"),
-                                start_diagnostic_label: Some(format!(
-                                    "{id}-start-{phase_index}"
-                                )),
+                                start_diagnostic_label: Some(format!("{id}-start-{phase_index}")),
                                 end_diagnostic_label: format!("{id}-end-{phase_index}"),
                             })
                             .collect(),
@@ -13653,6 +14183,20 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn population_oracle_scenarios() -> Vec<OracleScenario> {
+        REQUIRED_SCENARIOS
+            .into_iter()
+            .map(|id| OracleScenario {
+                id: id.to_owned(),
+                phases: if id == "IP" {
+                    ip_oracle_scenario().phases
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect()
     }
 
     fn complete_population_samples() -> Vec<SampleEvidence> {
@@ -19091,8 +19635,16 @@ mod tests {
 
     #[test]
     fn sanitized_receipt_contains_commitments_but_no_private_paths() {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let mut profile_value = profile();
+        profile_value.build.repository_revision = repository_identity_at(&repository_root)
+            .commit
+            .expect("the receipt bridge test runs in a Git worktree");
         let profile = LoadedProfile {
-            profile: profile(),
+            profile: profile_value,
             sha256: "55".repeat(32),
         };
         let workload = LoadedBundle {
@@ -19126,7 +19678,7 @@ mod tests {
                 },
                 numerical_contract: numerical_contract(),
                 conformance_cases: Vec::new(),
-                scenarios: Vec::new(),
+                scenarios: population_oracle_scenarios(),
             },
             sha256: "44".repeat(32),
             path: PathBuf::from("/private/secret/oracle.json"),
@@ -19150,6 +19702,7 @@ mod tests {
             &mut reasons,
         );
         assert!(reasons.is_empty());
+        let conformance = conformance_receipt::valid_test_evidence();
         let receipt = sanitized_receipt(
             &profile,
             &workload,
@@ -19157,11 +19710,92 @@ mod tests {
             &oracle,
             &"66".repeat(32),
             &"77".repeat(32),
-            None,
+            Some(&conformance),
             &samples,
             population,
             &instrumentation_overhead,
             &BTreeSet::new(),
+        );
+        let mut bindings =
+            receipt_bindings(&profile, &workload, &scripts, &oracle, &repository_root).unwrap();
+        bindings.conformance_commitments = conformance_receipt::test_replay_authority(&conformance);
+        let raw = json!({
+            "schema": RAW_REPORT_SCHEMA,
+            "evidence_status": "valid_complete",
+            "product_gate_status": "failed",
+            "claim_status": "development_E1_semantic_automation_non_OS_input_non_E4_no_product_claim",
+            "build_binding": {},
+            "protocol": {},
+            "private_paths": {
+                "workload_bundle": workload.path,
+                "interaction_script_bundle": scripts.path,
+                "independent_oracle": oracle.path,
+            },
+            "commitments": {
+                "qualification_profile_sha256": bindings.qualification_profile_sha256,
+                "owner_accepted_profile_contract_sha256": bindings.owner_accepted_profile_contract_sha256,
+                "ep01_selection_authority_sha256": bindings.ep01_selection_authority_sha256,
+                "workload_bundle_sha256": bindings.workload_bundle_sha256,
+                "ep01_trace_geometry_sha256": bindings.ep01_trace_geometry_sha256,
+                "interaction_script_bundle_sha256": bindings.interaction_script_bundle_sha256,
+                "independent_oracle_sha256": bindings.independent_oracle_sha256,
+                "app_binary_sha256_before_run": "66".repeat(32),
+                "app_binary_sha256_after_run": "66".repeat(32),
+                "app_binary_unchanged": true,
+                "representative_package_fingerprint_sha256": bindings.representative_package_fingerprint_sha256,
+                "supporting_temporal_package_fingerprint_sha256": bindings.supporting_temporal_package_fingerprint_sha256,
+                "build_binding_fingerprint_sha256": bindings.build_binding_fingerprint_sha256,
+            },
+            "bindings": {},
+            "executable_conformance": conformance.raw_json(),
+            "population": population_json(population),
+            "instrumentation_overhead_populations": instrumentation_overhead_population_rows(
+                &instrumentation_overhead,
+            ),
+            "product_gate_outcomes": raw_product_gate_outcome_rows(&samples),
+            "product_gate_failures": classified_product_gate_failure_rows(&samples),
+            "attempts": samples.iter().map(sample_json).collect::<Vec<_>>(),
+            "integrity_reason_codes": [],
+            "limitations": [],
+        });
+        let projected = receipt::project_development_receipt(&raw, &"77".repeat(32), &bindings)
+            .expect("a schema-5 raw report must reproduce the legacy receipt exactly");
+        assert_eq!(projected, receipt);
+        let mut reordered_attempts = raw.clone();
+        reordered_attempts["attempts"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        assert!(
+            receipt::project_development_receipt(&reordered_attempts, &"77".repeat(32), &bindings,)
+                .is_err()
+        );
+        let mut changed_local_gate = raw.clone();
+        changed_local_gate["attempts"][0]["instrumented"]["product_gate_outcomes"][0]["gate_id"] =
+            json!("tampered.gate");
+        assert!(
+            receipt::project_development_receipt(&changed_local_gate, &"77".repeat(32), &bindings,)
+                .is_err()
+        );
+        let mut reordered_global_gates = raw.clone();
+        reordered_global_gates["product_gate_outcomes"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        assert!(
+            receipt::project_development_receipt(
+                &reordered_global_gates,
+                &"77".repeat(32),
+                &bindings,
+            )
+            .is_err()
+        );
+        let mut changed_overhead = raw.clone();
+        changed_overhead["instrumentation_overhead_populations"][0]["instrumented_adjusted_app_wall_time_ns"] =
+            json!(4);
+        assert!(
+            receipt::project_development_receipt(&changed_overhead, &"77".repeat(32), &bindings,)
+                .is_err()
         );
         let encoded = serde_json::to_string(&receipt).unwrap();
         assert!(encoded.contains(&"55".repeat(32)));
@@ -19183,7 +19817,7 @@ mod tests {
         assert_eq!(receipt["population"]["exact"], true);
         assert_eq!(
             receipt["product_gate_outcomes"].as_array().unwrap().len(),
-            60
+            population.expected_product_gate_observations
         );
         let overhead_rows = receipt["instrumentation_overhead_populations"]
             .as_array()
@@ -19247,5 +19881,49 @@ mod tests {
         assert!(receipt.get("status").is_none());
         assert!(receipt.get("reason_codes").is_none());
         assert!(encoded.contains("non_OS_input_non_E4"));
+    }
+
+    #[test]
+    fn receipt_cli_requires_one_absolute_path_per_external_authority() {
+        let common = [
+            "--qualification-profile",
+            "/private/profile.json",
+            "--workload-bundle",
+            "/private/workload.json",
+            "--interaction-script-bundle",
+            "/private/scripts.json",
+            "--independent-oracle",
+            "/private/oracle.json",
+            "--raw-report",
+            "/private/raw-private-report.json",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let publish = parse_receipt_cli_args(common.clone(), false).unwrap();
+        assert!(publish.receipt.is_none());
+
+        let mut preflight = common.clone();
+        preflight.extend([
+            "--receipt".to_owned(),
+            "/private/development-receipt.json".to_owned(),
+        ]);
+        assert!(
+            parse_receipt_cli_args(preflight, true)
+                .unwrap()
+                .receipt
+                .is_some()
+        );
+        assert!(parse_receipt_cli_args(common.clone(), true).is_err());
+
+        let mut relative = common.clone();
+        relative[1] = "profile.json".to_owned();
+        assert!(parse_receipt_cli_args(relative, false).is_err());
+        let mut duplicate = common;
+        duplicate.extend([
+            "--raw-report".to_owned(),
+            "/private/second-raw-private-report.json".to_owned(),
+        ]);
+        assert!(parse_receipt_cli_args(duplicate, false).is_err());
     }
 }

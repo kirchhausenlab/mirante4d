@@ -269,6 +269,14 @@ validated profile or protocol and is at most 30 seconds, with no script-authored
 multi-minute viewer wait.
 This protocol correction is implemented evidence infrastructure, not a
 qualified viewer-performance result.
+The schema-5 runner now finalizes a durable private raw report before creating
+its fixed path-free development-receipt sibling. A separate clean-release
+publisher can replay only that projection, and EP-01 preflight rereads and
+exactly reprojects the pair before admission. The bridge revalidates the four
+external authorities, expected population, product/evidence status, privacy,
+and file currentness; it admits complete failed predecessor results while
+rejecting every integrity-invalid or incomplete envelope. Receipt replay does
+not reopen the application or repeat conformance.
 Focused predecessor evidence already reproduces the off-axis perspective DVR
 distance error, unjustifiably coarse four-panel LOD, temporal refinement
 handoff, and prepared-layout lineage defects; these are baseline findings, not

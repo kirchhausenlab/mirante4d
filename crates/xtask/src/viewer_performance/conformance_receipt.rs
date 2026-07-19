@@ -130,6 +130,12 @@ struct CaseCommitment {
     expected_fact_sha256: String,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct ReplayCommitmentAuthority {
+    source_commitments: Vec<(String, String)>,
+    case_commitments: Vec<(String, String, String)>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProcessReceipt {
@@ -190,21 +196,515 @@ impl ConformanceEvidence {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn sanitized_json(&self) -> Value {
-        json!({
-            "scope": "exact_release_harnesses_built_in_fresh_private_target",
-            "automatic_retries": 0,
-            "source_commitments": self.source_commitments,
-            "oracle_binding": {
-                "bound_case_ids": self.bound_case_ids,
-                "all_six_frozen_cases_bound": self.bound_case_ids.len() == 6,
-                "case_commitments": self.case_commitments,
-            },
-            "harnesses": self.harnesses.iter().map(harness_sanitized_json).collect::<Vec<_>>(),
-            "reason_codes": self.reasons,
-            "status": if self.reasons.is_empty() { "passed" } else { "failed" },
-        })
+        sanitized_json_from_raw(&self.raw_json(), false, &test_replay_authority(self))
+            .expect("in-memory conformance evidence always projects to its sanitized receipt")
     }
+}
+
+pub(super) fn replay_commitment_authority(
+    repository_root: &Path,
+    revision: &str,
+    oracle_cases: &[Value],
+) -> anyhow::Result<ReplayCommitmentAuthority> {
+    let source_commitments = SOURCE_FILES
+        .into_iter()
+        .map(|path| {
+            let bytes = super::git_blob_at_revision(
+                repository_root,
+                revision,
+                path,
+                MAX_CAPTURE_BYTES,
+                "historical EP-00 conformance source",
+            )?;
+            Ok((path.to_owned(), Sha256Hasher::digest(&bytes).to_string()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let case_commitments = oracle_cases
+        .iter()
+        .map(|case| {
+            let commitment = case_commitment(case)?;
+            Ok((
+                commitment.id,
+                commitment.input_fact_sha256,
+                commitment.expected_fact_sha256,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(ReplayCommitmentAuthority {
+        source_commitments,
+        case_commitments,
+    })
+}
+
+pub(super) fn sanitized_json_from_raw(
+    raw: &Value,
+    require_complete: bool,
+    authority: &ReplayCommitmentAuthority,
+) -> anyhow::Result<Value> {
+    require_object_keys(
+        raw,
+        &[
+            "scope",
+            "automatic_retries",
+            "source_commitments",
+            "oracle_binding",
+            "harnesses",
+            "reason_codes",
+            "status",
+        ],
+        "raw conformance evidence",
+    )?;
+    if raw.get("scope").and_then(Value::as_str)
+        != Some("exact_release_harnesses_built_in_fresh_private_target")
+        || raw.get("automatic_retries").and_then(Value::as_u64) != Some(0)
+    {
+        bail!("raw conformance evidence lost its execution authority");
+    }
+    validate_replayed_commitments(raw, require_complete, authority)?;
+    let harnesses = raw
+        .get("harnesses")
+        .and_then(Value::as_array)
+        .context("raw conformance evidence lacks its harness array")?;
+    if harnesses.len() != HARNESSES.len() {
+        bail!("raw conformance evidence has the wrong harness population");
+    }
+    let mut sanitized = Vec::with_capacity(harnesses.len());
+    for (harness, kind) in harnesses.iter().zip(HARNESSES) {
+        let expected_id = kind.id();
+        require_object_keys(
+            harness,
+            &[
+                "id",
+                "exact_command",
+                "captures",
+                "process",
+                "marker_receipt",
+                "parsed_marker",
+                "reason_codes",
+                "status",
+            ],
+            "raw conformance harness",
+        )?;
+        if harness.get("id").and_then(Value::as_str) != Some(expected_id) {
+            bail!("raw conformance harness order or identity changed");
+        }
+        if harness.get("exact_command") != Some(&exact_command_json(kind)) {
+            bail!("raw conformance harness command changed");
+        }
+        let captures = harness
+            .get("captures")
+            .context("raw conformance harness lacks captures")?;
+        require_object_keys(
+            captures,
+            &[
+                "stdout_file",
+                "stderr_file",
+                "stdout_sha256",
+                "stderr_sha256",
+            ],
+            "raw conformance captures",
+        )?;
+        let stdout_file = format!("conformance/{expected_id}.stdout.log");
+        let stderr_file = format!("conformance/{expected_id}.stderr.log");
+        if captures.get("stdout_file").and_then(Value::as_str) != Some(stdout_file.as_str())
+            || captures.get("stderr_file").and_then(Value::as_str) != Some(stderr_file.as_str())
+        {
+            bail!("raw conformance capture locations changed");
+        }
+        for field in ["stdout_sha256", "stderr_sha256"] {
+            if let Some(digest) = captures.get(field).and_then(Value::as_str)
+                && (digest.len() != 64
+                    || !digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+            {
+                bail!("raw conformance capture digest is malformed");
+            }
+            if !matches!(captures.get(field), Some(Value::Null | Value::String(_))) {
+                bail!("raw conformance capture digest has the wrong type");
+            }
+        }
+        let reasons = harness
+            .get("reason_codes")
+            .and_then(Value::as_array)
+            .context("raw conformance harness lacks reason codes")?;
+        if reasons.iter().any(|reason| {
+            reason
+                .as_str()
+                .is_none_or(|reason| !is_path_free_id(reason))
+        }) || harness.get("status").and_then(Value::as_str)
+            != Some(if reasons.is_empty() {
+                "passed"
+            } else {
+                "failed"
+            })
+        {
+            bail!("raw conformance harness status is inconsistent");
+        }
+        validate_replayed_harness(kind, harness, captures, require_complete)?;
+        let explicit_oracle_gap = expected_id == HarnessKind::NumericalPerspectiveDvr.id()
+            && harness
+                .pointer("/parsed_marker/result")
+                .and_then(Value::as_str)
+                == Some("failed");
+        sanitized.push(json!({
+            "id": expected_id,
+            "exact_command": harness.get("exact_command").cloned().context("raw conformance harness lacks exact command")?,
+            "stdout_sha256": captures.get("stdout_sha256").cloned().context("raw conformance harness lacks stdout digest")?,
+            "stderr_sha256": captures.get("stderr_sha256").cloned().context("raw conformance harness lacks stderr digest")?,
+            "process": harness.get("process").cloned().context("raw conformance harness lacks process receipt")?,
+            "marker": harness.get("marker_receipt").cloned().context("raw conformance harness lacks marker receipt")?,
+            "explicit_frozen_oracle_gap_observed": explicit_oracle_gap,
+            "reason_codes": harness.get("reason_codes").cloned().context("raw conformance harness lacks reason codes")?,
+            "status": harness.get("status").cloned().context("raw conformance harness lacks status")?,
+        }));
+    }
+    let reasons = raw
+        .get("reason_codes")
+        .and_then(Value::as_array)
+        .context("raw conformance evidence lacks reason codes")?;
+    if reasons.iter().any(|reason| {
+        reason
+            .as_str()
+            .is_none_or(|reason| !is_path_free_id(reason))
+    }) || raw.get("status").and_then(Value::as_str)
+        != Some(if reasons.is_empty() {
+            "passed"
+        } else {
+            "failed"
+        })
+    {
+        bail!("raw conformance evidence status is inconsistent");
+    }
+    let mut expected_reasons = harnesses
+        .iter()
+        .filter_map(|harness| harness.get("reason_codes").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    if raw
+        .pointer("/oracle_binding/all_six_frozen_cases_bound")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        expected_reasons.insert("conformance_not_all_frozen_oracle_cases_bound".to_owned());
+    }
+    let observed_reasons = reasons
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    if expected_reasons != observed_reasons {
+        bail!("raw conformance aggregate reasons do not reconcile with its harnesses");
+    }
+    Ok(json!({
+        "scope": raw.get("scope").cloned().expect("scope was validated"),
+        "automatic_retries": 0,
+        "source_commitments": raw.get("source_commitments").cloned().context("raw conformance evidence lacks source commitments")?,
+        "oracle_binding": raw.get("oracle_binding").cloned().context("raw conformance evidence lacks oracle binding")?,
+        "harnesses": sanitized,
+        "reason_codes": raw.get("reason_codes").cloned().context("raw conformance evidence lacks reason codes")?,
+        "status": raw.get("status").cloned().context("raw conformance evidence lacks status")?,
+    }))
+}
+
+fn validate_replayed_commitments(
+    raw: &Value,
+    require_complete: bool,
+    authority: &ReplayCommitmentAuthority,
+) -> anyhow::Result<()> {
+    let sources = raw
+        .get("source_commitments")
+        .and_then(Value::as_array)
+        .context("raw conformance evidence lacks source commitments")?;
+    if authority.source_commitments.len() != SOURCE_FILES.len()
+        || sources.len() != authority.source_commitments.len()
+    {
+        bail!("raw conformance source commitment population changed");
+    }
+    for ((source, fixed_path), (expected_path, expected_sha256)) in sources
+        .iter()
+        .zip(SOURCE_FILES)
+        .zip(&authority.source_commitments)
+    {
+        require_object_keys(
+            source,
+            &["repository_relative_path", "sha256"],
+            "raw conformance source commitment",
+        )?;
+        if source
+            .get("repository_relative_path")
+            .and_then(Value::as_str)
+            != Some(fixed_path)
+            || expected_path != fixed_path
+            || source.get("sha256").and_then(Value::as_str) != Some(expected_sha256.as_str())
+        {
+            bail!("raw conformance source commitment differs from its measurement revision");
+        }
+    }
+    let oracle = raw
+        .get("oracle_binding")
+        .context("raw conformance evidence lacks oracle binding")?;
+    require_object_keys(
+        oracle,
+        &[
+            "bound_case_ids",
+            "all_six_frozen_cases_bound",
+            "case_commitments",
+        ],
+        "raw conformance oracle binding",
+    )?;
+    let bound = oracle
+        .get("bound_case_ids")
+        .and_then(Value::as_array)
+        .context("raw conformance bound-case IDs are malformed")?;
+    let bound_ids = bound
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|id| is_path_free_id(id))
+                .context("raw conformance bound-case ID is malformed")
+        })
+        .collect::<anyhow::Result<BTreeSet<_>>>()?;
+    if bound_ids.len() != bound.len() {
+        bail!("raw conformance bound-case IDs are duplicated");
+    }
+    let commitments = oracle
+        .get("case_commitments")
+        .and_then(Value::as_array)
+        .context("raw conformance case commitments are malformed")?;
+    if commitments.len() != authority.case_commitments.len() {
+        bail!("raw conformance case commitment population changed");
+    }
+    let mut commitment_ids = BTreeSet::new();
+    for (commitment, (expected_id, expected_input, expected_output)) in
+        commitments.iter().zip(&authority.case_commitments)
+    {
+        require_object_keys(
+            commitment,
+            &["id", "input_fact_sha256", "expected_fact_sha256"],
+            "raw conformance case commitment",
+        )?;
+        let id = commitment
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| is_path_free_id(id))
+            .context("raw conformance case commitment ID is malformed")?;
+        if !commitment_ids.insert(id)
+            || id != expected_id
+            || commitment.get("input_fact_sha256").and_then(Value::as_str)
+                != Some(expected_input.as_str())
+            || commitment
+                .get("expected_fact_sha256")
+                .and_then(Value::as_str)
+                != Some(expected_output.as_str())
+        {
+            bail!("raw conformance case commitment differs from its external oracle");
+        }
+    }
+    let authority_ids = authority
+        .case_commitments
+        .iter()
+        .map(|(id, _, _)| id.as_str())
+        .collect::<BTreeSet<_>>();
+    if commitment_ids != authority_ids || !bound_ids.is_subset(&authority_ids) {
+        bail!("raw conformance oracle binding differs from its external authority");
+    }
+    let all_six = authority_ids.len() == 6 && bound_ids == authority_ids;
+    if oracle
+        .get("all_six_frozen_cases_bound")
+        .and_then(Value::as_bool)
+        != Some(all_six)
+        || (require_complete && !all_six)
+    {
+        bail!("raw conformance oracle binding is internally inconsistent");
+    }
+    Ok(())
+}
+
+fn validate_replayed_harness(
+    kind: HarnessKind,
+    harness: &Value,
+    captures: &Value,
+    require_complete: bool,
+) -> anyhow::Result<()> {
+    let process = harness
+        .get("process")
+        .context("raw conformance harness lacks process receipt")?;
+    require_object_keys(
+        process,
+        &[
+            "exit_code",
+            "signal",
+            "timed_out",
+            "wall_time_ns",
+            "spawn_failed",
+        ],
+        "raw conformance process receipt",
+    )?;
+    if !matches!(
+        process.get("exit_code"),
+        Some(Value::Null | Value::Number(_))
+    ) || !matches!(process.get("signal"), Some(Value::Null | Value::Number(_)))
+        || process.get("timed_out").and_then(Value::as_bool).is_none()
+        || process
+            .get("wall_time_ns")
+            .and_then(Value::as_u64)
+            .is_none()
+        || process
+            .get("spawn_failed")
+            .and_then(Value::as_bool)
+            .is_none()
+    {
+        bail!("raw conformance process receipt is malformed");
+    }
+    let marker = harness
+        .get("parsed_marker")
+        .context("raw conformance marker is absent")?;
+    let marker_receipt = harness
+        .get("marker_receipt")
+        .context("raw conformance marker receipt is absent")?;
+    require_object_keys(
+        marker_receipt,
+        &["schema", "result", "canonical_sha256", "parsed"],
+        "raw conformance marker receipt",
+    )?;
+    let derived = match marker {
+        Value::Null => json!({
+            "schema": null,
+            "result": null,
+            "canonical_sha256": null,
+            "parsed": false,
+        }),
+        marker => json!({
+            "schema": marker.get("schema").and_then(Value::as_str),
+            "result": marker.get("result").and_then(Value::as_str),
+            "canonical_sha256": Sha256Hasher::digest(&serde_json::to_vec(marker)?).to_string(),
+            "parsed": true,
+        }),
+    };
+    if marker_receipt != &derived {
+        bail!("raw conformance marker receipt is not derived from its parsed marker");
+    }
+    if require_complete {
+        let marker = marker
+            .as_object()
+            .context("complete raw conformance harness lacks its parsed marker")?;
+        let marker_result = marker.get("result").and_then(Value::as_str);
+        let expected_exit = match kind {
+            HarnessKind::NumericalPlaneMipIso if marker_result == Some("passed") => 0,
+            HarnessKind::NumericalPerspectiveDvr if marker_result == Some("passed") => 0,
+            HarnessKind::NumericalPerspectiveDvr if marker_result == Some("failed") => 101,
+            HarnessKind::ProductionShaderAudit if marker_result.is_none() => 0,
+            HarnessKind::TimestampPlacementControls | HarnessKind::QueueWriteEnvelopeControl
+                if marker_result == Some("measured") =>
+            {
+                0
+            }
+            _ => bail!("complete raw conformance harness marker result is incoherent"),
+        };
+        let reasons = harness
+            .get("reason_codes")
+            .and_then(Value::as_array)
+            .expect("conformance reason codes were validated");
+        if reasons.iter().any(|reason| {
+            reason
+                .as_str()
+                .is_none_or(|reason| !is_known_product_reason(reason))
+        }) || (kind == HarnessKind::NumericalPerspectiveDvr
+            && marker_result == Some("failed")
+            && !reasons.iter().any(|reason| {
+                reason.as_str() == Some("conformance_dvr_frozen_world_distance_oracle_failed")
+            }))
+        {
+            bail!("complete raw conformance harness contains incoherent reason codes");
+        }
+        if marker.get("schema").and_then(Value::as_str) != Some(kind.expected_schema())
+            || process.get("signal") != Some(&Value::Null)
+            || process.get("timed_out").and_then(Value::as_bool) != Some(false)
+            || process.get("spawn_failed").and_then(Value::as_bool) != Some(false)
+            || process.get("exit_code").and_then(Value::as_i64) != Some(expected_exit)
+            || !is_sha256(captures.get("stdout_sha256"))
+            || !is_sha256(captures.get("stderr_sha256"))
+        {
+            bail!("complete raw conformance harness process or marker is incoherent");
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn is_known_product_reason(reason: &str) -> bool {
+    if matches!(
+        reason,
+        "conformance_primary_numerical_result_not_passed"
+            | "conformance_dvr_frozen_world_distance_oracle_failed"
+            | "conformance_dvr_observed_coverage_mismatch"
+            | "conformance_dvr_observed_validity_mismatch"
+    ) {
+        return true;
+    }
+    const CASES: [&str; 6] = [
+        "plane_smooth_valid",
+        "plane_smooth_invalid",
+        "perspective_mip",
+        "perspective_dvr_world_distance",
+        "perspective_iso",
+        "perspective_iso_depth_order",
+    ];
+    const OBSERVATIONS: [&str; 13] = [
+        "pixel_mismatch",
+        "rgba8_mismatch",
+        "premultiplied_rgba_mismatch",
+        "coverage_mismatch",
+        "validity_mismatch",
+        "authored_order_mismatch",
+        "source_order_mismatch",
+        "hit_depth_mismatch",
+        "pick_kind_mismatch",
+        "pick_completeness_mismatch",
+        "pick_value_mismatch",
+        "pick_world_mismatch",
+        "pick_distance_mismatch",
+    ];
+    CASES.iter().any(|case| {
+        let prefix = format!("conformance_{case}_");
+        reason
+            .strip_prefix(&prefix)
+            .is_some_and(|suffix| OBSERVATIONS.contains(&suffix))
+    })
+}
+
+fn is_sha256(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_str).is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn is_path_free_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn require_object_keys(value: &Value, expected: &[&str], label: &str) -> anyhow::Result<()> {
+    let object = value
+        .as_object()
+        .with_context(|| format!("{label} is not an object"))?;
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+    if actual != expected {
+        bail!("{label} has an unexpected key set");
+    }
+    Ok(())
 }
 
 pub(super) fn execute(
@@ -1190,6 +1690,7 @@ fn harness_raw_json(receipt: &HarnessReceipt) -> Value {
     })
 }
 
+#[cfg(test)]
 fn harness_sanitized_json(receipt: &HarnessReceipt) -> Value {
     let explicit_oracle_gap = receipt.kind == HarnessKind::NumericalPerspectiveDvr
         && receipt
@@ -1225,6 +1726,93 @@ fn exact_command_json(kind: HarnessKind) -> Value {
         "nocapture": true,
         "test_threads": 1,
     })
+}
+
+#[cfg(test)]
+pub(super) fn valid_test_evidence() -> ConformanceEvidence {
+    let harnesses = HARNESSES
+        .into_iter()
+        .map(|kind| {
+            let marker = match kind {
+                HarnessKind::NumericalPlaneMipIso | HarnessKind::NumericalPerspectiveDvr => {
+                    json!({"schema": kind.expected_schema(), "result": "passed"})
+                }
+                HarnessKind::ProductionShaderAudit => {
+                    json!({"schema": kind.expected_schema()})
+                }
+                HarnessKind::TimestampPlacementControls
+                | HarnessKind::QueueWriteEnvelopeControl => {
+                    json!({"schema": kind.expected_schema(), "result": "measured"})
+                }
+            };
+            HarnessReceipt {
+                kind,
+                process: ProcessReceipt {
+                    exit_code: Some(0),
+                    signal: None,
+                    timed_out: false,
+                    wall_time_ns: 1,
+                    spawn_failed: false,
+                },
+                stdout_sha256: Some("11".repeat(32)),
+                stderr_sha256: Some("22".repeat(32)),
+                marker_receipt: marker_receipt(Some(&marker)),
+                marker: Some(marker),
+                reasons: BTreeSet::new(),
+            }
+        })
+        .collect();
+    let source_commitments = SOURCE_FILES
+        .into_iter()
+        .map(|repository_relative_path| SourceCommitment {
+            repository_relative_path,
+            sha256: "44".repeat(32),
+        })
+        .collect();
+    let case_commitments = (0..6)
+        .map(|index| CaseCommitment {
+            id: format!("case-{index}"),
+            input_fact_sha256: "55".repeat(32),
+            expected_fact_sha256: "66".repeat(32),
+        })
+        .collect::<Vec<_>>();
+    ConformanceEvidence {
+        source_commitments,
+        bound_case_ids: case_commitments
+            .iter()
+            .map(|commitment| commitment.id.clone())
+            .collect(),
+        case_commitments,
+        harnesses,
+        reasons: BTreeSet::new(),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_replay_authority(evidence: &ConformanceEvidence) -> ReplayCommitmentAuthority {
+    ReplayCommitmentAuthority {
+        source_commitments: evidence
+            .source_commitments
+            .iter()
+            .map(|commitment| {
+                (
+                    commitment.repository_relative_path.to_owned(),
+                    commitment.sha256.clone(),
+                )
+            })
+            .collect(),
+        case_commitments: evidence
+            .case_commitments
+            .iter()
+            .map(|commitment| {
+                (
+                    commitment.id.clone(),
+                    commitment.input_fact_sha256.clone(),
+                    commitment.expected_fact_sha256.clone(),
+                )
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -1523,5 +2111,63 @@ mod tests {
         assert!(!encoded.contains("stderr.log"));
         assert!(!encoded.contains("/private"));
         assert!(encoded.contains("exact_command"));
+    }
+
+    #[test]
+    fn raw_conformance_projection_matches_the_in_memory_schema_5_receipt() {
+        let evidence = valid_test_evidence();
+        let authority = test_replay_authority(&evidence);
+        let raw = evidence.raw_json();
+        assert_eq!(
+            sanitized_json_from_raw(&raw, true, &authority).unwrap(),
+            evidence.sanitized_json()
+        );
+
+        let mut tampered_process = raw.clone();
+        tampered_process["harnesses"][0]["process"]["timed_out"] = json!(true);
+        assert!(sanitized_json_from_raw(&tampered_process, true, &authority).is_err());
+        let mut tampered_source = raw.clone();
+        tampered_source["source_commitments"][0]["sha256"] = json!("77".repeat(32));
+        assert!(sanitized_json_from_raw(&tampered_source, true, &authority).is_err());
+        let mut tampered_case = raw.clone();
+        tampered_case["oracle_binding"]["case_commitments"][0]["expected_fact_sha256"] =
+            json!("77".repeat(32));
+        assert!(sanitized_json_from_raw(&tampered_case, true, &authority).is_err());
+        let mut tampered_marker = raw;
+        tampered_marker["harnesses"][0]["marker_receipt"]["canonical_sha256"] =
+            json!("77".repeat(32));
+        assert!(sanitized_json_from_raw(&tampered_marker, true, &authority).is_err());
+
+        let mut wrong_kind_result = valid_test_evidence().raw_json();
+        let marker = json!({
+            "schema": HarnessKind::TimestampPlacementControls.expected_schema(),
+            "result": "passed",
+        });
+        wrong_kind_result["harnesses"][3]["parsed_marker"] = marker.clone();
+        wrong_kind_result["harnesses"][3]["marker_receipt"] =
+            serde_json::to_value(marker_receipt(Some(&marker))).unwrap();
+        assert!(sanitized_json_from_raw(&wrong_kind_result, true, &authority).is_err());
+
+        let mut explicit_dvr_gap = valid_test_evidence().raw_json();
+        let marker = json!({
+            "schema": HarnessKind::NumericalPerspectiveDvr.expected_schema(),
+            "result": "failed",
+        });
+        explicit_dvr_gap["harnesses"][1]["parsed_marker"] = marker.clone();
+        explicit_dvr_gap["harnesses"][1]["marker_receipt"] =
+            serde_json::to_value(marker_receipt(Some(&marker))).unwrap();
+        explicit_dvr_gap["harnesses"][1]["process"]["exit_code"] = json!(101);
+        explicit_dvr_gap["harnesses"][1]["reason_codes"] =
+            json!(["conformance_dvr_frozen_world_distance_oracle_failed"]);
+        explicit_dvr_gap["harnesses"][1]["status"] = json!("failed");
+        explicit_dvr_gap["reason_codes"] =
+            json!(["conformance_dvr_frozen_world_distance_oracle_failed"]);
+        explicit_dvr_gap["status"] = json!("failed");
+        assert!(sanitized_json_from_raw(&explicit_dvr_gap, true, &authority).is_ok());
+        explicit_dvr_gap["harnesses"][1]["reason_codes"] = json!([]);
+        explicit_dvr_gap["harnesses"][1]["status"] = json!("passed");
+        explicit_dvr_gap["reason_codes"] = json!([]);
+        explicit_dvr_gap["status"] = json!("passed");
+        assert!(sanitized_json_from_raw(&explicit_dvr_gap, true, &authority).is_err());
     }
 }

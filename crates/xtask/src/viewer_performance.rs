@@ -32,6 +32,8 @@ const PROFILE_AUTHORITY_SCHEMA: &str = "mirante4d-viewer-performance-profile-aut
 const PROFILE_AUTHORITY_SCHEMA_VERSION: u64 = 1;
 const PROFILE_AUTHORITY_BYTES: &[u8] =
     include_bytes!("../../../verification/viewer-performance-profile.json");
+const PROFILE_AUTHORITY_PATH: &str = "verification/viewer-performance-profile.json";
+const EP01_SELECTION_AUTHORITY_PATH: &str = "verification/viewer-performance-ep01-selection.json";
 const REPORT_SCHEMA: &str = "mirante4d-viewer-performance-preflight-report-1";
 const PROFILE_MAX_BYTES: u64 = 64 * 1024;
 const PACKAGE_ROOT_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
@@ -43,6 +45,7 @@ const EXERCISE_HEIGHT: u32 = 1080;
 
 mod conformance_receipt;
 mod ep01_selection;
+mod receipt;
 mod runner;
 mod source_inventory;
 
@@ -54,7 +57,7 @@ pub(crate) const USAGE: &str = "usage: cargo xtask viewer-performance-preflight 
     --cache-condition warm|cold --competing-activity DESCRIPTION \
     --power-state DESCRIPTION --compositor-scale-milli INTEGER";
 
-pub(crate) use runner::run_measurement;
+pub(crate) use runner::{preflight_ep01, publish_receipt, run_measurement};
 
 pub(crate) fn build_qualification_runner(arguments: Vec<String>) -> anyhow::Result<()> {
     if !arguments.is_empty() {
@@ -586,6 +589,14 @@ pub(crate) fn read_bounded_regular_file(
 
 fn validate_profile(profile: &ViewerQualificationProfile) -> anyhow::Result<()> {
     ep01_selection::validate_committed_authority()?;
+    validate_profile_shape(profile)?;
+    if profile.ep01_selection_authority_sha256 != ep01_selection::authority_fingerprint_sha256() {
+        bail!("viewer qualification profile does not bind the committed EP-01 selection authority")
+    }
+    Ok(())
+}
+
+fn validate_profile_shape(profile: &ViewerQualificationProfile) -> anyhow::Result<()> {
     if profile.schema != PROFILE_SCHEMA {
         bail!("viewer qualification profile schema must be {PROFILE_SCHEMA:?}")
     }
@@ -594,9 +605,6 @@ fn validate_profile(profile: &ViewerQualificationProfile) -> anyhow::Result<()> 
         &profile.ep01_selection_authority_sha256,
         "ep01_selection_authority_sha256",
     )?;
-    if profile.ep01_selection_authority_sha256 != ep01_selection::authority_fingerprint_sha256() {
-        bail!("viewer qualification profile does not bind the committed EP-01 selection authority")
-    }
     validate_build(&profile.build)?;
     validate_workload(&profile.workload)?;
     validate_host(&profile.host)?;
@@ -613,6 +621,77 @@ fn validate_owner_accepted_profile(profile: &ViewerQualificationProfile) -> anyh
     validate_profile(profile)?;
     let expected = owner_accepted_profile_contract_sha256()?;
     validate_profile_contract(profile, &expected)
+}
+
+fn validate_owner_accepted_profile_at_revision(
+    profile: &ViewerQualificationProfile,
+    repository_root: &Path,
+) -> anyhow::Result<()> {
+    validate_profile_shape(profile)?;
+    let revision = profile.build.repository_revision.as_str();
+    let reachable = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(["merge-base", "--is-ancestor", revision, "HEAD"])
+        .status()
+        .context("failed to verify historical viewer profile reachability")?;
+    if !reachable.success() {
+        bail!("viewer measurement revision is not a reachable ancestor of the publisher")
+    }
+    let profile_authority = git_blob_at_revision(
+        repository_root,
+        revision,
+        PROFILE_AUTHORITY_PATH,
+        PROFILE_MAX_BYTES,
+        "historical viewer profile authority",
+    )?;
+    let expected = profile_authority_contract_sha256(&profile_authority)?;
+    validate_profile_contract(profile, &expected)?;
+    let selection_authority = git_blob_at_revision(
+        repository_root,
+        revision,
+        EP01_SELECTION_AUTHORITY_PATH,
+        4 * 1024 * 1024,
+        "historical EP-01 selection authority",
+    )?;
+    if Sha256Hasher::digest(&selection_authority).to_string()
+        != profile.ep01_selection_authority_sha256
+    {
+        bail!("viewer profile does not bind the EP-01 authority at its measurement revision")
+    }
+    Ok(())
+}
+
+fn git_blob_at_revision(
+    repository_root: &Path,
+    revision: &str,
+    repository_relative_path: &str,
+    maximum_bytes: u64,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    if !valid_git_object_id(revision)
+        || repository_relative_path.is_empty()
+        || repository_relative_path.starts_with('/')
+        || repository_relative_path
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        bail!("{label} lookup authority is malformed")
+    }
+    let object = format!("{revision}:{repository_relative_path}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(["show", "--no-ext-diff", &object])
+        .output()
+        .with_context(|| format!("failed to read {label}"))?;
+    if !output.status.success()
+        || output.stdout.is_empty()
+        || u64::try_from(output.stdout.len()).unwrap_or(u64::MAX) > maximum_bytes
+    {
+        bail!("{label} is unavailable or exceeds its bound")
+    }
+    Ok(output.stdout)
 }
 
 fn exact_release_build_binding_reason_codes(
@@ -691,7 +770,11 @@ fn validate_profile_contract(
 }
 
 fn owner_accepted_profile_contract_sha256() -> anyhow::Result<String> {
-    let authority = serde_json::from_slice::<ViewerProfileAuthority>(PROFILE_AUTHORITY_BYTES)
+    profile_authority_contract_sha256(PROFILE_AUTHORITY_BYTES)
+}
+
+fn profile_authority_contract_sha256(bytes: &[u8]) -> anyhow::Result<String> {
+    let authority = serde_json::from_slice::<ViewerProfileAuthority>(bytes)
         .context("repository viewer-performance profile authority is not strict valid JSON")?;
     if authority.schema != PROFILE_AUTHORITY_SCHEMA
         || authority.schema_version != PROFILE_AUTHORITY_SCHEMA_VERSION
@@ -2345,6 +2428,54 @@ mod tests {
         let accepted = owner_accepted_profile_contract_sha256().unwrap();
         require_sha256(&accepted, "test owner authority").unwrap();
         assert_eq!(accepted.len(), 64);
+    }
+
+    #[test]
+    fn historical_authority_reader_is_bound_to_one_full_revision_and_fixed_path() {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let revision = Command::new("git")
+            .arg("-C")
+            .arg(&repository_root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(revision.status.success());
+        let revision = String::from_utf8(revision.stdout).unwrap();
+        let revision = revision.trim();
+        assert_eq!(
+            git_blob_at_revision(
+                &repository_root,
+                revision,
+                PROFILE_AUTHORITY_PATH,
+                PROFILE_MAX_BYTES,
+                "test historical profile authority",
+            )
+            .unwrap(),
+            PROFILE_AUTHORITY_BYTES,
+        );
+        assert!(
+            git_blob_at_revision(
+                &repository_root,
+                "HEAD",
+                PROFILE_AUTHORITY_PATH,
+                PROFILE_MAX_BYTES,
+                "test historical profile authority",
+            )
+            .is_err()
+        );
+        assert!(
+            git_blob_at_revision(
+                &repository_root,
+                revision,
+                "../viewer-performance-profile.json",
+                PROFILE_MAX_BYTES,
+                "test historical profile authority",
+            )
+            .is_err()
+        );
     }
 
     #[test]

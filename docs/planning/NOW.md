@@ -71,6 +71,13 @@ viewer prerequisite remains.
 The runner derives each role-process bound from that validated schedule plus
 bounded launch/closeout grace, counting the IP import-primary wall once; there
 is no caller-authored process-timeout override.
+Schema-5 evidence publication is now durable and replayable: the measurement
+finalizes `raw-private-report.json`, derives a create-new path-free
+`development-receipt.json` sibling, and supports a no-viewer replay command for
+an already finalized raw report. EP-01 has a separate admission command that
+requires the byte-exact reprojection, current private files, matching external
+authorities and expected population, and an empty integrity axis. A complete
+failed predecessor product result remains admissible evidence.
 The immediate next action is to freeze the v5 repair on one clean revision,
 rotate the opaque profile binding, and run the complete predecessor protocol
 against its exact release build. EP-01 may begin only after the resulting
