@@ -8571,11 +8571,13 @@ fn evaluate_phase(
             validate_unique_work(
                 start,
                 end,
-                script_phase
-                    .start_diagnostic_label
-                    .as_deref()
-                    .expect("phase start checkpoint was resolved"),
-                &script_phase.end_diagnostic_label,
+                [
+                    script_phase
+                        .start_diagnostic_label
+                        .as_deref()
+                        .expect("phase start checkpoint was resolved"),
+                    &script_phase.end_diagnostic_label,
+                ],
                 oracle
                     .unique_work
                     .residency_baseline
@@ -11714,13 +11716,13 @@ fn validate_observed_exact_resource_union<'a>(
 fn validate_unique_work(
     start_checkpoint: &Value,
     end_checkpoint: &Value,
-    start_label: &str,
-    end_label: &str,
+    checkpoint_labels: [&str; 2],
     residency_baseline_checkpoint: Option<&Value>,
     expected: &UniqueWorkExpectation,
     dataset_counter_epoch: DatasetCounterEpoch,
     reasons: &mut BTreeSet<String>,
 ) {
+    let [start_label, end_label] = checkpoint_labels;
     let start_union = validate_observed_exact_resource_union(
         start_checkpoint,
         start_label,
@@ -18569,8 +18571,7 @@ mod tests {
         validate_unique_work(
             &start,
             &end,
-            "start",
-            "end",
+            ["start", "end"],
             None,
             &expected,
             DatasetCounterEpoch::Continuous,
@@ -18587,8 +18588,7 @@ mod tests {
         validate_unique_work(
             &start,
             &end,
-            "start",
-            "end",
+            ["start", "end"],
             None,
             &different_oracle_unions,
             DatasetCounterEpoch::Continuous,
@@ -18616,8 +18616,7 @@ mod tests {
         validate_unique_work(
             &start,
             &misbound_delta,
-            "start",
-            "end",
+            ["start", "end"],
             None,
             &expected,
             DatasetCounterEpoch::Continuous,
@@ -18637,8 +18636,7 @@ mod tests {
         validate_unique_work(
             &malformed_start,
             &malformed_bound_end,
-            "start",
-            "end",
+            ["start", "end"],
             None,
             &expected,
             DatasetCounterEpoch::Continuous,
@@ -18658,8 +18656,7 @@ mod tests {
         validate_unique_work(
             &start,
             &end,
-            "start",
-            "end",
+            ["start", "end"],
             None,
             &expected,
             DatasetCounterEpoch::Continuous,
