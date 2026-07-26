@@ -35,6 +35,9 @@ pub(crate) fn frame_failure_kind_for_successor_error(
         | Error::AdapterLimitsInsufficient
         | Error::DeviceLimitsInsufficient
         | Error::DeviceCreationFailed
+        | Error::DeviceLost
+        | Error::DeviceOutOfMemory
+        | Error::BackendInternal
         | Error::ExtentExceeded
         | Error::PresentationCapacityExceeded { .. }
         | Error::PresentationNotRegistered { .. }
@@ -89,6 +92,16 @@ mod successor_error_tests {
             frame_failure_kind_for_successor_error(&WgpuRenderRuntimeError::UnsupportedBackend),
             FrameFailureKind::BackendLimit
         );
+        for error in [
+            WgpuRenderRuntimeError::DeviceLost,
+            WgpuRenderRuntimeError::DeviceOutOfMemory,
+            WgpuRenderRuntimeError::BackendInternal,
+        ] {
+            assert_eq!(
+                frame_failure_kind_for_successor_error(&error),
+                FrameFailureKind::BackendLimit
+            );
+        }
         assert_eq!(
             frame_failure_kind_for_successor_error(&WgpuRenderRuntimeError::PickFrameUnavailable,),
             FrameFailureKind::IncompleteResidency

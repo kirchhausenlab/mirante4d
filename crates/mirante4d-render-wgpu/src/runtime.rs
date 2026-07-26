@@ -7,7 +7,7 @@ use std::{
     num::NonZeroU64,
     ops::Bound::{Excluded, Unbounded},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::Instant,
@@ -93,6 +93,35 @@ const PICK_OUTPUT_BYTES: u64 = PICK_OUTPUT_WORDS as u64 * 4;
 const PICK_OUTPUT_MAGIC: u32 = 0x4d34_504b;
 const MAX_PAYLOAD_SEGMENTS: usize = 4;
 const MAX_SHADER_SEGMENT_BYTES: u64 = u32::MAX as u64 + 1;
+
+#[derive(Debug, Default)]
+struct GpuFailureLatch {
+    first: OnceLock<WgpuRenderRuntimeError>,
+}
+
+impl GpuFailureLatch {
+    fn record_device_loss(&self, reason: wgpu::DeviceLostReason) {
+        let error = match reason {
+            wgpu::DeviceLostReason::Unknown | wgpu::DeviceLostReason::Destroyed => {
+                WgpuRenderRuntimeError::DeviceLost
+            }
+        };
+        let _ = self.first.set(error);
+    }
+
+    fn record_uncaptured_error(&self, error: &wgpu::Error) {
+        let error = match error {
+            wgpu::Error::OutOfMemory { .. } => WgpuRenderRuntimeError::DeviceOutOfMemory,
+            wgpu::Error::Internal { .. } => WgpuRenderRuntimeError::BackendInternal,
+            wgpu::Error::Validation { .. } => WgpuRenderRuntimeError::BackendValidation,
+        };
+        let _ = self.first.set(error);
+    }
+
+    fn ensure_available(&self) -> Result<(), WgpuRenderRuntimeError> {
+        self.first.get().copied().map_or(Ok(()), Err)
+    }
+}
 
 const fn host_metadata_record_bytes(bytes: usize) -> u64 {
     bytes.div_ceil(64) as u64 * 64
@@ -559,7 +588,12 @@ fn create_display(
     })
 }
 
-fn mapped_staging_buffer(device: &wgpu::Device, label: &'static str, bytes: &[u8]) -> wgpu::Buffer {
+fn mapped_staging_buffer(
+    device: &wgpu::Device,
+    gpu_failure: &GpuFailureLatch,
+    label: &'static str,
+    bytes: &[u8],
+) -> Result<wgpu::Buffer, WgpuRenderRuntimeError> {
     debug_assert!(!bytes.is_empty() && bytes.len().is_multiple_of(COPY_ALIGNMENT as usize));
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
@@ -567,12 +601,14 @@ fn mapped_staging_buffer(device: &wgpu::Device, label: &'static str, bytes: &[u8
         usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: true,
     });
+    gpu_failure.ensure_available()?;
     buffer
         .slice(..)
         .get_mapped_range_mut()
         .copy_from_slice(bytes);
     buffer.unmap();
-    buffer
+    gpu_failure.ensure_available()?;
+    Ok(buffer)
 }
 
 fn encode_render_pass(
@@ -3058,7 +3094,13 @@ impl UploadStagingPool {
         Ok(Some((index, required)))
     }
 
-    fn stage(&mut self, index: usize, uploads: &[UploadPlan<'_>]) -> u64 {
+    fn stage(
+        &mut self,
+        index: usize,
+        uploads: &[UploadPlan<'_>],
+        gpu_failure: &GpuFailureLatch,
+    ) -> Result<u64, WgpuRenderRuntimeError> {
+        gpu_failure.ensure_available()?;
         let slot = &mut self.slots[index];
         debug_assert!(matches!(slot.state, UploadStagingState::Mapped));
         let required = uploads
@@ -3100,8 +3142,9 @@ impl UploadStagingPool {
         }
         drop(mapped);
         slot.buffer.unmap();
+        gpu_failure.ensure_available()?;
         slot.state = UploadStagingState::Encoding;
-        padding_zero_bytes
+        Ok(padding_zero_bytes)
     }
 
     fn encode_copies(
@@ -3539,6 +3582,7 @@ pub(super) struct Runtime {
     _instance: Option<wgpu::Instance>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    gpu_failure: Arc<GpuFailureLatch>,
     pipeline: wgpu::RenderPipeline,
     mip_pipeline: wgpu::RenderPipeline,
     render_bind_group_layout: wgpu::BindGroupLayout,
@@ -3677,13 +3721,18 @@ impl Runtime {
             .filter(|capacity| **capacity != 0)
             .count();
 
+        let gpu_failure = Arc::new(GpuFailureLatch::default());
+        let device_loss = Arc::clone(&gpu_failure);
+        device.set_device_lost_callback(move |reason, _message| {
+            device_loss.record_device_loss(reason);
+        });
         let validation_error_count = Arc::new(AtomicUsize::new(0));
         let error_count = Arc::clone(&validation_error_count);
+        let uncaptured_failure = Arc::clone(&gpu_failure);
         device.on_uncaptured_error(Arc::new(move |error| {
             #[cfg(test)]
             eprintln!("mirante4d uncaptured WGPU error: {error}");
-            #[cfg(not(test))]
-            let _ = error;
+            uncaptured_failure.record_uncaptured_error(&error);
             error_count.fetch_add(1, Ordering::Relaxed);
         }));
 
@@ -3814,10 +3863,12 @@ impl Runtime {
         let gpu_timing_enabled = timing.is_some();
         let pick = create_pick_resources(&device, &segment_capacities, &mut pipeline_creations);
         let upload_staging = UploadStagingPool::new(transfer_capacity_bytes);
+        gpu_failure.ensure_available()?;
         Ok(Self {
             _instance: instance,
             device,
             queue,
+            gpu_failure,
             pipeline,
             mip_pipeline,
             render_bind_group_layout: bind_group_layout,
@@ -3942,6 +3993,10 @@ impl Runtime {
         &self.diagnostics
     }
 
+    fn ensure_device_available(&self) -> Result<(), WgpuRenderRuntimeError> {
+        self.gpu_failure.ensure_available()
+    }
+
     pub(super) const fn residency_epoch(&self) -> u64 {
         self.residency_epoch
     }
@@ -3958,6 +4013,7 @@ impl Runtime {
         &mut self,
         extent: RenderExtent,
     ) -> Result<PresentationRegistration, WgpuRenderRuntimeError> {
+        self.ensure_device_available()?;
         validate_extent(extent)?;
         validate_presentation_capacity(self.presentations.len())?;
         let token = PresentationToken::new(self.next_presentation)
@@ -3988,6 +4044,7 @@ impl Runtime {
                 INITIAL_CONTROL_BYTES,
                 &mut self.diagnostics.bind_group_creations,
             );
+        self.ensure_device_available()?;
         self.presentations.insert(
             token,
             PresentationState {
@@ -4035,6 +4092,7 @@ impl Runtime {
         &self,
         token: PresentationToken,
     ) -> Result<&wgpu::TextureView, WgpuRenderRuntimeError> {
+        self.ensure_device_available()?;
         self.presentations
             .get(&token)
             .map(|presentation| &presentation.display.color_view)
@@ -4242,6 +4300,7 @@ impl Runtime {
         requirements: &RenderRequirements,
         setup: FrameExecutionSetup<'_>,
     ) -> Result<Option<FrameExecutionReport>, WgpuRenderRuntimeError> {
+        self.ensure_device_available()?;
         let FrameExecutionSetup {
             cpu_timing_start,
             display_generation,
@@ -4359,6 +4418,7 @@ impl Runtime {
         } else {
             None
         };
+        self.ensure_device_available()?;
         let timing_plan = self.timing.as_ref().and_then(|timing| {
             timing
                 .slots
@@ -4389,6 +4449,7 @@ impl Runtime {
         let gpu_timing_ticket = timing_plan.map(|plan| plan.ticket);
         let timing_prelude_submit_ns =
             timing_plan.and_then(|plan| self.submit_timing_batch_prelude(plan));
+        self.ensure_device_available()?;
         let timing_prelude_submitted = timing_prelude_submit_ns.is_some();
         if timing_prelude_submitted {
             self.diagnostics.gpu_timing_prelude_submissions = self
@@ -4493,11 +4554,13 @@ impl Runtime {
             );
         }
         let command_buffer = encoder.finish();
+        self.ensure_device_available()?;
         let cpu_planning_ns = cpu_timing_start.as_ref().map(|start| {
             elapsed_nanoseconds(start).saturating_sub(timing_prelude_submit_ns.unwrap_or(0))
         });
         let cpu_submit_start = cpu_timing_start.as_ref().map(|_| Instant::now());
         self.queue.submit([command_buffer]);
+        self.ensure_device_available()?;
         let cpu_queue_submit_ns = cpu_submit_start.as_ref().map(|start| {
             elapsed_nanoseconds(start).saturating_add(timing_prelude_submit_ns.unwrap_or(0))
         });
@@ -4539,6 +4602,7 @@ impl Runtime {
             };
             self.next_timing = self.next_timing.saturating_add(1);
         }
+        self.ensure_device_available()?;
 
         let current_cursor = self
             .presentations
@@ -4719,6 +4783,7 @@ impl Runtime {
         setup: FrameExecutionSetup<'_>,
         lease_updates: &[Arc<dyn ResourceLease>],
     ) -> Result<FrameExecutionReport, WgpuRenderRuntimeError> {
+        self.ensure_device_available()?;
         let layout = setup.prepared_layout;
         debug_assert!(setup.nonblocking_progress_collected);
         self.validate_presentation_activation(presentation_token)?;
@@ -4781,7 +4846,10 @@ impl Runtime {
         // validation or backlog traversal. The next admitted frame consumes
         // the same retained updates; no scheduler work is lost.
         let _ = self.device.poll(wgpu::PollType::Poll);
-        self.upload_staging.refresh()?;
+        self.ensure_device_available()?;
+        let staging_refresh = self.upload_staging.refresh();
+        self.ensure_device_available()?;
+        staging_refresh?;
         self.collect_gpu_timings()?;
         let in_flight = self.in_flight_submissions.load(Ordering::Acquire);
         self.diagnostics.current_in_flight_submissions = in_flight;
@@ -4917,6 +4985,7 @@ impl Runtime {
         setup: FrameExecutionSetup<'_>,
         leases: &[&dyn ResourceLease],
     ) -> Result<FrameExecutionReport, WgpuRenderRuntimeError> {
+        self.ensure_device_available()?;
         let retained_navigation_setup = setup;
         let FrameExecutionSetup {
             prepared_layout,
@@ -4932,7 +5001,10 @@ impl Runtime {
         // pending cohort, so it must not repeat the device/staging/timing walk.
         if !nonblocking_progress_collected {
             let _ = self.device.poll(wgpu::PollType::Poll);
-            self.upload_staging.refresh()?;
+            self.ensure_device_available()?;
+            let staging_refresh = self.upload_staging.refresh();
+            self.ensure_device_available()?;
+            staging_refresh?;
             self.collect_gpu_timings()?;
         }
         let current_frame_state = self
@@ -5651,6 +5723,7 @@ impl Runtime {
                 required_control,
             )
         });
+        self.ensure_device_available()?;
         let mut pending_capture = None;
         let timing_plan = self.timing.as_ref().and_then(|timing| {
             let payload_copy_timestamps = staging_slot.is_some() && timing.encoder_copy_timestamps;
@@ -5689,6 +5762,7 @@ impl Runtime {
         let mut payload_staging_ns = None;
         let timing_prelude_submit_ns =
             timing_plan.and_then(|plan| self.submit_timing_batch_prelude(plan));
+        self.ensure_device_available()?;
         let timing_prelude_submitted = timing_prelude_submit_ns.is_some();
         if timing_prelude_submitted {
             self.diagnostics.gpu_timing_prelude_submissions = self
@@ -5734,7 +5808,9 @@ impl Runtime {
                 });
             if let Some(slot) = staging_slot {
                 let payload_staging_start = cpu_timing_start.as_ref().map(|_| Instant::now());
-                let padding_zero_bytes = self.upload_staging.stage(slot, &uploads);
+                let padding_zero_bytes =
+                    self.upload_staging
+                        .stage(slot, &uploads, self.gpu_failure.as_ref())?;
                 payload_staging_ns = payload_staging_start.as_ref().map(elapsed_nanoseconds);
                 self.diagnostics.upload_staging_padding_zero_bytes = self
                     .diagnostics
@@ -5868,11 +5944,13 @@ impl Runtime {
             }
 
             let command_buffer = encoder.finish();
+            self.ensure_device_available()?;
             let cpu_planning_ns = cpu_timing_start.as_ref().map(|start| {
                 elapsed_nanoseconds(start).saturating_sub(timing_prelude_submit_ns.unwrap_or(0))
             });
             let cpu_submit_start = cpu_timing_start.as_ref().map(|_| Instant::now());
             self.queue.submit([command_buffer]);
+            self.ensure_device_available()?;
             let cpu_queue_submit_ns = cpu_submit_start.as_ref().map(|start| {
                 elapsed_nanoseconds(start).saturating_add(timing_prelude_submit_ns.unwrap_or(0))
             });
@@ -5928,6 +6006,7 @@ impl Runtime {
                 self.next_timing = self.next_timing.saturating_add(1);
             }
         }
+        self.ensure_device_available()?;
 
         // Commit only after every capacity/control/view preflight and the one
         // allowed submission have succeeded. Only the compact free-range
@@ -6516,6 +6595,8 @@ impl Runtime {
     }
 
     fn collect_gpu_timings(&mut self) -> Result<(), WgpuRenderRuntimeError> {
+        let gpu_failure = Arc::clone(&self.gpu_failure);
+        gpu_failure.ensure_available()?;
         let Some(timing) = self.timing.as_mut() else {
             return Ok(());
         };
@@ -6556,11 +6637,13 @@ impl Runtime {
             match status {
                 None => continue,
                 Some(Err(())) => {
+                    gpu_failure.ensure_available()?;
                     slot.readback.unmap();
                     slot.state = TimingSlotState::Free;
                     failures = failures.saturating_add(1);
                 }
                 Some(Ok(())) => {
+                    gpu_failure.ensure_available()?;
                     let mapped_bytes = slot.readback.slice(..).get_mapped_range();
                     let read_u64 = |offset: usize| {
                         u64::from_le_bytes(
@@ -6663,12 +6746,13 @@ impl Runtime {
         &mut self,
         ticket: GpuTimingTicket,
     ) -> Result<Option<GpuFrameTiming>, WgpuRenderRuntimeError> {
+        self.ensure_device_available()?;
         if self.timing.is_none() {
             return Err(WgpuRenderRuntimeError::UnknownGpuTiming);
         }
-        self.device
-            .poll(wgpu::PollType::Poll)
-            .map_err(|_| WgpuRenderRuntimeError::GpuTimingFailed)?;
+        let poll_result = self.device.poll(wgpu::PollType::Poll);
+        self.ensure_device_available()?;
+        poll_result.map_err(|_| WgpuRenderRuntimeError::GpuTimingFailed)?;
         self.collect_gpu_timings()?;
         let timing = self.timing.as_mut().expect("timing support was checked");
         if let Some(result) = timing.completed.remove(&ticket) {
@@ -6693,6 +6777,8 @@ impl Runtime {
         &mut self,
         ticket: ValidationCaptureTicket,
     ) -> Result<Option<ValidationCapture>, WgpuRenderRuntimeError> {
+        let gpu_failure = Arc::clone(&self.gpu_failure);
+        gpu_failure.ensure_available()?;
         if self
             .presentations
             .get(&ticket.presentation)
@@ -6705,9 +6791,9 @@ impl Runtime {
         {
             return Err(WgpuRenderRuntimeError::StaleValidationCapture);
         }
-        self.device
-            .poll(wgpu::PollType::Poll)
-            .map_err(|_| WgpuRenderRuntimeError::ValidationCaptureFailed)?;
+        let poll_result = self.device.poll(wgpu::PollType::Poll);
+        gpu_failure.ensure_available()?;
+        poll_result.map_err(|_| WgpuRenderRuntimeError::ValidationCaptureFailed)?;
         self.sync_validation_errors();
         if self.diagnostics.validation_error_count != 0 {
             return Err(WgpuRenderRuntimeError::BackendValidation);
@@ -6730,10 +6816,12 @@ impl Runtime {
         match status {
             None => Ok(None),
             Some(Err(())) => {
+                gpu_failure.ensure_available()?;
                 presentation.pending_capture = None;
                 Err(WgpuRenderRuntimeError::ValidationCaptureFailed)
             }
             Some(Ok(())) => {
+                gpu_failure.ensure_available()?;
                 let pending = presentation
                     .pending_capture
                     .take()
@@ -6784,12 +6872,14 @@ impl Runtime {
         presentation_token: PresentationToken,
         query: VolumePickQuery,
     ) -> Result<VolumePickTicket, WgpuRenderRuntimeError> {
+        let gpu_failure = Arc::clone(&self.gpu_failure);
+        gpu_failure.ensure_available()?;
         if query.token() != presentation_token {
             return Err(WgpuRenderRuntimeError::PickQueryMismatch);
         }
-        self.device
-            .poll(wgpu::PollType::Poll)
-            .map_err(|_| WgpuRenderRuntimeError::VolumePickFailed)?;
+        let poll_result = self.device.poll(wgpu::PollType::Poll);
+        gpu_failure.ensure_available()?;
+        poll_result.map_err(|_| WgpuRenderRuntimeError::VolumePickFailed)?;
         self.diagnostics.current_in_flight_submissions =
             self.in_flight_submissions.load(Ordering::Acquire);
         self.sync_validation_errors();
@@ -6891,8 +6981,12 @@ impl Runtime {
             .next_pick
             .checked_add(1)
             .ok_or(WgpuRenderRuntimeError::PickTicketExhausted)?;
-        let staging =
-            mapped_staging_buffer(&self.device, "mirante4d-vp05-pick-staging", staging_bytes);
+        let staging = mapped_staging_buffer(
+            &self.device,
+            gpu_failure.as_ref(),
+            "mirante4d-vp05-pick-staging",
+            staging_bytes,
+        )?;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -6918,7 +7012,10 @@ impl Runtime {
             pass.dispatch_workgroups(1, 1, 1);
         }
         encoder.copy_buffer_to_buffer(&slot.output_buffer, 0, &slot.readback, 0, PICK_OUTPUT_BYTES);
-        self.queue.submit([encoder.finish()]);
+        let command_buffer = encoder.finish();
+        gpu_failure.ensure_available()?;
+        self.queue.submit([command_buffer]);
+        gpu_failure.ensure_available()?;
         let in_flight_counter = Arc::clone(&self.in_flight_submissions);
         let submitted = in_flight_counter.fetch_add(1, Ordering::AcqRel) + 1;
         self.queue.on_submitted_work_done(move || {
@@ -6933,6 +7030,7 @@ impl Runtime {
                     *status = Some(result.map_err(|_| ()));
                 }
             });
+        gpu_failure.ensure_available()?;
         slot.state = PickSlotState::Pending {
             ticket,
             query,
@@ -6954,9 +7052,11 @@ impl Runtime {
         &mut self,
         ticket: VolumePickTicket,
     ) -> Result<Option<VolumePickResult>, WgpuRenderRuntimeError> {
-        self.device
-            .poll(wgpu::PollType::Poll)
-            .map_err(|_| WgpuRenderRuntimeError::VolumePickFailed)?;
+        let gpu_failure = Arc::clone(&self.gpu_failure);
+        gpu_failure.ensure_available()?;
+        let poll_result = self.device.poll(wgpu::PollType::Poll);
+        gpu_failure.ensure_available()?;
+        poll_result.map_err(|_| WgpuRenderRuntimeError::VolumePickFailed)?;
         self.diagnostics.current_in_flight_submissions =
             self.in_flight_submissions.load(Ordering::Acquire);
         self.sync_validation_errors();
@@ -6989,10 +7089,12 @@ impl Runtime {
         match status {
             None => Ok(None),
             Some(Err(())) => {
+                gpu_failure.ensure_available()?;
                 slot.state = PickSlotState::Free;
                 Err(WgpuRenderRuntimeError::VolumePickFailed)
             }
             Some(Ok(())) => {
+                gpu_failure.ensure_available()?;
                 let mapped_bytes = slot.readback.slice(..).get_mapped_range();
                 let result = decode_pick_result(query, &mapped_bytes);
                 drop(mapped_bytes);
@@ -7490,6 +7592,79 @@ mod tests {
 
     fn requirement(key: DatasetResourceKey) -> RenderRequirement {
         RenderRequirement::new(key, mirante4d_render_api::RenderRequirementRole::Refinement)
+    }
+
+    #[test]
+    fn gpu_failure_latch_preserves_the_first_typed_cause() {
+        let latch = GpuFailureLatch::default();
+        assert_eq!(latch.ensure_available(), Ok(()));
+
+        latch.record_device_loss(wgpu::DeviceLostReason::Unknown);
+        let derivative = wgpu::Error::Validation {
+            source: Box::new(std::io::Error::other("derivative validation")),
+            description: "derivative validation".to_owned(),
+        };
+        latch.record_uncaptured_error(&derivative);
+
+        assert_eq!(
+            latch.ensure_available(),
+            Err(WgpuRenderRuntimeError::DeviceLost)
+        );
+    }
+
+    #[test]
+    fn gpu_failure_latch_classifies_wgpu_terminal_causes() {
+        for reason in [
+            wgpu::DeviceLostReason::Unknown,
+            wgpu::DeviceLostReason::Destroyed,
+        ] {
+            let latch = GpuFailureLatch::default();
+            latch.record_device_loss(reason);
+            assert_eq!(
+                latch.ensure_available(),
+                Err(WgpuRenderRuntimeError::DeviceLost)
+            );
+        }
+
+        let cases = [
+            (
+                wgpu::Error::OutOfMemory {
+                    source: Box::new(std::io::Error::other("oom detail")),
+                },
+                WgpuRenderRuntimeError::DeviceOutOfMemory,
+            ),
+            (
+                wgpu::Error::Internal {
+                    source: Box::new(std::io::Error::other("internal detail")),
+                    description: "internal detail".to_owned(),
+                },
+                WgpuRenderRuntimeError::BackendInternal,
+            ),
+            (
+                wgpu::Error::Validation {
+                    source: Box::new(std::io::Error::other("validation detail")),
+                    description: "validation detail".to_owned(),
+                },
+                WgpuRenderRuntimeError::BackendValidation,
+            ),
+        ];
+        for (error, expected) in cases {
+            let latch = GpuFailureLatch::default();
+            latch.record_uncaptured_error(&error);
+            assert_eq!(latch.ensure_available(), Err(expected));
+        }
+    }
+
+    #[test]
+    fn terminal_device_rejects_upload_staging_before_mapped_access() {
+        let mut staging = UploadStagingPool::new(COPY_ALIGNMENT);
+        let latch = GpuFailureLatch::default();
+        latch.record_device_loss(wgpu::DeviceLostReason::Destroyed);
+
+        assert_eq!(
+            staging.stage(usize::MAX, &[], &latch),
+            Err(WgpuRenderRuntimeError::DeviceLost)
+        );
     }
 
     #[test]

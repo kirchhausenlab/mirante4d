@@ -996,6 +996,12 @@ pub enum WgpuRenderRuntimeError {
     DeviceLimitsInsufficient,
     #[error("the GPU device could not be created")]
     DeviceCreationFailed,
+    #[error("the active GPU device was lost")]
+    DeviceLost,
+    #[error("the GPU backend exhausted device memory")]
+    DeviceOutOfMemory,
+    #[error("the GPU backend reported an internal failure")]
+    BackendInternal,
     #[error("render intent and requirements name different frame generations")]
     FrameContractMismatch,
     #[error("the requested render extent exceeds 1920x1080")]
