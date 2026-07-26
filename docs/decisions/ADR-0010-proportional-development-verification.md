@@ -76,5 +76,5 @@ checkpoint chains, per-role executables, or test-result receipts.
 - Workflow audits retain the two required identities, public-runner and
   permission rules, lack of retries/caches/artifacts, and the ten-minute Rust
   timeout.
-- [Current work](../planning/NOW.md) records the active simplification and
-  viewer-product slice.
+- [Current state](../CURRENT_STATE.md) records the implemented cutover, and
+  [current work](../planning/NOW.md) records the next product checkpoint.

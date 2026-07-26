@@ -1,6 +1,6 @@
 # Architecture
 
-Last updated: 2026-07-17
+Last updated: 2026-07-26
 
 Mirante4D is a native Rust desktop viewer and analysis workbench. It opens
 strict `.m4d` packages; source microscopy data enters through explicit
@@ -42,8 +42,8 @@ The workspace has eighteen packages (seventeen `mirante4d-*` crates plus
   correctness; it owns no product route or GPU authority.
 - `mirante4d-render-wgpu`: sole product renderer, with bounded progressive GPU
   residency, direct page lookup, brick traversal, asynchronous timing and
-  picking, and presentation built only against dataset leases and render
-  contracts.
+  picking, first-cause typed terminal-device latching, and presentation built
+  only against dataset leases and render contracts.
 - `mirante4d-storage`: active target-profile catalog, checked ceilings,
   portable package paths, bounded local validation/reads, exact and scientific
   capabilities, dataset source, and deterministic create-only local writer.
@@ -77,6 +77,11 @@ Widget layout and interaction state do not have a second native path.
 `ProjectStoreApplicationService` is the sole product project I/O route; its
 actor owns project roots, sessions, leases, refs, recovery, and filesystem
 mutation. There is no compatibility reader or fallback.
+
+Native SIGINT/SIGTERM handling sets one monotonic process-termination latch and
+wakes egui. The app issues one prompt-free close request; the existing
+`on_exit` path remains the sole cancellation and join owner. There is no
+guardian process, timeout kill path, or second shutdown authority.
 
 The native `ImportWorkflow` owns TIFF worker cancellation, bounded terminal
 results, retry options, and explicit joining. It projects immutable import
@@ -326,13 +331,19 @@ sampling, flat and gradient-lit ISO, and attached or detached light. It also
 owns latest-only asynchronous compute picks against an exact presented
 page/arena snapshot. MIP argmax, first ISO threshold, and maximum DVR opacity
 contribution are distinct pick policies; smooth results are explicitly marked
-as interpolated samples. Crosshair, numeric ROI, and distance tools consume
-current exact world hits and draw through one small UI overlay model, not a
-scene graph.
+as interpolated samples. DVR opacity integrates the physical world length of
+each ray step, including off-axis and affine-transformed views. Exact
+FirstThreshold ISO picks include the six neighboring samples required by
+gradient lighting before reporting complete. Crosshair, numeric ROI, and
+distance tools consume current exact world hits and draw through one small UI
+overlay model, not a scene graph.
 
-The UI evaluates bounded demand signatures; one latest-only camera-demand
-worker builds candidate bricks from the selected-scale view-volume AABB plus
-exact brick intersection, then freezes canonical sorted requirements,
+The UI evaluates bounded demand signatures. Each visible layer selects its LOD
+independently from the affine cell footprint in the physical pixels of the
+actual 3D or cross-section view; installed or staged reuse requires the same
+projected selection map. One latest-only camera-demand worker builds candidate
+bricks from that selected-scale view-volume AABB plus exact brick intersection,
+then freezes canonical sorted requirements,
 contribution-prioritized admission, scope deltas, render requirements, and the
 renderer-specific static sparse-page layout. Worker results share immutable
 arrays and their CPU-ledger lifetime, so the UI commits at scope/layer scale
@@ -360,10 +371,15 @@ Cancelled staged waiters carry their minimum exact retry cursor into the
 promoted scope, so atomic current/refinement replacement cannot strand an
 already-advanced guard position. A rejected result therefore neither cancels
 useful overlap nor exposes a mixed generation. A complete prior/coarse
-presentation remains eligible while the current target refines. The inactive
-hidden refinement target uses exact-frame-only presentation and swaps only
-when the required prefix is exact; target, scope, retained ownership, and
-ticket reconciliation then publish as one staged transaction.
+presentation remains eligible while the current target refines. Once a visible
+presentation is complete, every retry remains exact-frame-only; progressive
+output cannot replace it. The inactive hidden target may promote only when its
+presented/request frame identity, extent, requirement count, and actual GPU
+coverage match and are Exact. Dormant prefetch is excluded from presentation
+completeness. An installed demand signature must match the current snapshot
+before either 3D or cross-section rendering can bind a body, so planning
+failure cannot attach new intent to old residency. Target, scope, retained
+ownership, and ticket reconciliation then publish as one staged transaction.
 Exact renderer residency additions allow CPU display leases to retire after
 GPU commit; exact removals enter bounded per-scope recovery sets without
 restarting unrelated admission. Generation/dirty tracking suppresses a volume
@@ -396,6 +412,14 @@ at once, and 1920x1080. The fifth registered target permits an inactive hidden
 target to stage an atomic refinement replacement without expanding the four-
 panel active union. The old 256-record,
 128-lease, and 16,384-global-dimension ceilings are deleted.
+
+The WGPU runtime shares one `OnceLock`-backed terminal-failure latch with the
+device-loss and uncaptured-error callbacks. The first observed device loss,
+out-of-memory, backend-internal, or validation cause wins. Frame, poll,
+submission, and mapped-buffer boundaries return that typed cause before
+continuing unsafe work. Cleanup remains usable, but there is deliberately no
+device-recovery epoch, CPU renderer, silent backend fallback, or second
+application-wide GPU latch.
 
 ## Persistence And Settings
 

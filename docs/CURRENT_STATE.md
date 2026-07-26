@@ -35,6 +35,10 @@ application-problem presentation, and transient UI drafts and interaction
 state. `mirante4d-render-wgpu` is the sole product renderer. The unpublished
 `mirante4d-render-reference` CPU oracle is test-only.
 
+Native SIGINT/SIGTERM handling sets one monotonic latch, wakes egui, and issues
+one prompt-free close request. Existing `on_exit` ownership performs the normal
+cancellation and joins; there is no guardian or competing shutdown path.
+
 The importer now indexes the reviewed TIFF inventory once, traverses admitted
 native strips/tiles in source order, decodes each admitted native chunk once
 into a two-file canonical base cache, and derives base chunks, pyramids, and
@@ -106,13 +110,18 @@ layer has one compact sparse hash page table, so shader lookup no longer scans
 the resident-resource list for every sample. The renderer traverses volume
 bricks, skips missing, all-invalid, and mode-noncontributing bricks, applies
 DVR early termination, and jointly integrates multichannel DVR even for
-smooth sampling or mixed affine grids. All-invalid bricks are metadata-only
-residents. Uploads use one bounded persistent mapped staging pool, and exact
-residency addition/removal deltas coordinate CPU-lease retirement and
-recovery. Reused mapped slots clear only alignment gaps and tails, not payload
-spans that the upload immediately overwrites. GPU timestamp results and volume
-picks are asynchronous; neither requires the UI thread to wait for a GPU
-mapping operation.
+smooth sampling or mixed affine grids. DVR opacity uses physical world-step
+length for off-axis and affine-transformed rays. Exact FirstThreshold ISO picks
+include the six-sample gradient halo before reporting complete. All-invalid
+bricks are metadata-only residents. Uploads use one bounded persistent mapped
+staging pool, and exact residency addition/removal deltas coordinate CPU-lease
+retirement and recovery. Reused mapped slots clear only alignment gaps and
+tails, not payload spans that the upload immediately overwrites. GPU timestamp
+results and volume picks are asynchronous; neither requires the UI thread to
+wait for a GPU mapping operation. One first-cause terminal GPU latch classifies
+device loss, out-of-memory, backend-internal, and validation failures before
+later frame, poll, submission, or mapped-buffer work; it does not create a
+fallback or recovery epoch.
 Full static render-control publication uses three queue writes regardless of
 the 65,536-entry availability pattern. Compatible exact successor bodies with
 at most 32 total added-and-removed keys preserve stable record/hash slots,
@@ -126,21 +135,24 @@ fragmented delta with one bounded dense record-slab write. Diagnostics expose
 the total, per-frame peak, and fallback count.
 
 Application demand is signature-diffed and split by 3D, linked-panel,
-playback, and analysis scope. One bounded latest-only worker performs exact
-camera candidate testing, contribution ranking, canonicalization, scope
-deltas, render-requirement preparation, and static sparse-page preparation;
-the UI swaps completed immutable artifacts instead of rebuilding a large
-camera cohort. Sustained orbit replaces one pending request and cancels the
-older traversal while retaining the last exact presentation. A full-volume
-resident cohort bypasses camera planning entirely. A bounded 17/16 camera
-guard appends at most one quarter of the primary resources plus two as a
-dormant prefetch suffix. It may decode and publish GPU control records after
-visible work, but does not affect readiness, coverage, fidelity, rendering, or
-picks until an O(1) scalar promotion. Contained camera and full-volume reuse
-promote the installed dataset/render wrappers without a membership walk or
-static rebuild. A queued guard is reprioritized in place without a duplicate
-waiter, decode, or queue slot, and exact admission-cursor rewinds preserve
-canceled staged guard work across atomic promotion.
+playback, and analysis scope. Every visible layer independently selects LOD
+from its affine cell footprint in the physical pixels of the actual 3D or
+cross-section view; installed and staged reuse requires the same projected
+selection map. One bounded latest-only worker performs exact camera candidate
+testing, contribution ranking, canonicalization, scope deltas,
+render-requirement preparation, and static sparse-page preparation; the UI
+swaps completed immutable artifacts instead of rebuilding a large camera
+cohort. Sustained orbit replaces one pending request and cancels the older
+traversal while retaining the last exact presentation. A full-volume resident
+cohort bypasses camera planning entirely. A bounded 17/16 camera guard appends
+at most one quarter of the primary resources plus two as a dormant prefetch
+suffix. It may decode and publish GPU control records after visible work, but
+does not affect readiness, coverage, fidelity, rendering, or picks until an
+O(1) scalar promotion. Contained camera and full-volume reuse promote the
+installed dataset/render wrappers without a membership walk or static rebuild.
+A queued guard is reprioritized in place without a duplicate waiter, decode,
+or queue slot, and exact admission-cursor rewinds preserve canceled staged
+guard work across atomic promotion.
 
 Raw wheel and drag samples now remain transient UI/render state. They do not
 dispatch the durable application reducer, extend project history, or invoke
@@ -169,6 +181,15 @@ bytes as explicit waste. A short fixed post-interaction grace keeps background
 verification below warm resident navigation. Verification blocks on a
 condition variable instead of periodically polling, then resumes after
 interaction settles.
+
+Cold refinement uses one atomic visible/hidden handoff. Any existing complete
+visible presentation remains exact-frame-only through every retry. The hidden
+replacement can promote only when its presented and requested frame identity,
+extent, requirement count, and actual GPU coverage match and are Exact;
+dormant prefetch does not count toward completeness. Current 3D and
+cross-section rendering also requires the installed demand signature to match
+the current snapshot, so new intent cannot bind an old body after planning
+fails. No partial refinement frame is published as current.
 
 Normal local reads retain one accounted package-root descriptor, resolve
 named objects beneath it with Linux `openat2` no-symlink/no-magic-link
@@ -208,55 +229,69 @@ exhaustive or redundant integration cases are explicit developer-local checks.
 The first revised run passed 1,357 routine cases in 81.9 seconds after a
 35.4-second Clippy phase.
 
+The changed-boundary trusted Vulkan command runs the focused ignored GPU tests
+directly under its hardware, timeout, and clean-revision guards. Ordinary test
+source is no longer treated as a hash-bound fixture, and no separate WP-09A
+receipt parser can override the native test result.
+
 See [testing](TESTING.md) for commands and claim language.
 
 ## Viewer Performance And Development Recovery Status
 
-The renderer, demand, scheduling, storage-read, capability-restoration, and
-small-tool implementation described above remains the normal product baseline
-on `main`. Revision `90c0f20` passed 11 policy phases, eight Rust phases, 1,275
-selected tests, and the two native viewer scenarios. Owner product testing
-nevertheless rejected it as the performance outcome: wheel zoom can lag or
-freeze, the four-panel workflow can settle at an unjustifiably coarse LOD, and
-compound-angle movement can visibly expose arriving bricks.
+The development-simplification and viewer-recovery program is complete.
+EP-00/EP-01 qualification commands, selection, schemas, receipt/replay,
+harness, shared gate/counter choreography, repeated resource-union hashing,
+test-source self-hashing, and post-test WP-09A receipt interpretation are no
+longer development prerequisites. More than 43,000 lines were removed while
+normal product validation, hard resource caps, source/import/project
+workflows, asynchronous GPU timing, and independent numerical oracles remain.
 
-That mismatch demonstrated that the subsequent EP-00/EP-01 development
-qualification was not proportionate or sufficiently product-directed. The
-five qualification commands, selection authority, nine schemas, receipt and
-replay implementation, harness, shared gate/counter choreography, repeated
-resource-union hashing, and test-only shader evidence generator are deleted.
-The two cuts removed 43,374 lines while retaining normal product validation,
-hard resource caps, source/import/project workflows, and asynchronous timing.
-The retired protocol establishes no current performance claim and is not a
-prerequisite for implementation.
-
-The damaged unpublished linked worktree has been independently preserved and
+The damaged unpublished linked worktree was independently preserved and
 reconstructed. Its 199 recoverable commits through `3d967f0` plus the surviving
-seven-file delta now exist as clean recovery commit `3dfe9de` in a verified
-external bundle. That branch includes real successor product experiments as
-well as a much larger qualification substrate. It is a research spike, not an
-implemented product fact, and will not be merged wholesale.
+seven-file delta exist as clean recovery commit `3dfe9de` in a verified
+external bundle. Only reviewed product mechanisms were reimplemented on
+`main`; the remainder is rejected research rather than an alternate product.
 
-The active [development-simplification and viewer-recovery
-plan](plans/active/DEVELOPMENT_SIMPLIFICATION.md) now owns recovery, process
-right-sizing, product-only extraction, and three independently validated
-viewer slices: resident interaction/per-view LOD, cold complete refinement,
-and MIP/DVR/ISO kernels. A storage-format rewrite is not presumed; it requires
-measurement showing that storage geometry remains a dominant blocker after
-runtime fixes.
+The resident-interaction/per-view-LOD slice is product-validated. Transient
+wheel and drag input no longer reconstructs durable state per sample, and a
+preview renders only from a complete geometrically valid resident body. Warm
+resident navigation caused no reads, decodes, requests, or uploads, and
+settled idle caused no queue submissions. The normal release app passed the
+real-display resident-navigation, compound-camera, 103-command render-mode,
+and four-panel workflows, alongside the independent projected-LOD oracle and
+full affected-package checks.
 
-The first viewer slice is complete. Transient wheel and drag input no longer
-reconstructs durable application/dataset state per sample, and a preview may
-render only from a complete geometrically valid resident body. Each visible
-layer now chooses LOD from its affine cell footprint in the physical pixels of
-the actual 3D or cross-section view. Installed-target matching prevents stale
-camera reuse, including while refinement is staged. Focused and full tests,
-the independent LOD oracle, compilation, Clippy, independent review, and the
-normal release application's real-display resident-navigation,
-compound-camera, render-mode, and four-panel workflows passed. Warm resident
-navigation caused no reads, decodes, requests, or uploads, and the settled idle
-period caused no queue submissions. The cold complete-refinement slice is now
-active.
+The cold-refinement slice is also product-validated. On a real-display
+65×1025×1537 public import fixture with four scales, the previous visible frame
+remained Exact while the hidden target held 20 of 100 requested resources and
+the runtime continued queued/in-flight work. No partial frame was presented as
+current. The target then promoted once as Complete/Current with no source,
+decode, or render fault. Focused atomic-handoff checks and the full app,
+application, and renderer suites passed.
+
+The kernel slice corrected DVR physical-distance opacity and ISO gradient-halo
+pick completeness. On the trusted RTX 3070 Ti Vulkan adapter, the independent
+off-axis DVR oracle produced expected RGBA8 `[109, 0, 0, 151]`; the focused
+nine-test Vulkan inventory passed with no validation errors and at most one
+RGBA8 channel of oracle delta. The real-display render-mode workflow passed
+after the correctness change.
+
+Two speculative shader edits were measured and deleted. In a fixed resident
+nine-brick 1920×1080 Vulkan timestamp workload with five trials after one
+warm-up, the smooth-ISO endpoint rewrite had a 28.68 ms baseline median and
+28.87/29.12 ms candidate medians. The MIP early-stop rewrite moved repeat
+medians only from 2.049–2.052 ms to 2.042–2.046 ms. Neither met the declared
+five-percent retention threshold, so no optimization claim or extra kernel
+complexity was retained.
+
+Compact failure handling is implemented. Native SIGINT/SIGTERM exits through
+the ordinary joined shutdown path in an actual release-process probe. WGPU
+terminal failures preserve the first typed cause and stop later unsafe work;
+focused classification, first-cause, mapped-access, and app-mapping checks
+passed. Actual hardware device loss or out-of-memory was not destructively
+induced, so that part is automated-verified rather than product-validated.
+A storage-format rewrite remains unauthorized unless later measurement shows
+storage geometry is still a dominant blocker.
 
 No absolute performance, comparison-viewer, successor-completion, or release
 claim follows from current evidence.
@@ -341,7 +376,11 @@ historical T5 performance claim.
   release.
 - Packaged runtime does not expose unsaved-autosave recovery.
 - Direct X11 close of a clean project can hit an inherited Winit shutdown
-  panic; the dirty-project save/discard/cancel route exits cleanly.
+  panic; the dirty-project save/discard/cancel route and native
+  SIGINT/SIGTERM close request exit cleanly.
+- Terminal GPU loss, out-of-memory, backend-internal, and validation failures
+  are typed and latched, but there is no device-recovery path or CPU fallback.
+  Actual hardware loss/OOM fault injection remains unperformed.
 - Exact linked-panel cursor readout remains lease-backed. The 3D viewer now
   submits latest-only asynchronous picks against the exact presented GPU
   residency for MIP, DVR, and ISO; stale or retired frames fail visibly rather

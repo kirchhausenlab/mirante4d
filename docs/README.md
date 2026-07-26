@@ -24,13 +24,11 @@ exceptions have one separate tool-owned
 
 ## Plans
 
-One high-risk corrective plan is active: [development simplification and
-viewer recovery](plans/active/DEVELOPMENT_SIMPLIFICATION.md). It preserves the
-strong scientific and data-safety foundation while removing disproportionate
-development-evidence machinery and delivering viewer performance as small,
-product-validated slices. [Current work](planning/NOW.md) owns the exact
-checkpoint; Git history and the verified external recovery bundle archive the
-superseded plan and unpublished research spike.
+No high-risk corrective plan is active. The development-simplification and
+viewer-recovery program completed on 2026-07-26; [current state](CURRENT_STATE.md)
+owns its implemented facts, [current work](planning/NOW.md) owns the next
+checkpoint, and Git history retains the completed plan. The verified external
+recovery bundle preserves the unpublished research spike.
 
 Two future outcomes remain deliberately separate from ordinary development:
 

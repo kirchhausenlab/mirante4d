@@ -102,6 +102,12 @@ MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
   cargo xtask verify-local trusted-gpu
 ```
 
+That lane is a bounded wrapper around the focused ignored Vulkan tests. It
+retains the clean-revision, hardware/adapter, timeout, independent-oracle, and
+normal verification-report checks. Ordinary GPU test source is not registered
+as a hash-bound fixture, and passing tests are not reinterpreted by a separate
+qualification-receipt parser.
+
 Focused release diagnostics are available for resident rendering and
 representation choices:
 
@@ -202,16 +208,17 @@ prerequisite and must not block product work. Their command, schema, selection,
 receipt, replay, harness, shared gate/counter, and repeated resource-union
 hashing roots have been removed from the live repository.
 
-Viewer-performance work now proceeds in small product slices:
+The corrective viewer program completed three small product slices:
 
 1. resident interaction and per-view LOD;
 2. cold complete refinement, reuse, and presentation correctness; and
 3. MIP, DVR, and ISO kernels.
 
-Each slice closes with focused automated checks, a small independent
+Each slice closed with focused automated checks, a small independent
 correctness oracle where needed, useful GPU timings, and real-product
-validation. See the active
-[development-simplification plan](plans/active/DEVELOPMENT_SIMPLIFICATION.md).
+validation. One-off cold-refinement scripts, signal probes, and terminal-latch
+tests remain scoped development evidence rather than permanent qualification
+protocols. [Current state](CURRENT_STATE.md) owns the implemented result.
 
 ## Reporting
 
