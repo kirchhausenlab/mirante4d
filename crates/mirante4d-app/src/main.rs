@@ -6,8 +6,8 @@ use std::{
 };
 
 use mirante4d_app::{
-    AppSmokeOptions, MiranteWorkbenchApp, collect_startup_diagnostics, default_log_path,
-    run_headless_smoke,
+    AppSmokeOptions, MiranteWorkbenchApp, ProcessTerminationLatch, collect_startup_diagnostics,
+    default_log_path, run_headless_smoke,
 };
 use mirante4d_domain::RenderMode;
 use mirante4d_render_wgpu::{qualify_adapter, renderer_device_descriptor};
@@ -138,13 +138,41 @@ fn main() -> anyhow::Result<()> {
         wgpu_options: wgpu_options(),
         ..Default::default()
     };
+    let process_termination = Arc::new(ProcessTerminationLatch::default());
+    install_process_termination_signals(Arc::clone(&process_termination))?;
 
     eframe::run_native(
         "Mirante4D",
         native_options,
-        Box::new(move |cc| Ok(Box::new(MiranteWorkbenchApp::open_dataset(cc, &dataset)?))),
+        Box::new(move |cc| {
+            Ok(Box::new(
+                MiranteWorkbenchApp::open_dataset_with_process_termination(
+                    cc,
+                    &dataset,
+                    process_termination,
+                )?,
+            ))
+        }),
     )
     .map_err(|err| anyhow::anyhow!("failed to launch native window: {err}"))
+}
+
+fn install_process_termination_signals(
+    process_termination: Arc<ProcessTerminationLatch>,
+) -> anyhow::Result<()> {
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ])?;
+    std::thread::Builder::new()
+        .name("mirante4d-process-signals".to_owned())
+        .spawn(move || {
+            for signal in signals.forever() {
+                process_termination.request();
+                tracing::info!(signal, "graceful process termination requested");
+            }
+        })?;
+    Ok(())
 }
 
 fn init_tracing() {

@@ -428,6 +428,8 @@ fn test_workbench_app_without_background_runtime(
         egui_ui,
         import: ImportWorkflow::new(),
         analysis_runtime,
+        process_termination: None,
+        process_termination_close_started: false,
         product_automation: None,
         test_render_viewport_max_side: None,
         runtime_diagnostics_collections: std::cell::Cell::new(0),

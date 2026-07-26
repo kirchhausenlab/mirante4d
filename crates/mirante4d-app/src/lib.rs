@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -26,6 +27,7 @@ mod import_workflow;
 mod layer_state;
 mod native_presentation;
 mod playback;
+mod process_termination;
 mod product_automation;
 mod product_render_intent;
 mod projected_lod;
@@ -100,6 +102,7 @@ use mirante4d_render_api::{PresentationToken, PresentationViewport};
 use mirante4d_render_wgpu::{WgpuRenderRuntime, WgpuRenderRuntimeConfig};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy, recommended_for_current_system};
 use mirante4d_ui_egui as ui_kit;
+pub use process_termination::ProcessTerminationLatch;
 use product_automation::ProductAutomationController;
 use render_state::set_render_viewport;
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
@@ -506,6 +509,8 @@ pub struct MiranteWorkbenchApp {
     import: ImportWorkflow,
     analysis_runtime: analysis_session::AnalysisProductRuntime,
     product_automation: Option<ProductAutomationController>,
+    process_termination: Option<Arc<ProcessTerminationLatch>>,
+    process_termination_close_started: bool,
     #[cfg(test)]
     test_render_viewport_max_side: Option<usize>,
     #[cfg(test)]
@@ -546,10 +551,35 @@ impl MiranteWorkbenchApp {
         cc: &eframe::CreationContext<'_>,
         path: impl AsRef<Path>,
     ) -> anyhow::Result<Self> {
+        Self::open_dataset_with_optional_process_termination(cc, path, None)
+    }
+
+    pub fn open_dataset_with_process_termination(
+        cc: &eframe::CreationContext<'_>,
+        path: impl AsRef<Path>,
+        process_termination: Arc<ProcessTerminationLatch>,
+    ) -> anyhow::Result<Self> {
+        Self::open_dataset_with_optional_process_termination(cc, path, Some(process_termination))
+    }
+
+    fn open_dataset_with_optional_process_termination(
+        cc: &eframe::CreationContext<'_>,
+        path: impl AsRef<Path>,
+        process_termination: Option<Arc<ProcessTerminationLatch>>,
+    ) -> anyhow::Result<Self> {
+        if let Some(termination) = process_termination.as_ref() {
+            termination.bind_egui_context(&cc.egui_ctx);
+        }
         let (settings_connection, resource_policy) =
             current_settings_connection::CurrentSettingsConnection::start();
         let opened = unified_source_open::open(path, resource_policy, DatasetSourceId::new(1))?;
-        Self::new_with_settings(cc, opened, settings_connection, resource_policy)
+        Self::new_with_settings(
+            cc,
+            opened,
+            settings_connection,
+            resource_policy,
+            process_termination,
+        )
     }
 
     fn new_with_settings(
@@ -557,6 +587,7 @@ impl MiranteWorkbenchApp {
         opened: unified_source_open::UnifiedOpenedSource,
         settings_connection: current_settings_connection::CurrentSettingsConnection,
         resource_policy: ResourcePolicy,
+        process_termination: Option<Arc<ProcessTerminationLatch>>,
     ) -> anyhow::Result<Self> {
         ui_kit::configure_visuals(&cc.egui_ctx);
         let unified_source_open::UnifiedOpenedSource {
@@ -647,6 +678,8 @@ impl MiranteWorkbenchApp {
             import: ImportWorkflow::new(),
             analysis_runtime,
             product_automation,
+            process_termination,
+            process_termination_close_started: false,
             #[cfg(test)]
             test_render_viewport_max_side: None,
             #[cfg(test)]
@@ -1707,6 +1740,23 @@ impl MiranteWorkbenchApp {
 
     fn project_dirty(&self) -> bool {
         self.application.snapshot().dirty().unwrap_or(false)
+    }
+
+    fn handle_process_termination_request(&mut self, ctx: &egui::Context) -> bool {
+        let requested = self
+            .process_termination
+            .as_ref()
+            .is_some_and(|termination| termination.requested());
+        if !requested {
+            return false;
+        }
+        if !self.process_termination_close_started {
+            self.process_termination_close_started = true;
+            self.egui_ui.allow_close_without_prompt = true;
+            self.egui_ui.close_prompt_open = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        true
     }
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {

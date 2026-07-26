@@ -96,7 +96,14 @@ fn active_layer_no_data_policy_label(snapshot: &ApplicationSnapshot) -> Option<&
 }
 
 impl eframe::App for MiranteWorkbenchApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_process_termination_request(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.handle_process_termination_request(ui.ctx()) {
+            return;
+        }
         let update_started = Instant::now();
         let generation_at_start = self.render_coordination.display_generation();
         let active_input_at_start = generation_at_start.input_generation > 0
