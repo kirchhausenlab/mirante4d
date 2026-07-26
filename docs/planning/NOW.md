@@ -16,31 +16,32 @@ visible brick assembly. The owner therefore authorized the
 [development-simplification and viewer-recovery plan](../plans/active/DEVELOPMENT_SIMPLIFICATION.md)
 on 2026-07-26. It supersedes EP-00 through EP-07.
 
-EP-00 and EP-01 evidence protocols are frozen, nonblocking, and scheduled for
-deletion or reduction. They establish no current performance claim and are not
-prerequisites for implementation.
+EP-00 and EP-01 evidence protocols are frozen, nonblocking, and being deleted.
+They establish no current performance claim and are not prerequisites for
+implementation.
 
 ## Active Checkpoint
 
-R0 recovery and R1 authority/process cutover are active.
+R0 recovery, R1 authority/process cutover, and R2 verification right-sizing
+are complete. R3 qualification-apparatus deletion is active.
 
-The damaged linked viewer worktree has been preserved outside the repository.
-The 199 recoverable commits through `3d967f0` and the surviving seven-file
-working delta were reconstructed as clean commit `3dfe9de`. A complete bundle
-and an independent clone both preserve `main`, the recovered branch, and the
-foundation tags; the clone passed `git fsck` and matched the worktree source
-byte-for-byte.
+The damaged linked viewer worktree is repaired and clean at reconstructed
+commit `3dfe9de`. Both live recovery refs resolve to it. Strict `git fsck`,
+reachable-object checks, index checks, and byte comparison with the independent
+clone pass; corrupt metadata is retained only in the external recovery area.
+
+Routine verification now has five public leaves, no empty doctest phase, and
+does not compile test targets twice through Clippy. Six exhaustive or redundant
+cases moved to explicit developer-local execution. The first revised Rust run
+passed all 1,357 routine cases in 81.9 seconds after a 35.4-second Clippy phase;
+the six deep cases also passed independently.
 
 The immediate ordered actions are:
 
-1. install the recovered branch in the live repository and repair the corrupt
-   linked-worktree metadata without deleting the verified recovery material;
-2. activate proportional edit, merge, affected-boundary, and release
-   verification tiers;
-3. remove or isolate EP-00/EP-01 schemas, receipts, replay, repeated hashing,
+1. remove EP-00/EP-01 schemas, receipts, replay, repeated hashing,
    and parallel successor implementations;
-4. classify and retain only useful successor product mechanisms; and
-5. deliver resident interaction/LOD, cold complete refinement, and MIP/DVR/ISO
+2. classify and retain only useful successor product mechanisms; and
+3. deliver resident interaction/LOD, cold complete refinement, and MIP/DVR/ISO
    improvements as separately product-validated slices.
 
 No storage-format rewrite is presumed. It requires measured evidence that

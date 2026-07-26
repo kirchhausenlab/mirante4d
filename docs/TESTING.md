@@ -83,6 +83,13 @@ Expensive exhaustive or fault-injection matrices belong in explicit
 developer-local lanes. They are not hidden prerequisites for ordinary pull
 requests.
 
+When their owned project-store or imported-publication boundary changes, run:
+
+```bash
+cargo test -p mirante4d-project-store matrix -- --ignored
+cargo test -p mirante4d-app imported_ -- --ignored
+```
+
 ### Tier 3: Changed-Boundary Checks
 
 Run these only when their boundary changes.

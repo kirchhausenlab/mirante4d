@@ -65,7 +65,7 @@ jobs:
   rust:
     name: Main / rust
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - name: Check out the protected revision
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -110,4 +110,4 @@ jobs:
         run: timeout 120s cargo fetch --locked --target x86_64-unknown-linux-gnu
       - name: Run the Rust group
         shell: bash
-        run: timeout 900s cargo xtask verify-pr rust
+        run: timeout 600s cargo xtask verify-pr rust

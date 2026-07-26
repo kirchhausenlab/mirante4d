@@ -192,6 +192,13 @@ Hosted jobs use free public runners without caches or artifacts. GPU,
 format, project-store, packaging, and product checks remain explicit local
 commands used only when their boundaries change.
 
+The routine Rust group has five leaves: lint, unit, contract, and UI under the
+Rust job, with policy separate. The empty doctest phase is removed, Clippy
+checks libraries and binaries without recompiling test targets, and six
+exhaustive or redundant integration cases are explicit developer-local checks.
+The first revised run passed 1,357 routine cases in 81.9 seconds after a
+35.4-second Clippy phase.
+
 See [testing](TESTING.md) for commands and claim language.
 
 ## Viewer Performance And Development Recovery Status

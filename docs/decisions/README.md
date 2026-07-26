@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-Last updated: 2026-07-14
+Last updated: 2026-07-26
 
 These ADRs preserve the decisions behind the completed foundation refactor.
 They explain rationale but do not replace `docs/CURRENT_STATE.md` as the
@@ -17,7 +17,10 @@ authority for current facts.
 | [ADR-0007](ADR-0007-foundation-dataset-hardware-product-envelope.md) | Profile-based dataset/hardware envelope, required GPU, Linux/Vulkan, 1080p, no segmentation | D-004/D-005/D-006/D-015/D-016 |
 | [ADR-0008](ADR-0008-contribution-governance.md) | Maintainer-led MIT contributions with no CLA/DCO initially | D-003 |
 | [ADR-0009](ADR-0009-canonical-model-contract.md) | Pure canonical domain, identity, and project model before the product hard cutover | WP-07A |
+| [ADR-0010](ADR-0010-proportional-development-verification.md) | Proportional development verification with deep checks at affected boundaries | 2026 simplification |
 
 D-003 contribution governance is operational in the public repository.
 ADR-0009's canonical model is the live authority. D-011 through D-014 and
-D-020 belong only to the deferred open-data follow-on.
+D-020 belong only to the deferred open-data follow-on. ADR-0010 supersedes the
+routine topology and time ceiling in ADR-0005 while retaining its public
+runner, `$0`, and workflow-safety decisions.

@@ -23,20 +23,20 @@
       "selector": "package(mirante4d-app) & (test(=tests::import_verify_analyze_save_and_reopen_atomically) | test(=tests::imported_publication_waits_for_project_close_then_installs_without_normal_verifier) | test(=tests::failed_project_close_retains_imported_authority_without_verifier_fallback) | test(=tests::imported_transfer_drift_fails_closed_without_external_open_fallback))",
       "warn_ms": 5000,
       "terminate_ms": 30000,
-      "reason": "These product integrations import and publish a real sharded target package before exercising verified open, project-close retention, drift rejection, or the wider analyze/save/reopen lifecycle; each debug path takes about 11 seconds locally and can approach 20 seconds on a shared hosted runner."
+      "reason": "These product integrations import and publish a real sharded target package before exercising verified open, project-close retention, drift rejection, or the wider analyze/save/reopen lifecycle. The broad lifecycle case remains routine; the three narrower cases retain this timeout for explicit developer-local execution."
     },
     {
       "selector": "package(mirante4d-project-store) & test(=actor::tests::hosted_durability_tests::exhaustive_hosted_and_process_transition_matrix)",
       "warn_ms": 20000,
       "terminate_ms": 180000,
       "threads_required": "num-test-threads",
-      "reason": "The exhaustive hosted WP-10B matrix discovers 424 transition-edge rows, runs 338 missing fail injections, inherits 86 exact rows, compares 120 parked before/after trees, and performs 102 bounded fresh-process kill/reopen/retry cases with eight internal workers. It reserves every Nextest test slot so unrelated tests cannot starve its child processes; each hosted actor completion is capped at 15 seconds inside its existing 20-second child bound, and the isolated matrix remains bounded by 180 seconds inside the five-minute PR test union."
+      "reason": "The developer-local matrix discovers 424 transition-edge rows, runs 338 missing fail injections, inherits 86 exact rows, compares 120 parked before/after trees, and performs 102 bounded fresh-process kill/reopen/retry cases with eight internal workers. It reserves every Nextest test slot so unrelated tests cannot starve its child processes, and each actor completion is capped at 15 seconds inside its existing 20-second child bound."
     },
     {
       "selector": "package(mirante4d-project-store) & test(=actor::tests::purge_fresh_process_kill_and_retry_matrix)",
       "warn_ms": 5000,
       "terminate_ms": 40000,
-      "reason": "The real-process Purge crash matrix spawns 32 child processes and performs filesystem syncs; public hosted runners can exceed the 20-second contract-lane default, so only its termination ceiling is 40 seconds."
+      "reason": "The developer-local Purge crash matrix spawns 32 child processes and performs filesystem syncs, so its termination ceiling remains 40 seconds when selected explicitly."
     }
   ],
   "lanes": [
@@ -123,20 +123,6 @@
       "warn_ms": 2000,
       "terminate_ms": 10000,
       "aggregate_timeout_secs": 720
-    },
-    {
-      "id": "doctest",
-      "kind": "doctest",
-      "owner": "rust-workspace",
-      "requirements": ["D-022-doctest"],
-      "fixture_tier": "none",
-      "capability": "hosted-cpu",
-      "hosted_required": true,
-      "packages": [],
-      "selector": null,
-      "warn_ms": 60000,
-      "terminate_ms": 120000,
-      "aggregate_timeout_secs": 240
     }
   ],
   "non_pr_lanes": [
@@ -187,8 +173,8 @@
       "fixture_tier": "none-or-T2",
       "timeout_secs": 600,
       "evidence_level": "support-only",
-      "trigger": "manual pre-push feedback",
-      "command": "cargo xtask verify-pr",
+      "trigger": "manual after a change to the boundary owned by an ignored diagnostic or deep matrix",
+      "command": "cargo test -p <affected-package> <test-filter> -- --ignored",
       "hosted_required": false,
       "activation_state": "active"
     },
@@ -207,6 +193,41 @@
     }
   ],
   "selector_adapters": [
+    {
+      "id": "R2-ADAPTER-DEEP-BOUNDARY-MATRICES",
+      "lane": "developer-local",
+      "owner": "project-store-and-application-boundaries",
+      "requirements": ["R2-affected-boundary-deep-checks"],
+      "fixture_tier": "none-or-T2",
+      "capability": "local-cpu",
+      "matches": [
+        {
+          "package": "mirante4d-project-store",
+          "test_prefix": "actor::tests::hosted_durability_tests::exhaustive_hosted_and_process_transition_matrix"
+        },
+        {
+          "package": "mirante4d-project-store",
+          "test_prefix": "actor::tests::trash_fresh_process_kill_and_retry_matrix"
+        },
+        {
+          "package": "mirante4d-project-store",
+          "test_prefix": "actor::tests::purge_fresh_process_kill_and_retry_matrix"
+        },
+        {
+          "package": "mirante4d-app",
+          "test_prefix": "tests::imported_publication_waits_for_project_close_then_installs_without_normal_verifier"
+        },
+        {
+          "package": "mirante4d-app",
+          "test_prefix": "tests::failed_project_close_retains_imported_authority_without_verifier_fallback"
+        },
+        {
+          "package": "mirante4d-app",
+          "test_prefix": "tests::imported_transfer_drift_fails_closed_without_external_open_fallback"
+        }
+      ],
+      "expected_ignored_cases": 6
+    },
     {
       "id": "VP02-ADAPTER-STORAGE-SCALE-DIAGNOSTICS",
       "lane": "developer-local",

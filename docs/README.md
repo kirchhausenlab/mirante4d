@@ -12,7 +12,7 @@ index. The machine inventory is
 4. The document that owns the task:
    - [Architecture](ARCHITECTURE.md)
    - [Data format and safety](DATA_FORMAT.md)
-   - [Testing and evidence](TESTING.md)
+   - [Testing and validation](TESTING.md)
    - [Development commands](DEVELOPMENT.md)
    - [Release status](RELEASE.md)
    - [Decisions](decisions/README.md)

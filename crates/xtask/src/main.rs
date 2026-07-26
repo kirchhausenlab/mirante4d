@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
         "verify-leaf" => {
             let leaf = args
                 .next()
-                .context("usage: cargo xtask verify-leaf policy|lint|unit|contract|ui|doctest")?;
+                .context("usage: cargo xtask verify-leaf policy|lint|unit|contract|ui")?;
             if args.next().is_some() {
                 bail!("verify-leaf accepts exactly one leaf");
             }
@@ -177,7 +177,7 @@ fn print_help() {
         "\
 Mirante4D developer tasks
 
-  cargo xtask verify-leaf policy|lint|unit|contract|ui|doctest
+  cargo xtask verify-leaf policy|lint|unit|contract|ui
   cargo xtask verify-pr [policy|rust]
   cargo xtask verify-local <format-lifecycle|project-store-lifecycle|trusted-gpu>
   cargo xtask verification-sync [--check]

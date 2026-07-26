@@ -713,6 +713,7 @@ fn invalid_external_open_does_not_close_the_current_project_store() {
 }
 
 #[test]
+#[ignore = "developer-local: deep imported-publication/project-close integration"]
 fn imported_publication_waits_for_project_close_then_installs_without_normal_verifier() {
     let temp = tempfile::tempdir().unwrap();
     let current_package = write_target_fixture(temp.path()).unwrap();
@@ -820,6 +821,7 @@ fn imported_publication_waits_for_project_close_then_installs_without_normal_ver
 }
 
 #[test]
+#[ignore = "developer-local: deep imported-publication/project-close integration"]
 fn failed_project_close_retains_imported_authority_without_verifier_fallback() {
     let temp = tempfile::tempdir().unwrap();
     let current_package = write_target_fixture(temp.path()).unwrap();
@@ -946,6 +948,7 @@ fn failed_project_close_retains_imported_authority_without_verifier_fallback() {
 }
 
 #[test]
+#[ignore = "developer-local: deep imported-publication drift integration"]
 fn imported_transfer_drift_fails_closed_without_external_open_fallback() {
     let temp = tempfile::tempdir().unwrap();
     let current_package = write_target_fixture(temp.path()).unwrap();

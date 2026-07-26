@@ -43,6 +43,8 @@ active authorities as a documentation defect; do not silently choose one.
   runners, and no public self-hosted workstation.
 - Keep process proportionate to a small academic project. Add it only when it
   protects scientific correctness, user data, security, or release integrity.
+  Verification or provenance machinery must not grow faster than the product
+  change it protects without explicit owner approval.
 
 ## High-Risk Work
 
@@ -61,6 +63,9 @@ Before editing:
 3. For a cutover, define how the predecessor is deleted and how the new
    authority will be checked. A cutover is incomplete while a hidden alternate
    path remains.
+
+Qualification can constrain a public or release claim. It must not block
+diagnosis, implementation, or focused product observation.
 
 ## Verification Language
 

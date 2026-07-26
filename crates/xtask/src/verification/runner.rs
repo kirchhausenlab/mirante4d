@@ -18,7 +18,6 @@ use super::{fixtures, registry};
 const FORMAT_TIMEOUT: Duration = Duration::from_secs(60);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PR_TEST_UNION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const DOCTEST_PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
 const SOURCE_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
 const TARGET_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
 const PROJECT_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -64,7 +63,6 @@ pub(crate) enum Leaf {
     Unit,
     Contract,
     Ui,
-    Doctest,
 }
 
 impl Leaf {
@@ -75,10 +73,9 @@ impl Leaf {
             "unit" => Ok(Self::Unit),
             "contract" => Ok(Self::Contract),
             "ui" => Ok(Self::Ui),
-            "doctest" => Ok(Self::Doctest),
-            _ => bail!(
-                "unknown verification leaf {value:?}; expected policy|lint|unit|contract|ui|doctest"
-            ),
+            _ => {
+                bail!("unknown verification leaf {value:?}; expected policy|lint|unit|contract|ui")
+            }
         }
     }
 
@@ -89,7 +86,6 @@ impl Leaf {
             Self::Unit => "unit",
             Self::Contract => "contract",
             Self::Ui => "ui",
-            Self::Doctest => "doctest",
         }
     }
 }
@@ -109,9 +105,6 @@ pub(crate) fn verify_leaf(leaf: Leaf) -> anyhow::Result<()> {
             phases.run(leaf.name(), nextest_leaf_command(leaf), || {
                 run_nextest_leaf(leaf)
             });
-        }
-        Leaf::Doctest => {
-            phases.run("doctest", doctest_command(), run_doctest);
         }
     }
     let report_path = verification_report_path(&format!("verify-leaf-{}", leaf.name()))?;
@@ -2083,7 +2076,6 @@ fn run_lint() -> anyhow::Result<()> {
         "--workspace",
         "--lib",
         "--bins",
-        "--tests",
         "--frozen",
         "--keep-going",
         "--message-format=json",
@@ -2146,12 +2138,6 @@ fn run_nextest_leaf(leaf: Leaf) -> anyhow::Result<()> {
         &filter,
     ]);
     run_command_with_timeout(&mut command, timeout)
-}
-
-fn run_doctest() -> anyhow::Result<()> {
-    let mut command = cargo_command();
-    command.args(["test", "--workspace", "--doc", "--frozen", "--no-fail-fast"]);
-    run_command_with_timeout(&mut command, DOCTEST_PROCESS_TIMEOUT)
 }
 
 fn verify_pr_rust() -> anyhow::Result<()> {
@@ -2248,17 +2234,12 @@ fn verify_pr_rust() -> anyhow::Result<()> {
         );
     }
 
-    phases.run("doctest", doctest_command(), run_doctest);
     let report_result = phases.write_report(&report_path, "rust", &identity);
     phases.finish("rust").and(report_result)
 }
 
 fn lint_command() -> &'static str {
-    "cargo clippy --workspace --lib --bins --tests --frozen --keep-going --message-format=json; require exact verification/registry.json warning set"
-}
-
-fn doctest_command() -> &'static str {
-    "cargo test --workspace --doc --frozen --no-fail-fast"
+    "cargo clippy --workspace --lib --bins --frozen --keep-going --message-format=json; require exact verification/registry.json warning set"
 }
 
 fn discovery_command() -> &'static str {
@@ -2762,7 +2743,7 @@ mod tests {
 
     #[test]
     fn leaf_parser_accepts_exact_surface() {
-        for name in ["policy", "lint", "unit", "contract", "ui", "doctest"] {
+        for name in ["policy", "lint", "unit", "contract", "ui"] {
             assert_eq!(Leaf::parse(name).unwrap().name(), name);
         }
         assert!(Leaf::parse("fast").is_err());

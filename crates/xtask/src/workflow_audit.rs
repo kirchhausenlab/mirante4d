@@ -60,7 +60,7 @@ const SPECS: &[Spec] = &[
                 "cargo xtask verify-pr policy",
                 6,
             ),
-            ("rust", "PR / rust", 15, "cargo xtask verify-pr rust", 7),
+            ("rust", "PR / rust", 10, "cargo xtask verify-pr rust", 7),
         ],
         required: &[
             "  pull_request:",
@@ -89,7 +89,7 @@ const SPECS: &[Spec] = &[
                 "cargo xtask verify-pr policy",
                 7,
             ),
-            ("rust", "Main / rust", 15, "cargo xtask verify-pr rust", 8),
+            ("rust", "Main / rust", 10, "cargo xtask verify-pr rust", 8),
         ],
         required: &[
             "  push:",

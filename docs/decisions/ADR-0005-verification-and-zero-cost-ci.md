@@ -1,10 +1,14 @@
 # ADR-0005: Use Six Verification Leaves, Two Zero-Cost Checks, And Trusted-Local Evidence
 
-Status: ACCEPTED AND IMPLEMENTED
+Status: SUPERSEDED IN PART BY ADR-0010
 Date accepted: 2026-07-10
-Last reviewed: 2026-07-14
+Last reviewed: 2026-07-26
 Decision IDs: D-022, D-023
 Current-state effect: SIX-LEAF TOPOLOGY AND TWO ZERO-COST CHECKS ACTIVE
+
+ADR-0010 retains the two zero-cost public check identities and hosted-safety
+rules, but supersedes this ADR's six-leaf topology, universal routine-test
+assignment, and fifteen-minute Rust ceiling.
 
 This ADR did not independently authorize a test rewrite, fixture generation,
 hosted run, runner registration, workflow change, branch rule, cache, artifact

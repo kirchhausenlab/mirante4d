@@ -46,7 +46,6 @@ cargo xtask verify-leaf lint
 cargo xtask verify-leaf unit
 cargo xtask verify-leaf contract
 cargo xtask verify-leaf ui
-cargo xtask verify-leaf doctest
 ```
 
 Check generated verification files or documentation only:
@@ -104,6 +103,16 @@ MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
 
 This lane is local-only and is not a GitHub Actions requirement.
 
+The exhaustive project-store matrices and redundant imported-publication
+variants are explicit developer-local checks:
+
+```bash
+cargo test -p mirante4d-project-store matrix -- --ignored
+cargo test -p mirante4d-app imported_ -- --ignored
+```
+
+Run them only after changing those boundaries.
+
 The bounded target-package open and verification scenario is retained as a
 small regression check for storage-source changes:
 
@@ -117,14 +126,10 @@ Import/preprocessing changes also run the native generated-source scenario:
 cargo xtask product-validate import_preprocessing
 ```
 
-For local public performance diagnostics or qualification, use the release
-`import-performance-t2` command documented in [Testing](TESTING.md). The same
-document owns the strict private `import-performance-t5` runner and its
-external configuration, real-display, raw-evidence, sanitization, and
-finalized-raw report-only publication rules.
-Qualification requires the exact owner-pinned local HW-2 host/ext4 profile to
-resolve outside the repository; an absent, mismatched, or differently
-committed profile produces diagnostic-only evidence.
+For deliberate local import diagnostics or a current claim, use the release
+`import-performance-t2` or private `import-performance-t5` command documented
+in [Testing](TESTING.md). These are changed-boundary or qualification tools,
+not ordinary edit-loop checks.
 Generated sources, packages, and evidence stay below ignored
 `target/mirante4d/` paths unless an explicit qualified scratch root is selected.
 
@@ -137,6 +142,8 @@ path, not as a recurring acceptance ritual.
   ignored local paths, never in the repository.
 - Use focused checks while iterating, then run the checks relevant to the
   affected boundary.
+- Reserve exhaustive process, crash, and durability matrices for changes to
+  the boundary they own.
 - Add a dependency only for a clear current need. Run
   `cargo xtask verify-deps`; exact exceptions live only in the
   [exception ledger](DEPENDENCY_EXCEPTIONS.md).

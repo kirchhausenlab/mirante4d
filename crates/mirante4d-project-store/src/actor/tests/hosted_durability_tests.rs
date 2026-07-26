@@ -173,6 +173,7 @@ impl Drop for PreparedRoots {
 }
 
 #[test]
+#[ignore = "developer-local: exhaustive transition and fresh-process matrix"]
 fn exhaustive_hosted_and_process_transition_matrix() {
     let started = Instant::now();
     let workspace = MatrixWorkspace::new();

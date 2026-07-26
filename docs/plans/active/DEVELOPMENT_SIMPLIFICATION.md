@@ -45,9 +45,10 @@ The external bundle SHA-256 is
 `f7abe46b34ee4d9a90d89748bae4bacd683b7f34accae0d6094bc457fd2e9b7e`.
 Private paths and unpublished evidence remain outside the repository.
 
-No destructive repair of the original linked worktree is allowed until the
-recovered branch is installed in the live repository and independently
-rechecked.
+The recovered branch is installed in the live repository. The five zero-byte
+loose objects, pre-repair index, and damaged reflog tails are quarantined in
+the recovery area. Strict full object/ref verification passes, and the linked
+worktree is clean and byte-identical to the independent recovery clone.
 
 ## Invariants Retained
 
@@ -141,7 +142,7 @@ explicit boundary, not a repeated internal ritual.
 
 ### R0 — Preserve And Reconstruct
 
-Status: PRESERVATION COMPLETE; LIVE REPOSITORY REPAIR PENDING
+Status: COMPLETE
 
 - Preserve shared Git state, linked-worktree files, and the surviving delta.
 - Reconstruct the recoverable chain on an independent repository.
@@ -154,6 +155,8 @@ damaged worktree.
 
 ### R1 — Authority And Process Cutover
 
+Status: COMPLETE
+
 - Make this plan and Current Work the sole active authorities.
 - Mark EP-00/EP-01 qualification nonblocking and frozen for deletion.
 - Update the agent, testing, development, contribution, and verification
@@ -165,6 +168,8 @@ Exit: ordinary implementation may proceed with focused checks and immediate
 product feedback.
 
 ### R2 — Required Verification Right-Sizing
+
+Status: COMPLETE
 
 - Preserve `PR / policy` and `PR / rust` names.
 - Remove the empty doctest lane.
@@ -179,7 +184,13 @@ product feedback.
 Exit: focused warm iteration is normally below two minutes and the required
 Rust job fits its ten-minute hard ceiling.
 
+The first post-cutover run discovered 1,357 routine cases and passed all of
+them in 81.9 seconds after a 35.4-second library/binary Clippy phase. The six
+demoted deep cases remain explicitly runnable and passed independently.
+
 ### R3 — Qualification Apparatus Deletion
+
+Status: ACTIVE
 
 - Delete the EP-01 selection authority and its bound schemas.
 - Delete development raw-report-to-receipt projection, replay, and admission

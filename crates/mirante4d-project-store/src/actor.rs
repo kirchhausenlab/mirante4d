@@ -5312,6 +5312,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "developer-local: exhaustive fresh-process trash matrix"]
     fn trash_fresh_process_kill_and_retry_matrix() {
         if let Some(role) = env::var_os(TRASH_PROCESS_ROLE) {
             let root_path = PathBuf::from(env::var_os(TRASH_PROCESS_ROOT).unwrap());
@@ -5471,6 +5472,7 @@ mod tests {
             let mut mutator = ChildGuard::new(
                 Command::new(env::current_exe().unwrap())
                     .arg(TRASH_PROCESS_TEST)
+                    .arg("--ignored")
                     .arg("--exact")
                     .arg("--nocapture")
                     .env(TRASH_PROCESS_ROLE, "mutator")
@@ -5510,6 +5512,7 @@ mod tests {
             let mut recovery = ChildGuard::new(
                 Command::new(env::current_exe().unwrap())
                     .arg(TRASH_PROCESS_TEST)
+                    .arg("--ignored")
                     .arg("--exact")
                     .arg("--nocapture")
                     .env(TRASH_PROCESS_ROLE, "recover")
@@ -5553,6 +5556,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "developer-local: exhaustive fresh-process purge matrix"]
     fn purge_fresh_process_kill_and_retry_matrix() {
         if let Some(role) = env::var_os(PURGE_PROCESS_ROLE) {
             let root_path = PathBuf::from(env::var_os(PURGE_PROCESS_ROOT).unwrap());
@@ -5691,6 +5695,7 @@ mod tests {
             let mut mutator = ChildGuard::new(
                 Command::new(env::current_exe().unwrap())
                     .arg(PURGE_PROCESS_TEST)
+                    .arg("--ignored")
                     .arg("--exact")
                     .arg("--nocapture")
                     .env(PURGE_PROCESS_ROLE, "mutator")
@@ -5729,6 +5734,7 @@ mod tests {
             let mut recovery = ChildGuard::new(
                 Command::new(env::current_exe().unwrap())
                     .arg(PURGE_PROCESS_TEST)
+                    .arg("--ignored")
                     .arg("--exact")
                     .arg("--nocapture")
                     .env(PURGE_PROCESS_ROLE, "recover")
