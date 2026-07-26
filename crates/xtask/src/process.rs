@@ -342,6 +342,7 @@ fn spawn_capture_thread(
                 }
             }
         }
+        drop(reader);
         let _ = sender.send(CaptureResult {
             stream,
             bytes,
@@ -353,21 +354,47 @@ fn spawn_capture_thread(
 
 fn drain_capture_results(receiver: &Receiver<CaptureResult>, captured: &mut CapturedOutput) {
     while let Ok(result) = receiver.try_recv() {
-        captured.overflowed |= result.overflowed;
-        if captured.read_error.is_none() {
-            captured.read_error = result.read_error;
-        }
-        match result.stream {
-            CaptureStream::Stdout => captured.stdout = Some(result.bytes),
-            CaptureStream::Stderr => captured.stderr = Some(result.bytes),
-        }
+        merge_capture_result(result, captured);
     }
 }
 
 fn finish_capture_threads(captures: CaptureThreads, captured: &mut CapturedOutput) {
-    let _ = captures.stdout_thread.join();
-    let _ = captures.stderr_thread.join();
+    let _ = await_capture_results(&captures, captured, CAPTURE_CLOSEOUT_TIMEOUT);
+    // A reader closes its pipe before publishing its final result. After the
+    // bounded wait, detach any stalled reader instead of making the process
+    // runner's advertised deadline depend on a descendant-held pipe.
+    drop(captures.stdout_thread);
+    drop(captures.stderr_thread);
     drain_capture_results(&captures.receiver, captured);
+}
+
+fn await_capture_results(
+    captures: &CaptureThreads,
+    captured: &mut CapturedOutput,
+    timeout: Duration,
+) -> bool {
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return false;
+    };
+    while (captured.stdout.is_none() || captured.stderr.is_none()) && Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match captures.receiver.recv_timeout(remaining) {
+            Ok(result) => merge_capture_result(result, captured),
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    captured.stdout.is_some() && captured.stderr.is_some()
+}
+
+fn merge_capture_result(result: CaptureResult, captured: &mut CapturedOutput) {
+    captured.overflowed |= result.overflowed;
+    if captured.read_error.is_none() {
+        captured.read_error = result.read_error;
+    }
+    match result.stream {
+        CaptureStream::Stdout => captured.stdout = Some(result.bytes),
+        CaptureStream::Stderr => captured.stderr = Some(result.bytes),
+    }
 }
 
 fn finish_capture_threads_after_exit(
@@ -375,20 +402,10 @@ fn finish_capture_threads_after_exit(
     captures: CaptureThreads,
     captured: &mut CapturedOutput,
 ) -> anyhow::Result<()> {
-    let closeout_deadline = Instant::now() + CAPTURE_CLOSEOUT_TIMEOUT;
-    while (captured.stdout.is_none() || captured.stderr.is_none())
-        && Instant::now() < closeout_deadline
-    {
-        drain_capture_results(&captures.receiver, captured);
-        if captured.stdout.is_some() && captured.stderr.is_some() {
-            break;
-        }
-        thread::sleep(PROCESS_POLL_INTERVAL);
-    }
-    if captured.stdout.is_none() || captured.stderr.is_none() {
+    if !await_capture_results(&captures, captured, CAPTURE_CLOSEOUT_TIMEOUT) {
         // The direct child has exited, so an open capture pipe can only be
         // retained by a descendant. End that original isolated process tree
-        // before joining the readers.
+        // before bounded reader closeout.
         terminate_process_tree(child);
     }
     finish_capture_threads(captures, captured);
@@ -443,6 +460,20 @@ fn missing_cargo_subcommand_message(tool_name: &str, install_command: &str) -> S
 mod tests {
     use super::*;
 
+    struct SlowDropReader(Duration);
+
+    impl Read for SlowDropReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Drop for SlowDropReader {
+        fn drop(&mut self) {
+            thread::sleep(self.0);
+        }
+    }
+
     fn bounded_policy() -> BoundedOutputPolicy {
         BoundedOutputPolicy {
             scope: "test_process",
@@ -473,6 +504,23 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout, b"stdout");
         assert_eq!(output.stderr, b"stderr");
+    }
+
+    #[test]
+    fn capture_closeout_detaches_instead_of_joining_a_stalled_reader() {
+        let captures = spawn_capture_threads(
+            SlowDropReader(Duration::from_secs(5)),
+            std::io::Cursor::new(Vec::<u8>::new()),
+            16,
+            16,
+        );
+        let mut captured = CapturedOutput::default();
+        let started = Instant::now();
+        finish_capture_threads(captures, &mut captured);
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(captured.stdout.is_none());
+        assert_eq!(captured.stderr, Some(Vec::new()));
     }
 
     #[test]
