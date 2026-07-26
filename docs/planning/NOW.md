@@ -25,8 +25,9 @@ GPU timing remain.
 ## Active Checkpoint
 
 R0 recovery, R1 authority/process cutover, R2 verification right-sizing, R3
-qualification-apparatus deletion, and R4 recovered-work classification are
-complete. V1 resident interaction and per-view LOD is active.
+qualification-apparatus deletion, R4 recovered-work classification, and V1
+resident interaction/per-view LOD are complete. V2 cold complete refinement is
+active.
 
 The damaged linked viewer worktree is repaired and clean at reconstructed
 commit `3dfe9de`. Both live recovery refs resolve to it. Strict `git fsck`,
@@ -45,11 +46,20 @@ only from a geometrically valid fully resident body, and commits once after
 the gesture settles. Stale previews are retired across canonical view,
 project, source, and tool transitions.
 
+Every visible layer now selects LOD independently from its affine cell
+footprint in physical pixels for the actual 3D or cross-section view. Reuse
+requires that projected map to match the installed current or staged target.
+Focused tests, the independent LOD oracle, full app tests, compilation, Clippy,
+and independent review passed. The normal release app also passed the
+real-display resident-navigation, compound-camera, and 103-command
+render-mode/four-panel workflows. Warm resident movement caused no reads,
+decodes, dataset requests, or uploads and idle caused no queue submissions.
+
 The immediate ordered actions are:
 
-1. finish V1 with independent projected-affine LOD per visible view/layer;
-2. close V2 complete-only cold refinement and visible presentation; and
-3. apply and measure the small MIP/DVR/ISO correctness and kernel changes.
+1. close V2 complete-only cold refinement and visible presentation;
+2. apply and measure the small MIP/DVR/ISO correctness and kernel changes; and
+3. land compact native/GPU terminal-failure handling retained from recovery.
 
 No storage-format rewrite is presumed. It requires measured evidence that
 unique byte/decode amplification remains a dominant blocker after runtime

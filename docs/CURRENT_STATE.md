@@ -245,6 +245,19 @@ and MIP/DVR/ISO kernels. A storage-format rewrite is not presumed; it requires
 measurement showing that storage geometry remains a dominant blocker after
 runtime fixes.
 
+The first viewer slice is complete. Transient wheel and drag input no longer
+reconstructs durable application/dataset state per sample, and a preview may
+render only from a complete geometrically valid resident body. Each visible
+layer now chooses LOD from its affine cell footprint in the physical pixels of
+the actual 3D or cross-section view. Installed-target matching prevents stale
+camera reuse, including while refinement is staged. Focused and full tests,
+the independent LOD oracle, compilation, Clippy, independent review, and the
+normal release application's real-display resident-navigation,
+compound-camera, render-mode, and four-panel workflows passed. Warm resident
+navigation caused no reads, decodes, requests, or uploads, and the settled idle
+period caused no queue submissions. The cold complete-refinement slice is now
+active.
+
 No absolute performance, comparison-viewer, successor-completion, or release
 claim follows from current evidence.
 

@@ -1,6 +1,6 @@
 # Development Simplification And Viewer Recovery Plan
 
-Status: ACTIVE — V1 PROJECTED-AFFINE LOD
+Status: ACTIVE — V2 COLD REFINEMENT
 Planning authorization: OWNER GRANTED 2026-07-26
 Implementation authorization: OWNER GRANTED 2026-07-26
 Last reviewed: 2026-07-26
@@ -241,7 +241,7 @@ populations, selectors, receipts, and provenance scaffolding remain rejected.
 
 ### V1 — Resident Interaction And Per-View LOD
 
-Status: ACTIVE — RESIDENT INTERACTION COMPLETE; LOD CUTOVER IN PROGRESS
+Status: COMPLETE
 
 - Keep the current format unless measurement proves it blocks this slice.
 - Make wheel and drag input update bounded hot state without static residency,
@@ -261,10 +261,27 @@ durable camera after drag completion or a short scroll-settle interval. A
 preview never invokes the reducer or demand planner and may reach the renderer
 only when the installed geometrically valid body is completely resident.
 Project/view/tool transitions retire stale previews. The remaining V1 work is
-independent projected-affine scale selection for every visible layer and
-physical view, followed by the real-display exercises.
+closed by the projected-affine scale selection and real-display results below.
+
+The LOD cutover now evaluates each visible layer's affine cell basis in physical
+render pixels. The 3D view uses all volume boundary corners and the actual
+camera projection; cross-sections use their panel-relative axes. Camera-only
+reuse requires the newly projected per-layer target map to equal the installed
+current or staged-refinement map. Presentation readout comes from the resources
+actually shown.
+
+The full application library passed 243 tests with four explicitly ignored,
+the independent LOD oracle passed all seven cases, and compilation, Clippy,
+formatting, and an independent focused review passed. The normal release
+application then passed all three real-display target-fixture workflows:
+resident navigation without validation readback, compound camera smoke, and
+the 103-command render-mode/four-panel exercise. Resident navigation performed
+no physical reads, decodes, dataset requests, or uploads after settlement and
+performed no queue submissions while idle.
 
 ### V2 — Cold Refinement And Complete Presentation
+
+Status: ACTIVE
 
 - Measure unique reads, decodes, uploads, target settlement, and visible
   completeness only.
