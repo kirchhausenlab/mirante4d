@@ -43,8 +43,8 @@ use mirante4d_render_reference::{
 };
 
 use super::{
-    FrameExecutionReport, GpuFrameTiming, GpuTimingTicket, RetainedFrameRenderPolicy,
-    ValidationCapture, ValidationCaptureTicket, WgpuRenderRuntime, WgpuRenderRuntimeConfig,
+    GpuFrameTiming, GpuTimingTicket, RetainedFrameRenderPolicy, ValidationCapture,
+    ValidationCaptureTicket, WgpuRenderRuntime, WgpuRenderRuntimeConfig,
     WgpuRenderRuntimeDiagnostics, WgpuRenderRuntimeError, preflight_static_presentation_layout,
     preflight_static_presentation_layout_update, prepare_static_presentation_layout,
     prepare_static_presentation_layout_update,
@@ -1128,49 +1128,6 @@ fn ep00_volume_facts(
         .expect("the independent EP-00 volume facts are bounded")
 }
 
-#[derive(Default)]
-struct Counters {
-    frames: u64,
-    resources_visited: u64,
-    resources_uploaded: u64,
-    payload_upload_bytes: u64,
-    control_upload_bytes: u64,
-    command_buffers: u64,
-    queue_submissions: u64,
-    max_resources_visited: u64,
-    max_resources_uploaded: u64,
-    max_payload_upload_bytes: u64,
-    max_control_upload_bytes: u64,
-    max_command_buffers: u64,
-    max_queue_submissions: u64,
-    captures: u64,
-}
-
-impl Counters {
-    fn record(&mut self, report: &FrameExecutionReport) {
-        let resources_visited = report.visited_resources() as u64;
-        let resources_uploaded = report.uploaded_resources() as u64;
-        let payload_upload_bytes = report.payload_upload_bytes();
-        let control_upload_bytes = report.control_upload_bytes();
-        let command_buffers = u64::from(report.command_buffers());
-        let queue_submissions = u64::from(report.queue_submissions());
-        self.frames += 1;
-        self.resources_visited += resources_visited;
-        self.resources_uploaded += resources_uploaded;
-        self.payload_upload_bytes += payload_upload_bytes;
-        self.control_upload_bytes += control_upload_bytes;
-        self.command_buffers += command_buffers;
-        self.queue_submissions += queue_submissions;
-        self.max_resources_visited = self.max_resources_visited.max(resources_visited);
-        self.max_resources_uploaded = self.max_resources_uploaded.max(resources_uploaded);
-        self.max_payload_upload_bytes = self.max_payload_upload_bytes.max(payload_upload_bytes);
-        self.max_control_upload_bytes = self.max_control_upload_bytes.max(control_upload_bytes);
-        self.max_command_buffers = self.max_command_buffers.max(command_buffers);
-        self.max_queue_submissions = self.max_queue_submissions.max(queue_submissions);
-        self.captures += u64::from(report.validation_capture().is_some());
-    }
-}
-
 struct ComparisonInput<'a> {
     catalog: &'a DatasetCatalog,
     intent: &'a RenderIntent,
@@ -1183,8 +1140,7 @@ fn execute_and_compare(
     presentation: PresentationToken,
     input: ComparisonInput<'_>,
     deadline: Instant,
-    counters: &mut Counters,
-) -> (ValidationCapture, u8) {
+) -> (ValidationCapture, u8, usize) {
     let report = gpu
         .execute_frame(
             presentation,
@@ -1194,7 +1150,7 @@ fn execute_and_compare(
             input.leases,
         )
         .expect("semantic GPU frame executes");
-    counters.record(&report);
+    let uploaded_resources = report.uploaded_resources();
     let ticket = report
         .validation_capture()
         .expect("qualification enables asynchronous validation capture");
@@ -1203,7 +1159,7 @@ fn execute_and_compare(
         .render(input.catalog, input.intent, input.leases)
         .expect("independent CPU reference renders fixture leases");
     let max_delta = compare_reference(&capture, &reference);
-    (capture, max_delta)
+    (capture, max_delta, uploaded_resources)
 }
 
 fn execute_and_capture(
@@ -1265,7 +1221,7 @@ fn execute_presented_and_capture(
     (presented, capture)
 }
 
-fn sanitize_evidence_text(text: &str) -> String {
+fn sanitize_diagnostic_text(text: &str) -> String {
     let sanitized = text
         .chars()
         .take(256)
@@ -1284,127 +1240,34 @@ fn sanitize_evidence_text(text: &str) -> String {
     }
 }
 
-fn ledger_json(diagnostics: &WgpuRenderRuntimeDiagnostics) -> String {
-    format!(
-        concat!(
-            "{{\"configured_bytes\":{},\"payload_residency_capacity_bytes\":{},",
-            "\"transfer_staging_capacity_bytes\":{},",
-            "\"display_page_table_scratch_capacity_bytes\":{},",
-            "\"peak_payload_residency_bytes\":{},\"peak_transfer_staging_bytes\":{},",
-            "\"peak_display_target_bytes\":{},\"peak_page_table_bytes\":{},",
-            "\"peak_scratch_bytes\":{}}}"
-        ),
-        diagnostics.gpu_budget_bytes(),
-        diagnostics.payload_capacity_bytes(),
-        diagnostics.transfer_capacity_bytes(),
-        diagnostics.other_capacity_bytes(),
+fn assert_qualifying_adapter(diagnostics: &WgpuRenderRuntimeDiagnostics) {
+    assert_eq!(diagnostics.backend(), "Vulkan");
+    assert!(diagnostics.max_buffer_size_bytes() >= 256 * MIB);
+    assert!(diagnostics.max_storage_buffer_binding_size_bytes() >= 256 * MIB);
+    assert!(diagnostics.max_storage_buffers_per_shader_stage() >= 8);
+}
+
+fn assert_gpu_ledger_bounded(diagnostics: &WgpuRenderRuntimeDiagnostics) {
+    assert_eq!(
+        diagnostics
+            .payload_capacity_bytes()
+            .checked_add(diagnostics.transfer_capacity_bytes())
+            .and_then(|sum| sum.checked_add(diagnostics.other_capacity_bytes())),
+        Some(diagnostics.gpu_budget_bytes())
+    );
+    assert!(
         diagnostics
             .peak_resident_payload_bytes()
-            .max(diagnostics.payload_arena_allocated_bytes()),
-        diagnostics.peak_transfer_bytes(),
-        diagnostics.peak_display_target_bytes(),
-        diagnostics.peak_page_table_bytes(),
-        diagnostics.peak_scratch_bytes(),
-    )
-}
-
-fn counters_json(counters: &Counters) -> String {
-    format!(
-        concat!(
-            "{{\"frames\":{},\"resources_visited\":{},\"resources_uploaded\":{},",
-            "\"payload_upload_bytes\":{},\"control_upload_bytes\":{},",
-            "\"command_buffers\":{},\"queue_submissions\":{},",
-            "\"max_resources_visited\":{},\"max_resources_uploaded\":{},",
-            "\"max_payload_upload_bytes\":{},\"max_control_upload_bytes\":{},",
-            "\"max_command_buffers\":{},\"max_queue_submissions\":{}}}"
-        ),
-        counters.frames,
-        counters.resources_visited,
-        counters.resources_uploaded,
-        counters.payload_upload_bytes,
-        counters.control_upload_bytes,
-        counters.command_buffers,
-        counters.queue_submissions,
-        counters.max_resources_visited,
-        counters.max_resources_uploaded,
-        counters.max_payload_upload_bytes,
-        counters.max_control_upload_bytes,
-        counters.max_command_buffers,
-        counters.max_queue_submissions,
-    )
-}
-
-fn emit_evidence(
-    diagnostics: &WgpuRenderRuntimeDiagnostics,
-    counters: &Counters,
-    capacity_diagnostics: &WgpuRenderRuntimeDiagnostics,
-    capacity_counters: &Counters,
-    max_delta: u8,
-) {
-    let frame_budget = super::FrameBudget::interactive();
-    let maximum_extent = WgpuRenderRuntime::maximum_extent();
-    let name = sanitize_evidence_text(diagnostics.adapter_name());
-    let driver = sanitize_evidence_text(diagnostics.driver());
-    let ledger = ledger_json(diagnostics);
-    let main_counters_json = counters_json(counters);
-    let capacity_ledger = ledger_json(capacity_diagnostics);
-    let capacity_counters_json = counters_json(capacity_counters);
-    println!(
-        concat!(
-            "wp09a-evidence-json:{{",
-            "\"schema\":\"mirante4d-wp09a-trusted-gpu-evidence\",",
-            "\"schema_version\":2,",
-            "\"adapter\":{{\"name\":\"{}\",\"backend\":\"{}\",\"driver\":\"{}\",",
-            "\"max_buffer_size_bytes\":{},\"max_storage_buffer_binding_size_bytes\":{},",
-            "\"max_storage_buffers_per_shader_stage\":{}}},",
-            "\"envelope\":{{\"resident_resources_visited\":{},",
-            "\"new_resources_uploaded\":{},\"payload_upload_bytes\":{},",
-            "\"control_upload_bytes\":{},\"command_buffers\":{},",
-            "\"queue_submissions\":{},\"maximum_extent_pixels\":[{},{}]}},",
-            "\"ledger\":{},\"counters\":{},",
-            "\"capacity_ledger\":{},\"capacity_counters\":{},",
-            "\"cases\":{{",
-            "\"semantic_modes_and_dtypes\":[\"mip-u8\",\"dvr-u16\",\"iso-f32\",\"cross-section-u8\"],",
-            "\"semantic_fixture_resources\":24,",
-            "\"semantic_fixture_decoded_bytes_with_validity\":241664,",
-            "\"perspective_expected_image_proved\":true,",
-            "\"full_affine_expected_image_proved\":true,",
-            "\"gradient_iso_attached_expected_image_proved\":true,",
-            "\"gradient_iso_detached_expected_image_proved\":true,",
-            "\"upload_first_resources\":8,\"upload_first_bytes\":8388608,",
-            "\"upload_second_resources\":1,\"upload_second_bytes\":1048576,",
-            "\"work_first_visits\":512,\"work_second_visits\":1,",
-            "\"all_invalid_zero_byte_resident_proved\":true,",
-            "\"cancellation_proved\":true,\"stale_capture_rejected\":true,",
-            "\"stale_frame_rejected_without_submit\":true,",
-            "\"eviction_reupload_proved\":true,",
-            "\"capacity_rejected_without_submit\":true,",
-            "\"lease_release_render_proved\":true,",
-            "\"qualification_extents\":[[1280,720],[1920,1080]]}},",
-            "\"readback\":{{\"captures\":{},\"rgba8_max_delta\":{},\"coverage_exact\":true,",
-            "\"validity_exact\":true,\"selected_hand_facts_exact\":true}},",
-            "\"validation_errors\":[],\"result\":\"passed\"}}"
-        ),
-        name,
-        diagnostics.backend(),
-        driver,
-        diagnostics.max_buffer_size_bytes(),
-        diagnostics.max_storage_buffer_binding_size_bytes(),
-        diagnostics.max_storage_buffers_per_shader_stage(),
-        frame_budget.resident_resources_visited(),
-        frame_budget.new_resources_uploaded(),
-        frame_budget.payload_upload_bytes(),
-        frame_budget.control_upload_bytes(),
-        frame_budget.command_buffers(),
-        frame_budget.queue_submissions(),
-        maximum_extent.width_pixels(),
-        maximum_extent.height_pixels(),
-        ledger,
-        main_counters_json,
-        capacity_ledger,
-        capacity_counters_json,
-        counters.captures,
-        max_delta,
+            .max(diagnostics.payload_arena_allocated_bytes())
+            <= diagnostics.payload_capacity_bytes()
+    );
+    assert!(diagnostics.peak_transfer_bytes() <= diagnostics.transfer_capacity_bytes());
+    assert!(
+        diagnostics
+            .peak_display_target_bytes()
+            .checked_add(diagnostics.peak_page_table_bytes())
+            .and_then(|sum| sum.checked_add(diagnostics.peak_scratch_bytes()))
+            .is_some_and(|peak| peak <= diagnostics.other_capacity_bytes())
     );
 }
 
@@ -2084,14 +1947,12 @@ fn qualification() {
             .with_validation_capture(true),
     ))
     .expect("trusted workstation exposes the qualifying Vulkan adapter");
-    assert_eq!(gpu.diagnostics().backend(), "Vulkan");
-    let mut counters = Counters::default();
+    assert_qualifying_adapter(gpu.diagnostics());
     let extent = RenderExtent::new(96, 96).expect("semantic extent is valid");
     let presentation = gpu
         .register_presentation(extent)
         .expect("qualification presentation registers")
         .token();
-    let mut rgba8_max_delta = 0_u8;
 
     let (mip, mip_requirements) = intent_and_requirements(
         1,
@@ -2102,7 +1963,7 @@ fn qualification() {
         &fixtures.semantic[0],
     );
     let u8_leases = borrowed_leases(&fixtures.semantic[0], &leases, Some(fixtures.missing_u8));
-    let (_, delta) = execute_and_compare(
+    let _ = execute_and_compare(
         &mut gpu,
         presentation,
         ComparisonInput {
@@ -2112,9 +1973,7 @@ fn qualification() {
             leases: &u8_leases,
         },
         deadline,
-        &mut counters,
     );
-    rgba8_max_delta = rgba8_max_delta.max(delta);
 
     let dvr_state = mirante4d_domain::RenderState::dvr(
         SamplingPolicy::VoxelExact,
@@ -2134,7 +1993,7 @@ fn qualification() {
         &fixtures.semantic[1],
     );
     let u16_leases = borrowed_leases(&fixtures.semantic[1], &leases, None);
-    let (_, delta) = execute_and_compare(
+    let _ = execute_and_compare(
         &mut gpu,
         presentation,
         ComparisonInput {
@@ -2144,9 +2003,7 @@ fn qualification() {
             leases: &u16_leases,
         },
         deadline,
-        &mut counters,
     );
-    rgba8_max_delta = rgba8_max_delta.max(delta);
 
     let iso_state =
         mirante4d_domain::RenderState::iso(SamplingPolicy::VoxelExact, IsoShadingPolicy::Flat, 0.5)
@@ -2160,7 +2017,7 @@ fn qualification() {
         &fixtures.semantic[2],
     );
     let f32_leases = borrowed_leases(&fixtures.semantic[2], &leases, None);
-    let (iso_capture, delta) = execute_and_compare(
+    let (iso_capture, _, _) = execute_and_compare(
         &mut gpu,
         presentation,
         ComparisonInput {
@@ -2170,9 +2027,7 @@ fn qualification() {
             leases: &f32_leases,
         },
         deadline,
-        &mut counters,
     );
-    rgba8_max_delta = rgba8_max_delta.max(delta);
 
     let (section, section_requirements) = intent_and_requirements(
         4,
@@ -2182,7 +2037,7 @@ fn qualification() {
         extent,
         &fixtures.semantic[0],
     );
-    let (section_capture, delta) = execute_and_compare(
+    let (section_capture, _, _) = execute_and_compare(
         &mut gpu,
         presentation,
         ComparisonInput {
@@ -2192,9 +2047,7 @@ fn qualification() {
             leases: &u8_leases,
         },
         deadline,
-        &mut counters,
     );
-    rgba8_max_delta = rgba8_max_delta.max(delta);
     assert_eq!(pixel(&section_capture, 16, 79), ([0, 0, 0, 255], 1, 1));
     assert_eq!(pixel(&section_capture, 18, 79), ([0, 0, 0, 0], 1, 0));
     assert_eq!(pixel(&section_capture, 46, 79), ([255, 0, 0, 255], 1, 1));
@@ -2230,7 +2083,6 @@ fn qualification() {
         empty_report.progress().map(FrameProgress::completeness),
         Some(FrameCompleteness::Exact)
     );
-    counters.record(&empty_report);
     let empty_capture = poll_capture(
         &mut gpu,
         empty_report
@@ -2241,7 +2093,7 @@ fn qualification() {
     let empty_reference = ReferenceRenderer::new()
         .render(&catalog, &empty_intent, &[empty_lease])
         .expect("reference renderer accepts all-invalid fixture");
-    rgba8_max_delta = rgba8_max_delta.max(compare_reference(&empty_capture, &empty_reference));
+    let _ = compare_reference(&empty_capture, &empty_reference);
     assert_eq!(
         gpu.diagnostics().resident_payload_bytes(),
         resident_bytes_before_empty,
@@ -2256,7 +2108,7 @@ fn qualification() {
         extent,
         &fixtures.semantic[0],
     );
-    let (_, delta) = execute_and_compare(
+    let _ = execute_and_compare(
         &mut gpu,
         presentation,
         ComparisonInput {
@@ -2266,9 +2118,7 @@ fn qualification() {
             leases: &u8_leases,
         },
         deadline,
-        &mut counters,
     );
-    rgba8_max_delta = rgba8_max_delta.max(delta);
 
     let gradient_iso_state = mirante4d_domain::RenderState::iso(
         SamplingPolicy::SmoothLinear,
@@ -2372,7 +2222,7 @@ fn qualification() {
         extent,
         &fixtures.semantic[2],
     );
-    let (gradient_capture, delta) = execute_and_compare(
+    let (gradient_capture, _, _) = execute_and_compare(
         &mut gpu,
         presentation,
         ComparisonInput {
@@ -2382,9 +2232,7 @@ fn qualification() {
             leases: &f32_leases,
         },
         deadline,
-        &mut counters,
     );
-    rgba8_max_delta = rgba8_max_delta.max(delta);
     assert_eq!(gradient_capture.coverage(), iso_capture.coverage());
     assert_eq!(gradient_capture.validity(), iso_capture.validity());
 
@@ -2499,7 +2347,6 @@ fn qualification() {
         rebuilds_before_atomic_upload,
         "an incomplete hidden cohort must not publish render controls"
     );
-    counters.record(&first_upload);
     let second_upload = gpu
         .execute_prepared_retained_frame_with_policy(
             presentation,
@@ -2543,7 +2390,6 @@ fn qualification() {
         rebuilds_before_atomic_upload + 1,
         "the hidden target publishes controls only with its final volume pass"
     );
-    counters.record(&second_upload);
     let _ = poll_capture(
         &mut gpu,
         second_upload
@@ -2669,9 +2515,6 @@ fn qualification() {
         gpu.diagnostics().control_dense_fallbacks(),
         dense_before_guard_prefetch
     );
-    counters.record(&initial_guard);
-    counters.record(&guard_prefetch);
-    counters.record(&promoted_report);
     let _ = poll_capture(
         &mut gpu,
         promoted_report
@@ -2756,7 +2599,6 @@ fn qualification() {
         cold_checks_after_first_work - cold_checks_before_work < loaded_work_keys.len() as u64,
         "cold coverage seeds from the smaller resident side instead of walking the 32,768-key body"
     );
-    counters.record(&first_work);
     let _ = poll_capture(
         &mut gpu,
         first_work
@@ -2791,7 +2633,6 @@ fn qualification() {
         second_work.control_upload_bytes() <= ((32 + 64) * 4 + 16 * 4) as u64,
         "one progressive addition patches one resource record plus the dynamic prefix"
     );
-    counters.record(&second_work);
     let _ = poll_capture(
         &mut gpu,
         second_work
@@ -2855,7 +2696,6 @@ fn qualification() {
         cold_checks_before_navigation,
         "retained camera navigation must not reseed coverage from either large set"
     );
-    counters.record(&navigation);
     let navigation_ticket = navigation
         .validation_capture()
         .expect("navigation capture exists");
@@ -2899,7 +2739,6 @@ fn qualification() {
         gpu.diagnostics().page_layout_constructions(),
         page_layouts_before_superseding_navigation
     );
-    counters.record(&superseding_navigation);
     assert_eq!(
         gpu.poll_validation_capture(navigation_ticket),
         Err(WgpuRenderRuntimeError::StaleValidationCapture)
@@ -3015,7 +2854,6 @@ fn qualification() {
         pin_keys_before + 2
     );
     assert!(gpu.diagnostics().control_publication_writes() - control_writes_before_delta <= 4);
-    counters.record(&delta_report);
     let _ = poll_capture(
         &mut gpu,
         delta_report
@@ -3046,7 +2884,6 @@ fn qualification() {
             &u8_leases,
         )
         .expect("candidate stale frame executes");
-    counters.record(&stale_report);
     let stale_ticket = stale_report
         .validation_capture()
         .expect("stale ticket exists");
@@ -3067,7 +2904,6 @@ fn qualification() {
             &u8_leases,
         )
         .expect("newer current frame executes");
-    counters.record(&current_report);
     assert_eq!(
         gpu.poll_validation_capture(stale_ticket),
         Err(WgpuRenderRuntimeError::StaleValidationCapture)
@@ -3131,7 +2967,6 @@ fn qualification() {
                 &u8_leases,
             )
             .expect("accepted positive qualification extent renders");
-        counters.record(&report);
         let capture = poll_capture(
             &mut gpu,
             report
@@ -3160,7 +2995,7 @@ fn qualification() {
         perspective_extent,
         &fixtures.semantic[2],
     );
-    let (perspective_capture, delta) = execute_and_compare(
+    let (perspective_capture, _, _) = execute_and_compare(
         &mut gpu,
         presentation,
         ComparisonInput {
@@ -3170,9 +3005,7 @@ fn qualification() {
             leases: &f32_leases,
         },
         deadline,
-        &mut counters,
     );
-    rgba8_max_delta = rgba8_max_delta.max(delta);
     assert_eq!(
         pixel(&perspective_capture, 47, 47),
         ([251, 0, 0, 255], 1, 1),
@@ -3190,7 +3023,7 @@ fn qualification() {
     let affine_lease = affine_leases
         .get(&fixtures.affine)
         .expect("full-affine fixture lease exists");
-    let (affine_capture, delta) = execute_and_compare(
+    let (affine_capture, _, _) = execute_and_compare(
         &mut gpu,
         presentation,
         ComparisonInput {
@@ -3200,9 +3033,7 @@ fn qualification() {
             leases: &[affine_lease],
         },
         deadline,
-        &mut counters,
     );
-    rgba8_max_delta = rgba8_max_delta.max(delta);
     assert_eq!(
         pixel(&affine_capture, 48, 48),
         ([241, 0, 0, 255], 1, 1),
@@ -3222,7 +3053,7 @@ fn qualification() {
         extent,
         &fixtures.semantic[2],
     );
-    let (detached_gradient_capture, delta) = execute_and_compare(
+    let (detached_gradient_capture, _, _) = execute_and_compare(
         &mut gpu,
         presentation,
         ComparisonInput {
@@ -3232,9 +3063,7 @@ fn qualification() {
             leases: &f32_leases,
         },
         deadline,
-        &mut counters,
     );
-    rgba8_max_delta = rgba8_max_delta.max(delta);
     assert_eq!(
         detached_gradient_capture.coverage(),
         gradient_capture.coverage()
@@ -3244,7 +3073,7 @@ fn qualification() {
         gradient_capture.validity()
     );
 
-    let (small_gpu, capacity_counters) = {
+    let small_gpu = {
         let mut small_gpu = pollster::block_on(WgpuRenderRuntime::new(
             WgpuRenderRuntimeConfig::new(SMALL_GPU_BYTES)
                 .expect("small qualification ledger is valid"),
@@ -3254,7 +3083,6 @@ fn qualification() {
             .register_presentation(upload_extent)
             .expect("small-ledger presentation registers")
             .token();
-        let mut capacity_counters = Counters::default();
         for (index, key) in fixtures.upload.iter().enumerate() {
             let (intent, requirements) = intent_and_requirements(
                 100 + index as u64,
@@ -3284,7 +3112,6 @@ fn qualification() {
             assert_eq!(report.uploaded_resources(), 1);
             assert_eq!(report.newly_resident_keys(), &[*key]);
             assert_eq!(report.evicted_keys().len(), usize::from(index >= 8));
-            capacity_counters.record(&report);
         }
         let first_key = fixtures.upload[0];
         let (replacement_intent, replacement_requirements) = intent_and_requirements(
@@ -3317,7 +3144,6 @@ fn qualification() {
         assert_eq!(replacement.uploaded_resources(), 1);
         assert_eq!(replacement.newly_resident_keys(), &[first_key]);
         assert_eq!(replacement.evicted_keys().len(), 1);
-        capacity_counters.record(&replacement);
         assert!(
             small_gpu.diagnostics().resident_payload_bytes()
                 <= small_gpu.diagnostics().payload_capacity_bytes()
@@ -3355,7 +3181,7 @@ fn qualification() {
             small_gpu.diagnostics().queue_submissions(),
             submissions_before_capacity
         );
-        (small_gpu, capacity_counters)
+        small_gpu
     };
 
     drop(u8_leases);
@@ -3391,7 +3217,6 @@ fn qualification() {
             &[],
         )
         .expect("GPU residency remains renderable after all runtime leases are released");
-    counters.record(&lease_release_report);
     let lease_release_capture = poll_capture(
         &mut gpu,
         lease_release_report
@@ -3417,16 +3242,12 @@ fn qualification() {
 
     assert_eq!(gpu.diagnostics().validation_error_count(), 0);
     assert_eq!(small_gpu.diagnostics().validation_error_count(), 0);
+    assert_gpu_ledger_bounded(gpu.diagnostics());
+    assert_gpu_ledger_bounded(small_gpu.diagnostics());
+    assert_qualifying_adapter(small_gpu.diagnostics());
     assert!(
         Instant::now() <= deadline,
         "qualification exceeded its 60-second deadline"
-    );
-    emit_evidence(
-        gpu.diagnostics(),
-        &counters,
-        small_gpu.diagnostics(),
-        &capacity_counters,
-        rgba8_max_delta,
     );
 }
 
@@ -3683,8 +3504,7 @@ fn prove_segmented_payload_upload_and_sampling_cross_the_first_binding() {
         extent,
         &[semantic_key],
     );
-    let mut counters = Counters::default();
-    let (capture, _) = execute_and_compare(
+    let (capture, _, uploaded_resources) = execute_and_compare(
         &mut gpu,
         presentation,
         ComparisonInput {
@@ -3694,11 +3514,10 @@ fn prove_segmented_payload_upload_and_sampling_cross_the_first_binding() {
             leases: &[semantic_lease],
         },
         deadline,
-        &mut counters,
     );
     assert_eq!(capture.coverage(), &[1]);
     assert_eq!(capture.validity(), &[1]);
-    assert_eq!(counters.resources_uploaded, 1);
+    assert_eq!(uploaded_resources, 1);
     assert!(gpu.diagnostics().resident_payload_bytes() > 4 * MIB);
 
     dataset_runtime.request_shutdown().unwrap();
@@ -3833,8 +3652,6 @@ fn multichannel_semantics_are_order_independent() {
             })
             .collect::<Vec<_>>()
     };
-    let mut reference_counters = Counters::default();
-
     let mip_state = mirante4d_domain::RenderState::mip(SamplingPolicy::VoxelExact);
     let mut mip_captures = Vec::new();
     for (frame, order) in [(600_u64, [5_u32, 6_u32]), (601, [6, 5])] {
@@ -3847,7 +3664,7 @@ fn multichannel_semantics_are_order_independent() {
             &keys,
         );
         let case_leases = leases_for(&order);
-        let (capture, delta) = execute_and_compare(
+        let (capture, delta, _) = execute_and_compare(
             &mut gpu,
             presentation,
             ComparisonInput {
@@ -3857,7 +3674,6 @@ fn multichannel_semantics_are_order_independent() {
                 leases: &case_leases,
             },
             deadline,
-            &mut reference_counters,
         );
         assert!(delta <= 1, "multichannel MIP reference delta was {delta}");
         mip_captures.push(capture);
@@ -3880,7 +3696,7 @@ fn multichannel_semantics_are_order_independent() {
             &keys,
         );
         let case_leases = leases_for(&order);
-        let (capture, delta) = execute_and_compare(
+        let (capture, delta, _) = execute_and_compare(
             &mut gpu,
             presentation,
             ComparisonInput {
@@ -3890,7 +3706,6 @@ fn multichannel_semantics_are_order_independent() {
                 leases: &case_leases,
             },
             deadline,
-            &mut reference_counters,
         );
         assert!(
             delta <= 1,
@@ -3925,7 +3740,7 @@ fn multichannel_semantics_are_order_independent() {
             &keys,
         );
         let case_leases = leases_for(&order);
-        let (capture, delta) = execute_and_compare(
+        let (capture, delta, _) = execute_and_compare(
             &mut gpu,
             presentation,
             ComparisonInput {
@@ -3935,7 +3750,6 @@ fn multichannel_semantics_are_order_independent() {
                 leases: &case_leases,
             },
             deadline,
-            &mut reference_counters,
         );
         assert!(delta <= 1, "joint DVR reference delta was {delta}");
         dvr_captures.push(capture);
@@ -3976,8 +3790,7 @@ fn multichannel_semantics_are_order_independent() {
             )],
             &[key],
         );
-        let mut counters = Counters::default();
-        let (capture, delta) = execute_and_compare(
+        let (capture, delta, _) = execute_and_compare(
             &mut gpu,
             presentation,
             ComparisonInput {
@@ -3987,7 +3800,6 @@ fn multichannel_semantics_are_order_independent() {
                 leases: &leases_for(&[5]),
             },
             deadline,
-            &mut counters,
         );
         assert!(
             delta <= 1,
@@ -4057,7 +3869,7 @@ fn multichannel_semantics_are_order_independent() {
             &keys,
         );
         let case_leases = leases_for(&order);
-        let (capture, delta) = execute_and_compare(
+        let (capture, delta, _) = execute_and_compare(
             &mut gpu,
             presentation,
             ComparisonInput {
@@ -4067,7 +3879,6 @@ fn multichannel_semantics_are_order_independent() {
                 leases: &case_leases,
             },
             deadline,
-            &mut reference_counters,
         );
         assert!(delta <= 1, "SmoothLinear DVR reference delta was {delta}");
         smooth_dvr_captures.push(capture);
@@ -4092,7 +3903,7 @@ fn multichannel_semantics_are_order_independent() {
             &keys,
         );
         let case_leases = leases_for(&order);
-        let (capture, delta) = execute_and_compare(
+        let (capture, delta, _) = execute_and_compare(
             &mut gpu,
             presentation,
             ComparisonInput {
@@ -4102,7 +3913,6 @@ fn multichannel_semantics_are_order_independent() {
                 leases: &case_leases,
             },
             deadline,
-            &mut reference_counters,
         );
         assert!(delta <= 1, "mixed-affine DVR reference delta was {delta}");
         mixed_affine_dvr_captures.push(capture);
@@ -4130,7 +3940,7 @@ fn multichannel_semantics_are_order_independent() {
             &keys,
         );
         let case_leases = leases_for(&order);
-        let (capture, delta) = execute_and_compare(
+        let (capture, delta, _) = execute_and_compare(
             &mut gpu,
             presentation,
             ComparisonInput {
@@ -4140,7 +3950,6 @@ fn multichannel_semantics_are_order_independent() {
                 leases: &case_leases,
             },
             deadline,
-            &mut reference_counters,
         );
         assert!(delta <= 1, "depth-sorted ISO reference delta was {delta}");
         iso_captures.push(capture);
@@ -4200,8 +4009,7 @@ fn multichannel_semantics_are_order_independent() {
             &keys,
         );
         let case_leases = leases_for(&layer_ordinals);
-        let mut counters = Counters::default();
-        let (capture, delta) = execute_and_compare(
+        let (capture, delta, _) = execute_and_compare(
             &mut gpu,
             presentation,
             ComparisonInput {
@@ -4211,7 +4019,6 @@ fn multichannel_semantics_are_order_independent() {
                 leases: &case_leases,
             },
             deadline,
-            &mut counters,
         );
         assert!(delta <= 1, "mixed-mode view-order delta was {delta}");
         mixed_captures.push(capture);
@@ -4622,8 +4429,8 @@ fn resident_volume_gpu_timing() {
     assert!(timing_off_second_upload.cpu_timing().is_none());
     assert!(timing_off_second_upload.gpu_timing().is_none());
 
-    let adapter = sanitize_evidence_text(gpu.diagnostics().adapter_name());
-    let driver = sanitize_evidence_text(gpu.diagnostics().driver());
+    let adapter = sanitize_diagnostic_text(gpu.diagnostics().adapter_name());
+    let driver = sanitize_diagnostic_text(gpu.diagnostics().driver());
     if gpu.diagnostics().gpu_timestamps_supported() {
         let mut frame = 501_u64;
         let mut distributions = Vec::new();
@@ -5096,7 +4903,7 @@ fn queue_write_batch_envelope_gpu_timing_control() {
     {
         println!(
             "mirante4d-ep00-queue-write-envelope-control-json:{{\"schema\":\"mirante4d-queue-write-envelope-control-v1\",\"adapter\":\"{}\",\"result\":\"timestamps-unavailable\"}}",
-            sanitize_evidence_text(&info.name),
+            sanitize_diagnostic_text(&info.name),
         );
         return;
     }
@@ -5201,7 +5008,7 @@ fn queue_write_batch_envelope_gpu_timing_control() {
             "\"enclosing_interval_detected_queue_write\":true,",
             "\"result\":\"measured\"}}"
         ),
-        sanitize_evidence_text(&info.name),
+        sanitize_diagnostic_text(&info.name),
         CONTROL_BYTES,
         TRIALS,
         no_control_ns,
@@ -5249,14 +5056,14 @@ fn payload_buffer_vs_texture_gpu_timing() {
     if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
         println!(
             "{{\"schema\":\"mirante4d-payload-representation-v1\",\"adapter\":\"{}\",\"gpu_timestamps\":false,\"result\":\"timestamps-unavailable\"}}",
-            sanitize_evidence_text(&info.name),
+            sanitize_diagnostic_text(&info.name),
         );
         return;
     }
     if !filterable_r32 {
         println!(
             "{{\"schema\":\"mirante4d-payload-representation-v1\",\"adapter\":\"{}\",\"gpu_timestamps\":true,\"filterable_r32float\":false,\"result\":\"filterable-texture-unavailable\"}}",
-            sanitize_evidence_text(&info.name),
+            sanitize_diagnostic_text(&info.name),
         );
         return;
     }
@@ -5640,8 +5447,8 @@ fn sample_payload(x: u32, y: u32, z: u32) -> f32 {
             "\"buffer_over_texture_p50_ratio\":{:.3},",
             "\"scope\":\"f32-all-valid-voxel-exact-fetch-only\",\"result\":\"measured\"}}"
         ),
-        sanitize_evidence_text(&info.name),
-        sanitize_evidence_text(&info.driver_info),
+        sanitize_diagnostic_text(&info.name),
+        sanitize_diagnostic_text(&info.driver_info),
         buffer_ns,
         buffer_p50,
         texture_ns,
