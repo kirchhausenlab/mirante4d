@@ -41,7 +41,7 @@ use std::{fmt::Display, hash::Hash, time::Duration};
 
 use eframe::egui::{self, Color32, RichText};
 use mirante4d_application::{
-    ApplicationCommand, ApplicationEvent, CrossSectionPanelId, OperationOutcome,
+    ApplicationCommand, ApplicationEvent, CameraView, CrossSectionPanelId, OperationOutcome,
     PresentationPaintRequest, PresentationSlot, PresentationSurface, PresentationViewport,
     ProjectGenerationId, ProjectId, RenderExtent, ResourcePolicy, VolumePickQuery,
     import_workflow::{
@@ -59,6 +59,7 @@ const U8_SENTINEL_POLICY_DESCRIPTION: &str =
 #[derive(Debug)]
 pub struct EguiUiState {
     pub viewport_orbit_drag: Option<ViewportOrbitDrag>,
+    viewport_camera_gesture: Option<ViewportCameraGestureState<CameraView>>,
     pub analysis_plot_view: Option<AnalysisPlotViewRange>,
     pub analysis_filter: String,
     pub analysis_sort: Option<AnalysisTableSort>,
@@ -79,6 +80,7 @@ impl EguiUiState {
     pub fn new(cpu_dataset_budget_bytes: u64, gpu_budget_bytes: u64) -> Self {
         Self {
             viewport_orbit_drag: None,
+            viewport_camera_gesture: None,
             analysis_plot_view: None,
             analysis_filter: String::new(),
             analysis_sort: None,
@@ -98,6 +100,98 @@ impl EguiUiState {
             import_checkpoint_retry_id: None,
         }
     }
+
+    /// Drops an unfinished transient camera interaction.
+    ///
+    /// The composition root should call this when it replaces the active
+    /// dataset or view through a path other than the matching camera commit.
+    pub fn cancel_viewport_camera_interaction(&mut self) {
+        self.viewport_orbit_drag = None;
+        self.viewport_camera_gesture = None;
+    }
+
+    /// Returns the latest transient camera while a viewport gesture is active.
+    pub fn viewport_camera_preview(&self) -> Option<CameraView> {
+        self.viewport_camera_gesture
+            .map(|gesture| gesture.latest_camera())
+    }
+
+    fn synchronize_viewport_camera(&mut self, durable_camera: CameraView) {
+        if self
+            .viewport_camera_gesture
+            .is_some_and(|gesture| gesture.durable_camera() != durable_camera)
+        {
+            self.cancel_viewport_camera_interaction();
+        }
+    }
+
+    fn effective_viewport_camera(&self, durable_camera: CameraView) -> CameraView {
+        latest_viewport_camera(self.viewport_camera_gesture, durable_camera)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ViewportCameraGestureState<C> {
+    kind: ViewportCameraGestureKind,
+    durable_camera: C,
+    latest_camera: C,
+    last_input_time_seconds: f64,
+}
+
+impl<C: Copy> ViewportCameraGestureState<C> {
+    const fn new(
+        kind: ViewportCameraGestureKind,
+        durable_camera: C,
+        latest_camera: C,
+        last_input_time_seconds: f64,
+    ) -> Self {
+        Self {
+            kind,
+            durable_camera,
+            latest_camera,
+            last_input_time_seconds,
+        }
+    }
+
+    const fn kind(self) -> ViewportCameraGestureKind {
+        self.kind
+    }
+
+    const fn durable_camera(self) -> C {
+        self.durable_camera
+    }
+
+    const fn latest_camera(self) -> C {
+        self.latest_camera
+    }
+
+    const fn last_input_time_seconds(self) -> f64 {
+        self.last_input_time_seconds
+    }
+
+    fn update(
+        &mut self,
+        kind: ViewportCameraGestureKind,
+        latest_camera: C,
+        last_input_time_seconds: f64,
+    ) {
+        self.kind = kind;
+        self.latest_camera = latest_camera;
+        self.last_input_time_seconds = last_input_time_seconds;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewportCameraGestureKind {
+    Drag,
+    Scroll,
+}
+
+fn latest_viewport_camera<C: Copy>(
+    gesture: Option<ViewportCameraGestureState<C>>,
+    durable_camera: C,
+) -> C {
+    gesture.map_or(durable_camera, |gesture| gesture.latest_camera())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -517,6 +611,28 @@ impl CrossSectionReadoutRequest {
     }
 }
 
+/// One coalesced camera interaction emitted by the 3D viewport.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ViewportCameraInteraction {
+    /// Updates bounded UI/render hot state without dispatching the application
+    /// reducer or rebuilding durable project history.
+    Preview(CameraView),
+    /// Commits the latest camera once after the pointer gesture settles.
+    Commit(CameraView),
+}
+
+impl ViewportCameraInteraction {
+    pub const fn camera(self) -> CameraView {
+        match self {
+            Self::Preview(camera) | Self::Commit(camera) => camera,
+        }
+    }
+
+    pub const fn is_commit(self) -> bool {
+        matches!(self, Self::Commit(_))
+    }
+}
+
 /// Typed results emitted while egui builds one visible workbench frame.
 ///
 /// Commands retain their existing post-build batching behavior. Actions and
@@ -525,6 +641,7 @@ impl CrossSectionReadoutRequest {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkbenchUiOutput {
     pub application_commands: Vec<ApplicationCommand>,
+    pub viewport_camera_interaction: Option<ViewportCameraInteraction>,
     pub import_commands: Vec<ImportCommand>,
     pub actions: Vec<WorkbenchUiAction>,
     pub viewport_observations: Vec<ViewportObservation>,
@@ -1347,6 +1464,7 @@ mod tests {
             }
         );
         assert!(state.viewport_orbit_drag.is_none());
+        assert!(state.viewport_camera_preview().is_none());
         assert!(state.analysis_filter.is_empty());
         assert!(!state.runtime_diagnostics_open);
         assert!(!state.close_prompt_open);
@@ -1359,6 +1477,7 @@ mod tests {
     fn workbench_output_contains_only_typed_ui_results() {
         let output = WorkbenchUiOutput {
             application_commands: vec![ApplicationCommand::SetPlaybackActive(true)],
+            viewport_camera_interaction: None,
             import_commands: vec![ImportCommand::CancelImport],
             actions: vec![
                 WorkbenchUiAction::OpenDatasetDialog,
@@ -1419,6 +1538,17 @@ mod tests {
         assert!(output.presentation_paints.is_empty());
         assert!(output.rerender_requested);
         assert!(!output.texture_refresh_requested);
+    }
+
+    #[test]
+    fn active_camera_gesture_uses_only_its_latest_preview() {
+        let mut gesture =
+            ViewportCameraGestureState::new(ViewportCameraGestureKind::Scroll, 10_u8, 11_u8, 1.0);
+
+        assert_eq!(latest_viewport_camera(Some(gesture), 10), 11);
+        gesture.update(ViewportCameraGestureKind::Scroll, 12, 1.1);
+        assert_eq!(latest_viewport_camera(Some(gesture), 10), 12);
+        assert_eq!(gesture.durable_camera(), 10);
     }
     use mirante4d_application::{PresentationSurface, PresentationViewport};
 

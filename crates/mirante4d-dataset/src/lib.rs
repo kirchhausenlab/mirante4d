@@ -12,7 +12,7 @@ use mirante4d_domain::{
     GridToWorld, IntensityDType, LogicalLayerKey, ScaleLevel, Shape3D, Shape4D, ShapeError,
     TimeIndex,
 };
-use mirante4d_identity::{ScientificContentId, Sha256Digest, Sha256Hasher};
+use mirante4d_identity::ScientificContentId;
 use thiserror::Error;
 
 pub const MAX_DATASET_LABEL_BYTES: usize = 256;
@@ -166,69 +166,6 @@ impl DatasetResourceKey {
     pub const fn region(self) -> ResourceRegion {
         self.region
     }
-}
-
-const CANONICAL_DATASET_RESOURCE_UNION_HASH_DOMAIN: &[u8] = b"mirante4d-ep00-resource-union-v1\0";
-
-/// Incremental canonical commitment over sorted semantic resource keys and
-/// their exact payload byte lengths.
-///
-/// The caller supplies unique entries in `DatasetResourceKey` order. The
-/// builder deliberately retains no entries so diagnostic partitions can be
-/// committed without another resource-sized allocation.
-pub struct CanonicalDatasetResourceUnionHasher {
-    hasher: Sha256Hasher,
-}
-
-impl CanonicalDatasetResourceUnionHasher {
-    pub fn new() -> Self {
-        let mut hasher = Sha256Hasher::new();
-        hasher.update(CANONICAL_DATASET_RESOURCE_UNION_HASH_DOMAIN);
-        Self { hasher }
-    }
-
-    pub fn push(&mut self, key: DatasetResourceKey, payload_bytes: u64) {
-        match key.identity() {
-            DatasetResourceIdentity::Unverified(source) => {
-                self.hasher.update([0]);
-                self.hasher.update(source.get().to_le_bytes());
-            }
-            DatasetResourceIdentity::Verified(scientific) => {
-                self.hasher.update([1]);
-                self.hasher.update(scientific.digest().as_bytes());
-            }
-        }
-        self.hasher.update(key.layer().ordinal().to_le_bytes());
-        self.hasher.update(key.timepoint().get().to_le_bytes());
-        self.hasher.update(key.scale().get().to_le_bytes());
-        for coordinate in key.region().origin() {
-            self.hasher.update(coordinate.to_le_bytes());
-        }
-        for dimension in key.region().shape().dimensions() {
-            self.hasher.update(dimension.to_le_bytes());
-        }
-        self.hasher.update(payload_bytes.to_le_bytes());
-    }
-
-    pub fn finalize(self) -> Sha256Digest {
-        self.hasher.finalize()
-    }
-}
-
-impl Default for CanonicalDatasetResourceUnionHasher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub fn canonical_dataset_resource_union_sha256(
-    entries: &[(DatasetResourceKey, u64)],
-) -> Sha256Digest {
-    let mut hasher = CanonicalDatasetResourceUnionHasher::new();
-    for (key, payload_bytes) in entries {
-        hasher.push(*key, *payload_bytes);
-    }
-    hasher.finalize()
 }
 
 /// Effective validity representation for one semantic resource.
@@ -1501,25 +1438,6 @@ mod tests {
             ScaleLevel::new(1),
             ResourceRegion::new([0, 1, 1], Shape3D::new(1, 1, 2).unwrap()).unwrap(),
         )
-    }
-
-    #[test]
-    fn canonical_resource_union_commitment_is_stable_and_incremental() {
-        let key = resource_key(scientific_id('1'));
-        let entries = [(key, 5)];
-        let expected = "266b0b4cb1e30b657d93644a97d310d6e1ccfe86142885f882367bc6bb4f664e";
-        assert_eq!(
-            canonical_dataset_resource_union_sha256(&entries).to_string(),
-            expected
-        );
-
-        let mut incremental = CanonicalDatasetResourceUnionHasher::new();
-        incremental.push(key, 5);
-        assert_eq!(incremental.finalize().to_string(), expected);
-        assert_ne!(
-            canonical_dataset_resource_union_sha256(&[(key, 6)]).to_string(),
-            expected
-        );
     }
 
     #[test]

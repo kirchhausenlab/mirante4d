@@ -4,11 +4,10 @@ use mirante4d_render_api::{MAX_RENDER_LAYERS, PresentationViewport, RenderExtent
 
 use crate::PresentationSlot;
 
-/// Bounded claim-bearing timing history. The frozen viewer qualification
-/// schedule can keep an input/loading phase active for thirty seconds while
-/// collecting up to 480 distributed input samples, so the former 256-entry
-/// ring could not retain one complete declared phase. 4096 covers that exact
-/// schedule with polling headroom while keeping recording allocation-free.
+/// Bounded timing history for long interactive or loading sequences.
+///
+/// The capacity matches the product automation input-sequence bound while
+/// keeping recording allocation-free.
 pub const DISPLAY_TIMING_SAMPLE_CAPACITY: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,19 +343,6 @@ impl DisplayTimingSamples {
     }
 }
 
-/// Opt-in counters whose additional detail is reserved for qualification and
-/// product automation. The always-on generation/heartbeat facts above remain
-/// available even while this surface is disabled.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DisplayDiagnosticCounters {
-    pub enabled: bool,
-    pub raw_input_samples: u64,
-    pub admitted_input_generations: u64,
-    pub coalesced_input_samples: u64,
-    pub superseded_input_generations: u64,
-    pub current_presentations: u64,
-}
-
 impl ResidentRenderFailureStatus {
     pub fn new(kind: FrameFailureKind, message: impl Into<String>) -> Self {
         Self {
@@ -486,7 +472,6 @@ pub struct RenderCoordinationState {
     pub last_display_refresh_timing: Option<DisplayRefreshTiming>,
     surfaces: [RenderSurfaceState; 4],
     display_generation: DisplayGenerationStatus,
-    display_diagnostic_counters: DisplayDiagnosticCounters,
     last_main_loop_heartbeat_at_ns: Option<u64>,
     active_last_main_loop_heartbeat_at_ns: Option<u64>,
     presentation_latency_samples: DisplayTimingSamples,
@@ -516,7 +501,6 @@ impl RenderCoordinationState {
                 RenderSurfaceState::new(true),
             ],
             display_generation: DisplayGenerationStatus::default(),
-            display_diagnostic_counters: DisplayDiagnosticCounters::default(),
             last_main_loop_heartbeat_at_ns: None,
             active_last_main_loop_heartbeat_at_ns: None,
             presentation_latency_samples: DisplayTimingSamples::default(),
@@ -529,10 +513,6 @@ impl RenderCoordinationState {
 
     pub const fn display_generation(&self) -> DisplayGenerationStatus {
         self.display_generation
-    }
-
-    pub const fn display_diagnostic_counters(&self) -> DisplayDiagnosticCounters {
-        self.display_diagnostic_counters
     }
 
     pub const fn presentation_latency_samples(&self) -> &DisplayTimingSamples {
@@ -563,34 +543,9 @@ impl RenderCoordinationState {
         self.active_ui_update_duration_samples.record(duration_ns);
     }
 
-    pub fn set_display_diagnostic_counters_enabled(&mut self, enabled: bool) {
-        self.display_diagnostic_counters.enabled = enabled;
-    }
-
-    /// Records one admitted effective display input. Replacing a generation
-    /// before it becomes current is counted as supersession only when the
-    /// detailed diagnostics surface is enabled.
+    /// Records one admitted effective display input.
     pub fn begin_display_input_generation(&mut self, now_ns: u64) -> u64 {
         let previous = self.display_generation.input_generation;
-        if self.display_diagnostic_counters.enabled {
-            self.display_diagnostic_counters.raw_input_samples = self
-                .display_diagnostic_counters
-                .raw_input_samples
-                .saturating_add(1);
-            self.display_diagnostic_counters.admitted_input_generations = self
-                .display_diagnostic_counters
-                .admitted_input_generations
-                .saturating_add(1);
-            if previous > 0
-                && self.display_generation.current_presentation_generation != Some(previous)
-            {
-                self.display_diagnostic_counters
-                    .superseded_input_generations = self
-                    .display_diagnostic_counters
-                    .superseded_input_generations
-                    .saturating_add(1);
-            }
-        }
         self.display_generation.input_generation = previous.saturating_add(1);
         self.display_generation.heartbeat_at_input_generation =
             self.display_generation.main_loop_heartbeat;
@@ -600,23 +555,6 @@ impl RenderCoordinationState {
         self.display_generation.current_main_loop_heartbeat_gap_ns = 0;
         self.active_last_main_loop_heartbeat_at_ns = Some(now_ns);
         self.display_generation.input_generation
-    }
-
-    /// Adds raw samples that were intentionally folded into a later admitted
-    /// generation. This is used by bounded framework-command automation; it
-    /// does not claim or imply operating-system input injection.
-    pub fn record_coalesced_input_samples(&mut self, samples: u64) {
-        if !self.display_diagnostic_counters.enabled {
-            return;
-        }
-        self.display_diagnostic_counters.raw_input_samples = self
-            .display_diagnostic_counters
-            .raw_input_samples
-            .saturating_add(samples);
-        self.display_diagnostic_counters.coalesced_input_samples = self
-            .display_diagnostic_counters
-            .coalesced_input_samples
-            .saturating_add(samples);
     }
 
     pub fn record_durable_gesture_commit(&mut self) {
@@ -676,11 +614,9 @@ impl RenderCoordinationState {
             .display_generation
             .maximum_presentation_gap_ns
             .max(gap_ns);
-        if self.display_diagnostic_counters.enabled {
-            self.active_main_loop_gap_samples
-                .record(active_heartbeat_gap_ns);
-            self.active_presentation_gap_samples.record(gap_ns);
-        }
+        self.active_main_loop_gap_samples
+            .record(active_heartbeat_gap_ns);
+        self.active_presentation_gap_samples.record(gap_ns);
     }
 
     /// Marks the newest admitted generation current. Repeated progressive
@@ -701,12 +637,6 @@ impl RenderCoordinationState {
         if generation > 0 {
             self.presentation_latency_samples
                 .record(now_ns.saturating_sub(self.display_generation.input_generation_at_ns));
-        }
-        if generation > 0 && self.display_diagnostic_counters.enabled {
-            self.display_diagnostic_counters.current_presentations = self
-                .display_diagnostic_counters
-                .current_presentations
-                .saturating_add(1);
         }
     }
 
@@ -1106,7 +1036,6 @@ mod tests {
     #[test]
     fn display_generation_heartbeat_exposes_and_clears_current_presentation_gap() {
         let mut state = coordination_state();
-        state.set_display_diagnostic_counters_enabled(true);
         assert_eq!(state.begin_display_input_generation(100), 1);
         state.record_main_loop_heartbeat(120);
         state.record_main_loop_heartbeat(150);
@@ -1135,35 +1064,6 @@ mod tests {
         assert_eq!(state.active_main_loop_gap_samples().sample(1), Some(30));
         assert_eq!(state.active_presentation_gap_samples().sample(0), Some(20));
         assert_eq!(state.active_presentation_gap_samples().sample(1), Some(50));
-    }
-
-    #[test]
-    fn detailed_generation_counters_are_opt_in_and_count_supersession() {
-        let mut state = coordination_state();
-        state.begin_display_input_generation(1);
-        assert_eq!(
-            state.display_diagnostic_counters(),
-            DisplayDiagnosticCounters::default()
-        );
-
-        state.set_display_diagnostic_counters_enabled(true);
-        state.begin_display_input_generation(2);
-        state.record_coalesced_input_samples(3);
-        state.begin_display_input_generation(3);
-        state.record_durable_gesture_commit();
-        state.record_current_presentation(4);
-        assert_eq!(
-            state.display_diagnostic_counters(),
-            DisplayDiagnosticCounters {
-                enabled: true,
-                raw_input_samples: 5,
-                admitted_input_generations: 2,
-                coalesced_input_samples: 3,
-                superseded_input_generations: 2,
-                current_presentations: 1,
-            }
-        );
-        assert_eq!(state.display_generation().durable_gesture_commits, 1);
     }
 
     #[test]

@@ -3497,12 +3497,10 @@ fn multi_presentation_pins_are_union_scoped_and_deactivatable() {
 
     let residency_epoch_before_retirement = gpu.residency_epoch();
     let invalidation_epoch_before_retirement = gpu.residency_invalidation_epoch();
-    assert!(gpu.resident_keys().len() > 0);
     assert!(gpu.resident_payload_bytes() > 0);
 
     gpu.retire_dataset_generation();
 
-    assert_eq!(gpu.resident_keys().len(), 0);
     assert_eq!(gpu.resident_payload_bytes(), 0);
     assert_eq!(gpu.diagnostics().empty_resident_metadata_records(), 0);
     assert!(gpu.residency_epoch() > residency_epoch_before_retirement);

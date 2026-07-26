@@ -9,8 +9,8 @@ use std::{
 use eframe::egui;
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationSnapshot, CommandEffect, CrossSectionPanelId,
-    OperationKind, OperationToken, PresentationSlot, ProjectStoreLifecycle,
-    SourceVerificationSnapshot, WorkspaceSnapshot,
+    OperationToken, PresentationSlot, ProjectStoreLifecycle, SourceVerificationSnapshot,
+    WorkspaceSnapshot,
     import_workflow::{
         ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportWorkflowSnapshot,
     },
@@ -23,10 +23,6 @@ use mirante4d_application::{
         orbit_camera, pan_camera, zoom_camera,
     },
 };
-use mirante4d_dataset::{
-    CanonicalDatasetResourceUnionHasher, DatasetResourceKey,
-    canonical_dataset_resource_union_sha256 as canonical_resource_union_sha256,
-};
 use mirante4d_domain::{
     CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer, IsoShadingPolicy,
     LayerTransfer, Opacity, Projection, RenderMode, RenderState, SamplingPolicy, TimeIndex,
@@ -34,7 +30,7 @@ use mirante4d_domain::{
 };
 use mirante4d_import_pipeline::{ImportReceipt, ImportStatistics, TiffSource};
 use mirante4d_project_model::{LayerViewState, ProjectRevisionId};
-use mirante4d_render_api::{PresentationViewport, RenderExtent, RenderPassKind, VolumePickQuery};
+use mirante4d_render_api::{RenderExtent, VolumePickQuery};
 use mirante4d_storage::ScientificPublicationTransferEvidence;
 use mirante4d_ui_egui::{ViewerPickPurpose, ViewerPickRequest};
 use rustix::time::{ClockId, clock_gettime};
@@ -43,13 +39,8 @@ use serde_json::{Value, json};
 
 use crate::{
     DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
-    MiranteWorkbenchApp, application_view,
-    import_worker_service::{ImportWorkerDiagnostics, ImportWorkerTimingOrigin},
-    native_presentation::{
-        PresentedFrameIntervalSample, ProductGpuExecutionIdentity, ProductGpuExecutionTiming,
-    },
-    set_render_viewport,
-    viewer_layout::PanelId,
+    MiranteWorkbenchApp, application_view, import_worker_service::ImportWorkerTimingOrigin,
+    set_render_viewport, viewer_layout::PanelId,
 };
 
 mod capture;
@@ -115,105 +106,6 @@ fn product_presentation(
         .as_ref()
 }
 
-#[derive(Clone, Copy)]
-struct ActiveViewGpuExecutionFacts {
-    identity: ProductGpuExecutionIdentity,
-    target: mirante4d_render_api::PresentationToken,
-    renderer_frame: mirante4d_render_api::FrameIdentity,
-    display_generation: u64,
-    pass_kind: RenderPassKind,
-}
-
-fn exact_current_gpu_timing_identity(
-    current_generation: u64,
-    expected_panel: PanelId,
-    expected_pass_kind: RenderPassKind,
-    execution: Option<ActiveViewGpuExecutionFacts>,
-    intervals: &std::collections::VecDeque<PresentedFrameIntervalSample>,
-) -> Option<ProductGpuExecutionIdentity> {
-    let execution = execution?;
-    let identity = execution.identity;
-    if identity.execution_id == 0
-        || identity.target.get() == 0
-        || identity.target != execution.target
-        || identity.renderer_frame != execution.renderer_frame
-        || identity.display_generation != execution.display_generation
-        || identity.pass_kind != execution.pass_kind
-        || execution.display_generation != current_generation
-        || execution.pass_kind != expected_pass_kind
-    {
-        return None;
-    }
-    intervals
-        .iter()
-        .rev()
-        .any(|sample| sample.panel == expected_panel && sample.gpu_execution == Some(identity))
-        .then_some(identity)
-}
-
-fn captured_gpu_timing_complete(
-    expected_panel: PanelId,
-    identity: ProductGpuExecutionIdentity,
-    intervals: &std::collections::VecDeque<PresentedFrameIntervalSample>,
-) -> Option<bool> {
-    intervals
-        .iter()
-        .rev()
-        .find(|sample| sample.panel == expected_panel && sample.gpu_execution == Some(identity))
-        .map(|sample| sample.gpu_timing.is_some())
-}
-
-fn active_view_gpu_timing_candidate(
-    app: &MiranteWorkbenchApp,
-    target: ProductAutomationGpuTarget,
-    pass_kind: ProductAutomationGpuPassKind,
-) -> Option<ProductGpuExecutionIdentity> {
-    let expected_panel = PanelId::from(target);
-    let expected_pass_kind = match pass_kind {
-        ProductAutomationGpuPassKind::Plane => RenderPassKind::Plane,
-        ProductAutomationGpuPassKind::Volume => RenderPassKind::Volume,
-    };
-    let product = app.native_presentation.product_gpu.as_ref()?;
-    let execution = product
-        .targets
-        .get(&expected_panel)
-        .and_then(|target| target.last_execution_timing)
-        .and_then(|execution| {
-            execution
-                .gpu_ticket
-                .map(ProductGpuExecutionIdentity::from_ticket)
-                .map(|identity| ActiveViewGpuExecutionFacts {
-                    identity,
-                    target: execution.target,
-                    renderer_frame: execution.frame,
-                    display_generation: execution.display_generation,
-                    pass_kind: execution.pass_kind,
-                })
-        });
-    exact_current_gpu_timing_identity(
-        app.render_coordination
-            .display_generation()
-            .input_generation,
-        expected_panel,
-        expected_pass_kind,
-        execution,
-        product.presented_frame_interval_samples(),
-    )
-}
-
-fn active_view_captured_gpu_timing_complete(
-    app: &MiranteWorkbenchApp,
-    target: ProductAutomationGpuTarget,
-    identity: ProductGpuExecutionIdentity,
-) -> Option<bool> {
-    let product = app.native_presentation.product_gpu.as_ref()?;
-    captured_gpu_timing_complete(
-        PanelId::from(target),
-        identity,
-        product.presented_frame_interval_samples(),
-    )
-}
-
 fn product_presentations_ready(
     app: &mut MiranteWorkbenchApp,
     panels: &[PanelId],
@@ -265,14 +157,8 @@ fn assertion_capture_panels(condition: &ProductAutomationAssertCondition) -> Vec
 }
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-const AUTOMATION_GATE_BATCH_OBSERVATION_SCHEMA: &str = "mirante4d-product-gate-batch-observation-1";
-const AUTOMATION_SCHEMA_VERSION: u32 = 5;
-const AUTOMATION_REPORT_SCHEMA_VERSION: u32 = 6;
-const GPU_TIMING_COMPLETE_DERIVATION: &str =
-    "identity_frozen_from_current_execution_then_completed_by_exact_presented_interval_ticket";
-const GPU_TIMING_UNAVAILABLE_REASON: &str =
-    "terminal_coordinated_presentation_settled_failure_without_exact_current_presented_interval";
-const GPU_TIMING_UNAVAILABLE_DERIVATION: &str = "terminal_coordinated_presentation_settled_failure_bound_to_adjacent_unavailable_gpu_timing_checkpoint";
+const AUTOMATION_SCHEMA_VERSION: u32 = 6;
+const AUTOMATION_REPORT_SCHEMA_VERSION: u32 = 7;
 
 fn dispatch_application_command(
     app: &mut MiranteWorkbenchApp,
@@ -281,77 +167,6 @@ fn dispatch_application_command(
 ) -> Result<CommandEffect, String> {
     app.apply_application_command(command, ctx)
         .map_err(|fault| format!("application command was rejected: {fault:?}"))
-}
-
-fn startup_dispatch(
-    app: &mut MiranteWorkbenchApp,
-    command: ApplicationCommand,
-) -> Result<CommandEffect, String> {
-    app.application
-        .dispatch(command)
-        .map_err(|fault| format!("startup application command was rejected: {fault:?}"))
-}
-
-fn startup_bootstrap_work_snapshot(app: &MiranteWorkbenchApp) -> Result<Value, String> {
-    let runtime = app
-        .dataset
-        .dispatcher()
-        .diagnostics()
-        .map_err(|error| format!("startup runtime diagnostics are unavailable: {error}"))?;
-    let source = app
-        .dataset
-        .local_source_diagnostics()
-        .ok_or_else(|| "startup local-source diagnostics are unavailable".to_owned())?;
-    let gpu = app
-        .native_presentation
-        .product_gpu
-        .as_ref()
-        .ok_or_else(|| "startup product GPU diagnostics are unavailable".to_owned())?
-        .renderer
-        .diagnostics();
-    let planner = app.camera_demand_planner.diagnostics();
-    Ok(json!({
-        "runtime_submitted_requests": runtime.submitted_requests(),
-        "runtime_started_decodes": runtime.started_decodes(),
-        "source_physical_range_reads": source.reader.physical_range_read_operations,
-        "source_codec_decodes": source.reader.codec_decode_operations,
-        "gpu_uploaded_resources": gpu.uploaded_resources(),
-        "gpu_uploaded_payload_bytes": gpu.uploaded_payload_bytes(),
-        "gpu_queue_submissions": gpu.queue_submissions(),
-        "gpu_frames_executed": gpu.frames_executed(),
-        "demand_jobs_submitted": planner.submitted,
-        "demand_jobs_completed": planner.completed,
-    }))
-}
-
-fn startup_bootstrap_work_delta(before: &Value, after: &Value) -> Result<Value, String> {
-    let mut delta = serde_json::Map::new();
-    for field in [
-        "runtime_submitted_requests",
-        "runtime_started_decodes",
-        "source_physical_range_reads",
-        "source_codec_decodes",
-        "gpu_uploaded_resources",
-        "gpu_uploaded_payload_bytes",
-        "gpu_queue_submissions",
-        "gpu_frames_executed",
-        "demand_jobs_submitted",
-        "demand_jobs_completed",
-    ] {
-        let before = before
-            .get(field)
-            .and_then(Value::as_u64)
-            .ok_or_else(|| format!("startup before-counter {field} is unavailable"))?;
-        let after = after
-            .get(field)
-            .and_then(Value::as_u64)
-            .ok_or_else(|| format!("startup after-counter {field} is unavailable"))?;
-        let value = after
-            .checked_sub(before)
-            .ok_or_else(|| format!("startup counter {field} regressed from {before} to {after}"))?;
-        delta.insert(field.to_owned(), Value::from(value));
-    }
-    Ok(Value::Object(delta))
 }
 
 fn dispatch_effective_interaction_sample(
@@ -464,34 +279,6 @@ fn camera_with_projection(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn exact_camera_view(
-    projection: ProductAutomationProjection,
-    target_world: [f64; 3],
-    orientation_xyzw: [f64; 4],
-    orthographic_world_per_screen_point: f64,
-    perspective_focal_length_screen_points: f64,
-    perspective_view_distance_world: f64,
-) -> Result<CameraView, String> {
-    let target = WorldPoint3::new(target_world[0], target_world[1], target_world[2])
-        .map_err(|error| format!("camera target was rejected: {error}"))?;
-    let orientation = UnitQuaternion::new_xyzw(
-        orientation_xyzw[0],
-        orientation_xyzw[1],
-        orientation_xyzw[2],
-        orientation_xyzw[3],
-    )
-    .map_err(|error| format!("camera orientation was rejected: {error}"))?;
-    CameraView::new(
-        projection.into(),
-        target,
-        orientation,
-        orthographic_world_per_screen_point,
-        perspective_focal_length_screen_points,
-        perspective_view_distance_world,
-    )
-    .map_err(|error| format!("camera view was rejected: {error}"))
-}
-
 fn exact_cross_section_view(
     center_world: [f64; 3],
     orientation_xyzw: [f64; 4],
@@ -712,331 +499,6 @@ pub(super) fn source_verification_inactive(app: &MiranteWorkbenchApp) -> bool {
         && !app.dataset.source_quarantined()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ProductGateObservationOutcome {
-    Passed,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LatchedProductGateObservation {
-    outcome: ProductGateObservationOutcome,
-    condition_met: bool,
-    timed_out: bool,
-    observed_after_origin_ns: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProductGateTerminalFailure {
-    ImportWorkerFailedBeforePublication,
-}
-
-fn terminal_import_failure_for_target(
-    target: &ProductAutomationGateTarget,
-    prepublication: Option<ImportPrepublicationState>,
-) -> Option<ProductGateTerminalFailure> {
-    if prepublication != Some(ImportPrepublicationState::TerminalWorkerFailure) {
-        return None;
-    }
-    matches!(
-        target,
-        ProductAutomationGateTarget::Condition {
-            condition: ProductAutomationWaitCondition::ImportIdle,
-        } | ProductAutomationGateTarget::ImportedOpenReady { .. }
-    )
-    .then_some(ProductGateTerminalFailure::ImportWorkerFailedBeforePublication)
-}
-
-#[derive(Debug, Serialize)]
-struct ProductGateBatchObservationDetails<'a> {
-    observation_index: usize,
-    gate_id: &'a str,
-    condition: &'static str,
-    deadline_authority: ProductAutomationGateDeadlineAuthority,
-    deadline_after_origin_ns: u64,
-    outcome: ProductGateObservationOutcome,
-    condition_met: bool,
-    timed_out: bool,
-    observed_after_origin_ns: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct ProductGateBatchDetails<'a> {
-    schema: &'static str,
-    batch_id: &'a str,
-    phase_id: &'a str,
-    origin: ProductAutomationGateBatchOrigin,
-    completed_after_origin_ns: u64,
-    observations: Vec<ProductGateBatchObservationDetails<'a>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-struct TerminalCoordinatedPresentationFailureAuthority {
-    command_index: usize,
-    batch_id: String,
-    phase_id: String,
-    observation_index: usize,
-    gate_id: String,
-    condition: &'static str,
-    deadline_authority: ProductAutomationGateDeadlineAuthority,
-    deadline_after_origin_ns: u64,
-    outcome: ProductGateObservationOutcome,
-    condition_met: bool,
-    timed_out: bool,
-    observed_after_origin_ns: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum CompletedGpuTimingCheckpoint {
-    Complete {
-        identity: ProductGpuExecutionIdentity,
-        waited_ns: u64,
-        current_presentation_generation: Option<u64>,
-    },
-    Unavailable {
-        target: ProductAutomationGpuTarget,
-        pass_kind: ProductAutomationGpuPassKind,
-        display_generation: u64,
-        current_presentation_generation: Option<u64>,
-        waited_ns: u64,
-        authority: TerminalCoordinatedPresentationFailureAuthority,
-    },
-}
-
-fn terminal_coordinated_presentation_failure_authority(
-    command_index: usize,
-    batch_id: &str,
-    phase_id: &str,
-    observations: &[ProductAutomationGateObservation],
-    outcomes: &[Option<LatchedProductGateObservation>],
-) -> Option<TerminalCoordinatedPresentationFailureAuthority> {
-    let mut coordinated = observations
-        .iter()
-        .zip(outcomes.iter().copied())
-        .enumerate()
-        .filter(|(_, (observation, _))| {
-            observation.target.condition_name() == "coordinated_presentation_settled"
-        });
-    let (observation_index, (observation, outcome)) = coordinated.next()?;
-    if coordinated.next().is_some() {
-        return None;
-    }
-    let outcome = outcome?;
-    (outcome.outcome == ProductGateObservationOutcome::Failed
-        && !outcome.condition_met
-        && outcome.timed_out
-        && outcome.observed_after_origin_ns >= observation.deadline_after_origin_ns)
-        .then(|| TerminalCoordinatedPresentationFailureAuthority {
-            command_index,
-            batch_id: batch_id.to_owned(),
-            phase_id: phase_id.to_owned(),
-            observation_index,
-            gate_id: observation.gate_id.clone(),
-            condition: observation.target.condition_name(),
-            deadline_authority: observation.deadline_authority,
-            deadline_after_origin_ns: observation.deadline_after_origin_ns,
-            outcome: outcome.outcome,
-            condition_met: outcome.condition_met,
-            timed_out: outcome.timed_out,
-            observed_after_origin_ns: outcome.observed_after_origin_ns,
-        })
-}
-
-fn gpu_timing_await_event_details(
-    checkpoint: &CompletedGpuTimingCheckpoint,
-    command_target: ProductAutomationGpuTarget,
-    command_pass_kind: ProductAutomationGpuPassKind,
-) -> Value {
-    match checkpoint {
-        CompletedGpuTimingCheckpoint::Complete {
-            identity,
-            waited_ns,
-            current_presentation_generation,
-        } => json!({
-            "available": true,
-            "unavailable_reason": Value::Null,
-            "target": command_target.name(),
-            "pass_kind": command_pass_kind.name(),
-            "display_generation": identity.display_generation,
-            "current_presentation_generation": current_presentation_generation,
-            "execution_id": identity.execution_id,
-            "renderer_target": identity.target.get(),
-            "renderer_frame": identity.renderer_frame.get(),
-            "identity_frozen_before_completion": true,
-            "exact_presented_interval_timing_complete": true,
-            "unavailable_authority": Value::Null,
-            "waited_ns": waited_ns,
-            "waited_ms": duration_ms(Duration::from_nanos(*waited_ns)),
-        }),
-        CompletedGpuTimingCheckpoint::Unavailable {
-            target,
-            pass_kind,
-            display_generation,
-            current_presentation_generation,
-            waited_ns,
-            authority,
-        } => {
-            debug_assert_eq!(*target, command_target);
-            debug_assert_eq!(*pass_kind, command_pass_kind);
-            json!({
-                "available": false,
-                "unavailable_reason": GPU_TIMING_UNAVAILABLE_REASON,
-                "target": target.name(),
-                "pass_kind": pass_kind.name(),
-                "display_generation": display_generation,
-                "current_presentation_generation": current_presentation_generation,
-                "execution_id": Value::Null,
-                "renderer_target": Value::Null,
-                "renderer_frame": Value::Null,
-                "identity_frozen_before_completion": false,
-                "exact_presented_interval_timing_complete": false,
-                "unavailable_authority": authority,
-                "waited_ns": waited_ns,
-                "waited_ms": duration_ms(Duration::from_nanos(*waited_ns)),
-            })
-        }
-    }
-}
-
-fn adjacent_gpu_timing_unavailable_authority(
-    current_command_index: usize,
-    authority: Option<&TerminalCoordinatedPresentationFailureAuthority>,
-) -> Option<TerminalCoordinatedPresentationFailureAuthority> {
-    authority
-        .filter(|authority| authority.command_index.checked_add(1) == Some(current_command_index))
-        .cloned()
-}
-
-fn latch_product_gate_observation(
-    observation: &ProductAutomationGateObservation,
-    condition_met: bool,
-    observed_after_origin_ns: u64,
-    terminal_failure: Option<ProductGateTerminalFailure>,
-) -> Option<LatchedProductGateObservation> {
-    if observed_after_origin_ns >= observation.deadline_after_origin_ns {
-        return Some(LatchedProductGateObservation {
-            outcome: ProductGateObservationOutcome::Failed,
-            condition_met,
-            timed_out: true,
-            observed_after_origin_ns,
-        });
-    }
-    if terminal_failure.is_some() {
-        debug_assert!(!condition_met);
-        return Some(LatchedProductGateObservation {
-            outcome: ProductGateObservationOutcome::Failed,
-            condition_met: false,
-            timed_out: false,
-            observed_after_origin_ns,
-        });
-    }
-    condition_met.then_some(LatchedProductGateObservation {
-        outcome: ProductGateObservationOutcome::Passed,
-        condition_met: true,
-        timed_out: false,
-        observed_after_origin_ns,
-    })
-}
-
-fn latch_product_gate_batch_observations(
-    observations: &[ProductAutomationGateObservation],
-    condition_states: &[bool],
-    terminal_failures: &[Option<ProductGateTerminalFailure>],
-    observed_after_origin_ns: u64,
-    outcomes: &mut [Option<LatchedProductGateObservation>],
-) -> Result<bool, String> {
-    if observations.len() != condition_states.len()
-        || observations.len() != terminal_failures.len()
-        || observations.len() != outcomes.len()
-    {
-        return Err("product gate batch state length does not match its command".to_owned());
-    }
-    for (((observation, condition_met), terminal_failure), outcome) in observations
-        .iter()
-        .zip(condition_states.iter().copied())
-        .zip(terminal_failures.iter().copied())
-        .zip(outcomes.iter_mut())
-    {
-        if outcome.is_none() {
-            *outcome = latch_product_gate_observation(
-                observation,
-                condition_met,
-                observed_after_origin_ns,
-                terminal_failure,
-            );
-        }
-    }
-    Ok(outcomes.iter().all(Option::is_some))
-}
-
-fn product_gate_batch_details_value(
-    batch_id: &str,
-    phase_id: &str,
-    origin: ProductAutomationGateBatchOrigin,
-    completed_after_origin_ns: u64,
-    observations: &[ProductAutomationGateObservation],
-    outcomes: &[Option<LatchedProductGateObservation>],
-) -> Result<Value, String> {
-    if observations.len() != outcomes.len() {
-        return Err("product gate batch outcomes do not match their command".to_owned());
-    }
-    let observations = observations
-        .iter()
-        .zip(outcomes.iter().copied())
-        .enumerate()
-        .map(|(observation_index, (observation, outcome))| {
-            let outcome = outcome.ok_or_else(|| {
-                "completed product gate batch is missing an observation outcome".to_owned()
-            })?;
-            Ok(ProductGateBatchObservationDetails {
-                observation_index,
-                gate_id: &observation.gate_id,
-                condition: observation.target.condition_name(),
-                deadline_authority: observation.deadline_authority,
-                deadline_after_origin_ns: observation.deadline_after_origin_ns,
-                outcome: outcome.outcome,
-                condition_met: outcome.condition_met,
-                timed_out: outcome.timed_out,
-                observed_after_origin_ns: outcome.observed_after_origin_ns,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    serde_json::to_value(ProductGateBatchDetails {
-        schema: AUTOMATION_GATE_BATCH_OBSERVATION_SCHEMA,
-        batch_id,
-        phase_id,
-        origin,
-        completed_after_origin_ns,
-        observations,
-    })
-    .map_err(|error| format!("failed to serialize product gate batch details: {error}"))
-}
-
-fn resolve_product_gate_batch_origin_at(
-    origin: ProductAutomationGateBatchOrigin,
-    automation_started_at: Instant,
-    command_completed_at: &[Option<Instant>],
-    import_primary_started_at: Option<Instant>,
-) -> Result<Instant, String> {
-    match origin {
-        ProductAutomationGateBatchOrigin::AutomationStarted => Ok(automation_started_at),
-        ProductAutomationGateBatchOrigin::CommandCompleted { command_index } => {
-            command_completed_at
-                .get(command_index)
-                .copied()
-                .flatten()
-                .ok_or_else(|| {
-                    format!("product gate batch origin command {command_index} has not completed")
-                })
-        }
-        ProductAutomationGateBatchOrigin::ImportPrimaryStarted => import_primary_started_at
-            .ok_or_else(|| {
-                "product gate batch has no active import-primary timing origin".to_owned()
-            }),
-    }
-}
-
 fn automation_pick_json(
     request: ViewerPickRequest,
     hit: &PickHit,
@@ -1087,19 +549,10 @@ pub(crate) struct ProductAutomationController {
     report_path: PathBuf,
     progress: Option<ProductAutomationProgressPublisher>,
     command_index: usize,
-    command_completed_at: Vec<Option<Instant>>,
     active_dataset_switch: Option<ActiveDatasetSwitch>,
-    active_gate_batch: Option<ActiveProductGateBatch>,
-    completed_gate_batch_gpu_timing_unavailable_authority:
-        Option<TerminalCoordinatedPresentationFailureAuthority>,
     active_wait_started: Option<Instant>,
-    active_gpu_timing_await_identity: Option<ProductGpuExecutionIdentity>,
-    completed_gpu_timing_checkpoint: Option<CompletedGpuTimingCheckpoint>,
     sleep_frames_remaining: Option<u32>,
     active_input_sequence: Option<ActiveInputSequence>,
-    previous_labeled_resource_union: Option<LabeledDiagnosticResourceUnion>,
-    diagnostic_union_peak_keys: usize,
-    diagnostic_union_peak_heap_bytes: u64,
     started_at_epoch_ms: u128,
     started_at: Instant,
     started_process_cpu_time_ns: Option<u64>,
@@ -1114,21 +567,11 @@ pub(crate) struct ProductAutomationController {
     active_import_pre_start_origin: Option<ImportPreStartOrigin>,
     completed_import_pre_start_measurement: Option<ImportPreStartMeasurement>,
     active_import_timing_origin: Option<ImportWorkerTimingOrigin>,
-    active_import_run_outcomes_origin: Option<ImportWorkerRunOutcomeCounters>,
     active_import_verification_diagnostics_origin:
         Option<crate::current_source_verification_service::CurrentSourceVerificationDiagnostics>,
     completed_import_primary_measurement: Option<ImportPrimaryMeasurement>,
     imported_open_ready_outcome: Option<ImportedOpenReadyOutcome>,
-    startup_bootstrap_evidence: Option<Value>,
-    qualification_only_ui_overhead_ns: u64,
     report_written: bool,
-}
-
-#[derive(Clone, Debug)]
-struct ActiveProductGateBatch {
-    command_index: usize,
-    origin_at: Instant,
-    outcomes: Vec<Option<LatchedProductGateObservation>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1269,7 +712,6 @@ struct ActiveInputSequence {
     duration_ms: u64,
     origin_generation: u64,
     origin_durable_commits: u64,
-    origin_diagnostics: mirante4d_application::DisplayDiagnosticCounters,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1339,172 +781,9 @@ struct ImportVerificationEvidenceSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImportOpenReadyUnavailableReason {
-    ActiveBeforePublicationDeadline,
-    TerminalWorkerFailureBeforePublication,
-}
-
-impl ImportOpenReadyUnavailableReason {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::ActiveBeforePublicationDeadline => {
-                "import_worker_active_before_publication_deadline"
-            }
-            Self::TerminalWorkerFailureBeforePublication => {
-                "import_worker_terminal_failure_before_publication"
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ImportOpenReadyUnavailableEvidence {
-    reason: ImportOpenReadyUnavailableReason,
-    readiness: ImportedOpenReadyReadiness,
-    verification: ImportVerificationEvidenceSnapshot,
-    source_open_worker_active: bool,
-    pending_source_install: bool,
-    dataset_open_operation_count: u64,
-    source_open_worker_bound_to_dataset_open_operation: bool,
-    pending_source_install_bound_to_dataset_open_operation: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ImportWorkerRunOutcomeCounters {
-    published_events: u64,
-    cancelled_runs: u64,
-    successful_runs: u64,
-    failed_runs: u64,
-}
-
-impl ImportWorkerRunOutcomeCounters {
-    fn from_diagnostics(diagnostics: &ImportWorkerDiagnostics) -> Self {
-        Self {
-            published_events: diagnostics.published_events,
-            cancelled_runs: diagnostics.cancelled_runs,
-            successful_runs: diagnostics.successful_runs,
-            failed_runs: diagnostics.failed_runs,
-        }
-    }
-
-    fn checked_delta(self, origin: Self) -> Option<Self> {
-        Some(Self {
-            published_events: self.published_events.checked_sub(origin.published_events)?,
-            cancelled_runs: self.cancelled_runs.checked_sub(origin.cancelled_runs)?,
-            successful_runs: self.successful_runs.checked_sub(origin.successful_runs)?,
-            failed_runs: self.failed_runs.checked_sub(origin.failed_runs)?,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImportPrepublicationState {
-    Active,
-    TerminalWorkerFailure,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BoundImportWorkerActivity {
-    Active,
-    Idle,
-    Other,
-}
-
-fn authentic_import_prepublication_state(
-    activity: BoundImportWorkerActivity,
-    workflow_failed: bool,
-    run_outcomes: ImportWorkerRunOutcomeCounters,
-    successful_receipt_present: bool,
-) -> Option<ImportPrepublicationState> {
-    if successful_receipt_present {
-        return None;
-    }
-    match (activity, workflow_failed, run_outcomes) {
-        (
-            BoundImportWorkerActivity::Active,
-            false,
-            ImportWorkerRunOutcomeCounters {
-                published_events: 0,
-                cancelled_runs: 0,
-                successful_runs: 0,
-                failed_runs: 0,
-            },
-        ) => Some(ImportPrepublicationState::Active),
-        (
-            BoundImportWorkerActivity::Idle,
-            true,
-            ImportWorkerRunOutcomeCounters {
-                published_events: 0,
-                cancelled_runs: 0,
-                successful_runs: 0,
-                failed_runs: 1,
-            },
-        ) => Some(ImportPrepublicationState::TerminalWorkerFailure),
-        _ => None,
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FailedImportPublicationCapture {
-    Available(ImportPublicationEvidenceSnapshot),
-    UnavailableBeforeTransfer(ImportPrepublicationState),
-}
-
-fn classify_failed_import_publication_capture(
-    captured: Result<ImportPublicationEvidenceSnapshot, String>,
-    prepublication: Option<ImportPrepublicationState>,
-) -> Result<FailedImportPublicationCapture, String> {
-    match (captured, prepublication) {
-        (Ok(evidence), None) => Ok(FailedImportPublicationCapture::Available(evidence)),
-        (Err(_), Some(state)) => Ok(FailedImportPublicationCapture::UnavailableBeforeTransfer(
-            state,
-        )),
-        (Ok(_), Some(_)) => Err(
-            "prepublication import state unexpectedly exposed publication-transfer evidence"
-                .to_owned(),
-        ),
-        (Err(error), None) => Err(error),
-    }
-}
-
-fn import_worker_timing_origins_match(
-    left: &ImportWorkerTimingOrigin,
-    right: &ImportWorkerTimingOrigin,
-) -> bool {
-    left.started_at == right.started_at
-        && left.started_at_epoch_ms == right.started_at_epoch_ms
-        && left.process_cpu_time_ns == right.process_cpu_time_ns
-        && left.review_id == right.review_id
-        && left.token == right.token
-        && normalize_path(&left.destination) == normalize_path(&right.destination)
-        && left.source_fingerprint == right.source_fingerprint
-        && left.reviewed_source_bytes == right.reviewed_source_bytes
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImportedOpenReadyOutcome {
-    Complete {
-        measurement: ImportPublicationToOpenReadyMeasurement,
-        evidence: ImportPublicationEvidenceSnapshot,
-    },
-    DeadlineFailedAfterTransfer {
-        evidence: ImportPublicationEvidenceSnapshot,
-    },
-    DeadlineFailedBeforeTransfer {
-        evidence: ImportOpenReadyUnavailableEvidence,
-    },
-}
-
-impl ImportedOpenReadyOutcome {
-    const fn status(self) -> &'static str {
-        match self {
-            Self::Complete { .. } => "open_ready_complete",
-            Self::DeadlineFailedAfterTransfer { .. } => "open_ready_deadline_failed_after_transfer",
-            Self::DeadlineFailedBeforeTransfer { .. } => {
-                "open_ready_deadline_failed_before_transfer"
-            }
-        }
-    }
+struct ImportedOpenReadyOutcome {
+    measurement: ImportPublicationToOpenReadyMeasurement,
+    evidence: ImportPublicationEvidenceSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1538,22 +817,20 @@ fn imported_open_ready_readiness(
     }
 }
 
-struct ImportedOpenReadyCommitState<'a, Origin, RunOrigin, VerificationOrigin, Outcome> {
+struct ImportedOpenReadyCommitState<'a, Origin, VerificationOrigin, Outcome> {
     active_origin: &'a mut Option<Origin>,
-    active_run_origin: &'a mut Option<RunOrigin>,
     active_verification_origin: &'a mut Option<VerificationOrigin>,
     completed_primary: &'a mut Option<ImportPrimaryMeasurement>,
     open_ready_outcome: &'a mut Option<Outcome>,
 }
 
-impl<Origin, RunOrigin, VerificationOrigin, Outcome>
-    ImportedOpenReadyCommitState<'_, Origin, RunOrigin, VerificationOrigin, Outcome>
+impl<Origin, VerificationOrigin, Outcome>
+    ImportedOpenReadyCommitState<'_, Origin, VerificationOrigin, Outcome>
 {
     fn commit(self, primary: ImportPrimaryMeasurement, outcome: Outcome) {
         *self.open_ready_outcome = Some(outcome);
         *self.completed_primary = Some(primary);
         *self.active_verification_origin = None;
-        *self.active_run_origin = None;
         *self.active_origin = None;
     }
 }
@@ -1585,21 +862,10 @@ impl ProductAutomationController {
         })
     }
 
-    /// Drives one automation step and returns the exactly measured interval
-    /// spent producing qualification-only diagnostic and liveness-control
-    /// evidence in this UI
-    /// callback. The caller subtracts this sequential interval from the
-    /// claim-bearing active UI-update sample; semantic automation commands and
-    /// ordinary product work remain inside that sample.
-    pub(crate) fn drive(app: &mut MiranteWorkbenchApp, ctx: &egui::Context) -> u64 {
+    pub(crate) fn drive(app: &mut MiranteWorkbenchApp, ctx: &egui::Context) {
         let Some(mut automation) = app.product_automation.take() else {
-            return 0;
+            return;
         };
-        automation.qualification_only_ui_overhead_ns = 0;
-        app.render_coordination
-            .set_display_diagnostic_counters_enabled(
-                automation.script.requires_diagnostic_counters(),
-            );
         let status = match automation.publish_progress_if_due() {
             Ok(()) => automation.step(app, ctx),
             Err(reason) => AutomationStatus::Failed(reason),
@@ -1632,9 +898,7 @@ impl ProductAutomationController {
                 automation.write_report_and_close(app, ctx, "failed", Some(reason));
             }
         }
-        let qualification_only_ui_overhead_ns = automation.qualification_only_ui_overhead_ns;
         app.product_automation = Some(automation);
-        qualification_only_ui_overhead_ns
     }
 
     fn load_from_env() -> anyhow::Result<Self> {
@@ -1654,25 +918,16 @@ impl ProductAutomationController {
     }
 
     fn new(script: ProductAutomationScript, script_path: PathBuf, report_path: PathBuf) -> Self {
-        let command_count = script.commands.len();
         Self {
             script,
             script_path,
             report_path,
             progress: None,
             command_index: 0,
-            command_completed_at: vec![None; command_count],
             active_dataset_switch: None,
-            active_gate_batch: None,
-            completed_gate_batch_gpu_timing_unavailable_authority: None,
             active_wait_started: None,
-            active_gpu_timing_await_identity: None,
-            completed_gpu_timing_checkpoint: None,
             sleep_frames_remaining: None,
             active_input_sequence: None,
-            previous_labeled_resource_union: None,
-            diagnostic_union_peak_keys: 0,
-            diagnostic_union_peak_heap_bytes: 0,
             started_at_epoch_ms: epoch_ms(),
             started_at: Instant::now(),
             started_process_cpu_time_ns: checked_process_cpu_time_ns(),
@@ -1687,12 +942,9 @@ impl ProductAutomationController {
             active_import_pre_start_origin: None,
             completed_import_pre_start_measurement: None,
             active_import_timing_origin: None,
-            active_import_run_outcomes_origin: None,
             active_import_verification_diagnostics_origin: None,
             completed_import_primary_measurement: None,
             imported_open_ready_outcome: None,
-            startup_bootstrap_evidence: None,
-            qualification_only_ui_overhead_ns: 0,
             report_written: false,
         }
     }
@@ -1710,11 +962,9 @@ impl ProductAutomationController {
         let command_index = self.command_index;
         let command_kind = command.name();
         let now = Instant::now();
-        let qualification_started = Instant::now();
         let result = self.progress.as_mut().map_or(Ok(false), |progress| {
             progress.publish_command_if_due(command_count, command_index, command_kind, now)
         });
-        self.add_progress_overhead(qualification_started.elapsed());
         result
             .map(|_| ())
             .map_err(|_| "product automation progress publication failed".to_owned())
@@ -1723,527 +973,16 @@ impl ProductAutomationController {
     fn publish_progress_closeout(&mut self) -> Result<(), String> {
         let command_count = self.script.commands.len();
         let now = Instant::now();
-        let qualification_started = Instant::now();
         let result = self.progress.as_mut().map_or(Ok(()), |progress| {
             progress.publish_closeout(command_count, now)
         });
-        self.add_progress_overhead(qualification_started.elapsed());
         result.map_err(|_| "product automation progress closeout publication failed".to_owned())
     }
 
     fn progress_repaint_after(&mut self, requested: Option<Duration>) -> Option<Duration> {
-        let qualification_started = Instant::now();
-        let repaint_after = self.progress.as_ref().map_or(requested, |progress| {
+        self.progress.as_ref().map_or(requested, |progress| {
             progress.clamp_repaint_after(requested, Instant::now())
-        });
-        self.add_progress_overhead(qualification_started.elapsed());
-        repaint_after
-    }
-
-    fn add_progress_overhead(&mut self, elapsed: Duration) {
-        if self.progress.is_some() {
-            self.qualification_only_ui_overhead_ns = self
-                .qualification_only_ui_overhead_ns
-                .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
-        }
-    }
-
-    /// Installs a qualification script's declared initial view before the
-    /// ordinary product submits its first visible demand. Commands are reduced
-    /// through the canonical application state, but payload reconciliation is
-    /// deliberately deferred until the whole bootstrap is committed so no
-    /// intermediate/default cohort can enter the runtime.
-    pub(crate) fn apply_startup_bootstrap(
-        &mut self,
-        app: &mut MiranteWorkbenchApp,
-        ctx: &egui::Context,
-    ) -> Result<(), String> {
-        let Some(bootstrap) = self.script.startup_bootstrap.clone() else {
-            return Ok(());
-        };
-        let started = Instant::now();
-        let work_before = startup_bootstrap_work_snapshot(app)?;
-        let before = app.application.snapshot();
-        let previous_view = application_view(&before).clone();
-        let intermediate_view_reconciliations = 0_u64;
-        let mut canonical_commit_reconciliations = 0_u64;
-        let mut command_evidence = Vec::with_capacity(bootstrap.commands.len());
-        for command in &bootstrap.commands {
-            let details = self.execute_startup_bootstrap_command(app, ctx, command)?;
-            command_evidence.push(json!({
-                "command": command.name(),
-                "details": details,
-            }));
-        }
-
-        let after = app.application.snapshot();
-        let next_view = application_view(&after);
-        let volume_changed = crate::layer_state::volume_render_changed(&previous_view, next_view);
-        let linked_changed =
-            crate::layer_state::cross_section_render_changed(&previous_view, next_view)
-                && (previous_view.layout() == ViewerLayout::FourPanel
-                    || next_view.layout() == ViewerLayout::FourPanel);
-        crate::layer_state::reconcile_view_runtime(
-            &previous_view,
-            &after,
-            &mut app.dataset,
-            &mut app.render_coordination,
-            &mut app.analysis_runtime,
-        )
-        .map_err(|error| format!("startup bootstrap runtime reconciliation failed: {error}"))?;
-        canonical_commit_reconciliations = canonical_commit_reconciliations.saturating_add(1);
-        if previous_view.layout() != next_view.layout()
-            && next_view.layout() == ViewerLayout::Single3d
-        {
-            app.clear_cross_section_product_presentations();
-        } else if linked_changed {
-            app.invalidate_cross_section_panel_display_frames();
-        }
-        if volume_changed || linked_changed {
-            app.render_coordination.request_refresh();
-        }
-        let work_after = startup_bootstrap_work_snapshot(app)?;
-        let work_delta = startup_bootstrap_work_delta(&work_before, &work_after)?;
-        let zero_payload_work_observed = work_delta
-            .as_object()
-            .is_some_and(|counters| counters.values().all(|value| value.as_u64() == Some(0)));
-
-        if let Some(label) = &bootstrap.start_diagnostic_label {
-            let sample_command = ProductAutomationCommand::SampleDiagnostics {
-                label: label.clone(),
-            };
-            match self.execute_command(app, ctx, &sample_command)? {
-                CommandProgress::Done(_) => {}
-                CommandProgress::Waiting | CommandProgress::PassiveWaiting(_) => {
-                    return Err("startup diagnostic checkpoint unexpectedly waited".to_owned());
-                }
-            }
-        }
-        if bootstrap.capture_start_checkpoint {
-            let current_generation = app
-                .render_coordination
-                .display_generation()
-                .input_generation;
-            // The cold-display clock begins after the exact zero-demand
-            // checkpoint and immediately before normal visible planning.
-            app.display_performance_milestones
-                .begin_generation(current_generation);
-        }
-        self.startup_bootstrap_evidence = Some(json!({
-            "qualification_only": true,
-            "payload_requests_submitted": !zero_payload_work_observed,
-            "intermediate_view_reconciliations": intermediate_view_reconciliations,
-            "canonical_commit_reconciliations": canonical_commit_reconciliations,
-            "observed_work": {
-                "before": work_before,
-                "after": work_after,
-                "delta": work_delta,
-                "zero_payload_or_demand_work": zero_payload_work_observed,
-                "counter_scope": "runtime_source_renderer_and_demand_planner_monotonic_counters",
-            },
-            "duration_ns": u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            "commands": command_evidence,
-            "capture_start_checkpoint": bootstrap.capture_start_checkpoint,
-            "start_diagnostic_label": bootstrap.start_diagnostic_label,
-            "start_checkpoint_captured_in_diagnostics": bootstrap.capture_start_checkpoint,
-        }));
-        Ok(())
-    }
-
-    fn execute_startup_bootstrap_command(
-        &mut self,
-        app: &mut MiranteWorkbenchApp,
-        ctx: &egui::Context,
-        command: &ProductAutomationCommand,
-    ) -> Result<Value, String> {
-        match command {
-            ProductAutomationCommand::SetMappedClientPixels { width, height } => {
-                if *width == 0 || *height == 0 {
-                    return Err("requested mapped client pixels must be nonzero".to_owned());
-                }
-                let pixels_per_point = ctx
-                    .input(|input| input.viewport().native_pixels_per_point)
-                    .unwrap_or_else(|| ctx.pixels_per_point());
-                if !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
-                    return Err("native pixels-per-point is unavailable".to_owned());
-                }
-                let fullscreen = *width == 1920 && *height == 1080;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                    *width as f32 / pixels_per_point,
-                    *height as f32 / pixels_per_point,
-                )));
-                self.requested_mapped_client_pixels = Some((*width, *height));
-                Ok(json!({
-                    "requested_mapped_client_pixels": { "width": width, "height": height },
-                    "pixels_per_point": pixels_per_point,
-                    "fullscreen_requested": fullscreen,
-                }))
-            }
-            ProductAutomationCommand::SetRenderTargetSize { width, height } => {
-                let viewport = RenderExtent::new(*width, *height)
-                    .map_err(|error| format!("invalid automation render target: {error}"))?;
-                let context_max = ctx.input(|input| input.max_texture_side);
-                #[cfg(test)]
-                let maximum = app
-                    .test_render_viewport_max_side
-                    .map_or(context_max, |test_max| context_max.min(test_max));
-                #[cfg(not(test))]
-                let maximum = context_max;
-                if usize::try_from(viewport.width_pixels())
-                    .ok()
-                    .is_none_or(|width| width > maximum)
-                    || usize::try_from(viewport.height_pixels())
-                        .ok()
-                        .is_none_or(|height| height > maximum)
-                {
-                    return Err(format!(
-                        "automation render target {}x{} exceeds maximum texture side {maximum}",
-                        viewport.width_pixels(),
-                        viewport.height_pixels()
-                    ));
-                }
-                self.render_target_override = Some(viewport);
-                set_render_viewport(&mut app.render_coordination, viewport);
-                Ok(json!({
-                    "requested_render_target_pixels": {
-                        "width": viewport.width_pixels(),
-                        "height": viewport.height_pixels(),
-                    },
-                }))
-            }
-            ProductAutomationCommand::SetFourPanelViewports {
-                presentation_width_points,
-                presentation_height_points,
-                three_d_render_width,
-                three_d_render_height,
-                linked_render_width,
-                linked_render_height,
-            } => {
-                let presentation = PresentationViewport::new(
-                    *presentation_width_points,
-                    *presentation_height_points,
-                )
-                .map_err(|error| format!("invalid four-panel presentation viewport: {error}"))?;
-                let three_d_render =
-                    RenderExtent::new(*three_d_render_width, *three_d_render_height).map_err(
-                        |error| format!("invalid four-panel 3D render viewport: {error}"),
-                    )?;
-                let linked_render = RenderExtent::new(*linked_render_width, *linked_render_height)
-                    .map_err(|error| {
-                        format!("invalid four-panel linked render viewport: {error}")
-                    })?;
-                let context_max = ctx.input(|input| input.max_texture_side);
-                #[cfg(test)]
-                let maximum = app
-                    .test_render_viewport_max_side
-                    .map_or(context_max, |test_max| context_max.min(test_max));
-                #[cfg(not(test))]
-                let maximum = context_max;
-                for (name, extent) in [("3D", three_d_render), ("linked", linked_render)] {
-                    if usize::try_from(extent.width_pixels())
-                        .ok()
-                        .is_none_or(|width| width > maximum)
-                        || usize::try_from(extent.height_pixels())
-                            .ok()
-                            .is_none_or(|height| height > maximum)
-                    {
-                        return Err(format!(
-                            "four-panel {name} render viewport {}x{} exceeds maximum texture side {maximum}",
-                            extent.width_pixels(),
-                            extent.height_pixels()
-                        ));
-                    }
-                }
-                self.render_target_override = Some(three_d_render);
-                for slot in PresentationSlot::ALL {
-                    app.render_coordination.record_viewports(
-                        slot,
-                        presentation,
-                        if slot == PresentationSlot::ThreeD {
-                            three_d_render
-                        } else {
-                            linked_render
-                        },
-                    );
-                }
-                Ok(json!({
-                    "presentation_points": {
-                        "width": presentation.width_points(),
-                        "height": presentation.height_points(),
-                    },
-                    "three_d_render_pixels": {
-                        "width": three_d_render.width_pixels(),
-                        "height": three_d_render.height_pixels(),
-                    },
-                    "linked_render_pixels": {
-                        "width": linked_render.width_pixels(),
-                        "height": linked_render.height_pixels(),
-                    },
-                    "external_geometry_observation_required": true,
-                }))
-            }
-            ProductAutomationCommand::SetViewerLayout { layout } => {
-                let snapshot = app.application.snapshot();
-                let cross_section = *application_view(&snapshot).cross_section();
-                startup_dispatch(
-                    app,
-                    ApplicationCommand::SetLayout {
-                        layout: (*layout).into(),
-                        cross_section,
-                    },
-                )?;
-                Ok(json!({ "layout": layout.name() }))
-            }
-            ProductAutomationCommand::SetTimeIndex { time_index } => {
-                let snapshot = app.application.snapshot();
-                let view = application_view(&snapshot);
-                let timepoint_count = snapshot
-                    .catalog()
-                    .layer(view.active_layer())
-                    .expect("application view closes over the dataset catalog")
-                    .shape()
-                    .t();
-                if *time_index >= timepoint_count {
-                    return Err(format!(
-                        "time index {time_index} is out of bounds for {timepoint_count} timepoints"
-                    ));
-                }
-                startup_dispatch(
-                    app,
-                    ApplicationCommand::SetTimepoint(TimeIndex::new(*time_index)),
-                )?;
-                Ok(json!({
-                    "time_index": time_index,
-                    "timepoint_count": timepoint_count,
-                }))
-            }
-            ProductAutomationCommand::SetLayerRenderMode { layer_index, mode } => {
-                let render_mode: RenderMode = (*mode).into();
-                let command = layer_command(app, *layer_index, |layer| {
-                    Ok(LayerViewState::new(
-                        layer.layer_key(),
-                        layer.visible(),
-                        layer.transfer().clone(),
-                        render_state_for_mode(
-                            *layer.render_state(),
-                            layer.transfer(),
-                            render_mode,
-                        )?,
-                    ))
-                })?;
-                startup_dispatch(app, command)?;
-                Ok(json!({ "layer_index": layer_index, "render_mode": mode.name() }))
-            }
-            ProductAutomationCommand::SetProjection { projection } => {
-                let snapshot = app.application.snapshot();
-                let camera = camera_with_projection(
-                    *application_view(&snapshot).camera(),
-                    (*projection).into(),
-                )?;
-                startup_dispatch(app, ApplicationCommand::SetCamera(camera))?;
-                Ok(json!({ "projection": projection.name() }))
-            }
-            ProductAutomationCommand::SetLayerSampling {
-                layer_index,
-                sampling,
-            } => {
-                let command = layer_command(app, *layer_index, |layer| {
-                    Ok(LayerViewState::new(
-                        layer.layer_key(),
-                        layer.visible(),
-                        layer.transfer().clone(),
-                        render_state_with_sampling(*layer.render_state(), (*sampling).into())?,
-                    ))
-                })?;
-                startup_dispatch(app, command)?;
-                Ok(json!({ "layer_index": layer_index, "sampling": sampling.name() }))
-            }
-            ProductAutomationCommand::SetLayerOpacity {
-                layer_index,
-                opacity,
-            } => {
-                if !opacity.is_finite() || !(0.0..=1.0).contains(opacity) {
-                    return Err("layer opacity must be finite and between 0.0 and 1.0".to_owned());
-                }
-                let command = layer_command(app, *layer_index, |layer| {
-                    let current = layer.transfer();
-                    let transfer = LayerTransfer::new(
-                        current.window(),
-                        current.color(),
-                        Opacity::new(*opacity).map_err(|error| error.to_string())?,
-                        current.curve(),
-                        current.invert(),
-                    );
-                    Ok(LayerViewState::new(
-                        layer.layer_key(),
-                        layer.visible(),
-                        transfer,
-                        *layer.render_state(),
-                    ))
-                })?;
-                startup_dispatch(app, command)?;
-                Ok(json!({ "layer_index": layer_index, "opacity": opacity }))
-            }
-            ProductAutomationCommand::SetLayerWindow {
-                layer_index,
-                low,
-                high,
-            } => {
-                if !low.is_finite() || !high.is_finite() || low >= high {
-                    return Err(
-                        "layer window bounds must be finite with low less than high".to_owned()
-                    );
-                }
-                let command = layer_command(app, *layer_index, |layer| {
-                    let current = layer.transfer();
-                    let transfer = LayerTransfer::new(
-                        DisplayWindow::new(*low, *high).map_err(|error| error.to_string())?,
-                        current.color(),
-                        current.opacity(),
-                        current.curve(),
-                        current.invert(),
-                    );
-                    Ok(LayerViewState::new(
-                        layer.layer_key(),
-                        layer.visible(),
-                        transfer,
-                        *layer.render_state(),
-                    ))
-                })?;
-                startup_dispatch(app, command)?;
-                Ok(json!({ "layer_index": layer_index, "low": low, "high": high }))
-            }
-            ProductAutomationCommand::SetCameraView {
-                projection,
-                target_world,
-                orientation_xyzw,
-                orthographic_world_per_screen_point,
-                perspective_focal_length_screen_points,
-                perspective_view_distance_world,
-            } => {
-                let camera = exact_camera_view(
-                    *projection,
-                    *target_world,
-                    *orientation_xyzw,
-                    *orthographic_world_per_screen_point,
-                    *perspective_focal_length_screen_points,
-                    *perspective_view_distance_world,
-                )?;
-                startup_dispatch(app, ApplicationCommand::SetCamera(camera))?;
-                Ok(json!({
-                    "projection": projection.name(),
-                    "target_world": camera.target().components(),
-                    "orientation_xyzw": camera.orientation().xyzw(),
-                    "orthographic_world_per_screen_point": camera.orthographic_world_per_screen_point(),
-                    "perspective_focal_length_screen_points": camera.perspective_focal_length_screen_points(),
-                    "perspective_view_distance_world": camera.perspective_view_distance_world(),
-                }))
-            }
-            ProductAutomationCommand::CameraFitData => {
-                let snapshot = app.application.snapshot();
-                let view = application_view(&snapshot);
-                let layer = snapshot
-                    .catalog()
-                    .layer(view.active_layer())
-                    .expect("application view closes over the dataset catalog");
-                let camera = fit_camera_to_shape_preserving_view(
-                    *view.camera(),
-                    layer.shape().spatial(),
-                    layer.grid_to_world(),
-                    app.render_coordination.presentation_viewport,
-                );
-                startup_dispatch(app, ApplicationCommand::SetCamera(camera))?;
-                Ok(json!({}))
-            }
-            ProductAutomationCommand::SetActiveCrossSectionPanel { panel } => {
-                startup_dispatch(
-                    app,
-                    ApplicationCommand::SetActiveCrossSectionPanel(Some(
-                        application_cross_section_panel(*panel),
-                    )),
-                )?;
-                Ok(json!({ "panel": PanelId::from(*panel).label() }))
-            }
-            ProductAutomationCommand::SetCrossSectionView {
-                center_world,
-                orientation_xyzw,
-                scale_world_per_screen_point,
-                depth_world,
-            } => {
-                let snapshot = app.application.snapshot();
-                if application_view(&snapshot).layout() != ViewerLayout::FourPanel {
-                    return Err(
-                        "setting the cross-section view requires four-panel layout".to_owned()
-                    );
-                }
-                let cross_section = exact_cross_section_view(
-                    *center_world,
-                    *orientation_xyzw,
-                    *scale_world_per_screen_point,
-                    *depth_world,
-                )?;
-                startup_dispatch(
-                    app,
-                    ApplicationCommand::SetLayout {
-                        layout: ViewerLayout::FourPanel,
-                        cross_section,
-                    },
-                )?;
-                Ok(json!({
-                    "center_world": cross_section.center_world().components(),
-                    "orientation_xyzw": cross_section.orientation().xyzw(),
-                    "scale_world_per_screen_point": cross_section.scale_world_per_screen_point(),
-                    "depth_world": cross_section.depth_world(),
-                }))
-            }
-            ProductAutomationCommand::CrossSectionZoomSequence {
-                panel,
-                samples,
-                duration_ms,
-                x_fraction,
-                y_fraction,
-                factor_per_sample,
-            } if *samples == 1 && *duration_ms == 1 && *x_fraction == 0.5 && *y_fraction == 0.5 => {
-                let snapshot = app.application.snapshot();
-                let view = application_view(&snapshot);
-                if view.layout() != ViewerLayout::FourPanel {
-                    return Err(
-                        "cross-section bootstrap zoom requires four-panel layout".to_owned()
-                    );
-                }
-                let current = *view.cross_section();
-                let cross_section = CrossSectionView::new(
-                    current.center_world(),
-                    current.orientation(),
-                    current.scale_world_per_screen_point() * *factor_per_sample,
-                    current.depth_world(),
-                )
-                .map_err(|error| format!("cross-section bootstrap zoom was rejected: {error}"))?;
-                startup_dispatch(
-                    app,
-                    ApplicationCommand::SetActiveCrossSectionPanel(Some(
-                        application_cross_section_panel(*panel),
-                    )),
-                )?;
-                startup_dispatch(
-                    app,
-                    ApplicationCommand::SetLayout {
-                        layout: ViewerLayout::FourPanel,
-                        cross_section,
-                    },
-                )?;
-                Ok(json!({
-                    "panel": PanelId::from(*panel).label(),
-                    "centered_anchor": true,
-                    "factor": factor_per_sample,
-                }))
-            }
-            _ => Err(format!(
-                "command {} is not permitted in the pre-demand startup bootstrap",
-                command.name()
-            )),
-        }
+        })
     }
 
     pub(crate) const fn render_target_override(&self) -> Option<RenderExtent> {
@@ -2256,10 +995,6 @@ impl ProductAutomationController {
 
     pub(crate) const fn requires_gpu_timing(&self) -> bool {
         self.script.requires_gpu_timing()
-    }
-
-    pub(crate) fn requires_diagnostic_counters(&self) -> bool {
-        self.script.requires_diagnostic_counters()
     }
 
     fn input_sequence_step(
@@ -2278,7 +1013,6 @@ impl ProductAutomationController {
                 duration_ms,
                 origin_generation: generation.input_generation,
                 origin_durable_commits: generation.durable_gesture_commits,
-                origin_diagnostics: app.render_coordination.display_diagnostic_counters(),
             }
         });
         debug_assert_eq!(sequence.command_index, self.command_index);
@@ -2322,7 +1056,6 @@ impl ProductAutomationController {
             .take()
             .expect("the completed automation sequence retains its state");
         let generation = app.render_coordination.display_generation();
-        let counters = app.render_coordination.display_diagnostic_counters();
         CommandProgress::Done(json!({
             "workload": workload,
             "samples": sequence.samples,
@@ -2335,13 +1068,8 @@ impl ProductAutomationController {
                 "time_distributed_across_app_updates": true,
             },
             "observed_counter_delta": {
-                "detailed_counters_enabled": counters.enabled,
                 "input_generations": generation.input_generation.saturating_sub(sequence.origin_generation),
                 "durable_gesture_commits": generation.durable_gesture_commits.saturating_sub(sequence.origin_durable_commits),
-                "raw_input_samples": counters.raw_input_samples.saturating_sub(sequence.origin_diagnostics.raw_input_samples),
-                "admitted_input_generations": counters.admitted_input_generations.saturating_sub(sequence.origin_diagnostics.admitted_input_generations),
-                "coalesced_input_samples": counters.coalesced_input_samples.saturating_sub(sequence.origin_diagnostics.coalesced_input_samples),
-                "superseded_input_generations": counters.superseded_input_generations.saturating_sub(sequence.origin_diagnostics.superseded_input_generations),
             },
         }))
     }
@@ -2382,12 +1110,6 @@ impl ProductAutomationController {
 
         let command = self.script.commands[self.command_index].clone();
         let command_index = self.command_index;
-        if !matches!(
-            &command,
-            ProductAutomationCommand::AwaitActiveViewGpuTiming { .. }
-        ) {
-            self.completed_gate_batch_gpu_timing_unavailable_authority = None;
-        }
         if self
             .active_input_sequence
             .is_some_and(|sequence| sequence.command_index != command_index)
@@ -2433,70 +1155,6 @@ impl ProductAutomationController {
                     command_started.elapsed(),
                     details,
                 );
-                // A GPU timing result is current only for the UI callback in
-                // which it was observed. Normal rendering and timestamp
-                // polling run before automation on the next callback and may
-                // replace it with a newer pending execution. Qualification
-                // scripts therefore publish the statically adjacent
-                // diagnostic checkpoint now, without yielding back to the
-                // product between readiness and evidence capture.
-                if matches!(
-                    &command,
-                    ProductAutomationCommand::AwaitActiveViewGpuTiming { .. }
-                ) && let Some(next_command @ ProductAutomationCommand::SampleDiagnostics { .. }) =
-                    self.script.commands.get(command_index + 1).cloned()
-                {
-                    let next_index = command_index + 1;
-                    let next_started = Instant::now();
-                    let next_result = self.execute_command(app, ctx, &next_command);
-                    if let Err(error) = self.observe_and_enforce_hard_safety_limits(app) {
-                        let reason =
-                            if let Some(cancellation) = self.cancel_active_dataset_switch(app) {
-                                format!("{error}; dataset_switch_cancellation={cancellation}")
-                            } else {
-                                error
-                            };
-                        return self.record_fatal_command_failure(
-                            next_index,
-                            next_command.name(),
-                            next_started.elapsed(),
-                            reason,
-                        );
-                    }
-                    return match next_result {
-                        Ok(CommandProgress::Done(details)) => {
-                            self.record_successful_command(
-                                next_index,
-                                next_command.name(),
-                                next_started.elapsed(),
-                                details,
-                            );
-                            AutomationStatus::Continue
-                        }
-                        Ok(CommandProgress::Waiting | CommandProgress::PassiveWaiting(_)) => self
-                            .record_fatal_command_failure(
-                                next_index,
-                                next_command.name(),
-                                next_started.elapsed(),
-                                "GPU timing checkpoint diagnostic unexpectedly waited".to_owned(),
-                            ),
-                        Err(reason) => {
-                            let reason = if let Some(cancellation) =
-                                self.cancel_active_dataset_switch(app)
-                            {
-                                format!("{reason}; dataset_switch_cancellation={cancellation}")
-                            } else {
-                                reason
-                            };
-                            self.record_fatal_command_failure(
-                                next_index,
-                                next_command.name(),
-                                next_started.elapsed(),
-                                reason,
-                            )
-                        }
-                    };
-                }
                 AutomationStatus::Continue
             }
             Ok(CommandProgress::Waiting) => AutomationStatus::Waiting {
@@ -2528,12 +1186,6 @@ impl ProductAutomationController {
         duration: Duration,
         reason: String,
     ) -> AutomationStatus {
-        // A fatal boundary invalidates any partially latched batch. Only the
-        // failed command event is reportable; incomplete product outcomes are
-        // never promoted or synthesized during closeout.
-        self.active_gate_batch = None;
-        self.completed_gate_batch_gpu_timing_unavailable_authority = None;
-        self.completed_gpu_timing_checkpoint = None;
         self.events.push(ProductAutomationEvent::failed(
             command_index,
             command,
@@ -2557,27 +1209,14 @@ impl ProductAutomationController {
             duration,
             details,
         ));
-        if let Some(slot) = self.command_completed_at.get_mut(command_index) {
-            *slot = Some(completed_at);
-        }
-        self.active_gate_batch = None;
-        if command != "observe_gate_batch" {
-            self.completed_gate_batch_gpu_timing_unavailable_authority = None;
-        }
         self.active_wait_started = None;
-        self.active_gpu_timing_await_identity = None;
-        if command != "await_active_view_gpu_timing" {
-            self.completed_gpu_timing_checkpoint = None;
-        }
         self.sleep_frames_remaining = None;
         if self.command_index == command_index {
             self.command_index += 1;
         }
-        let qualification_started = Instant::now();
         if let Some(progress) = self.progress.as_mut() {
             progress.observe_command(self.command_index, completed_at);
         }
-        self.add_progress_overhead(qualification_started.elapsed());
     }
 
     fn cancel_active_dataset_switch(&mut self, app: &mut MiranteWorkbenchApp) -> Option<String> {
@@ -2666,8 +1305,6 @@ impl ProductAutomationController {
                     .active_dataset_switch
                     .take()
                     .expect("an installed dataset switch retains its exact operation state");
-                let previous_union_was_present =
-                    self.previous_labeled_resource_union.take().is_some();
                 Ok(CommandProgress::Done(json!({
                     "mode": "normal_product_external_dataset_switch",
                     "path": app.dataset.selected_path().display().to_string(),
@@ -2676,8 +1313,6 @@ impl ProductAutomationController {
                     "external_open_requests": 1,
                     "timeout_ms": AUTOMATION_DATASET_SWITCH_TIMEOUT.as_millis(),
                     "waited_ms": duration_ms(active.started_at.elapsed()),
-                    "diagnostic_union_authority_reset": true,
-                    "previous_labeled_union_was_present": previous_union_was_present,
                 })))
             }
             DatasetSwitchProtocolDecision::Failed => {
@@ -2706,46 +1341,6 @@ impl ProductAutomationController {
                 ))
             }
         }
-    }
-
-    fn import_prepublication_state(
-        &self,
-        app: &MiranteWorkbenchApp,
-    ) -> Option<ImportPrepublicationState> {
-        if self.imported_open_ready_outcome.is_some() {
-            return None;
-        }
-        let origin = self.active_import_run_outcomes_origin?;
-        let bound_timing_origin = self.active_import_timing_origin.as_ref()?;
-        let diagnostics = app.import.workers.diagnostics();
-        let run_outcomes =
-            ImportWorkerRunOutcomeCounters::from_diagnostics(&diagnostics).checked_delta(origin)?;
-        let worker_status = app.import.workers.status();
-        let activity = if worker_status.is_importing() {
-            if app
-                .import
-                .workers
-                .active_import_timing_origin()
-                .as_ref()
-                .is_some_and(|active| {
-                    import_worker_timing_origins_match(active, bound_timing_origin)
-                })
-            {
-                BoundImportWorkerActivity::Active
-            } else {
-                BoundImportWorkerActivity::Other
-            }
-        } else if worker_status.is_active() {
-            BoundImportWorkerActivity::Other
-        } else {
-            BoundImportWorkerActivity::Idle
-        };
-        authentic_import_prepublication_state(
-            activity,
-            matches!(app.import.snapshot(), ImportWorkflowSnapshot::Failed(_)),
-            run_outcomes,
-            diagnostics.last_successful_import.is_some(),
-        )
     }
 
     fn capture_import_verification_evidence(
@@ -2841,88 +1436,6 @@ impl ProductAutomationController {
         })
     }
 
-    fn capture_unavailable_import_open_ready_evidence(
-        &self,
-        app: &MiranteWorkbenchApp,
-        snapshot: &ApplicationSnapshot,
-        path: &Path,
-        state: ImportPrepublicationState,
-    ) -> Result<ImportOpenReadyUnavailableEvidence, String> {
-        let verification = self.capture_import_verification_evidence(app)?;
-        if verification
-            != (ImportVerificationEvidenceSnapshot {
-                source_verification_started_runs: 0,
-                source_verification_progress_updates: 0,
-                source_verification_cancelled_runs: 0,
-                source_verification_failed_runs: 0,
-                source_verification_successes: 0,
-            })
-        {
-            return Err(
-                "prepublication import failure overlapped ordinary source verification".to_owned(),
-            );
-        }
-        let readiness = imported_open_ready_readiness(app, snapshot, path);
-        let readiness_is_authentic = !readiness.selected_matches
-            && match state {
-                ImportPrepublicationState::Active => {
-                    !readiness.import_idle && readiness.problem_absent
-                }
-                ImportPrepublicationState::TerminalWorkerFailure => {
-                    readiness.import_idle && !readiness.problem_absent
-                }
-            };
-        if !readiness_is_authentic {
-            return Err("prepublication import failure has incoherent open-ready facts".to_owned());
-        }
-
-        let source_open_token = app
-            .source_open_service
-            .as_ref()
-            .and_then(|service| service.active_token());
-        let pending_install_token = app
-            .pending_source_install
-            .as_ref()
-            .map(|pending| &pending.token);
-        let dataset_open_operations = snapshot
-            .active_operations()
-            .iter()
-            .filter(|token| token.kind() == OperationKind::DatasetOpen)
-            .collect::<Vec<_>>();
-        let dataset_open_operation_count = u64::try_from(dataset_open_operations.len())
-            .map_err(|_| "dataset-open operation count overflowed u64".to_owned())?;
-        let source_open_worker_bound_to_dataset_open_operation =
-            source_open_token.is_some_and(|token| dataset_open_operations.contains(&token));
-        let pending_source_install_bound_to_dataset_open_operation =
-            pending_install_token.is_some_and(|token| dataset_open_operations.contains(&token));
-        if source_open_token.is_some()
-            || pending_install_token.is_some()
-            || dataset_open_operation_count != 0
-        {
-            return Err(
-                "prepublication import failure unexpectedly has dataset-open work".to_owned(),
-            );
-        }
-
-        Ok(ImportOpenReadyUnavailableEvidence {
-            reason: match state {
-                ImportPrepublicationState::Active => {
-                    ImportOpenReadyUnavailableReason::ActiveBeforePublicationDeadline
-                }
-                ImportPrepublicationState::TerminalWorkerFailure => {
-                    ImportOpenReadyUnavailableReason::TerminalWorkerFailureBeforePublication
-                }
-            },
-            readiness,
-            verification,
-            source_open_worker_active: source_open_token.is_some(),
-            pending_source_install: pending_install_token.is_some(),
-            dataset_open_operation_count,
-            source_open_worker_bound_to_dataset_open_operation,
-            pending_source_install_bound_to_dataset_open_operation,
-        })
-    }
-
     fn complete_imported_open_ready_measurement(
         &mut self,
         app: &MiranteWorkbenchApp,
@@ -2995,216 +1508,18 @@ impl ProductAutomationController {
         };
         ImportedOpenReadyCommitState {
             active_origin: &mut self.active_import_timing_origin,
-            active_run_origin: &mut self.active_import_run_outcomes_origin,
             active_verification_origin: &mut self.active_import_verification_diagnostics_origin,
             completed_primary: &mut self.completed_import_primary_measurement,
             open_ready_outcome: &mut self.imported_open_ready_outcome,
         }
         .commit(
             measurement,
-            ImportedOpenReadyOutcome::Complete {
+            ImportedOpenReadyOutcome {
                 measurement: publication_measurement,
                 evidence: publication_evidence,
             },
         );
         Ok(measurement)
-    }
-
-    fn product_gate_batch_origin_at(
-        &self,
-        origin: ProductAutomationGateBatchOrigin,
-    ) -> Result<Instant, String> {
-        resolve_product_gate_batch_origin_at(
-            origin,
-            self.started_at,
-            &self.command_completed_at,
-            self.active_import_timing_origin
-                .as_ref()
-                .map(|origin| origin.started_at),
-        )
-    }
-
-    fn product_gate_target_met(
-        &self,
-        app: &MiranteWorkbenchApp,
-        snapshot: &ApplicationSnapshot,
-        target: &ProductAutomationGateTarget,
-    ) -> bool {
-        match target {
-            ProductAutomationGateTarget::Condition { condition } => {
-                self.wait_condition_met_with_snapshot(app, snapshot, *condition)
-            }
-            ProductAutomationGateTarget::ImportedOpenReady { path } => {
-                imported_open_ready_readiness(app, snapshot, path).condition_met()
-            }
-        }
-    }
-
-    fn execute_product_gate_batch(
-        &mut self,
-        app: &MiranteWorkbenchApp,
-        batch_id: &str,
-        phase_id: &str,
-        origin: ProductAutomationGateBatchOrigin,
-        observations: &[ProductAutomationGateObservation],
-    ) -> Result<CommandProgress, String> {
-        if self.active_gate_batch.is_none() {
-            self.active_gate_batch = Some(ActiveProductGateBatch {
-                command_index: self.command_index,
-                origin_at: self.product_gate_batch_origin_at(origin)?,
-                outcomes: vec![None; observations.len()],
-            });
-        }
-        let active = self
-            .active_gate_batch
-            .as_ref()
-            .expect("a product gate batch was installed above");
-        if active.command_index != self.command_index || active.outcomes.len() != observations.len()
-        {
-            return Err("active product gate batch does not match the current command".to_owned());
-        }
-
-        // Every still-live predicate is sampled from the same application
-        // snapshot and monotonic instant. Terminal outcomes remain latched.
-        let snapshot = app.application.snapshot();
-        let condition_states = observations
-            .iter()
-            .map(|observation| self.product_gate_target_met(app, &snapshot, &observation.target))
-            .collect::<Vec<_>>();
-        let import_prepublication = self.import_prepublication_state(app);
-        let terminal_failures = observations
-            .iter()
-            .map(|observation| {
-                terminal_import_failure_for_target(&observation.target, import_prepublication)
-            })
-            .collect::<Vec<_>>();
-        // Timestamp after the bounded predicate snapshot so a sample whose
-        // collection crosses its deadline cannot receive an early pass.
-        let now = Instant::now();
-        let origin_at = active.origin_at;
-        let observed_after_origin_ns = u64::try_from(
-            now.checked_duration_since(origin_at)
-                .ok_or_else(|| "product gate batch origin instant moved backwards".to_owned())?
-                .as_nanos(),
-        )
-        .map_err(|_| "product gate batch origin-relative time overflowed u64".to_owned())?;
-
-        let previously_terminal = active
-            .outcomes
-            .iter()
-            .map(Option::is_some)
-            .collect::<Vec<_>>();
-        let complete = {
-            let active = self
-                .active_gate_batch
-                .as_mut()
-                .expect("a product gate batch remains active");
-            latch_product_gate_batch_observations(
-                observations,
-                &condition_states,
-                &terminal_failures,
-                observed_after_origin_ns,
-                &mut active.outcomes,
-            )?
-        };
-        let newly_terminal = self
-            .active_gate_batch
-            .as_ref()
-            .expect("a product gate batch remains active")
-            .outcomes
-            .iter()
-            .copied()
-            .enumerate()
-            .filter_map(|(index, outcome)| {
-                (!previously_terminal[index]).then_some((index, outcome?))
-            })
-            .collect::<Vec<_>>();
-
-        for (index, outcome) in newly_terminal {
-            let ProductAutomationGateTarget::ImportedOpenReady { path } =
-                &observations[index].target
-            else {
-                continue;
-            };
-            match outcome.outcome {
-                ProductGateObservationOutcome::Passed => {
-                    self.complete_imported_open_ready_measurement_at(app, path, now)?;
-                }
-                ProductGateObservationOutcome::Failed => {
-                    self.imported_open_ready_outcome = Some(
-                        match classify_failed_import_publication_capture(
-                            self.capture_bound_import_publication_evidence(app, path),
-                            import_prepublication,
-                        )? {
-                            FailedImportPublicationCapture::Available(evidence) => {
-                                ImportedOpenReadyOutcome::DeadlineFailedAfterTransfer { evidence }
-                            }
-                            FailedImportPublicationCapture::UnavailableBeforeTransfer(state) => {
-                                ImportedOpenReadyOutcome::DeadlineFailedBeforeTransfer {
-                                    evidence: self.capture_unavailable_import_open_ready_evidence(
-                                        app, &snapshot, path, state,
-                                    )?,
-                                }
-                            }
-                        },
-                    );
-                    self.active_import_timing_origin = None;
-                    self.active_import_run_outcomes_origin = None;
-                    self.active_import_verification_diagnostics_origin = None;
-                }
-            }
-        }
-
-        if !complete {
-            let active = self
-                .active_gate_batch
-                .as_ref()
-                .expect("an incomplete product gate batch remains active");
-            let unresolved = observations
-                .iter()
-                .zip(&active.outcomes)
-                .filter(|(_, outcome)| outcome.is_none())
-                .collect::<Vec<_>>();
-            if unresolved
-                .iter()
-                .all(|(observation, _)| observation.target.is_passive())
-            {
-                let repaint_after_ns = unresolved
-                    .iter()
-                    .map(|(observation, _)| {
-                        observation
-                            .deadline_after_origin_ns
-                            .saturating_sub(observed_after_origin_ns)
-                    })
-                    .min();
-                return Ok(CommandProgress::PassiveWaiting(
-                    repaint_after_ns.map(Duration::from_nanos),
-                ));
-            }
-            return Ok(CommandProgress::Waiting);
-        }
-
-        let active = self
-            .active_gate_batch
-            .take()
-            .expect("a complete product gate batch retains its outcomes");
-        self.completed_gate_batch_gpu_timing_unavailable_authority =
-            terminal_coordinated_presentation_failure_authority(
-                active.command_index,
-                batch_id,
-                phase_id,
-                observations,
-                &active.outcomes,
-            );
-        let details = product_gate_batch_details_value(
-            batch_id,
-            phase_id,
-            origin,
-            observed_after_origin_ns,
-            observations,
-            &active.outcomes,
-        )?;
-        Ok(CommandProgress::Done(details))
     }
 
     fn execute_command(
@@ -3493,9 +1808,6 @@ impl ProductAutomationController {
                         "reviewed TIFF import has no source-verification service".to_owned()
                     })?
                     .diagnostics();
-                let import_run_outcomes_origin = ImportWorkerRunOutcomeCounters::from_diagnostics(
-                    &app.import.workers.diagnostics(),
-                );
                 app.apply_import_command(
                     ImportCommand::Start {
                         review_id: review.review_id,
@@ -3517,7 +1829,6 @@ impl ProductAutomationController {
                         "reviewed TIFF import has no exact worker timing origin".to_owned()
                     })?;
                 self.active_import_timing_origin = Some(timing_origin.clone());
-                self.active_import_run_outcomes_origin = Some(import_run_outcomes_origin);
                 self.active_import_verification_diagnostics_origin =
                     Some(verification_diagnostics_origin);
                 self.completed_import_primary_measurement = None;
@@ -3625,102 +1936,6 @@ impl ProductAutomationController {
                     })
                 }
             }
-            ProductAutomationCommand::AwaitActiveViewGpuTiming {
-                target,
-                pass_kind,
-                timeout_ms,
-            } => {
-                let qualification_started = Instant::now();
-                let started = *self.active_wait_started.get_or_insert_with(Instant::now);
-                let adjacent_unavailable_authority = adjacent_gpu_timing_unavailable_authority(
-                    self.command_index,
-                    self.completed_gate_batch_gpu_timing_unavailable_authority
-                        .as_ref(),
-                );
-                let identity = self.active_gpu_timing_await_identity.or_else(|| {
-                    let identity = active_view_gpu_timing_candidate(app, *target, *pass_kind)?;
-                    self.active_gpu_timing_await_identity = Some(identity);
-                    Some(identity)
-                });
-                let generation = app.render_coordination.display_generation();
-                let result = match identity {
-                    Some(identity) => {
-                        match active_view_captured_gpu_timing_complete(app, *target, identity) {
-                            Some(true) => {
-                                let waited = started.elapsed();
-                                let checkpoint = CompletedGpuTimingCheckpoint::Complete {
-                                    identity,
-                                    waited_ns: u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX),
-                                    current_presentation_generation: generation
-                                        .current_presentation_generation,
-                                };
-                                let details = gpu_timing_await_event_details(
-                                    &checkpoint,
-                                    *target,
-                                    *pass_kind,
-                                );
-                                self.completed_gpu_timing_checkpoint = Some(checkpoint);
-                                Ok(CommandProgress::Done(details))
-                            }
-                            Some(false)
-                                if started.elapsed() < Duration::from_millis(*timeout_ms) =>
-                            {
-                                Ok(CommandProgress::Waiting)
-                            }
-                            Some(false) => Err(format!(
-                                "timed out after {timeout_ms} ms waiting for captured exact {} {} GPU timing",
-                                target.name(),
-                                pass_kind.name(),
-                            )),
-                            None => Err(format!(
-                                "captured exact {} {} GPU timing interval was no longer retained",
-                                target.name(),
-                                pass_kind.name(),
-                            )),
-                        }
-                    }
-                    None if adjacent_unavailable_authority.is_some()
-                        && generation.current_presentation_generation
-                            != Some(generation.input_generation) =>
-                    {
-                        let waited = started.elapsed();
-                        let checkpoint = CompletedGpuTimingCheckpoint::Unavailable {
-                            target: *target,
-                            pass_kind: *pass_kind,
-                            display_generation: generation.input_generation,
-                            current_presentation_generation: generation
-                                .current_presentation_generation,
-                            waited_ns: u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX),
-                            authority: adjacent_unavailable_authority
-                                .expect("the unavailable branch checked its exact authority"),
-                        };
-                        let details =
-                            gpu_timing_await_event_details(&checkpoint, *target, *pass_kind);
-                        self.completed_gpu_timing_checkpoint = Some(checkpoint);
-                        Ok(CommandProgress::Done(details))
-                    }
-                    None if started.elapsed() >= Duration::from_millis(*timeout_ms) => {
-                        Err(format!(
-                            "timed out after {timeout_ms} ms waiting to capture exact {} {} GPU timing",
-                            target.name(),
-                            pass_kind.name(),
-                        ))
-                    }
-                    None => Ok(CommandProgress::Waiting),
-                };
-                self.qualification_only_ui_overhead_ns =
-                    self.qualification_only_ui_overhead_ns.saturating_add(
-                        u64::try_from(qualification_started.elapsed().as_nanos())
-                            .unwrap_or(u64::MAX),
-                    );
-                result
-            }
-            ProductAutomationCommand::ObserveGateBatch {
-                batch_id,
-                phase_id,
-                origin,
-                observations,
-            } => self.execute_product_gate_batch(app, batch_id, phase_id, *origin, observations),
             ProductAutomationCommand::SetViewportSize { width, height } => {
                 if *width == 0 || *height == 0 {
                     return Err("requested window inner size in points must be nonzero".to_owned());
@@ -3798,9 +2013,6 @@ impl ProductAutomationController {
                     },
                     "evidence_scope": "automation_only_internal_gpu_render_target",
                 })))
-            }
-            ProductAutomationCommand::SetFourPanelViewports { .. } => {
-                Err("set_four_panel_viewports is permitted only in startup_bootstrap".to_owned())
             }
             ProductAutomationCommand::SetViewerLayout { layout } => {
                 let viewer_layout: ViewerLayout = (*layout).into();
@@ -4124,9 +2336,6 @@ impl ProductAutomationController {
                     "low": low,
                     "high": high,
                 })))
-            }
-            ProductAutomationCommand::SetCameraView { .. } => {
-                Err("set_camera_view is permitted only in startup_bootstrap".to_owned())
             }
             ProductAutomationCommand::CameraFitData => {
                 let snapshot = app.application.snapshot();
@@ -4549,181 +2758,9 @@ impl ProductAutomationController {
                 ViewerPickPurpose::PrimaryClick,
             ),
             ProductAutomationCommand::CopyDiagnostics => {
-                let qualification_started = Instant::now();
                 let diagnostics = self.diagnostics_json(app);
                 self.diagnostics.push(diagnostics.clone());
-                self.qualification_only_ui_overhead_ns =
-                    self.qualification_only_ui_overhead_ns.saturating_add(
-                        u64::try_from(qualification_started.elapsed().as_nanos())
-                            .unwrap_or(u64::MAX),
-                    );
                 Ok(CommandProgress::Done(diagnostics))
-            }
-            ProductAutomationCommand::SampleDiagnostics { label } => {
-                let qualification_started = Instant::now();
-                let (
-                    union_accounting,
-                    gpu_resident_union_accounting,
-                    target_residency_at_phase_start,
-                ) = match (
-                    build_diagnostic_resource_union(app),
-                    build_diagnostic_gpu_resident_union(app),
-                ) {
-                    (Ok(union), Ok(gpu_resident_union)) => {
-                        let delta = self
-                            .previous_labeled_resource_union
-                            .as_ref()
-                            .map(|previous| {
-                                diagnostic_resource_union_delta(
-                                    &previous.label,
-                                    &previous.entries,
-                                    label,
-                                    &union.entries,
-                                )
-                            })
-                            .unwrap_or(Value::Null);
-                        let target_residency_at_phase_start = self
-                            .previous_labeled_resource_union
-                            .as_ref()
-                            .map(|previous| {
-                                target_residency_partition_json(
-                                    &previous.label,
-                                    &previous.gpu_resident_entries,
-                                    &union.entries,
-                                )
-                            })
-                            .unwrap_or(Value::Null);
-                        let previous_heap_bytes = self
-                            .previous_labeled_resource_union
-                            .as_ref()
-                            .and_then(|previous| {
-                                let demand =
-                                    diagnostic_vec_heap_bytes::<(DatasetResourceKey, u64)>(
-                                        previous.entries.capacity(),
-                                    )
-                                    .ok()?;
-                                let resident =
-                                    diagnostic_vec_heap_bytes::<(DatasetResourceKey, u64)>(
-                                        previous.gpu_resident_entries.capacity(),
-                                    )
-                                    .ok()?;
-                                Some(demand.saturating_add(resident))
-                            })
-                            .unwrap_or(0);
-                        let peak_heap_bytes = previous_heap_bytes
-                            .saturating_add(union.working_peak_heap_bytes)
-                            .saturating_add(gpu_resident_union.working_peak_heap_bytes);
-                        let peak_key_records = self
-                            .previous_labeled_resource_union
-                            .as_ref()
-                            .map(|previous| {
-                                previous
-                                    .entries
-                                    .capacity()
-                                    .saturating_add(previous.gpu_resident_entries.capacity())
-                            })
-                            .unwrap_or_default()
-                            .saturating_add(union.working_peak_key_records)
-                            .saturating_add(gpu_resident_union.working_peak_key_records);
-                        self.diagnostic_union_peak_heap_bytes =
-                            self.diagnostic_union_peak_heap_bytes.max(peak_heap_bytes);
-                        self.diagnostic_union_peak_keys =
-                            self.diagnostic_union_peak_keys.max(peak_key_records);
-                        let amplification = (union.unique_payload_bytes != 0).then(|| {
-                            union.summed_scope_payload_bytes as f64
-                                / union.unique_payload_bytes as f64
-                        });
-                        let canonical_entries_sha256 =
-                            canonical_resource_union_sha256(&union.entries);
-                        let exact_union = json!({
-                            "available": true,
-                            "label": label,
-                            "canonical_entries_sha256": canonical_entries_sha256.to_string(),
-                            "canonical_entries_sha256_derivation": "sha256_domain_mirante4d_ep00_resource_union_v1_sorted_binary_le",
-                            "unique_keys": union.entries.len(),
-                            "unique_payload_bytes": union.unique_payload_bytes,
-                            "summed_scope_payload_bytes": union.summed_scope_payload_bytes,
-                            "scope_overlap_amplification": amplification,
-                            "delta_from_previous_label": delta,
-                            "raw_keys_serialized": false,
-                            "derivation": "DatasetCatalog_resource_payload_descriptor_for_sorted_deduplicated_visible_prepared_scope_keys",
-                            "qualification_only_not_product_cache": true,
-                        });
-                        let exact_gpu_resident_union = json!({
-                            "available": true,
-                            "label": label,
-                            "canonical_entries_sha256": canonical_resource_union_sha256(&gpu_resident_union.entries).to_string(),
-                            "canonical_entries_sha256_derivation": "sha256_domain_mirante4d_ep00_resource_union_v1_sorted_binary_le",
-                            "unique_keys": gpu_resident_union.entries.len(),
-                            "unique_payload_bytes": gpu_resident_union.unique_payload_bytes,
-                            "raw_keys_serialized": false,
-                            "derivation": "WgpuRenderRuntime_sorted_resident_keys_joined_with_DatasetCatalog_resource_payload_descriptor",
-                            "qualification_only_not_product_cache": true,
-                        });
-                        self.previous_labeled_resource_union =
-                            Some(LabeledDiagnosticResourceUnion {
-                                label: label.as_str().to_owned(),
-                                entries: union.entries,
-                                gpu_resident_entries: gpu_resident_union.entries,
-                            });
-                        (
-                            exact_union,
-                            exact_gpu_resident_union,
-                            target_residency_at_phase_start,
-                        )
-                    }
-                    (union, resident) => {
-                        let union_error = union.err();
-                        let resident_error = resident.err();
-                        (
-                            json!({
-                                "available": false,
-                                "error_kind": "exact_resource_union_derivation_failed",
-                                "error": union_error,
-                                "raw_keys_serialized": false,
-                            }),
-                            json!({
-                                "available": false,
-                                "error_kind": "exact_gpu_resident_union_derivation_failed",
-                                "error": resident_error,
-                                "raw_keys_serialized": false,
-                            }),
-                            Value::Null,
-                        )
-                    }
-                };
-                let diagnostics = self.diagnostics_json(app);
-                let planned_scope_accounting = planned_scope_accounting_json(app);
-                let sample = json!({
-                    "label": label,
-                    "sampled_at_instrumentation_epoch_ns": app.display_instrumentation_now_ns(),
-                    "input_evidence": {
-                        "automation_level": "E1_semantic_application_commands",
-                        "os_input_injected": false,
-                        "os_input_claimed": false,
-                    },
-                    "resource_accounting": {
-                        "dataset_runtime_counters": diagnostics.get("dataset_runtime").cloned().unwrap_or(Value::Null),
-                        "dataset_source_io_counters": diagnostics.get("dataset_source_io").cloned().unwrap_or(Value::Null),
-                        "planned_semantic_payload_by_scope": planned_scope_accounting,
-                        "exact_cross_scope_union": union_accounting,
-                        "exact_gpu_resident_union": gpu_resident_union_accounting,
-                        "target_residency_at_phase_start": target_residency_at_phase_start,
-                        "qualification_snapshot_duration_ns": u64::try_from(qualification_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                        "qualification_overhead_excluded_from_interaction_task_ring": true,
-                        "union_instrumentation_peak_key_records": self.diagnostic_union_peak_keys,
-                        "union_instrumentation_peak_heap_payload_bytes": self.diagnostic_union_peak_heap_bytes,
-                        "union_instrumentation_heap_accounting": "exact_Vec_capacity_times_element_size_excludes_allocator_metadata_and_stack_fields",
-                    },
-                    "diagnostics": diagnostics,
-                });
-                self.diagnostics.push(sample.clone());
-                self.qualification_only_ui_overhead_ns =
-                    self.qualification_only_ui_overhead_ns.saturating_add(
-                        u64::try_from(qualification_started.elapsed().as_nanos())
-                            .unwrap_or(u64::MAX),
-                    );
-                Ok(CommandProgress::Done(sample))
             }
             ProductAutomationCommand::CaptureScreenshot { name } => {
                 if !product_presentations_ready(app, &[PanelId::ThreeD])? {
@@ -5509,15 +3546,8 @@ impl ProductAutomationController {
                         })).collect::<Vec<_>>(),
                     },
                 })),
-                "qualification_gpu_timing_checkpoint": qualification_gpu_timing_checkpoint_json(
-                    app,
-                    self.completed_gpu_timing_checkpoint.as_ref(),
-                ),
                 "performance_milestones": display_performance_milestones_json(app),
-                "display_coordination": display_coordination_diagnostics_json(
-                    app,
-                    self.script.requires_diagnostic_counters(),
-                ),
+                "display_coordination": display_coordination_diagnostics_json(app),
             },
             "dataset_demand": {
                 "current_scale_level": app.dataset.current_scale().get(),
@@ -5653,7 +3683,6 @@ impl ProductAutomationController {
                 "scenario": self.script.scenario.clone(),
                 "command_count": self.script.commands.len(),
             },
-            "startup_bootstrap": &self.startup_bootstrap_evidence,
             "hard_safety_limits": self.script.hard_safety_limits,
             "limit_observations": self.limit_observations.json(),
             "dataset": {
@@ -5775,43 +3804,13 @@ fn import_publication_to_open_ready_measurement_json(
     let Some(outcome) = outcome else {
         return Value::Null;
     };
-    if let ImportedOpenReadyOutcome::DeadlineFailedBeforeTransfer { evidence } = outcome {
-        return json!({
-            "status": outcome.status(),
-            "unavailable_reason": evidence.reason.name(),
-            "readiness": {
-                "selected_matches": evidence.readiness.selected_matches,
-                "verified": evidence.readiness.verified,
-                "import_idle": evidence.readiness.import_idle,
-                "problem_absent": evidence.readiness.problem_absent,
-            },
-            "source_verification_deltas": {
-                "started_runs": evidence.verification.source_verification_started_runs,
-                "progress_updates": evidence.verification.source_verification_progress_updates,
-                "cancelled_runs": evidence.verification.source_verification_cancelled_runs,
-                "failed_runs": evidence.verification.source_verification_failed_runs,
-                "successes": evidence.verification.source_verification_successes,
-            },
-            "source_open_state": {
-                "worker_active": evidence.source_open_worker_active,
-                "pending_install": evidence.pending_source_install,
-                "active_dataset_open_operations": evidence.dataset_open_operation_count,
-                "worker_bound_to_dataset_open_operation": evidence.source_open_worker_bound_to_dataset_open_operation,
-                "pending_install_bound_to_dataset_open_operation": evidence.pending_source_install_bound_to_dataset_open_operation,
-            },
-        });
-    }
-    let (measurement, evidence) = match outcome {
-        ImportedOpenReadyOutcome::Complete {
-            measurement,
-            evidence,
-        } => (Some(measurement), evidence),
-        ImportedOpenReadyOutcome::DeadlineFailedAfterTransfer { evidence } => (None, evidence),
-        ImportedOpenReadyOutcome::DeadlineFailedBeforeTransfer { .. } => unreachable!(),
-    };
+    let ImportedOpenReadyOutcome {
+        measurement,
+        evidence,
+    } = outcome;
     let currentness = evidence.publication_currentness;
-    let mut result = json!({
-        "status": outcome.status(),
+    json!({
+        "status": "open_ready_complete",
         "publication_currentness_execution": {
             "contract_id": currentness.contract_id,
             "expected_snapshot_object_reads": currentness.expected_snapshot_object_reads,
@@ -5826,41 +3825,17 @@ fn import_publication_to_open_ready_measurement_json(
         "source_verification_cancelled_runs": evidence.source_verification_cancelled_runs,
         "source_verification_failed_runs": evidence.source_verification_failed_runs,
         "source_verification_successes": evidence.source_verification_successes,
-    });
-    if let Some(measurement) = measurement {
-        let object = result
-            .as_object_mut()
-            .expect("import publication evidence is a fixed JSON object");
-        object.insert(
-            "start_boundary".to_owned(),
-            json!("import_worker_published_event"),
-        );
-        object.insert(
-            "end_boundary".to_owned(),
-            json!("published_destination_verified_and_open_ready_for_normal_product_use"),
-        );
-        object.insert("wall_clock".to_owned(), json!("std_instant_monotonic"));
-        object.insert("cpu_clock".to_owned(), json!("process_cpu_time"));
-        object.insert(
-            "published_at_epoch_ms".to_owned(),
-            json!(measurement.published_at_epoch_ms),
-        );
-        object.insert(
-            "open_ready_at_epoch_ms".to_owned(),
-            json!(measurement.open_ready_at_epoch_ms),
-        );
-        object.insert("wall_time_ns".to_owned(), json!(measurement.wall_time_ns));
-        object.insert(
-            "process_cpu_time_ns".to_owned(),
-            json!(measurement.process_cpu_time_ns),
-        );
-        object.insert("included_in_primary_clock".to_owned(), json!(true));
-        object.insert(
-            "transfer_mode".to_owned(),
-            json!("staged_verified_capability"),
-        );
-    }
-    result
+        "start_boundary": "import_worker_published_event",
+        "end_boundary": "published_destination_verified_and_open_ready_for_normal_product_use",
+        "wall_clock": "std_instant_monotonic",
+        "cpu_clock": "process_cpu_time",
+        "published_at_epoch_ms": measurement.published_at_epoch_ms,
+        "open_ready_at_epoch_ms": measurement.open_ready_at_epoch_ms,
+        "wall_time_ns": measurement.wall_time_ns,
+        "process_cpu_time_ns": measurement.process_cpu_time_ns,
+        "included_in_primary_clock": true,
+        "transfer_mode": "staged_verified_capability",
+    })
 }
 
 fn import_receipt_json(receipt: &ImportReceipt) -> Value {
@@ -6171,166 +4146,6 @@ fn timing_samples_json(samples: &mirante4d_application::DisplayTimingSamples) ->
     })
 }
 
-fn complete_gpu_timing_checkpoint_json(
-    identity: ProductGpuExecutionIdentity,
-    current_presentation_generation: Option<u64>,
-    waited_ns: u64,
-    sample: &PresentedFrameIntervalSample,
-    timing: ProductGpuExecutionTiming,
-) -> Value {
-    json!({
-        "available": true,
-        "derivation": GPU_TIMING_COMPLETE_DERIVATION,
-        "reason": Value::Null,
-        "presented_interval_sequence": sample.sequence,
-        "panel": sample.panel.label(),
-        "execution_id": identity.execution_id,
-        "target": identity.target.get(),
-        "display_generation": identity.display_generation,
-        "current_presentation_generation": current_presentation_generation,
-        "renderer_frame": identity.renderer_frame.get(),
-        "pass_kind": format!("{:?}", identity.pass_kind),
-        "gpu_batch_envelope_ns": timing.batch_gpu_envelope_ns,
-        "gpu_payload_copy_ns": timing.payload_copy_ns,
-        "gpu_render_pass_ns": timing.render_pass_ns,
-        "identity_frozen_before_completion": true,
-        "exact_presented_interval_timing_complete": true,
-        "unavailable_authority": Value::Null,
-        "waited_ns": waited_ns,
-    })
-}
-
-fn unavailable_gpu_timing_checkpoint_json(
-    target: ProductAutomationGpuTarget,
-    pass_kind: ProductAutomationGpuPassKind,
-    display_generation: u64,
-    current_presentation_generation: Option<u64>,
-    waited_ns: u64,
-    authority: &TerminalCoordinatedPresentationFailureAuthority,
-) -> Value {
-    let pass_kind = match pass_kind {
-        ProductAutomationGpuPassKind::Plane => "Plane",
-        ProductAutomationGpuPassKind::Volume => "Volume",
-    };
-    json!({
-        "available": false,
-        "derivation": GPU_TIMING_UNAVAILABLE_DERIVATION,
-        "reason": GPU_TIMING_UNAVAILABLE_REASON,
-        "presented_interval_sequence": Value::Null,
-        "panel": PanelId::from(target).label(),
-        "execution_id": Value::Null,
-        "target": Value::Null,
-        "display_generation": display_generation,
-        "current_presentation_generation": current_presentation_generation,
-        "renderer_frame": Value::Null,
-        "pass_kind": pass_kind,
-        "gpu_batch_envelope_ns": Value::Null,
-        "gpu_payload_copy_ns": Value::Null,
-        "gpu_render_pass_ns": Value::Null,
-        "identity_frozen_before_completion": false,
-        "exact_presented_interval_timing_complete": false,
-        "unavailable_authority": authority,
-        "waited_ns": waited_ns,
-    })
-}
-
-fn qualification_gpu_timing_checkpoint_json(
-    app: &MiranteWorkbenchApp,
-    checkpoint: Option<&CompletedGpuTimingCheckpoint>,
-) -> Value {
-    let Some(checkpoint) = checkpoint else {
-        return Value::Null;
-    };
-    if let CompletedGpuTimingCheckpoint::Unavailable {
-        target,
-        pass_kind,
-        display_generation,
-        current_presentation_generation,
-        waited_ns,
-        authority,
-    } = checkpoint
-    {
-        return unavailable_gpu_timing_checkpoint_json(
-            *target,
-            *pass_kind,
-            *display_generation,
-            *current_presentation_generation,
-            *waited_ns,
-            authority,
-        );
-    }
-    let CompletedGpuTimingCheckpoint::Complete {
-        identity,
-        waited_ns,
-        current_presentation_generation,
-    } = checkpoint
-    else {
-        unreachable!("the unavailable checkpoint returned above")
-    };
-    let sample = app
-        .native_presentation
-        .product_gpu
-        .as_ref()
-        .and_then(|product| {
-            product
-                .presented_frame_interval_samples()
-                .iter()
-                .rev()
-                .find(|sample| sample.gpu_execution == Some(*identity))
-        });
-    let Some(sample) = sample else {
-        return json!({
-            "available": false,
-            "derivation": GPU_TIMING_COMPLETE_DERIVATION,
-            "reason": "captured_presented_interval_not_retained",
-            "presented_interval_sequence": Value::Null,
-            "panel": Value::Null,
-            "execution_id": identity.execution_id,
-            "target": identity.target.get(),
-            "display_generation": identity.display_generation,
-            "current_presentation_generation": current_presentation_generation,
-            "renderer_frame": identity.renderer_frame.get(),
-            "pass_kind": format!("{:?}", identity.pass_kind),
-            "gpu_batch_envelope_ns": Value::Null,
-            "gpu_payload_copy_ns": Value::Null,
-            "gpu_render_pass_ns": Value::Null,
-            "identity_frozen_before_completion": true,
-            "exact_presented_interval_timing_complete": false,
-            "unavailable_authority": Value::Null,
-            "waited_ns": waited_ns,
-        });
-    };
-    let Some(timing) = sample.gpu_timing else {
-        return json!({
-            "available": false,
-            "derivation": GPU_TIMING_COMPLETE_DERIVATION,
-            "reason": "captured_presented_interval_timing_incomplete",
-            "presented_interval_sequence": sample.sequence,
-            "panel": sample.panel.label(),
-            "execution_id": identity.execution_id,
-            "target": identity.target.get(),
-            "display_generation": identity.display_generation,
-            "current_presentation_generation": current_presentation_generation,
-            "renderer_frame": identity.renderer_frame.get(),
-            "pass_kind": format!("{:?}", identity.pass_kind),
-            "gpu_batch_envelope_ns": Value::Null,
-            "gpu_payload_copy_ns": Value::Null,
-            "gpu_render_pass_ns": Value::Null,
-            "identity_frozen_before_completion": true,
-            "exact_presented_interval_timing_complete": false,
-            "unavailable_authority": Value::Null,
-            "waited_ns": waited_ns,
-        });
-    };
-    complete_gpu_timing_checkpoint_json(
-        *identity,
-        *current_presentation_generation,
-        *waited_ns,
-        sample,
-        timing,
-    )
-}
-
 fn display_performance_milestones_json(app: &MiranteWorkbenchApp) -> Value {
     let milestones = &app.display_performance_milestones;
     let snapshot = app.application.snapshot();
@@ -6561,319 +4376,8 @@ fn source_verification_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     })
 }
 
-struct DiagnosticResourceUnion {
-    entries: Vec<(DatasetResourceKey, u64)>,
-    unique_payload_bytes: u64,
-    summed_scope_payload_bytes: u64,
-    working_peak_heap_bytes: u64,
-    working_peak_key_records: usize,
-}
-
-struct LabeledDiagnosticResourceUnion {
-    label: String,
-    entries: Vec<(DatasetResourceKey, u64)>,
-    gpu_resident_entries: Vec<(DatasetResourceKey, u64)>,
-}
-
-fn diagnostic_vec_heap_bytes<T>(capacity: usize) -> Result<u64, String> {
-    let bytes = capacity
-        .checked_mul(std::mem::size_of::<T>())
-        .ok_or_else(|| "diagnostic union allocation size overflowed usize".to_owned())?;
-    u64::try_from(bytes).map_err(|_| "diagnostic union allocation size does not fit u64".to_owned())
-}
-
-fn is_viewer_display_scope(scope: u64) -> bool {
-    matches!(
-        scope,
-        crate::dataset_requests::SCOPE_CURRENT_3D
-            | crate::dataset_requests::SCOPE_CURRENT_3D_REFINEMENT
-            | crate::dataset_requests::SCOPE_CROSS_SECTION_XY
-            | crate::dataset_requests::SCOPE_CROSS_SECTION_XZ
-            | crate::dataset_requests::SCOPE_CROSS_SECTION_YZ
-    )
-}
-
-fn build_diagnostic_resource_union(
-    app: &MiranteWorkbenchApp,
-) -> Result<DiagnosticResourceUnion, String> {
-    let total_scope_keys = app
-        .prepared_scope_render_plans
-        .iter()
-        .filter(|(scope, _)| is_viewer_display_scope(**scope))
-        .try_fold(0_usize, |total, (_, plan)| {
-            total
-                .checked_add(plan.requirements.body().canonical().len())
-                .ok_or_else(|| "diagnostic scope-key count overflowed usize".to_owned())
-        })?;
-    let mut keys = Vec::new();
-    keys.try_reserve_exact(total_scope_keys)
-        .map_err(|error| format!("diagnostic scope-key allocation failed: {error}"))?;
-    for (_, plan) in app
-        .prepared_scope_render_plans
-        .iter()
-        .filter(|(scope, _)| is_viewer_display_scope(**scope))
-    {
-        keys.extend(plan.requirements.body().canonical().iter().copied());
-    }
-    keys.sort_unstable();
-    keys.dedup();
-    let unique_key_count = keys.len();
-    let key_working_bytes = diagnostic_vec_heap_bytes::<DatasetResourceKey>(keys.capacity())?;
-    let mut entries = Vec::new();
-    entries
-        .try_reserve_exact(unique_key_count)
-        .map_err(|error| format!("diagnostic key-byte allocation failed: {error}"))?;
-    let snapshot = app.application.snapshot();
-    let mut unique_payload_bytes = 0_u64;
-    for key in keys.iter().copied() {
-        let byte_len = snapshot
-            .catalog()
-            .resource_payload_descriptor(key)
-            .map_err(|error| {
-                format!("diagnostic payload derivation failed for a prepared resource: {error}")
-            })?
-            .byte_len();
-        unique_payload_bytes = unique_payload_bytes
-            .checked_add(byte_len)
-            .ok_or_else(|| "diagnostic unique payload-byte sum overflowed u64".to_owned())?;
-        entries.push((key, byte_len));
-    }
-    let entry_bytes = diagnostic_vec_heap_bytes::<(DatasetResourceKey, u64)>(entries.capacity())?;
-    let summed_scope_payload_bytes = app
-        .prepared_scope_render_plans
-        .iter()
-        .filter(|(scope, _)| is_viewer_display_scope(**scope))
-        .try_fold(0_u64, |total, (_, plan)| {
-            total
-                .checked_add(plan.planned_payload_bytes)
-                .ok_or_else(|| "diagnostic scope payload-byte sum overflowed u64".to_owned())
-        })?;
-    let working_peak_key_records = keys.capacity().saturating_add(entries.capacity());
-    Ok(DiagnosticResourceUnion {
-        entries,
-        unique_payload_bytes,
-        summed_scope_payload_bytes,
-        working_peak_heap_bytes: key_working_bytes.saturating_add(entry_bytes),
-        working_peak_key_records,
-    })
-}
-
-fn build_diagnostic_gpu_resident_union(
-    app: &MiranteWorkbenchApp,
-) -> Result<DiagnosticResourceUnion, String> {
-    let renderer = app
-        .native_presentation
-        .product_gpu
-        .as_ref()
-        .ok_or_else(|| "product GPU runtime is unavailable".to_owned())?;
-    let resident_keys = renderer.renderer.resident_keys();
-    let resident_count = resident_keys.len();
-    let mut keys = Vec::new();
-    keys.try_reserve_exact(resident_count)
-        .map_err(|error| format!("diagnostic GPU-resident key allocation failed: {error}"))?;
-    keys.extend(resident_keys);
-    debug_assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
-    let key_working_bytes = diagnostic_vec_heap_bytes::<DatasetResourceKey>(keys.capacity())?;
-    let mut entries = Vec::new();
-    entries
-        .try_reserve_exact(keys.len())
-        .map_err(|error| format!("diagnostic GPU-resident entry allocation failed: {error}"))?;
-    let snapshot = app.application.snapshot();
-    let mut unique_payload_bytes = 0_u64;
-    for key in keys.iter().copied() {
-        let byte_len = snapshot
-            .catalog()
-            .resource_payload_descriptor(key)
-            .map_err(|error| {
-                format!("GPU residency contains a key outside the current dataset catalog: {error}")
-            })?
-            .byte_len();
-        unique_payload_bytes = unique_payload_bytes
-            .checked_add(byte_len)
-            .ok_or_else(|| "diagnostic GPU-resident payload sum overflowed u64".to_owned())?;
-        entries.push((key, byte_len));
-    }
-    let entry_bytes = diagnostic_vec_heap_bytes::<(DatasetResourceKey, u64)>(entries.capacity())?;
-    let working_peak_key_records = keys.capacity().saturating_add(entries.capacity());
-    Ok(DiagnosticResourceUnion {
-        entries,
-        unique_payload_bytes,
-        summed_scope_payload_bytes: unique_payload_bytes,
-        working_peak_heap_bytes: key_working_bytes.saturating_add(entry_bytes),
-        working_peak_key_records,
-    })
-}
-
-fn target_residency_partition_json(
-    phase_start_label: &str,
-    phase_start_resident: &[(DatasetResourceKey, u64)],
-    target: &[(DatasetResourceKey, u64)],
-) -> Value {
-    let mut resident_index = 0_usize;
-    let mut intersection_hasher = CanonicalDatasetResourceUnionHasher::new();
-    let mut difference_hasher = CanonicalDatasetResourceUnionHasher::new();
-    let (mut intersection_keys, mut intersection_bytes) = (0_u64, 0_u64);
-    let (mut difference_keys, mut difference_bytes) = (0_u64, 0_u64);
-    for (target_key, target_bytes) in target.iter().copied() {
-        while phase_start_resident
-            .get(resident_index)
-            .is_some_and(|(resident_key, _)| resident_key < &target_key)
-        {
-            resident_index += 1;
-        }
-        if let Some((resident_key, resident_bytes)) = phase_start_resident.get(resident_index)
-            && *resident_key == target_key
-        {
-            debug_assert_eq!(*resident_bytes, target_bytes);
-            intersection_keys = intersection_keys.saturating_add(1);
-            intersection_bytes = intersection_bytes.saturating_add(target_bytes);
-            intersection_hasher.push(target_key, target_bytes);
-        } else {
-            difference_keys = difference_keys.saturating_add(1);
-            difference_bytes = difference_bytes.saturating_add(target_bytes);
-            difference_hasher.push(target_key, target_bytes);
-        }
-    }
-    json!({
-        "available": true,
-        "phase_start_label": phase_start_label,
-        "phase_start_resident_union_sha256": canonical_resource_union_sha256(phase_start_resident).to_string(),
-        "target_union_sha256": canonical_resource_union_sha256(target).to_string(),
-        "resident_target_intersection": {
-            "canonical_entries_sha256": intersection_hasher.finalize().to_string(),
-            "unique_keys": intersection_keys,
-            "unique_payload_bytes": intersection_bytes,
-        },
-        "nonresident_target_difference": {
-            "canonical_entries_sha256": difference_hasher.finalize().to_string(),
-            "unique_keys": difference_keys,
-            "unique_payload_bytes": difference_bytes,
-        },
-        "partitions_pairwise_disjoint": true,
-        "target_union_reconciles": intersection_keys.saturating_add(difference_keys)
-            == u64::try_from(target.len()).unwrap_or(u64::MAX),
-        "derivation": "sorted_target_union_partition_by_phase_start_gpu_residency",
-    })
-}
-
-fn diagnostic_resource_union_delta(
-    previous_label: &str,
-    previous: &[(DatasetResourceKey, u64)],
-    current_label: &str,
-    current: &[(DatasetResourceKey, u64)],
-) -> Value {
-    let (mut previous_index, mut current_index) = (0_usize, 0_usize);
-    let (mut retained_count, mut retained_bytes) = (0_u64, 0_u64);
-    let (mut added_count, mut added_bytes) = (0_u64, 0_u64);
-    let (mut removed_count, mut removed_bytes) = (0_u64, 0_u64);
-    let mut retained_hasher = CanonicalDatasetResourceUnionHasher::new();
-    let mut added_hasher = CanonicalDatasetResourceUnionHasher::new();
-    let mut removed_hasher = CanonicalDatasetResourceUnionHasher::new();
-    let mut retained_payload_bytes_match = true;
-    while previous_index < previous.len() || current_index < current.len() {
-        match (previous.get(previous_index), current.get(current_index)) {
-            (Some((previous_key, previous_bytes)), Some((current_key, current_bytes))) => {
-                match previous_key.cmp(current_key) {
-                    std::cmp::Ordering::Equal => {
-                        retained_payload_bytes_match &= previous_bytes == current_bytes;
-                        retained_count = retained_count.saturating_add(1);
-                        retained_bytes = retained_bytes.saturating_add(*current_bytes);
-                        retained_hasher.push(*current_key, *current_bytes);
-                        previous_index += 1;
-                        current_index += 1;
-                    }
-                    std::cmp::Ordering::Less => {
-                        removed_count = removed_count.saturating_add(1);
-                        removed_bytes = removed_bytes.saturating_add(*previous_bytes);
-                        removed_hasher.push(*previous_key, *previous_bytes);
-                        previous_index += 1;
-                    }
-                    std::cmp::Ordering::Greater => {
-                        added_count = added_count.saturating_add(1);
-                        added_bytes = added_bytes.saturating_add(*current_bytes);
-                        added_hasher.push(*current_key, *current_bytes);
-                        current_index += 1;
-                    }
-                }
-            }
-            (Some((previous_key, previous_bytes)), None) => {
-                removed_count = removed_count.saturating_add(1);
-                removed_bytes = removed_bytes.saturating_add(*previous_bytes);
-                removed_hasher.push(*previous_key, *previous_bytes);
-                previous_index += 1;
-            }
-            (None, Some((current_key, current_bytes))) => {
-                added_count = added_count.saturating_add(1);
-                added_bytes = added_bytes.saturating_add(*current_bytes);
-                added_hasher.push(*current_key, *current_bytes);
-                current_index += 1;
-            }
-            (None, None) => break,
-        }
-    }
-    json!({
-        "previous_label": previous_label,
-        "previous_union_sha256": canonical_resource_union_sha256(previous).to_string(),
-        "current_label": current_label,
-        "current_union_sha256": canonical_resource_union_sha256(current).to_string(),
-        "retained_unique_keys": retained_count,
-        "retained_unique_payload_bytes": retained_bytes,
-        "retained_entries_sha256": retained_hasher.finalize().to_string(),
-        "added_unique_keys": added_count,
-        "added_unique_payload_bytes": added_bytes,
-        "added_entries_sha256": added_hasher.finalize().to_string(),
-        "removed_unique_keys": removed_count,
-        "removed_unique_payload_bytes": removed_bytes,
-        "removed_entries_sha256": removed_hasher.finalize().to_string(),
-        "retained_payload_bytes_match": retained_payload_bytes_match,
-        "partitions_pairwise_disjoint": true,
-        "partition_derivation": "sorted_DatasetResourceKey_payload_descriptor_three_way_merge",
-    })
-}
-
-fn display_coordination_diagnostics_json(
-    app: &MiranteWorkbenchApp,
-    detailed_counters_enabled: bool,
-) -> Value {
+fn display_coordination_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     let generation = app.render_coordination.display_generation();
-    let detailed = app.render_coordination.display_diagnostic_counters();
-    let targets = app
-        .native_presentation
-        .product_gpu
-        .as_ref()
-        .map(|product| {
-            product
-                .targets
-                .iter()
-                .map(|(panel, target)| product_target_renderer_facts_json(panel.label(), target))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let staging_3d_renderer_facts = app
-        .native_presentation
-        .product_gpu
-        .as_ref()
-        .and_then(|product| product.staging_3d.as_ref())
-        .map(|target| {
-            let mut facts = product_target_renderer_facts_json("3D", target);
-            facts["purpose"] = Value::String("hidden_staging_3d_fallback_target".to_owned());
-            facts
-        });
-    let aggregate_target_counters = app
-        .native_presentation
-        .product_gpu
-        .as_ref()
-        .map(|product| {
-            aggregate_product_target_diagnostic_counters(
-                product
-                    .targets
-                    .values()
-                    .chain(product.staging_3d.iter())
-                    .map(|target| target.diagnostic_counters),
-            )
-        })
-        .unwrap_or_default();
-    let planner = app.camera_demand_planner.diagnostics();
     json!({
         "instrumentation_epoch": "app_private_monotonic_epoch",
         "input_generation": generation.input_generation,
@@ -6894,7 +4398,7 @@ fn display_coordination_diagnostics_json(
             "samples": timing_samples_json(
                 app.render_coordination.active_main_loop_gap_samples(),
             ),
-            "qualification_scope": "only_while_newest_input_not_current",
+            "scope": "only_while_newest_input_not_current",
         },
         "active_input_presentation_gap_ns": {
             "current": generation.current_presentation_gap_ns,
@@ -6902,12 +4406,12 @@ fn display_coordination_diagnostics_json(
             "samples": timing_samples_json(
                 app.render_coordination.active_presentation_gap_samples(),
             ),
-            "qualification_scope": "only_while_newest_input_not_current",
+            "scope": "only_while_newest_input_not_current",
         },
         "raw_main_loop_gap_ns": {
             "current": generation.raw_current_main_loop_heartbeat_gap_ns,
             "maximum": generation.raw_maximum_main_loop_heartbeat_gap_ns,
-            "qualification_scope": "includes_settled_event_driven_idle",
+            "scope": "includes_settled_event_driven_idle",
         },
         "durable_gesture_commits": generation.durable_gesture_commits,
         "admitted_generation_latency": timing_samples_json(
@@ -6915,120 +4419,23 @@ fn display_coordination_diagnostics_json(
         ),
         "semantic_interaction_task_duration": {
             "ownership": "SetCamera_or_SetLayout_application_dispatch_reconciliation_and_service_pump_attribution_only",
-            "claim_bearing_2ms_gate": false,
             "whole_idle_frame_included": false,
             "samples": timing_samples_json(
                 app.render_coordination.interaction_task_duration_samples(),
             ),
         },
         "active_ui_update_duration": {
-            "ownership": "eframe_App_ui_callback_when_input_or_loading_work_is_active_minus_exact_sequential_qualification_diagnostic_or_timing_await_interval",
-            "excludes": "compositor_present_and_vsync_outside_callback_and_sample_diagnostics_copy_diagnostics_or_await_active_view_gpu_timing_evidence_production",
-            "claim_bearing_2ms_gate": true,
+            "ownership": "complete_eframe_App_ui_callback_when_input_or_loading_work_is_active",
+            "excludes": "compositor_present_and_vsync_outside_callback",
             "settled_event_driven_idle_updates_included": false,
-            "qualification_only_automation_overhead_excluded": true,
-            "qualification_only_automation_commands_excluded": ["sample_diagnostics", "copy_diagnostics", "await_active_view_gpu_timing"],
-            "subtraction_method": "saturating_subtract_exact_monotonic_elapsed_interval_from_enclosing_ui_callback",
             "samples": timing_samples_json(
                 app.render_coordination.active_ui_update_duration_samples(),
             ),
         },
         "coordinated_visible_layout_current_complete": coordinated_visible_layout_current_complete(app),
-        "detailed_counters": detailed_counters_enabled.then(|| json!({
-            "enabled": detailed.enabled,
-            "raw_input_samples": detailed.raw_input_samples,
-            "admitted_input_generations": detailed.admitted_input_generations,
-            "coalesced_input_samples": detailed.coalesced_input_samples,
-            "superseded_input_generations": detailed.superseded_input_generations,
-            "current_presentations": detailed.current_presentations,
-            "pending_display_batches_peak": {
-                "available": false,
-                "reason": "no_display_batch_coordinator",
-            },
-            "display_batch_ownership": "synchronous_ui_thread_encode_submit_no_replaceable_queue",
-            "color_passes": aggregate_target_counters.color_passes,
-            "completion_notifications": aggregate_target_counters.completion_notifications,
-            "encoded_display_batches": aggregate_target_counters.encoded_display_batches,
-            "encoded_but_dropped_batches": 0_u64,
-            "sealed_obsolete_submitted_batches": 0_u64,
-            "renderer_static_preparations": planner.renderer_static_preparations,
-            "per_target_renderer_facts": targets,
-            "staging_3d_renderer_facts": staging_3d_renderer_facts,
-        })),
         "os_input_injected": false,
         "os_input_claimed": false,
     })
-}
-
-fn product_target_renderer_facts_json(
-    panel: &str,
-    target: &crate::native_presentation::ProductPresentationTarget,
-) -> Value {
-    let request = target.request.as_ref();
-    let progressive_probe = target.progressive_lease_probe_state();
-    let presentation_matches_request = request.is_some_and(|request| {
-        target.presented.as_ref().is_some_and(|frame| {
-            frame.frame() == request.intent.frame() && frame.extent() == request.intent.extent()
-        })
-    });
-    json!({
-        "panel": panel,
-        "request_bound": request.is_some(),
-        "request_frame": request.map(|request| request.intent.frame().get()),
-        "request_timepoint": request.map(|request| request.intent.timepoint().get()),
-        "request_requirement_count": request.map(|request| request.requirements.resource_keys().len()),
-        "target_requirement_count": target.requirement_keys.len(),
-        "target_satisfied_requirement_count": target.satisfied_requirement_keys.len(),
-        "last_renderer_available_resources": target.last_renderer_available_resources,
-        "presentation_present": target.presented.is_some(),
-        "presentation_matches_request": presentation_matches_request,
-        "progressive_probe": {
-            "next_requirement": progressive_probe.next_requirement,
-            "requirements_remaining": progressive_probe.requirements_remaining,
-            "render_requested": progressive_probe.render_requested,
-        },
-        "renderer_calls": target.diagnostic_counters.renderer_calls,
-        "command_buffers": target.diagnostic_counters.command_buffers,
-        "queue_submissions": target.diagnostic_counters.queue_submissions,
-        "backpressure_deferrals": target.diagnostic_counters.backpressure_deferrals,
-        "control_static_rebuilds": target.diagnostic_counters.control_static_rebuilds,
-        "last_execution": target.last_execution_timing.map(|execution| json!({
-            "execution_id": execution.gpu_ticket.map(|ticket| ticket.execution_id()),
-            "target": execution.target.get(),
-            "generation": execution.gpu_ticket.map_or(execution.display_generation, |ticket| ticket.display_generation()),
-            "renderer_frame": execution.frame.get(),
-            "pass_kind": format!("{:?}", execution.pass_kind),
-            "cpu_planning_ns": execution.cpu.map(|timing| timing.planning_ns()),
-            "cpu_control_publication_ns": execution.cpu.and_then(|timing| timing.control_publication_ns()),
-            "cpu_payload_staging_ns": execution.cpu.and_then(|timing| timing.payload_staging_ns()),
-            "cpu_queue_submit_ns": execution.cpu.map(|timing| timing.queue_submit_ns()),
-            "gpu_batch_envelope_ns": execution.gpu.and_then(|timing| timing.batch_gpu_envelope_ns()),
-            "gpu_payload_copy_ns": execution.gpu.and_then(|timing| timing.payload_copy_ns()),
-            "gpu_render_pass_ns": execution.gpu.and_then(|timing| timing.render_pass_ns()),
-            "gpu_timing_available": execution.gpu.is_some(),
-        })),
-    })
-}
-
-fn aggregate_product_target_diagnostic_counters(
-    counters: impl IntoIterator<Item = crate::native_presentation::ProductTargetDiagnosticCounters>,
-) -> crate::native_presentation::ProductTargetDiagnosticCounters {
-    counters.into_iter().fold(
-        crate::native_presentation::ProductTargetDiagnosticCounters::default(),
-        |mut total, counter| {
-            total.color_passes = total.color_passes.saturating_add(counter.color_passes);
-            total.completion_notifications = total
-                .completion_notifications
-                .saturating_add(counter.completion_notifications);
-            total.encoded_display_batches = total
-                .encoded_display_batches
-                .saturating_add(counter.encoded_display_batches);
-            total.control_static_rebuilds = total
-                .control_static_rebuilds
-                .saturating_add(counter.control_static_rebuilds);
-            total
-        },
-    )
 }
 
 fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {

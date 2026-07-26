@@ -61,6 +61,9 @@ fn synchronize_viewer_tool(
     if state.viewer_tools.active_tool != canonical {
         state.viewer_tools.set_active_tool(canonical);
     }
+    if !matches!(canonical, ViewerTool::Navigate | ViewerTool::Inspect) {
+        state.cancel_viewport_camera_interaction();
+    }
     state
         .viewer_tools
         .synchronize_context(ViewerToolContext::new(

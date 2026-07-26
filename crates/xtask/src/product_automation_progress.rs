@@ -127,14 +127,9 @@ fn parse_command_plan(index: usize, value: &Value) -> anyhow::Result<CommandPlan
         .with_context(|| format!("automation command {index} has an unknown command kind"))?;
 
     let budget = match kind {
-        "wait_for_import_progress"
-        | "wait_for_imported_open_ready"
-        | "wait_for"
-        | "await_active_view_gpu_timing" => Some(Duration::from_millis(required_u64(
-            object,
-            "timeout_ms",
-            index,
-        )?)),
+        "wait_for_import_progress" | "wait_for_imported_open_ready" | "wait_for" => Some(
+            Duration::from_millis(required_u64(object, "timeout_ms", index)?),
+        ),
         "switch_dataset" => Some(Duration::from_secs(120)),
         "camera_orbit_sequence"
         | "camera_pan_sequence"
@@ -164,7 +159,7 @@ fn parse_command_plan(index: usize, value: &Value) -> anyhow::Result<CommandPlan
         "capture_screenshot" | "assert" | "probe_hover" | "primary_click" => {
             Some(Duration::from_secs(30))
         }
-        "observe_gate_batch" | "hold_for_external_kill" => None,
+        "hold_for_external_kill" => None,
         // Commands without a script-declared duration are still bounded. A
         // live heartbeat proves that the event loop is running; it does not
         // prove that one semantic command is making progress. Leaving these
@@ -177,10 +172,7 @@ fn parse_command_plan(index: usize, value: &Value) -> anyhow::Result<CommandPlan
         let accepted = match reserved {
             "timeout_ms" => matches!(
                 kind,
-                "wait_for_import_progress"
-                    | "wait_for_imported_open_ready"
-                    | "wait_for"
-                    | "await_active_view_gpu_timing"
+                "wait_for_import_progress" | "wait_for_imported_open_ready" | "wait_for"
             ),
             "duration_ms" => kind.ends_with("_sequence"),
             "frames" => kind == "sleep_frames",
@@ -222,12 +214,9 @@ fn known_command_kind(kind: &str) -> Option<&'static str> {
         "cancel_import" => "cancel_import",
         "wait_for_imported_open_ready" => "wait_for_imported_open_ready",
         "wait_for" => "wait_for",
-        "await_active_view_gpu_timing" => "await_active_view_gpu_timing",
-        "observe_gate_batch" => "observe_gate_batch",
         "set_viewport_size" => "set_viewport_size",
         "set_mapped_client_pixels" => "set_mapped_client_pixels",
         "set_render_target_size" => "set_render_target_size",
-        "set_four_panel_viewports" => "set_four_panel_viewports",
         "set_viewer_layout" => "set_viewer_layout",
         "set_time_index" => "set_time_index",
         "set_layer_visibility" => "set_layer_visibility",
@@ -242,7 +231,6 @@ fn known_command_kind(kind: &str) -> Option<&'static str> {
         "set_dvr_density_scale" => "set_dvr_density_scale",
         "set_layer_opacity" => "set_layer_opacity",
         "set_layer_window" => "set_layer_window",
-        "set_camera_view" => "set_camera_view",
         "camera_fit_data" => "camera_fit_data",
         "camera_orbit" => "camera_orbit",
         "camera_pan" => "camera_pan",
@@ -260,7 +248,6 @@ fn known_command_kind(kind: &str) -> Option<&'static str> {
         "probe_hover" => "probe_hover",
         "primary_click" => "primary_click",
         "copy_diagnostics" => "copy_diagnostics",
-        "sample_diagnostics" => "sample_diagnostics",
         "capture_screenshot" => "capture_screenshot",
         "assert" => "assert",
         "sleep_frames" => "sleep_frames",

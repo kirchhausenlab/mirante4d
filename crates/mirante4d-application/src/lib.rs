@@ -30,11 +30,11 @@ pub use project_store_service::{
 };
 pub use render_coordination::{
     CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
-    CrossSectionPanelScheduleStatus, DISPLAY_TIMING_SAMPLE_CAPACITY, DisplayDiagnosticCounters,
-    DisplayGenerationStatus, DisplayRefreshPath, DisplayRefreshTiming, DisplayTimingSamples,
-    DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind, FrameFidelityStatus,
-    LayerPresentationOverflow, LayerPresentationStatus, LodDecisionReason, RenderBackend,
-    RenderCoordinationState, RenderSurfaceState, ResidentRenderFailureStatus,
+    CrossSectionPanelScheduleStatus, DISPLAY_TIMING_SAMPLE_CAPACITY, DisplayGenerationStatus,
+    DisplayRefreshPath, DisplayRefreshTiming, DisplayTimingSamples, DisplayedFrameFreshness,
+    FrameCompleteness, FrameFailureKind, FrameFidelityStatus, LayerPresentationOverflow,
+    LayerPresentationStatus, LodDecisionReason, RenderBackend, RenderCoordinationState,
+    RenderSurfaceState, ResidentRenderFailureStatus,
 };
 
 use std::{

@@ -3942,10 +3942,6 @@ impl Runtime {
         self.resident.contains_key(&key)
     }
 
-    pub(super) fn resident_keys(&self) -> impl ExactSizeIterator<Item = DatasetResourceKey> + '_ {
-        self.resident.keys().copied()
-    }
-
     pub(super) fn register_presentation(
         &mut self,
         extent: RenderExtent,

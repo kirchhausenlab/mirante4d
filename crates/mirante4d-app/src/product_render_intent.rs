@@ -2,7 +2,7 @@
 
 use glam::DQuat;
 use mirante4d_application::{ApplicationSnapshot, WorkspaceSnapshot};
-use mirante4d_domain::{CrossSectionView, UnitQuaternion};
+use mirante4d_domain::{CameraView, CrossSectionView, UnitQuaternion};
 use mirante4d_project_model::ViewState;
 use mirante4d_render_api::{
     FrameIdentity, LayerRenderIntent, MAX_RENDER_REQUIREMENTS, PresentationViewport, RenderExtent,
@@ -38,12 +38,13 @@ pub(crate) fn volume_intent(
     frame: FrameIdentity,
     presentation: PresentationViewport,
     extent: RenderExtent,
+    camera_override: Option<CameraView>,
 ) -> anyhow::Result<Option<RenderIntent>> {
     build_intent(
         snapshot,
         frame,
         RenderViewIntent::volume(
-            *application_view(snapshot).camera(),
+            camera_override.unwrap_or(*application_view(snapshot).camera()),
             *application_view(snapshot).iso_light(),
         ),
         presentation,

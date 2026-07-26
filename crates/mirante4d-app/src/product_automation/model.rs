@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, path::PathBuf};
+use std::path::PathBuf;
 
 use mirante4d_dataset::CpuLedgerCategory;
 use mirante4d_dataset_runtime::DatasetRuntimeDiagnostics;
@@ -15,13 +15,6 @@ use super::{AUTOMATION_SCHEMA_VERSION, AUTOMATION_SCRIPT_SCHEMA};
 pub(super) const MAX_INPUT_SEQUENCE_SAMPLES: u32 = 4_096;
 pub(super) const MAX_INPUT_SEQUENCE_DURATION_MS: u64 = 120_000;
 pub(super) const MAX_SLEEP_FRAMES: u32 = 600;
-pub(super) const MAX_GATE_BATCH_OBSERVATIONS: usize = 64;
-pub(super) const MAX_GATE_DEADLINE_AFTER_ORIGIN_NS: u64 = 7_200_000_000_000;
-pub(super) const MAX_GPU_TIMING_AWAIT_TIMEOUT_MS: u64 = 30_000;
-const MAX_GATE_ID_BYTES: usize = 128;
-const MAX_GATE_BATCH_ID_BYTES: usize = 128;
-const MAX_GATE_PHASE_ID_BYTES: usize = 128;
-const MAX_DIAGNOSTIC_SAMPLE_LABEL_BYTES: usize = 128;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,19 +22,10 @@ pub(super) struct ProductAutomationScript {
     pub(super) schema: String,
     pub(super) schema_version: u32,
     pub(super) scenario: String,
-    /// Qualification-only timestamp queries. Normal interactive startup has
-    /// no automation script and keeps this renderer instrumentation off.
+    /// Optional asynchronous GPU timestamps for product diagnostics. Normal
+    /// interactive startup keeps this renderer instrumentation off.
     #[serde(default)]
     pub(super) gpu_timing: bool,
-    /// Qualification-only detailed counters. Minimal display generation,
-    /// heartbeat, scale, and coverage facts remain always on.
-    #[serde(default)]
-    pub(super) diagnostic_counters: bool,
-    /// Qualification-only state installed before the product issues its first
-    /// visible demand. This exists so a cold-start checkpoint can describe the
-    /// exact requested view without admitting an unrelated default cohort.
-    #[serde(default)]
-    pub(super) startup_bootstrap: Option<ProductAutomationStartupBootstrap>,
     pub(super) hard_safety_limits: ProductAutomationHardSafetyLimits,
     pub(super) commands: Vec<ProductAutomationCommand>,
 }
@@ -64,49 +48,8 @@ impl ProductAutomationScript {
         if self.commands.is_empty() {
             anyhow::bail!("automation script must contain at least one command");
         }
-        if let Some(bootstrap) = &self.startup_bootstrap {
-            bootstrap.validate()?;
-        }
-        let mut batch_ids = BTreeSet::new();
-        let mut gate_ids = BTreeSet::new();
-        for (command_index, command) in self.commands.iter().enumerate() {
+        for command in &self.commands {
             command.validate()?;
-            if let ProductAutomationCommand::ObserveGateBatch {
-                batch_id,
-                observations,
-                ..
-            } = command
-            {
-                if !batch_ids.insert(batch_id.as_str()) {
-                    anyhow::bail!(
-                        "observe_gate_batch batch_id {:?} is duplicated within the script",
-                        batch_id
-                    );
-                }
-                for observation in observations {
-                    if !gate_ids.insert(observation.gate_id.as_str()) {
-                        anyhow::bail!(
-                            "observe_gate_batch gate_id {:?} is duplicated within the script",
-                            observation.gate_id
-                        );
-                    }
-                }
-            }
-            if let ProductAutomationCommand::ObserveGateBatch {
-                origin:
-                    ProductAutomationGateBatchOrigin::CommandCompleted {
-                        command_index: origin_command_index,
-                    },
-                ..
-            } = command
-                && *origin_command_index >= command_index
-            {
-                anyhow::bail!(
-                    "observe_gate_batch command_completed origin {} must name an earlier command than {}",
-                    origin_command_index,
-                    command_index
-                );
-            }
         }
         Ok(())
     }
@@ -117,8 +60,6 @@ impl ProductAutomationScript {
             schema_version: AUTOMATION_SCHEMA_VERSION,
             scenario: "failed_to_initialize".to_owned(),
             gpu_timing: false,
-            diagnostic_counters: false,
-            startup_bootstrap: None,
             hard_safety_limits: ProductAutomationHardSafetyLimits::default(),
             commands: Vec::new(),
         }
@@ -137,86 +78,6 @@ impl ProductAutomationScript {
     pub(super) const fn requires_gpu_timing(&self) -> bool {
         self.gpu_timing
     }
-
-    pub(super) fn requires_diagnostic_counters(&self) -> bool {
-        self.diagnostic_counters
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ProductAutomationStartupBootstrap {
-    /// Cold-start bootstraps capture the exact zero-demand checkpoint and
-    /// restart the cold milestone clock. Setup-only bootstraps deliberately
-    /// do neither; their scenario phase captures its start after settling.
-    pub(super) capture_start_checkpoint: bool,
-    pub(super) start_diagnostic_label: Option<String>,
-    pub(super) commands: Vec<ProductAutomationCommand>,
-}
-
-impl ProductAutomationStartupBootstrap {
-    fn validate(&self) -> anyhow::Result<()> {
-        match (self.capture_start_checkpoint, &self.start_diagnostic_label) {
-            (true, Some(label)) => validate_diagnostic_sample_label(label)?,
-            (false, None) => {}
-            (true, None) => anyhow::bail!(
-                "a checkpoint-capturing startup bootstrap requires start_diagnostic_label"
-            ),
-            (false, Some(_)) => anyhow::bail!(
-                "a setup-only startup bootstrap must not declare start_diagnostic_label"
-            ),
-        }
-        if self.commands.is_empty() {
-            anyhow::bail!("automation startup bootstrap must contain at least one command");
-        }
-        let mut mapped_client_sizes = 0_u8;
-        let mut render_target_sizes = 0_u8;
-        for command in &self.commands {
-            command.validate()?;
-            match command {
-                ProductAutomationCommand::SetMappedClientPixels { .. } => {
-                    mapped_client_sizes = mapped_client_sizes.saturating_add(1);
-                }
-                ProductAutomationCommand::SetRenderTargetSize { .. } => {
-                    render_target_sizes = render_target_sizes.saturating_add(1);
-                }
-                ProductAutomationCommand::SetFourPanelViewports { .. } => {
-                    render_target_sizes = render_target_sizes.saturating_add(1);
-                }
-                ProductAutomationCommand::SetViewerLayout { .. }
-                | ProductAutomationCommand::SetTimeIndex { .. }
-                | ProductAutomationCommand::SetLayerRenderMode { .. }
-                | ProductAutomationCommand::SetProjection { .. }
-                | ProductAutomationCommand::SetLayerSampling { .. }
-                | ProductAutomationCommand::SetLayerOpacity { .. }
-                | ProductAutomationCommand::SetLayerWindow { .. }
-                | ProductAutomationCommand::SetCameraView { .. }
-                | ProductAutomationCommand::CameraFitData
-                | ProductAutomationCommand::SetActiveCrossSectionPanel { .. }
-                | ProductAutomationCommand::SetCrossSectionView { .. } => {}
-                ProductAutomationCommand::CrossSectionZoomSequence {
-                    samples,
-                    duration_ms,
-                    x_fraction,
-                    y_fraction,
-                    ..
-                } if *samples == 1
-                    && *duration_ms == 1
-                    && *x_fraction == 0.5
-                    && *y_fraction == 0.5 => {}
-                _ => anyhow::bail!(
-                    "command {} is not permitted in the pre-demand startup bootstrap",
-                    command.name()
-                ),
-            }
-        }
-        if mapped_client_sizes > 1 || render_target_sizes > 1 {
-            anyhow::bail!(
-                "startup bootstrap accepts at most one mapped-client size and one render-target size"
-            );
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
@@ -234,62 +95,6 @@ pub(super) struct ProductAutomationHardSafetyLimits {
     pub(super) max_runtime_in_flight_decodes: Option<u64>,
     pub(super) max_runtime_pending_completions: Option<u64>,
     pub(super) max_runtime_resident_resources: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub(super) enum ProductAutomationGateBatchOrigin {
-    AutomationStarted,
-    CommandCompleted { command_index: usize },
-    ImportPrimaryStarted,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ProductAutomationGateDeadlineAuthority {
-    MaximumCurrentPresentationGapPlusPollGrace,
-    ColdFirstUseful,
-    ColdCompleteCoarse,
-    ColdTargetSettlement,
-    NonresidentTargetSettlement,
-    SourceVerificationCompletion,
-    ImportPrimaryWall,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub(super) enum ProductAutomationGateTarget {
-    Condition {
-        condition: ProductAutomationWaitCondition,
-    },
-    ImportedOpenReady {
-        path: PathBuf,
-    },
-}
-
-impl ProductAutomationGateTarget {
-    pub(super) fn condition_name(&self) -> &'static str {
-        match self {
-            Self::Condition { condition } => condition.name(),
-            Self::ImportedOpenReady { .. } => "imported_open_ready",
-        }
-    }
-
-    pub(super) const fn is_passive(&self) -> bool {
-        match self {
-            Self::Condition { condition } => condition.is_passive(),
-            Self::ImportedOpenReady { .. } => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ProductAutomationGateObservation {
-    pub(super) gate_id: String,
-    pub(super) deadline_authority: ProductAutomationGateDeadlineAuthority,
-    pub(super) deadline_after_origin_ns: u64,
-    pub(super) target: ProductAutomationGateTarget,
 }
 
 impl ProductAutomationHardSafetyLimits {
@@ -484,19 +289,6 @@ pub(super) enum ProductAutomationCommand {
         condition: ProductAutomationWaitCondition,
         timeout_ms: u64,
     },
-    /// Qualification-only nonblocking wait for the exact current target's
-    /// asynchronous timestamp result and its presented-interval binding.
-    AwaitActiveViewGpuTiming {
-        target: ProductAutomationGpuTarget,
-        pass_kind: ProductAutomationGpuPassKind,
-        timeout_ms: u64,
-    },
-    ObserveGateBatch {
-        batch_id: String,
-        phase_id: String,
-        origin: ProductAutomationGateBatchOrigin,
-        observations: Vec<ProductAutomationGateObservation>,
-    },
     SetViewportSize {
         width: u32,
         height: u32,
@@ -508,16 +300,6 @@ pub(super) enum ProductAutomationCommand {
     SetRenderTargetSize {
         width: u32,
         height: u32,
-    },
-    /// Qualification-only exact panel geometry installed before first demand.
-    /// Normal product geometry continues to come from the UI observation path.
-    SetFourPanelViewports {
-        presentation_width_points: f64,
-        presentation_height_points: f64,
-        three_d_render_width: u32,
-        three_d_render_height: u32,
-        linked_render_width: u32,
-        linked_render_height: u32,
     },
     SetViewerLayout {
         layout: ProductAutomationViewerLayout,
@@ -567,15 +349,6 @@ pub(super) enum ProductAutomationCommand {
         layer_index: usize,
         low: f32,
         high: f32,
-    },
-    /// Qualification-only exact camera state for pre-demand bootstrap.
-    SetCameraView {
-        projection: ProductAutomationProjection,
-        target_world: [f64; 3],
-        orientation_xyzw: [f64; 4],
-        orthographic_world_per_screen_point: f64,
-        perspective_focal_length_screen_points: f64,
-        perspective_view_distance_world: f64,
     },
     CameraFitData,
     CameraOrbit {
@@ -656,9 +429,6 @@ pub(super) enum ProductAutomationCommand {
         y_fraction: f32,
     },
     CopyDiagnostics,
-    SampleDiagnostics {
-        label: String,
-    },
     CaptureScreenshot {
         name: Option<String>,
     },
@@ -693,12 +463,9 @@ impl ProductAutomationCommand {
             Self::CancelImport => "cancel_import",
             Self::WaitForImportedOpenReady { .. } => "wait_for_imported_open_ready",
             Self::WaitFor { .. } => "wait_for",
-            Self::AwaitActiveViewGpuTiming { .. } => "await_active_view_gpu_timing",
-            Self::ObserveGateBatch { .. } => "observe_gate_batch",
             Self::SetViewportSize { .. } => "set_viewport_size",
             Self::SetMappedClientPixels { .. } => "set_mapped_client_pixels",
             Self::SetRenderTargetSize { .. } => "set_render_target_size",
-            Self::SetFourPanelViewports { .. } => "set_four_panel_viewports",
             Self::SetViewerLayout { .. } => "set_viewer_layout",
             Self::SetTimeIndex { .. } => "set_time_index",
             Self::SetLayerVisibility { .. } => "set_layer_visibility",
@@ -713,7 +480,6 @@ impl ProductAutomationCommand {
             Self::SetDvrDensityScale { .. } => "set_dvr_density_scale",
             Self::SetLayerOpacity { .. } => "set_layer_opacity",
             Self::SetLayerWindow { .. } => "set_layer_window",
-            Self::SetCameraView { .. } => "set_camera_view",
             Self::CameraFitData => "camera_fit_data",
             Self::CameraOrbit { .. } => "camera_orbit",
             Self::CameraPan { .. } => "camera_pan",
@@ -731,7 +497,6 @@ impl ProductAutomationCommand {
             Self::ProbeHover { .. } => "probe_hover",
             Self::PrimaryClick { .. } => "primary_click",
             Self::CopyDiagnostics => "copy_diagnostics",
-            Self::SampleDiagnostics { .. } => "sample_diagnostics",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
             Self::Assert { .. } => "assert",
             Self::SleepFrames { .. } => "sleep_frames",
@@ -744,28 +509,6 @@ impl ProductAutomationCommand {
             && path.as_os_str().is_empty()
         {
             anyhow::bail!("switch_dataset requires a nonempty package path");
-        }
-        if let Self::SetCameraView {
-            target_world,
-            orientation_xyzw,
-            orthographic_world_per_screen_point,
-            perspective_focal_length_screen_points,
-            perspective_view_distance_world,
-            ..
-        } = self
-            && (!target_world.iter().all(|value| value.is_finite())
-                || !orientation_xyzw.iter().all(|value| value.is_finite())
-                || orientation_xyzw.iter().all(|value| *value == 0.0)
-                || !orthographic_world_per_screen_point.is_finite()
-                || *orthographic_world_per_screen_point <= 0.0
-                || !perspective_focal_length_screen_points.is_finite()
-                || *perspective_focal_length_screen_points <= 0.0
-                || !perspective_view_distance_world.is_finite()
-                || *perspective_view_distance_world <= 0.0)
-        {
-            anyhow::bail!(
-                "camera view must contain finite coordinates and positive projection scales"
-            );
         }
         if let Self::SetCrossSectionView {
             center_world,
@@ -893,109 +636,10 @@ impl ProductAutomationCommand {
                 anyhow::bail!("automation input sequence deltas must be finite and nonzero");
             }
         }
-        if let Self::SampleDiagnostics { label } = self
-            && let Err(error) = validate_diagnostic_sample_label(label)
-        {
-            return Err(error);
-        }
-        if let Self::AwaitActiveViewGpuTiming { timeout_ms, .. } = self
-            && !(1..=MAX_GPU_TIMING_AWAIT_TIMEOUT_MS).contains(timeout_ms)
-        {
-            anyhow::bail!(
-                "await_active_view_gpu_timing timeout_ms must be in 1..={MAX_GPU_TIMING_AWAIT_TIMEOUT_MS}"
-            );
-        }
         if let Self::SleepFrames { frames } = self
             && !(1..=MAX_SLEEP_FRAMES).contains(frames)
         {
             anyhow::bail!("sleep_frames frames must be in 1..={MAX_SLEEP_FRAMES}");
-        }
-        if let Self::ObserveGateBatch {
-            batch_id,
-            phase_id,
-            origin,
-            observations,
-        } = self
-        {
-            validate_safe_gate_identity(
-                batch_id,
-                MAX_GATE_BATCH_ID_BYTES,
-                "observe_gate_batch batch_id",
-            )?;
-            validate_safe_gate_identity(
-                phase_id,
-                MAX_GATE_PHASE_ID_BYTES,
-                "observe_gate_batch phase_id",
-            )?;
-            if observations.is_empty() || observations.len() > MAX_GATE_BATCH_OBSERVATIONS {
-                anyhow::bail!(
-                    "observe_gate_batch observations must contain 1..={MAX_GATE_BATCH_OBSERVATIONS} entries"
-                );
-            }
-            let mut gate_ids = BTreeSet::new();
-            let mut imported_open_ready_count = 0_usize;
-            for observation in observations {
-                validate_gate_id(&observation.gate_id, "observe_gate_batch")?;
-                if !gate_ids.insert(observation.gate_id.as_str()) {
-                    anyhow::bail!(
-                        "observe_gate_batch gate_id {:?} is duplicated within the batch",
-                        observation.gate_id
-                    );
-                }
-                if !(1..=MAX_GATE_DEADLINE_AFTER_ORIGIN_NS)
-                    .contains(&observation.deadline_after_origin_ns)
-                {
-                    anyhow::bail!(
-                        "observe_gate_batch deadline_after_origin_ns must be in 1..={MAX_GATE_DEADLINE_AFTER_ORIGIN_NS}"
-                    );
-                }
-                let authority_matches_origin = match observation.deadline_authority {
-                    ProductAutomationGateDeadlineAuthority::ColdFirstUseful
-                    | ProductAutomationGateDeadlineAuthority::ColdCompleteCoarse
-                    | ProductAutomationGateDeadlineAuthority::ColdTargetSettlement => matches!(
-                        origin,
-                        ProductAutomationGateBatchOrigin::AutomationStarted
-                    ),
-                    ProductAutomationGateDeadlineAuthority::MaximumCurrentPresentationGapPlusPollGrace
-                    | ProductAutomationGateDeadlineAuthority::NonresidentTargetSettlement
-                    | ProductAutomationGateDeadlineAuthority::SourceVerificationCompletion => {
-                        matches!(
-                            origin,
-                            ProductAutomationGateBatchOrigin::CommandCompleted { .. }
-                        )
-                    }
-                    ProductAutomationGateDeadlineAuthority::ImportPrimaryWall => matches!(
-                        origin,
-                        ProductAutomationGateBatchOrigin::ImportPrimaryStarted
-                    ),
-                };
-                if !authority_matches_origin {
-                    anyhow::bail!(
-                        "observe_gate_batch deadline_authority is inconsistent with its origin"
-                    );
-                }
-                if let ProductAutomationGateTarget::ImportedOpenReady { path } = &observation.target
-                {
-                    imported_open_ready_count = imported_open_ready_count.saturating_add(1);
-                    if observation.deadline_authority
-                        != ProductAutomationGateDeadlineAuthority::ImportPrimaryWall
-                    {
-                        anyhow::bail!(
-                            "observe_gate_batch imported_open_ready requires import_primary_wall deadline authority"
-                        );
-                    }
-                    if path.as_os_str().is_empty() {
-                        anyhow::bail!(
-                            "observe_gate_batch imported_open_ready requires a nonempty package path"
-                        );
-                    }
-                }
-            }
-            if imported_open_ready_count > 1 {
-                anyhow::bail!(
-                    "observe_gate_batch accepts at most one imported_open_ready observation"
-                );
-            }
         }
         if let Self::SetLayerOrder { layer_indices } = self
             && (layer_indices.is_empty()
@@ -1006,57 +650,8 @@ impl ProductAutomationCommand {
                 mirante4d_render_api::MAX_RENDER_LAYERS
             );
         }
-        if let Self::SetFourPanelViewports {
-            presentation_width_points,
-            presentation_height_points,
-            three_d_render_width,
-            three_d_render_height,
-            linked_render_width,
-            linked_render_height,
-        } = self
-            && (!presentation_width_points.is_finite()
-                || *presentation_width_points <= 0.0
-                || !presentation_height_points.is_finite()
-                || *presentation_height_points <= 0.0
-                || *three_d_render_width == 0
-                || *three_d_render_height == 0
-                || *linked_render_width == 0
-                || *linked_render_height == 0)
-        {
-            anyhow::bail!("four-panel bootstrap viewports must be finite and positive");
-        }
         Ok(())
     }
-}
-
-fn validate_diagnostic_sample_label(label: &str) -> anyhow::Result<()> {
-    if label.is_empty() || label.len() > MAX_DIAGNOSTIC_SAMPLE_LABEL_BYTES {
-        anyhow::bail!(
-            "diagnostic sample label must contain 1..={MAX_DIAGNOSTIC_SAMPLE_LABEL_BYTES} bytes"
-        );
-    }
-    Ok(())
-}
-
-fn validate_gate_id(gate_id: &str, command: &str) -> anyhow::Result<()> {
-    validate_safe_gate_identity(gate_id, MAX_GATE_ID_BYTES, &format!("{command} gate_id"))
-}
-
-fn validate_safe_gate_identity(
-    value: &str,
-    maximum_bytes: usize,
-    field: &str,
-) -> anyhow::Result<()> {
-    if value.is_empty() || value.len() > maximum_bytes {
-        anyhow::bail!("{field} must contain 1..={maximum_bytes} bytes");
-    }
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-    {
-        anyhow::bail!("{field} must use only ASCII letters, digits, underscore, hyphen, and dot");
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1274,53 +869,6 @@ pub(super) enum ProductAutomationPanelId {
     Xy,
     Xz,
     Yz,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ProductAutomationGpuTarget {
-    ThreeD,
-    Xy,
-    Xz,
-    Yz,
-}
-
-impl From<ProductAutomationGpuTarget> for PanelId {
-    fn from(value: ProductAutomationGpuTarget) -> Self {
-        match value {
-            ProductAutomationGpuTarget::ThreeD => Self::ThreeD,
-            ProductAutomationGpuTarget::Xy => Self::Xy,
-            ProductAutomationGpuTarget::Xz => Self::Xz,
-            ProductAutomationGpuTarget::Yz => Self::Yz,
-        }
-    }
-}
-
-impl ProductAutomationGpuTarget {
-    pub(super) const fn name(self) -> &'static str {
-        match self {
-            Self::ThreeD => "three_d",
-            Self::Xy => "xy",
-            Self::Xz => "xz",
-            Self::Yz => "yz",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ProductAutomationGpuPassKind {
-    Plane,
-    Volume,
-}
-
-impl ProductAutomationGpuPassKind {
-    pub(super) const fn name(self) -> &'static str {
-        match self {
-            Self::Plane => "plane",
-            Self::Volume => "volume",
-        }
-    }
 }
 
 impl From<ProductAutomationPanelId> for PanelId {

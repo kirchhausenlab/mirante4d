@@ -30,8 +30,8 @@ use crate::{
 const PRODUCT_VALIDATION_SCHEMA: &str = "mirante4d-product-validation-report";
 pub(crate) const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 pub(crate) const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-pub(crate) const SCRIPT_SCHEMA_VERSION: u32 = 5;
-pub(crate) const REPORT_SCHEMA_VERSION: u32 = 6;
+pub(crate) const SCRIPT_SCHEMA_VERSION: u32 = 6;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 7;
 pub(crate) const IMPORT_OPEN_READY_COMPLETE_STATUS: &str = "open_ready_complete";
 pub(crate) const PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS: [&str; 12] = [
     "max_cpu_total_bytes",
@@ -2537,8 +2537,6 @@ pub(crate) fn validate_product_automation_script(script: &Value) -> anyhow::Resu
         "schema_version",
         "scenario",
         "gpu_timing",
-        "diagnostic_counters",
-        "startup_bootstrap",
         "hard_safety_limits",
         "commands",
     ]);

@@ -137,6 +137,92 @@ fn one_camera_change_runs_one_semantic_demand_plan() {
 }
 
 #[test]
+fn camera_previews_skip_the_reducer_and_planner_then_commit_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let original = *application_view(&app.application.snapshot()).camera();
+    let preview = mirante4d_domain::CameraView::new(
+        original.projection(),
+        original.target(),
+        original.orientation(),
+        original.orthographic_world_per_screen_point() * 0.9,
+        original.perspective_focal_length_screen_points(),
+        original.perspective_view_distance_world(),
+    )
+    .unwrap();
+    let latest = mirante4d_domain::CameraView::new(
+        preview.projection(),
+        preview.target(),
+        preview.orientation(),
+        preview.orthographic_world_per_screen_point() * 0.9,
+        preview.perspective_focal_length_screen_points(),
+        preview.perspective_view_distance_world(),
+    )
+    .unwrap();
+    let plans_before = app.visible_demand_plan_calls;
+    let context = egui::Context::default();
+
+    app.apply_viewport_camera_interaction(
+        ViewportCameraInteraction::Preview(preview),
+        &context,
+    );
+    app.apply_viewport_camera_interaction(
+        ViewportCameraInteraction::Preview(latest),
+        &context,
+    );
+
+    assert_eq!(*application_view(&app.application.snapshot()).camera(), original);
+    assert_eq!(app.visible_demand_plan_calls, plans_before);
+    assert_eq!(
+        app.camera_preview, None,
+        "an unplanned camera remains UI-only until its durable commit"
+    );
+
+    app.apply_viewport_camera_interaction(
+        ViewportCameraInteraction::Commit(latest),
+        &context,
+    );
+
+    assert_eq!(*application_view(&app.application.snapshot()).camera(), latest);
+    assert_eq!(app.visible_demand_plan_calls, plans_before + 1);
+    assert_eq!(app.camera_preview, None);
+
+    // A durable view replacement must retire any resident preview before
+    // reconciliation can issue another render. Undo and redo pass through the
+    // same post-dispatch canonical-view comparison.
+    app.camera_preview = Some(latest);
+    let current = application_view(&app.application.snapshot()).clone();
+    let restored = mirante4d_project_model::ViewState::new(
+        current.layers().to_vec(),
+        current.active_layer(),
+        current.timepoint(),
+        original,
+        current.layout(),
+        *current.cross_section(),
+        *current.iso_light(),
+    )
+    .unwrap();
+    app.apply_application_command(ApplicationCommand::ReplaceView(restored), &context)
+        .unwrap();
+    assert_eq!(*application_view(&app.application.snapshot()).camera(), original);
+    assert_eq!(app.camera_preview, None);
+
+    app.camera_preview = Some(original);
+    app.apply_application_command(
+        ApplicationCommand::SetActiveTool(mirante4d_domain::ToolKind::Crosshair),
+        &context,
+    )
+    .unwrap();
+    assert_eq!(
+        app.camera_preview, None,
+        "leaving a navigation tool retires an unsettled preview"
+    );
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
 fn unchanged_completion_refreshes_reuse_one_semantic_demand_plan() {
     let temp = tempfile::tempdir().unwrap();
     let package = write_target_fixture(temp.path()).unwrap();
@@ -1216,6 +1302,9 @@ fn import_verify_analyze_save_and_reopen_atomically() {
     install_test_project_store(&mut reopened_app);
     verify_test_source(&mut reopened_app);
     reopened_app.project_store_noninteractive_paths.open = Some(project_path);
+    reopened_app.camera_preview = Some(
+        *application_view(&reopened_app.application.snapshot()).camera(),
+    );
     reopened_app
         .apply_application_command(ApplicationCommand::RequestProjectOpen, &context)
         .unwrap();
@@ -1226,6 +1315,10 @@ fn import_verify_analyze_save_and_reopen_atomically() {
             && snapshot.transient().analysis_plots().len() == 1
             && reopened_app.pending_analysis_artifact_load.is_none()
     });
+    assert_eq!(
+        reopened_app.camera_preview, None,
+        "project-open completion retires transient camera render authority"
+    );
     let reopened_snapshot = reopened_app.application.snapshot();
     let mut row_counts = reopened_snapshot
         .transient()

@@ -1351,13 +1351,6 @@ impl WgpuRenderRuntime {
         self.inner.resource_is_resident(key)
     }
 
-    /// Exact sorted snapshot source for qualification diagnostics. The
-    /// iterator is read-only and allocation-free; callers that retain a
-    /// snapshot must own and account for their bounded diagnostic storage.
-    pub fn resident_keys(&self) -> impl ExactSizeIterator<Item = DatasetResourceKey> + '_ {
-        self.inner.resident_keys()
-    }
-
     /// Polls once without waiting. `None` means the GPU/map callback has not
     /// completed yet and the caller should poll on a later event-loop turn.
     pub fn poll_validation_capture(

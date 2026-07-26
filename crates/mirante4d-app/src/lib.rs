@@ -82,9 +82,9 @@ use mirante4d_application::{
     histogram_can_auto_window, import_workflow::ImportWorkflowSnapshot, stepped_timepoint,
 };
 use mirante4d_dataset::{DatasetSourceId, ResourceValidity, ScientificIdentityStatus};
+use mirante4d_domain::{CameraView, ScaleLevel, ViewerLayout as CanonicalViewerLayout};
 #[cfg(test)]
 use mirante4d_domain::{IntensityDType, Shape3D, TimeIndex};
-use mirante4d_domain::{ScaleLevel, ViewerLayout as CanonicalViewerLayout};
 #[cfg(test)]
 use mirante4d_import_pipeline::ImportCancellation;
 use mirante4d_import_pipeline::{
@@ -104,8 +104,8 @@ use render_state::set_render_viewport;
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
 use ui_kit::{
     DirtyProjectCloseView, DirtyProjectSaveAction, ProjectRecoveryCandidateView,
-    ProjectRecoveryView, RenderUiRequest, ViewportObservation, WorkbenchAnalysisKind,
-    WorkbenchUiAction, WorkbenchUiOutput,
+    ProjectRecoveryView, RenderUiRequest, ViewportCameraInteraction, ViewportObservation,
+    WorkbenchAnalysisKind, WorkbenchUiAction, WorkbenchUiOutput,
 };
 #[cfg(test)]
 use ui_kit::{histogram_bins_label, playback_status_label};
@@ -500,6 +500,7 @@ pub struct MiranteWorkbenchApp {
         Option<workbench_brick_runtime::VisibleDemandPlanningSignature>,
     viewer_verification_busy_until: Option<Instant>,
     active_histogram_cache: histogram::ActiveLayerHistogramCache,
+    camera_preview: Option<CameraView>,
     egui_ui: ui_kit::EguiUiState,
     import: ImportWorkflow,
     analysis_runtime: analysis_session::AnalysisProductRuntime,
@@ -584,9 +585,6 @@ impl MiranteWorkbenchApp {
         let gpu_timing = product_automation
             .as_ref()
             .is_some_and(ProductAutomationController::requires_gpu_timing);
-        let diagnostic_counters = product_automation
-            .as_ref()
-            .is_some_and(ProductAutomationController::requires_diagnostic_counters);
         let product_renderer = WgpuRenderRuntime::from_existing_device(
             &render_state.adapter,
             render_state.device.clone(),
@@ -643,6 +641,7 @@ impl MiranteWorkbenchApp {
             visible_demand_planning_signature: None,
             viewer_verification_busy_until: None,
             active_histogram_cache: histogram::ActiveLayerHistogramCache::default(),
+            camera_preview: None,
             egui_ui,
             import: ImportWorkflow::new(),
             analysis_runtime,
@@ -682,16 +681,6 @@ impl MiranteWorkbenchApp {
             ),
             pending_automatic_source_verification: None,
         };
-        app.render_coordination
-            .set_display_diagnostic_counters_enabled(diagnostic_counters);
-        let mut product_automation = app.product_automation.take();
-        let startup_bootstrap = product_automation
-            .as_mut()
-            .map(|automation| automation.apply_startup_bootstrap(&mut app, &cc.egui_ctx))
-            .transpose();
-        app.product_automation = product_automation;
-        startup_bootstrap
-            .map_err(|error| anyhow::anyhow!("automation startup bootstrap failed: {error}"))?;
         // Establish visible interactive demand before the verifier can reserve
         // its scan workspace. The verifier observes the busy predicate when
         // its worker starts and therefore cannot overlap the initial decode
@@ -1208,11 +1197,20 @@ impl MiranteWorkbenchApp {
         completion: OperationCompletion,
     ) -> bool {
         let operation_id = token.operation_id();
+        let replaces_project_view = matches!(
+            &completion,
+            OperationCompletion::ProjectOpened(_) | OperationCompletion::ProjectRecovered(_)
+        );
         match self
             .application
             .dispatch(ApplicationCommand::CompleteOperation { token, completion })
         {
-            Ok(_) => true,
+            Ok(_) => {
+                if replaces_project_view {
+                    self.clear_viewport_camera_preview();
+                }
+                true
+            }
             Err(fault) if fault.code() == ApplicationFaultCode::OperationNotFound => false,
             Err(fault) => {
                 tracing::warn!(?fault, "project persistence completion was rejected");
@@ -2305,6 +2303,7 @@ impl MiranteWorkbenchApp {
     }
 
     fn retire_invalidated_source_runtime(&mut self) {
+        self.clear_viewport_camera_preview();
         if let Err(error) = self.camera_demand_planner.invalidate() {
             tracing::warn!(%error, "camera-demand planner invalidation failed during source quarantine");
         }
@@ -2637,6 +2636,7 @@ impl MiranteWorkbenchApp {
         &mut self,
         transfer: current_source_open_service::CurrentSourceRuntimeTransfer,
     ) {
+        self.clear_viewport_camera_preview();
         let current_source_open_service::CurrentSourceRuntimeTransfer {
             dataset,
             render_coordination,
@@ -2725,6 +2725,12 @@ impl MiranteWorkbenchApp {
         ctx: &egui::Context,
     ) -> Result<CommandEffect, ApplicationFault> {
         let command_kind = command.kind();
+        if matches!(
+            command_kind,
+            ApplicationCommandKind::SetCamera | ApplicationCommandKind::SetActiveTool
+        ) {
+            self.clear_viewport_camera_preview();
+        }
         let interaction_started = matches!(
             command_kind,
             ApplicationCommandKind::SetCamera | ApplicationCommandKind::SetLayout
@@ -2742,6 +2748,13 @@ impl MiranteWorkbenchApp {
                 self.render_coordination.record_durable_gesture_commit();
             }
             let after = self.application.snapshot();
+            if previous_view != *application_view(&after) {
+                // A transient preview is valid only for the exact canonical
+                // view against which its resident body was checked. Undo,
+                // redo, ReplaceView, and non-camera view edits must retire it
+                // before reconciliation can trigger another render.
+                self.clear_viewport_camera_preview();
+            }
             self.reconcile_application_change(
                 &previous_view,
                 previous_playback_active,
@@ -2751,11 +2764,6 @@ impl MiranteWorkbenchApp {
             if let Err(error) = self.reconcile_analysis_currentness() {
                 tracing::warn!(%error, "stale analysis could not be retired");
             }
-        } else if matches!(
-            command_kind,
-            ApplicationCommandKind::SetCamera | ApplicationCommandKind::SetLayout
-        ) {
-            self.render_coordination.record_coalesced_input_samples(1);
         }
         self.pump_application_services();
         if let Some(started) = interaction_started {
@@ -2816,7 +2824,7 @@ impl MiranteWorkbenchApp {
         if previous_view.layout() != next_view.layout() {
             self.egui_ui.hovered_pixel = None;
             self.egui_ui.hovered_source_readout = None;
-            self.egui_ui.viewport_orbit_drag = None;
+            self.clear_viewport_camera_preview();
             if next_view.layout() == CanonicalViewerLayout::Single3d {
                 self.clear_cross_section_product_presentations();
             }
@@ -2844,6 +2852,11 @@ impl MiranteWorkbenchApp {
         }
         ctx.request_repaint();
         ctx.request_repaint_after(CROSS_SECTION_INTERACTION_SETTLE_DURATION);
+    }
+
+    pub(crate) fn clear_viewport_camera_preview(&mut self) {
+        self.camera_preview = None;
+        self.egui_ui.cancel_viewport_camera_interaction();
     }
 
     pub(crate) fn begin_display_input_generation(&mut self) {

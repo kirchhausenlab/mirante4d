@@ -215,8 +215,11 @@ impl eframe::App for MiranteWorkbenchApp {
             || project_recovery_ui.has_candidates()
             || project_recovery_ui.has_locators();
         let no_data_policy_label = active_layer_no_data_policy_label(&application_snapshot);
-        let camera_frame =
-            CameraFrame::new(*view.camera(), viewer_ui_snapshot.presentation_viewport).ok();
+        let camera_frame = CameraFrame::new(
+            self.camera_preview.unwrap_or(*view.camera()),
+            viewer_ui_snapshot.presentation_viewport,
+        )
+        .ok();
         let camera_inspector_view = ui_kit::CameraInspectorView {
             forward: camera_frame.as_ref().map(|frame| frame.axes().forward()),
             world_per_screen_point: camera_frame
@@ -276,6 +279,7 @@ impl eframe::App for MiranteWorkbenchApp {
                     test_render_viewport_max_side: viewer_ui_snapshot.test_render_viewport_max_side,
                     automation_render_target: viewer_ui_snapshot.automation_render_target,
                     interaction: ui_kit::ViewerInteractionConfig {
+                        camera_settle_duration: CROSS_SECTION_INTERACTION_SETTLE_DURATION,
                         cross_section_settle_duration: CROSS_SECTION_INTERACTION_SETTLE_DURATION,
                         cross_section_fast_slice_multiplier: CROSS_SECTION_FAST_SLICE_MULTIPLIER,
                         cross_section_rotate_radians_per_point:
@@ -350,7 +354,7 @@ impl eframe::App for MiranteWorkbenchApp {
             && self.pending_visible_demand_plan.is_none();
         self.observe_coordinated_display_milestones(foreground_idle);
 
-        let qualification_only_ui_overhead_ns = ProductAutomationController::drive(self, ui.ctx());
+        ProductAutomationController::drive(self, ui.ctx());
         let generation_at_end = self.render_coordination.display_generation();
         let active_input_at_end = generation_at_end.input_generation > 0
             && generation_at_end.current_presentation_generation
@@ -361,9 +365,8 @@ impl eframe::App for MiranteWorkbenchApp {
             || loading_work_at_start
             || loading_work_at_end
         {
-            let duration_ns = u64::try_from(update_started.elapsed().as_nanos())
-                .unwrap_or(u64::MAX)
-                .saturating_sub(qualification_only_ui_overhead_ns);
+            let duration_ns =
+                u64::try_from(update_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             self.render_coordination
                 .record_active_ui_update_duration(duration_ns);
         }

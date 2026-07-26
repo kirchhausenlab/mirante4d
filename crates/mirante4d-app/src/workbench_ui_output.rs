@@ -29,6 +29,7 @@ impl MiranteWorkbenchApp {
     ) {
         let WorkbenchUiOutput {
             application_commands,
+            viewport_camera_interaction,
             import_commands,
             actions,
             viewport_observations,
@@ -293,6 +294,9 @@ impl MiranteWorkbenchApp {
             }
         }
 
+        if let Some(interaction) = viewport_camera_interaction {
+            self.apply_viewport_camera_interaction(interaction, ui.ctx());
+        }
         for command in application_commands {
             if let Err(fault) = self.apply_application_command(command, ui.ctx()) {
                 tracing::warn!(?fault, "UI application command rejected");
@@ -306,6 +310,40 @@ impl MiranteWorkbenchApp {
         }
         for command in import_commands {
             self.apply_import_command(command, ui.ctx());
+        }
+    }
+
+    pub(crate) fn apply_viewport_camera_interaction(
+        &mut self,
+        interaction: ViewportCameraInteraction,
+        ctx: &egui::Context,
+    ) {
+        match interaction {
+            ViewportCameraInteraction::Preview(camera) => {
+                // `camera_preview` is render authority, not merely UI state.
+                // Keep it absent unless the installed immutable body is both
+                // geometrically valid for this camera and completely
+                // resident. The egui gesture retains the visual hot state
+                // independently while a cold camera waits for its one durable
+                // commit and normal planning.
+                self.camera_preview = None;
+                if self.prepare_resident_camera_preview(camera) {
+                    self.camera_preview = Some(camera);
+                    self.begin_display_input_generation();
+                    if let Err(error) = self.render_current_product_frame() {
+                        tracing::warn!(%error, "resident camera preview could not be rendered");
+                    }
+                }
+                ctx.request_repaint();
+            }
+            ViewportCameraInteraction::Commit(camera) => {
+                self.clear_viewport_camera_preview();
+                if let Err(fault) =
+                    self.apply_application_command(ApplicationCommand::SetCamera(camera), ctx)
+                {
+                    tracing::warn!(?fault, "camera interaction commit was rejected");
+                }
+            }
         }
     }
 }

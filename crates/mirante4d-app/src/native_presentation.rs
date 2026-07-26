@@ -30,18 +30,6 @@ pub(crate) struct ProductLayerRequirementFacts {
     pub(crate) total_requirements: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ProductTargetDiagnosticCounters {
-    pub(crate) renderer_calls: u64,
-    pub(crate) command_buffers: u64,
-    pub(crate) queue_submissions: u64,
-    pub(crate) color_passes: u64,
-    pub(crate) completion_notifications: u64,
-    pub(crate) encoded_display_batches: u64,
-    pub(crate) backpressure_deferrals: u64,
-    pub(crate) control_static_rebuilds: u64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProductGpuExecutionIdentity {
     pub(crate) execution_id: u64,
@@ -281,7 +269,6 @@ pub(crate) struct ProductPresentationTarget {
     pub(crate) layer_requirement_facts: BTreeMap<LogicalLayerKey, ProductLayerRequirementFacts>,
     pub(crate) presented_layer_requirement_facts:
         BTreeMap<LogicalLayerKey, ProductLayerRequirementFacts>,
-    pub(crate) diagnostic_counters: ProductTargetDiagnosticCounters,
     progressive_lease_probe: Cell<ProgressiveLeaseProbeState>,
 }
 
@@ -305,7 +292,6 @@ impl ProductPresentationTarget {
             partial_seen: false,
             layer_requirement_facts: BTreeMap::new(),
             presented_layer_requirement_facts: BTreeMap::new(),
-            diagnostic_counters: ProductTargetDiagnosticCounters::default(),
             progressive_lease_probe: Cell::new(ProgressiveLeaseProbeState {
                 next_requirement: 0,
                 requirements_remaining: 0,
@@ -317,9 +303,7 @@ impl ProductPresentationTarget {
     pub(crate) fn reset(&mut self) {
         let token = self.token;
         let extent = self.extent;
-        let diagnostic_counters = self.diagnostic_counters;
         *self = Self::new(token, extent);
-        self.diagnostic_counters = diagnostic_counters;
     }
 
     pub(crate) fn reset_layer_requirement_facts(&mut self) {

@@ -980,8 +980,23 @@ impl MiranteWorkbenchApp {
             prepared.requirements.prefetch_promoted(),
         );
         let current_intent = target.request.as_ref().map(|request| &request.intent);
-        let candidate_intent =
-            build_product_intent(snapshot, current_frame, cross_section, presentation, extent)?;
+        let camera_override = cross_section
+            .is_none()
+            .then_some(self.camera_preview)
+            .flatten();
+        let candidate_intent = build_product_intent(
+            snapshot,
+            current_frame,
+            cross_section,
+            presentation,
+            extent,
+            camera_override,
+        )?;
+        // A transient camera must never replace the last complete texture
+        // with an arriving-brick mosaic. Exact-frame-only execution can still
+        // hot-rebind and publish immediately when the installed body is fully
+        // resident.
+        let publish_to_display = publish_to_display && camera_override.is_none();
         let changed = !reusable_requirement_binding || current_intent != candidate_intent.as_ref();
         let priority_changed = !Arc::ptr_eq(&target.lease_priority_keys, &lease_priority);
         if changed {
@@ -1119,10 +1134,6 @@ impl MiranteWorkbenchApp {
             .render_coordination
             .display_generation()
             .input_generation;
-        let detailed_diagnostics_enabled = self
-            .render_coordination
-            .display_diagnostic_counters()
-            .enabled;
         let (dataset, native_presentation, render_failure_latches) = (
             &mut self.dataset,
             &mut self.native_presentation,
@@ -1133,16 +1144,11 @@ impl MiranteWorkbenchApp {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("progressive GPU renderer is unavailable"))?;
         let residency_invalidation_epoch = product.renderer.residency_invalidation_epoch();
-        let control_rebuilds_before = product.renderer.diagnostics().control_static_rebuilds();
         let target = product
             .targets
             .get_mut(&target_id)
             .expect("the product target was registered");
         target.clear_progressive_render_request();
-        if detailed_diagnostics_enabled {
-            target.diagnostic_counters.renderer_calls =
-                target.diagnostic_counters.renderer_calls.saturating_add(1);
-        }
         let lease_work = collect_requirement_lease_updates(
             target.lease_priority_keys.as_ref(),
             |key| *key,
@@ -1213,7 +1219,6 @@ impl MiranteWorkbenchApp {
             }
         };
         drop(lease_updates);
-        let control_rebuilds_after = product.renderer.diagnostics().control_static_rebuilds();
         let invalidation_epoch = product.renderer.residency_invalidation_epoch();
         {
             let target = product
@@ -1244,37 +1249,6 @@ impl MiranteWorkbenchApp {
                 {
                     target.mark_layer_requirement_available(key);
                 }
-            }
-            if detailed_diagnostics_enabled {
-                target.diagnostic_counters.command_buffers = target
-                    .diagnostic_counters
-                    .command_buffers
-                    .saturating_add(u64::from(report.command_buffers()));
-                target.diagnostic_counters.queue_submissions = target
-                    .diagnostic_counters
-                    .queue_submissions
-                    .saturating_add(u64::from(report.queue_submissions()));
-                target.diagnostic_counters.color_passes = target
-                    .diagnostic_counters
-                    .color_passes
-                    .saturating_add(u64::from(report.presentation().is_some()));
-                let submitted_display_batch = u64::from(report.command_buffers() > 0);
-                target.diagnostic_counters.completion_notifications = target
-                    .diagnostic_counters
-                    .completion_notifications
-                    .saturating_add(submitted_display_batch);
-                target.diagnostic_counters.encoded_display_batches = target
-                    .diagnostic_counters
-                    .encoded_display_batches
-                    .saturating_add(submitted_display_batch);
-                target.diagnostic_counters.backpressure_deferrals = target
-                    .diagnostic_counters
-                    .backpressure_deferrals
-                    .saturating_add(u64::from(report.deferred_by_backpressure()));
-                target.diagnostic_counters.control_static_rebuilds = target
-                    .diagnostic_counters
-                    .control_static_rebuilds
-                    .saturating_add(control_rebuilds_after.saturating_sub(control_rebuilds_before));
             }
             if let Some(progress) = report.progress() {
                 let coverage = progress.coverage();
@@ -2230,10 +2204,11 @@ fn build_product_intent(
     cross_section: Option<PanelId>,
     presentation: PresentationViewport,
     extent: RenderExtent,
+    camera_override: Option<CameraView>,
 ) -> anyhow::Result<Option<mirante4d_render_api::RenderIntent>> {
     match cross_section {
         Some(panel) => cross_section_intent(snapshot, frame, panel, presentation, extent),
-        None => volume_intent(snapshot, frame, presentation, extent),
+        None => volume_intent(snapshot, frame, presentation, extent, camera_override),
     }
 }
 

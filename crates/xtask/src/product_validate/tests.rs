@@ -19,9 +19,9 @@ fn x11_automation_helpers_have_short_silence_absolute_and_output_bounds() {
 }
 
 fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_resources: u64) {
-    assert_eq!(SCRIPT_SCHEMA_VERSION, 5);
-    assert_eq!(REPORT_SCHEMA_VERSION, 6);
-    assert_eq!(script["schema_version"], 5);
+    assert_eq!(SCRIPT_SCHEMA_VERSION, 6);
+    assert_eq!(REPORT_SCHEMA_VERSION, 7);
+    assert_eq!(script["schema_version"], 6);
     assert_eq!(
         script["hard_safety_limits"]["max_cpu_total_bytes"],
         total_bytes
@@ -1043,7 +1043,7 @@ fn fixed_product_automation_script_validation_rejects_wrong_schema() {
 
     let predecessor_version = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": 4,
+        "schema_version": 5,
         "scenario": "unit",
         "commands": [
             { "command": "open_dataset", "path": "/tmp/demo.m4d" },
@@ -1054,7 +1054,7 @@ fn fixed_product_automation_script_validation_rejects_wrong_schema() {
         validate_product_automation_script(&predecessor_version)
             .unwrap_err()
             .to_string()
-            .contains("schema_version must be 5")
+            .contains("schema_version must be 6")
     );
 }
 
@@ -1183,7 +1183,7 @@ fn product_automation_script_shape_rejects_legacy_and_unknown_top_level_fields()
 }
 
 #[test]
-fn product_automation_report_contract_requires_v6_with_a_v5_script_binding() {
+fn product_automation_report_contract_requires_v7_with_a_v6_script_binding() {
     let report = json!({
         "status": "passed",
         "artifacts": []

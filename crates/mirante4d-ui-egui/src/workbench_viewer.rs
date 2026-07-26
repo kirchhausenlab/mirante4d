@@ -17,6 +17,7 @@ use mirante4d_application::{
 use crate as ui_kit;
 use crate::{
     CrossSectionReadoutRequest, EguiUiState, RenderUiRequest, ViewerPickPurpose, ViewerPickRequest,
+    ViewportCameraGestureKind, ViewportCameraGestureState, ViewportCameraInteraction,
     ViewportObservation, WorkbenchUiOutput,
 };
 
@@ -44,6 +45,7 @@ impl ViewportDisplayImage {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ViewerInteractionConfig {
+    pub camera_settle_duration: Duration,
     pub cross_section_settle_duration: Duration,
     pub cross_section_fast_slice_multiplier: f64,
     pub cross_section_rotate_radians_per_point: f64,
@@ -153,6 +155,7 @@ pub(crate) fn show_workbench_viewer(
 ) {
     let snapshot = viewer.application;
     let view = snapshot.view();
+    egui_ui.synchronize_viewport_camera(*view.camera());
     egui::CentralPanel::default().show_inside(ui, |ui| match view.layout() {
         ViewerLayout::Single3d => {
             show_single_3d_viewport(ui, snapshot, view, viewer, egui_ui, output);
@@ -390,16 +393,24 @@ fn show_3d_viewport_image(
         egui_ui.hovered_source_readout = None;
     }
     queue_viewer_pick_request(snapshot, egui_ui, &response, output);
-    draw_viewer_tool_overlay(ui, view, egui_ui, &response);
+    draw_viewer_tool_overlay(
+        ui,
+        egui_ui.effective_viewport_camera(*view.camera()),
+        egui_ui,
+        &response,
+    );
     if matches!(
         egui_ui.viewer_tools.active_tool,
         ViewerTool::Navigate | ViewerTool::Inspect
     ) {
-        output
-            .application_commands
-            .extend(viewport_interaction_commands(
-                egui_ui, view, &response, image_size,
-            ));
+        viewport_interaction(
+            egui_ui,
+            view,
+            &response,
+            image_size,
+            viewer.interaction.camera_settle_duration,
+            output,
+        );
     }
 }
 
@@ -727,16 +738,23 @@ fn extent_size(extent: RenderExtent) -> egui::Vec2 {
     egui::vec2(extent.width_pixels() as f32, extent.height_pixels() as f32)
 }
 
-fn viewport_interaction_commands(
+fn viewport_interaction(
     egui_ui: &mut EguiUiState,
     view: &ViewState,
     response: &egui::Response,
     viewport_size: egui::Vec2,
-) -> Vec<ApplicationCommand> {
-    let mut commands = Vec::new();
+    settle_duration: Duration,
+    output: &mut WorkbenchUiOutput,
+) {
+    let durable_camera = *view.camera();
+    egui_ui.synchronize_viewport_camera(durable_camera);
+    let now_seconds = response.ctx.input(|input| input.time);
+
     if response.drag_stopped() {
         egui_ui.viewport_orbit_drag = None;
     }
+
+    let mut raw_sample = None;
     if response.dragged() {
         let camera_pan_requested = response.ctx.input(|input| {
             input.pointer.middle_down() || input.pointer.secondary_down() || input.modifiers.shift
@@ -744,35 +762,126 @@ fn viewport_interaction_commands(
         if camera_pan_requested {
             egui_ui.viewport_orbit_drag = None;
         }
-        if let Some(command) = viewport_drag_command(
+        if let Some(camera) = viewport_drag_camera(
             egui_ui,
-            *view.camera(),
+            egui_ui.effective_viewport_camera(durable_camera),
             response,
             viewport_size,
             camera_pan_requested,
         ) {
-            commands.push(command);
+            raw_sample = Some((ViewportCameraGestureKind::Drag, camera));
         }
     }
 
-    if response.hovered() {
+    if raw_sample.is_none() && response.hovered() {
         let scroll_y = response.ctx.input(|input| input.smooth_scroll_delta().y);
-        if scroll_y != 0.0
-            && let Some(command) = viewport_scroll_command(*view.camera(), scroll_y)
+        if let Some(camera) =
+            viewport_scroll_camera(egui_ui.effective_viewport_camera(durable_camera), scroll_y)
         {
-            commands.push(command);
+            raw_sample = Some((ViewportCameraGestureKind::Scroll, camera));
         }
     }
-    commands
+
+    if let Some((kind, camera)) = raw_sample {
+        record_viewport_camera_sample(egui_ui, kind, durable_camera, camera, now_seconds);
+        output.viewport_camera_interaction = Some(ViewportCameraInteraction::Preview(camera));
+        output.request_repaint_after(settle_duration);
+        return;
+    }
+
+    if response.drag_stopped()
+        && egui_ui
+            .viewport_camera_gesture
+            .is_some_and(|gesture| gesture.kind() == ViewportCameraGestureKind::Drag)
+    {
+        finish_viewport_camera_interaction(egui_ui, output);
+        return;
+    }
+
+    match scroll_settle_state(
+        egui_ui.viewport_camera_gesture,
+        now_seconds,
+        settle_duration,
+    ) {
+        ScrollSettleState::Inactive => {}
+        ScrollSettleState::Waiting(remaining) => output.request_repaint_after(remaining),
+        ScrollSettleState::Ready => finish_viewport_camera_interaction(egui_ui, output),
+    }
 }
 
-fn viewport_drag_command(
+fn record_viewport_camera_sample(
+    egui_ui: &mut EguiUiState,
+    kind: ViewportCameraGestureKind,
+    durable_camera: CameraView,
+    camera: CameraView,
+    now_seconds: f64,
+) {
+    let last_input_time_seconds = if now_seconds.is_finite() {
+        now_seconds
+    } else {
+        egui_ui
+            .viewport_camera_gesture
+            .map_or(0.0, |gesture| gesture.last_input_time_seconds())
+    };
+    if let Some(gesture) = egui_ui.viewport_camera_gesture.as_mut() {
+        gesture.update(kind, camera, last_input_time_seconds);
+    } else {
+        egui_ui.viewport_camera_gesture = Some(ViewportCameraGestureState::new(
+            kind,
+            durable_camera,
+            camera,
+            last_input_time_seconds,
+        ));
+    }
+}
+
+fn finish_viewport_camera_interaction(egui_ui: &mut EguiUiState, output: &mut WorkbenchUiOutput) {
+    egui_ui.viewport_orbit_drag = None;
+    if let Some(camera) = take_latest_camera(&mut egui_ui.viewport_camera_gesture) {
+        output.viewport_camera_interaction = Some(ViewportCameraInteraction::Commit(camera));
+    }
+}
+
+fn take_latest_camera<C: Copy>(gesture: &mut Option<ViewportCameraGestureState<C>>) -> Option<C> {
+    gesture.take().map(|gesture| gesture.latest_camera())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollSettleState {
+    Inactive,
+    Waiting(Duration),
+    Ready,
+}
+
+fn scroll_settle_state<C: Copy>(
+    gesture: Option<ViewportCameraGestureState<C>>,
+    now_seconds: f64,
+    settle_duration: Duration,
+) -> ScrollSettleState {
+    let Some(gesture) =
+        gesture.filter(|gesture| gesture.kind() == ViewportCameraGestureKind::Scroll)
+    else {
+        return ScrollSettleState::Inactive;
+    };
+    if !now_seconds.is_finite() || !gesture.last_input_time_seconds().is_finite() {
+        return ScrollSettleState::Waiting(settle_duration);
+    }
+    let elapsed_seconds = (now_seconds - gesture.last_input_time_seconds()).max(0.0);
+    let settle_seconds = settle_duration.as_secs_f64();
+    if elapsed_seconds >= settle_seconds {
+        ScrollSettleState::Ready
+    } else {
+        ScrollSettleState::Waiting(Duration::from_secs_f64(settle_seconds - elapsed_seconds))
+    }
+}
+
+fn viewport_drag_camera(
     egui_ui: &mut EguiUiState,
     camera: CameraView,
     response: &egui::Response,
     viewport_size_points: egui::Vec2,
     camera_pan_requested: bool,
-) -> Option<ApplicationCommand> {
+) -> Option<CameraView> {
     if viewport_size_points.x <= 0.0
         || viewport_size_points.y <= 0.0
         || !viewport_size_points.x.is_finite()
@@ -785,8 +894,7 @@ fn viewport_drag_command(
         if !motion_points.x.is_finite() || !motion_points.y.is_finite() {
             return None;
         }
-        let camera = pan_camera(camera, [motion_points.x, motion_points.y]);
-        return Some(ApplicationCommand::SetCamera(camera));
+        return Some(pan_camera(camera, [motion_points.x, motion_points.y]));
     }
 
     let current_pointer = response.interact_pointer_pos()?;
@@ -803,21 +911,19 @@ fn viewport_drag_command(
         .get_or_insert(ViewportOrbitDrag::new(camera));
     let current_position_points = current_pointer - response.rect.min.to_vec2();
     let start_position_points = current_position_points - total_drag_delta;
-    let camera = orbit_camera(
+    Some(orbit_camera(
         drag_state.start_camera(),
         [start_position_points.x, start_position_points.y],
         [current_position_points.x, current_position_points.y],
         [viewport_size_points.x, viewport_size_points.y],
-    );
-    Some(ApplicationCommand::SetCamera(camera))
+    ))
 }
 
-fn viewport_scroll_command(camera: CameraView, scroll_y_points: f32) -> Option<ApplicationCommand> {
+fn viewport_scroll_camera(camera: CameraView, scroll_y_points: f32) -> Option<CameraView> {
     if scroll_y_points == 0.0 || !scroll_y_points.is_finite() {
         return None;
     }
-    let camera = zoom_camera(camera, scroll_y_points);
-    Some(ApplicationCommand::SetCamera(camera))
+    Some(zoom_camera(camera, scroll_y_points))
 }
 
 fn queue_viewer_pick_request(
@@ -972,7 +1078,7 @@ const ROI_BOX_EDGES: [(usize, usize); 12] = [
 
 fn draw_viewer_tool_overlay(
     ui: &egui::Ui,
-    view: &ViewState,
+    camera: CameraView,
     egui_ui: &EguiUiState,
     response: &egui::Response,
 ) {
@@ -982,7 +1088,7 @@ fn draw_viewer_tool_overlay(
     ) else {
         return;
     };
-    let Ok(camera) = CameraFrame::new(*view.camera(), presentation) else {
+    let Ok(camera) = CameraFrame::new(camera, presentation) else {
         return;
     };
     let painter = ui.painter_at(response.rect);
@@ -1171,5 +1277,61 @@ mod tests {
         assert!(zoom_out_scroll > 0.0);
         let reconstructed = (-zoom_in_scroll * CROSS_SECTION_SCROLL_ZOOM_FACTOR_SCALE).exp();
         assert!((reconstructed - 1.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn camera_gesture_commits_only_its_latest_sample_once() {
+        let mut gesture = Some(ViewportCameraGestureState::new(
+            ViewportCameraGestureKind::Drag,
+            10_u8,
+            11_u8,
+            1.0,
+        ));
+        gesture
+            .as_mut()
+            .unwrap()
+            .update(ViewportCameraGestureKind::Drag, 12, 1.1);
+
+        assert_eq!(take_latest_camera(&mut gesture), Some(12));
+        assert_eq!(take_latest_camera(&mut gesture), None);
+    }
+
+    #[test]
+    fn scroll_camera_commits_only_after_the_settle_window() {
+        let gesture = Some(ViewportCameraGestureState::new(
+            ViewportCameraGestureKind::Scroll,
+            10_u8,
+            11_u8,
+            1.0,
+        ));
+        let settle = Duration::from_millis(120);
+
+        assert_eq!(
+            scroll_settle_state(gesture, 1.05, settle),
+            ScrollSettleState::Waiting(Duration::from_millis(70))
+        );
+        assert_eq!(
+            scroll_settle_state(gesture, 1.12, settle),
+            ScrollSettleState::Ready
+        );
+        assert_eq!(
+            scroll_settle_state(gesture, f64::NAN, settle),
+            ScrollSettleState::Waiting(settle)
+        );
+    }
+
+    #[test]
+    fn drag_camera_does_not_use_the_scroll_settle_timer() {
+        let gesture = Some(ViewportCameraGestureState::new(
+            ViewportCameraGestureKind::Drag,
+            10_u8,
+            11_u8,
+            1.0,
+        ));
+
+        assert_eq!(
+            scroll_settle_state(gesture, 10.0, Duration::from_millis(120)),
+            ScrollSettleState::Inactive
+        );
     }
 }

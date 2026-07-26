@@ -364,7 +364,7 @@ mod tests {
         let origin = Instant::now();
         let mut publisher = publisher_at(root.path(), origin);
         publisher
-            .publish_command_if_due(2, 0, "sample_diagnostics", origin)
+            .publish_command_if_due(2, 0, "copy_diagnostics", origin)
             .unwrap();
         publisher
             .publish_closeout(2, origin + Duration::from_millis(20))

@@ -9,7 +9,7 @@ use eframe::egui;
 use mirante4d_application::ApplicationCommand;
 use mirante4d_dataset::{CpuLedgerCategory, CpuLedgerError};
 use mirante4d_dataset_runtime::{RuntimeFault, RuntimeFaultCode};
-use mirante4d_domain::{TimeIndex, ViewerLayout};
+use mirante4d_domain::{CameraView, TimeIndex, ViewerLayout};
 use mirante4d_render_api::{MAX_RENDER_REQUIREMENTS, PreparedRenderRequirements};
 use mirante4d_render_wgpu::PreparedStaticPresentationLayout;
 
@@ -122,6 +122,29 @@ fn promote_installed_camera_guards(
         debug_assert!(promoted_dataset);
     }
     true
+}
+
+fn installed_camera_guard_bodies_are_complete(
+    dataset: &DatasetDemandState,
+    native: &NativePresentationBridge,
+) -> bool {
+    [SCOPE_CURRENT_3D, SCOPE_CURRENT_3D_REFINEMENT]
+        .into_iter()
+        .all(|scope| {
+            let requirements = dataset.scope_requirements(scope);
+            native.product_gpu.as_ref().map_or_else(
+                || {
+                    requirements
+                        .iter()
+                        .all(|key| dataset.retained_leases().payload(*key).is_some())
+                },
+                |product| {
+                    requirements
+                        .iter()
+                        .all(|key| product.renderer.resource_is_resident(*key))
+                },
+            )
+        })
 }
 
 fn promote_ready_staged_plan_with_renderer(
@@ -433,6 +456,39 @@ pub(crate) struct VisibleDemandPlanningSignature {
 }
 
 impl MiranteWorkbenchApp {
+    /// Prepares the existing immutable demand body for a transient camera.
+    ///
+    /// This path never plans or changes application/project state. It accepts
+    /// only full-volume coverage or a camera proven inside the installed guard
+    /// envelope, and it promotes a guard only after its complete body is
+    /// already resident. The caller can therefore rebind the current request
+    /// without exposing an arriving-brick mosaic.
+    pub(crate) fn prepare_resident_camera_preview(&mut self, camera: CameraView) -> bool {
+        let inside_reuse_envelope =
+            self.current_camera_reuse_envelope
+                .as_ref()
+                .is_some_and(|envelope| {
+                    mirante4d_render_api::CameraFrame::new(
+                        camera,
+                        self.render_coordination.presentation_viewport,
+                    )
+                    .ok()
+                    .and_then(|camera| {
+                        envelope
+                            .contains(camera, self.render_coordination.render_viewport)
+                            .ok()
+                    })
+                    .unwrap_or(false)
+                });
+        if !self.dataset.current_covers_full_volume() && !inside_reuse_envelope {
+            return false;
+        }
+        if !installed_camera_guard_bodies_are_complete(&self.dataset, &self.native_presentation) {
+            return false;
+        }
+        promote_installed_camera_guards(&mut self.dataset, &mut self.prepared_scope_render_plans)
+    }
+
     fn effective_gpu_payload_capacity(&self) -> u64 {
         self.native_presentation
             .product_gpu
@@ -647,10 +703,13 @@ impl MiranteWorkbenchApp {
                 })
             && (self.dataset.current_covers_full_volume() || camera_is_inside_reuse_envelope);
         let camera_guard_is_reusable = !current_plan_is_reusable
-            || promote_installed_camera_guards(
+            || (installed_camera_guard_bodies_are_complete(
+                &self.dataset,
+                &self.native_presentation,
+            ) && promote_installed_camera_guards(
                 &mut self.dataset,
                 &mut self.prepared_scope_render_plans,
-            );
+            ));
         if current_plan_is_reusable && camera_guard_is_reusable {
             current_plan_required = false;
             let reusable_candidates = self.current_camera_reuse_envelope.as_ref().map_or_else(

@@ -424,6 +424,7 @@ fn test_workbench_app_without_background_runtime(
         visible_demand_planning_signature: None,
         viewer_verification_busy_until: None,
         active_histogram_cache: histogram::ActiveLayerHistogramCache::default(),
+        camera_preview: None,
         egui_ui,
         import: ImportWorkflow::new(),
         analysis_runtime,
