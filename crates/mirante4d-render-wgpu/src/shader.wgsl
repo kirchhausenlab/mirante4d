@@ -714,6 +714,7 @@ fn render_dvr_layer(
     entry: f32,
     exit: f32,
     step: f32,
+    step_world: f32,
     count: u32,
 ) -> PixelResult {
     var result = transparent_pixel();
@@ -777,7 +778,7 @@ fn render_dvr_layer(
                 );
                 let base_tau = opacity_display
                     * layer_f32(layer_index, 23u)
-                    * step;
+                    * step_world;
                 let sample_alpha = dvr_effective_alpha(
                     base_tau,
                     layer_f32(layer_index, 15u),
@@ -923,6 +924,7 @@ fn render_volume_layer(
         );
     }
     if mode == 1u {
+        let step_world = step * length(world_direction);
         return render_dvr_layer(
             layer_index,
             ray.origin,
@@ -930,6 +932,7 @@ fn render_volume_layer(
             ray.entry,
             ray.exit,
             step,
+            step_world,
             count,
         );
     }
@@ -956,6 +959,7 @@ fn render_fused_dvr(world_origin: vec3<f32>, world_direction: vec3<f32>) -> Pixe
     let origin = ray.origin;
     let direction = ray.direction;
     let step = 1.0 / ray.grid_speed;
+    let step_world = step * length(world_direction);
     let count = max(u32(ceil((ray.exit - ray.entry) / step)), 1u);
     let layer_count = control[2u];
     var result = transparent_pixel();
@@ -1037,7 +1041,7 @@ fn render_fused_dvr(world_origin: vec3<f32>, world_direction: vec3<f32>) -> Pixe
                     0u,
                 );
                 let tau = dvr_effective_tau(
-                    opacity * layer_f32(layer_index, 23u) * step,
+                    opacity * layer_f32(layer_index, 23u) * step_world,
                     layer_f32(layer_index, 15u),
                 );
                 if tau <= 0.0 {
@@ -1092,6 +1096,7 @@ fn render_general_dvr(world_origin: vec3<f32>, world_direction: vec3<f32>) -> Pi
         return transparent_pixel();
     }
 
+    let step_world = step * length(world_direction);
     let count = max(u32(ceil((exit - entry) / step)), 1u);
     var result = transparent_pixel();
     var any_valid = false;
@@ -1200,7 +1205,7 @@ fn render_general_dvr(world_origin: vec3<f32>, world_direction: vec3<f32>) -> Pi
                     0u,
                 );
                 let tau = dvr_effective_tau(
-                    opacity * layer_f32(layer_index, 23u) * step,
+                    opacity * layer_f32(layer_index, 23u) * step_world,
                     layer_f32(layer_index, 15u),
                 );
                 if tau <= 0.0 {

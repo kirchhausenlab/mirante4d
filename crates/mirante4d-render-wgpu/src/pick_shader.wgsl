@@ -47,6 +47,13 @@ fn pick_completeness(incomplete: bool) -> u32 {
     return select(PICK_EXACT, PICK_INCOMPLETE, incomplete);
 }
 
+fn iso_pick_gradient_is_missing(layer_index: u32, point: vec3<f32>) -> bool {
+    if layer_word(layer_index, 18u) != 2u || layer_word(layer_index, 57u) == 0u {
+        return false;
+    }
+    return u32(iso_gradient(layer_index, point).w) == SAMPLE_MISSING;
+}
+
 fn write_empty_pick(incomplete: bool) {
     pick_output[0u] = PICK_EMPTY;
     pick_output[1u] = pick_completeness(incomplete);
@@ -221,6 +228,8 @@ fn pick_main() {
 
             if policy == PICK_FIRST_THRESHOLD {
                 if transfer_value(layer_index, sample.value) >= layer_f32(layer_index, 19u) {
+                    incomplete =
+                        incomplete || iso_pick_gradient_is_missing(layer_index, sample_point);
                     write_voxel_pick(
                         layer_index,
                         page.resource_index,

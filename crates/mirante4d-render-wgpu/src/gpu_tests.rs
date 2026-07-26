@@ -1887,10 +1887,9 @@ fn ep00_plane_mip_iso_depth_and_pick_match_independent_numerical_oracle() {
 #[test]
 #[ignore = "requires the trusted HW2 Vulkan workstation"]
 fn ep00_off_axis_perspective_dvr_uses_physical_world_distance() {
-    // This is an acceptance gate, not a snapshot of predecessor output. The
-    // EP-00 baseline currently fails it because the fragment path attenuates
-    // by an unnormalized perspective ray parameter. Keep the independent
-    // world-distance expectation fixed until the product kernel conforms.
+    // Keep the independent physical-world-distance expectation fixed so a
+    // perspective ray's native, non-unit parameter cannot silently become an
+    // optical-distance unit.
     let deadline = Instant::now() + Duration::from_secs(60);
     let fixtures = build_fixtures();
     let (dataset_runtime, catalog) = start_dataset_runtime(&fixtures.source);
@@ -2340,6 +2339,29 @@ fn qualification() {
         (halo_coverage, halo_validity),
         (0, 1),
         "missing gradient support is incomplete even when the ISO center sample is valid"
+    );
+    let missing_gradient_presented = missing_gradient_report
+        .presentation()
+        .cloned()
+        .expect("the useful incomplete gradient frame is presented");
+    let missing_gradient_pick_query = VolumePickQuery::new(
+        &missing_gradient_presented,
+        TimeIndex::new(0),
+        LogicalLayerKey::new(0),
+        [47.5, 47.5],
+        VolumePickPolicy::FirstThresholdHit,
+    )
+    .expect("the missing-halo ISO pick query is valid");
+    let missing_gradient_pick_ticket = gpu
+        .request_pick(presentation, missing_gradient_pick_query)
+        .expect("the missing-halo ISO pick is accepted");
+    let missing_gradient_pick = poll_pick(&mut gpu, missing_gradient_pick_ticket, deadline);
+    assert_eq!(missing_gradient_pick.query(), missing_gradient_pick_query);
+    assert_eq!(missing_gradient_pick.kind(), VolumePickHitKind::Voxel);
+    assert_eq!(
+        missing_gradient_pick.completeness(),
+        VolumePickCompleteness::Incomplete,
+        "gradient ISO pick completeness includes the six-sample lighting halo"
     );
 
     let (gradient_iso, gradient_iso_requirements) = intent_and_requirements(
@@ -4425,8 +4447,8 @@ fn multichannel_semantics_are_order_independent() {
     );
     assert_eq!(smooth_result.completeness(), VolumePickCompleteness::Exact);
 
-    assert_eq!(gpu.diagnostics().pick_submissions(), 5);
-    assert_eq!(gpu.diagnostics().completed_picks(), 5);
+    assert_eq!(gpu.diagnostics().pick_submissions(), 6);
+    assert_eq!(gpu.diagnostics().completed_picks(), 6);
 
     assert_eq!(gpu.diagnostics().validation_error_count(), 0);
     dataset_runtime
