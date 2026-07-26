@@ -17,14 +17,16 @@ visible brick assembly. The owner therefore authorized the
 on 2026-07-26. It supersedes EP-00 through EP-07.
 
 EP-00 and EP-01 evidence protocols are retired and nonblocking. Their command,
-schema, selection, receipt, replay, and harness roots are deleted. Remaining
-qualification-only counters in shared product automation are being removed
-without disturbing useful product scripting.
+schema, selection, receipt, replay, harness, shared gate/counter, and repeated
+resource-union hashing surfaces are deleted. Normal product scripting, hard
+resource caps, source/import/project workflows, screenshots, and asynchronous
+GPU timing remain.
 
 ## Active Checkpoint
 
-R0 recovery, R1 authority/process cutover, and R2 verification right-sizing
-are complete. R3 qualification-apparatus deletion is active.
+R0 recovery, R1 authority/process cutover, R2 verification right-sizing, R3
+qualification-apparatus deletion, and R4 recovered-work classification are
+complete. V1 resident interaction and per-view LOD is active.
 
 The damaged linked viewer worktree is repaired and clean at reconstructed
 commit `3dfe9de`. Both live recovery refs resolve to it. Strict `git fsck`,
@@ -37,13 +39,17 @@ cases moved to explicit developer-local execution. The first revised Rust run
 passed all 1,357 routine cases in 81.9 seconds after a 35.4-second Clippy phase;
 the six deep cases also passed independently.
 
+The two qualification-deletion cuts removed 43,374 lines. Resident wheel and
+drag input now bypasses durable reducer/history/demand reconstruction, renders
+only from a geometrically valid fully resident body, and commits once after
+the gesture settles. Stale previews are retired across canonical view,
+project, source, and tool transitions.
+
 The immediate ordered actions are:
 
-1. finish removing qualification-only automation counters and repeated
-   internal hashing;
-2. retain only useful successor product mechanisms; and
-3. deliver resident interaction/LOD, cold complete refinement, and MIP/DVR/ISO
-   improvements as separately product-validated slices.
+1. finish V1 with independent projected-affine LOD per visible view/layer;
+2. close V2 complete-only cold refinement and visible presentation; and
+3. apply and measure the small MIP/DVR/ISO correctness and kernel changes.
 
 No storage-format rewrite is presumed. It requires measured evidence that
 unique byte/decode amplification remains a dominant blocker after runtime

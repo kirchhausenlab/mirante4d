@@ -199,7 +199,8 @@ The EP-00 and EP-01 viewer-performance protocols are frozen historical
 development artifacts. Their raw-report, receipt, replay, population,
 selection, and per-role provenance machinery is not a current development
 prerequisite and must not block product work. Their command, schema, selection,
-receipt, replay, and harness roots have been removed from the live repository.
+receipt, replay, harness, shared gate/counter, and repeated resource-union
+hashing roots have been removed from the live repository.
 
 Viewer-performance work now proceeds in small product slices:
 

@@ -1,6 +1,6 @@
 # Development Simplification And Viewer Recovery Plan
 
-Status: ACTIVE — QUALIFICATION CLEANUP AND PRODUCT DELIVERY
+Status: ACTIVE — V1 PROJECTED-AFFINE LOD
 Planning authorization: OWNER GRANTED 2026-07-26
 Implementation authorization: OWNER GRANTED 2026-07-26
 Last reviewed: 2026-07-26
@@ -190,7 +190,7 @@ demoted deep cases remain explicitly runnable and passed independently.
 
 ### R3 — Qualification Apparatus Deletion
 
-Status: ACTIVE — ROOT CUT COMPLETE; SHARED AUTOMATION CLEANUP PENDING
+Status: COMPLETE
 
 - Delete the EP-01 selection authority and its bound schemas.
 - Delete development raw-report-to-receipt projection, replay, and admission
@@ -207,14 +207,18 @@ Status: ACTIVE — ROOT CUT COMPLETE; SHARED AUTOMATION CLEANUP PENDING
 Exit: performance tooling is materially smaller than the product code it
 exercises and is not on the edit or merge critical path.
 
-The live command/schema root cut deleted five viewer qualification commands,
-the selection authority, nine schemas, receipt/replay/harness implementations,
-the unused schema-validator pin, and a test-only shader evidence generator:
-about 37,700 lines in total. Ordinary product validation, bounded subprocess
-handling, asynchronous GPU timings, and independent numerical/LOD oracles
-remain.
+The live command/schema root cut and shared-automation cleanup deleted five
+viewer qualification commands, the selection authority, nine schemas,
+receipt/replay/harness implementations, repeated resource-union hashing,
+gate-batch and startup-bootstrap choreography, qualification-only counters,
+the unused schema-validator pin, and a test-only shader evidence generator.
+The two cuts removed 43,374 lines. Ordinary product validation, hard resource
+caps, bounded subprocess handling, source/import/project workflows,
+asynchronous GPU timings, and independent numerical/LOD oracles remain.
 
 ### R4 — Recover Product Work
+
+Status: COMPLETE — CLASSIFICATION; SELECTIVE PORTS CONTINUE IN V1–V3
 
 - Classify the recovered branch into product mechanisms, shared safety
   utilities, tests/oracles, and qualification-only scaffolding.
@@ -227,7 +231,17 @@ remain.
 Exit: every retained successor module has a normal-product consumer, a focused
 reason to exist, and proportionate checks.
 
+The recovered branch was reviewed by product area rather than merged. The
+normal application already owns most of its useful residency, sparse-page,
+progressive staging, and renderer mechanisms. The accepted remainder is a
+small projected-affine LOD calculation, two renderer correctness fixes,
+measured mode-specific kernel experiments, and compact native/GPU terminal
+safety latches. Successor runtime architecture, duplicate kernels, evidence
+populations, selectors, receipts, and provenance scaffolding remain rejected.
+
 ### V1 — Resident Interaction And Per-View LOD
+
+Status: ACTIVE — RESIDENT INTERACTION COMPLETE; LOD CUTOVER IN PROGRESS
 
 - Keep the current format unless measurement proves it blocks this slice.
 - Make wheel and drag input update bounded hot state without static residency,
@@ -241,6 +255,14 @@ normal real-display wheel, compound-angle, and four-panel exercises.
 
 Exit: no observed wheel freeze, no unjustified settled coarse LOD, and no
 per-sample durable revision churn on the representative workflow.
+
+Wheel and drag samples now update bounded egui/render hot state and commit one
+durable camera after drag completion or a short scroll-settle interval. A
+preview never invokes the reducer or demand planner and may reach the renderer
+only when the installed geometrically valid body is completely resident.
+Project/view/tool transitions retire stale previews. The remaining V1 work is
+independent projected-affine scale selection for every visible layer and
+physical view, followed by the real-display exercises.
 
 ### V2 — Cold Refinement And Complete Presentation
 

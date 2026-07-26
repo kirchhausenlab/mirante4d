@@ -1,6 +1,6 @@
 # Current State
 
-Last reviewed: 2026-07-18
+Last reviewed: 2026-07-26
 
 Mirante4D is public, pre-alpha academic research software. Persisted formats
 and APIs can change through explicit hard cutovers; there is no supported
@@ -142,6 +142,15 @@ static rebuild. A queued guard is reprioritized in place without a duplicate
 waiter, decode, or queue slot, and exact admission-cursor rewinds preserve
 canceled staged guard work across atomic promotion.
 
+Raw wheel and drag samples now remain transient UI/render state. They do not
+dispatch the durable application reducer, extend project history, or invoke
+the demand planner. Drag completion and a short scroll-settle boundary commit
+only the latest camera. A transient camera may rebind the renderer only inside
+an installed geometrically valid body whose complete resource set is already
+resident; otherwise the previous complete image remains until the committed
+camera follows normal planning. Canonical view, source, project, and tool
+transitions retire stale previews.
+
 Candidate bricks come from the selected-scale view volume rather than
 per-pixel ray discovery. Bounded admission cursors, exact eviction-recovery
 sets, and retained leases preserve overlapping work. Worker-prepared retained-
@@ -214,10 +223,12 @@ compound-angle movement can visibly expose arriving bricks.
 That mismatch demonstrated that the subsequent EP-00/EP-01 development
 qualification was not proportionate or sufficiently product-directed. The
 five qualification commands, selection authority, nine schemas, receipt and
-replay implementation, harness, and test-only shader evidence generator are
-deleted. Remaining qualification-only counters in shared product automation
-are frozen for focused cleanup. The retired protocol establishes no current
-performance claim and is not a prerequisite for implementation.
+replay implementation, harness, shared gate/counter choreography, repeated
+resource-union hashing, and test-only shader evidence generator are deleted.
+The two cuts removed 43,374 lines while retaining normal product validation,
+hard resource caps, source/import/project workflows, and asynchronous timing.
+The retired protocol establishes no current performance claim and is not a
+prerequisite for implementation.
 
 The damaged unpublished linked worktree has been independently preserved and
 reconstructed. Its 199 recoverable commits through `3d967f0` plus the surviving
