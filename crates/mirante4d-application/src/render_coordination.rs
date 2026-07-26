@@ -190,7 +190,9 @@ impl CrossSectionPanelScheduleState {
     }
 
     pub const fn rendered(mut self) -> Self {
-        self.status = if self.missing_occupied_bricks > 0 {
+        self.status = if matches!(self.status, CrossSectionPanelScheduleStatus::Incomplete)
+            || self.missing_occupied_bricks > 0
+        {
             CrossSectionPanelScheduleStatus::Incomplete
         } else if self.fallback_scale_level.is_some() {
             CrossSectionPanelScheduleStatus::Coarse

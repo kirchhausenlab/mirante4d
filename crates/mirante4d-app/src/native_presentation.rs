@@ -12,6 +12,7 @@ use mirante4d_dataset::DatasetResourceKey;
 use mirante4d_domain::LogicalLayerKey;
 use mirante4d_render_api::{
     FrameIdentity, PresentationToken, PresentedFrame, RenderExtent, RenderPassKind,
+    RenderRequirementRole, RenderRequirements,
 };
 use mirante4d_render_wgpu::{
     CpuFrameTiming, GpuFrameTiming, GpuResidencyInvalidationEpoch, GpuTimingTicket,
@@ -269,6 +270,7 @@ pub(crate) struct ProductPresentationTarget {
     pub(crate) layer_requirement_facts: BTreeMap<LogicalLayerKey, ProductLayerRequirementFacts>,
     pub(crate) presented_layer_requirement_facts:
         BTreeMap<LogicalLayerKey, ProductLayerRequirementFacts>,
+    layer_requirement_facts_requirements: Option<RenderRequirements>,
     progressive_lease_probe: Cell<ProgressiveLeaseProbeState>,
 }
 
@@ -292,6 +294,7 @@ impl ProductPresentationTarget {
             partial_seen: false,
             layer_requirement_facts: BTreeMap::new(),
             presented_layer_requirement_facts: BTreeMap::new(),
+            layer_requirement_facts_requirements: None,
             progressive_lease_probe: Cell::new(ProgressiveLeaseProbeState {
                 next_requirement: 0,
                 requirements_remaining: 0,
@@ -307,24 +310,64 @@ impl ProductPresentationTarget {
     }
 
     pub(crate) fn reset_layer_requirement_facts(&mut self) {
-        self.layer_requirement_facts.clear();
-        for key in self.requirement_keys.iter().copied() {
-            let facts = self.layer_requirement_facts.entry(key.layer()).or_default();
-            facts.displayed_scale_level = Some(key.scale().get());
-            facts.total_requirements = facts.total_requirements.saturating_add(1);
-        }
+        self.rebuild_layer_requirement_facts();
     }
 
     pub(crate) fn mark_layer_requirement_available(&mut self, key: DatasetResourceKey) {
+        if self.synchronize_layer_requirement_facts() || !self.request_requires(key) {
+            return;
+        }
         if let Some(facts) = self.layer_requirement_facts.get_mut(&key.layer()) {
             facts.available_requirements = facts.available_requirements.saturating_add(1);
         }
     }
 
     pub(crate) fn mark_layer_requirement_unavailable(&mut self, key: DatasetResourceKey) {
+        if self.synchronize_layer_requirement_facts() || !self.request_requires(key) {
+            return;
+        }
         if let Some(facts) = self.layer_requirement_facts.get_mut(&key.layer()) {
             facts.available_requirements = facts.available_requirements.saturating_sub(1);
         }
+    }
+
+    fn request_requires(&self, key: DatasetResourceKey) -> bool {
+        self.request
+            .as_ref()
+            .is_some_and(|request| request.requirements.is_required_resource(key))
+    }
+
+    /// Rebuilds coverage when the immutable resource body or its O(1)
+    /// prefetch-promotion semantics changed. The satisfied set is already the
+    /// target's exact residency observation, so totals and availability move
+    /// together instead of incrementally relabeling dormant guard keys.
+    fn synchronize_layer_requirement_facts(&mut self) -> bool {
+        let current = self.request.as_ref().map(|request| &request.requirements);
+        let semantics_match = match (self.layer_requirement_facts_requirements.as_ref(), current) {
+            (Some(recorded), Some(current)) => {
+                recorded.shares_resources_with(current)
+                    && recorded.prefetch_promoted() == current.prefetch_promoted()
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if semantics_match {
+            return false;
+        }
+        self.rebuild_layer_requirement_facts();
+        true
+    }
+
+    fn rebuild_layer_requirement_facts(&mut self) {
+        let requirements = self
+            .request
+            .as_ref()
+            .map(|request| request.requirements.clone());
+        self.layer_requirement_facts =
+            requirements.as_ref().map_or_else(BTreeMap::new, |current| {
+                product_layer_requirement_facts(current, &self.satisfied_requirement_keys)
+            });
+        self.layer_requirement_facts_requirements = requirements;
     }
 
     /// Opens one finite membership pass after an event that can make another
@@ -356,11 +399,32 @@ impl ProductPresentationTarget {
         self.progressive_lease_probe.get().render_requested
     }
 
-    pub(crate) fn clear_progressive_render_request(&self) {
+    pub(crate) fn clear_progressive_render_request(&mut self) {
+        self.synchronize_layer_requirement_facts();
         let mut state = self.progressive_lease_probe.get();
         state.render_requested = false;
         self.progressive_lease_probe.set(state);
     }
+}
+
+fn product_layer_requirement_facts(
+    requirements: &RenderRequirements,
+    satisfied: &HashSet<DatasetResourceKey>,
+) -> BTreeMap<LogicalLayerKey, ProductLayerRequirementFacts> {
+    let mut facts_by_layer = BTreeMap::<LogicalLayerKey, ProductLayerRequirementFacts>::new();
+    for requirement in requirements
+        .resources()
+        .filter(|requirement| requirement.role() != RenderRequirementRole::Prefetch)
+    {
+        let key = requirement.key();
+        let facts = facts_by_layer.entry(key.layer()).or_default();
+        facts.displayed_scale_level = Some(key.scale().get());
+        facts.total_requirements = facts.total_requirements.saturating_add(1);
+        if satisfied.contains(&key) {
+            facts.available_requirements = facts.available_requirements.saturating_add(1);
+        }
+    }
+    facts_by_layer
 }
 
 pub(crate) struct ProductGpuRenderRuntime {
@@ -572,9 +636,154 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    use mirante4d_dataset::{DatasetResourceIdentity, DatasetSourceId, ResourceRegion};
+    use mirante4d_domain::{
+        CameraView, DisplayWindow, IsoLightState, LayerTransfer, Opacity, Projection, RenderState,
+        RgbColor, SamplingPolicy, ScaleLevel, Shape3D, TimeIndex, TransferCurve, UnitQuaternion,
+        WorldPoint3,
+    };
+    use mirante4d_render_api::{
+        LayerRenderIntent, PreparedRenderRequirements, PreparedResourceBody, PresentationViewport,
+        RenderIntent, RenderViewIntent,
+    };
+
+    fn guard_resource(x: u64) -> DatasetResourceKey {
+        DatasetResourceKey::new(
+            DatasetResourceIdentity::Unverified(DatasetSourceId::new(77)),
+            LogicalLayerKey::new(4),
+            TimeIndex::new(0),
+            ScaleLevel::BASE,
+            ResourceRegion::new([0, 0, x], Shape3D::new(1, 1, 1).unwrap()).unwrap(),
+        )
+    }
+
+    fn guard_requirements() -> (PreparedRenderRequirements, [DatasetResourceKey; 3]) {
+        let keys = [guard_resource(0), guard_resource(1), guard_resource(2)];
+        let canonical: Arc<[DatasetResourceKey]> = keys.to_vec().into();
+        let ranked: Arc<[DatasetResourceKey]> = keys.to_vec().into();
+        let body = PreparedResourceBody::new(canonical, ranked, None).unwrap();
+        let requirements = PreparedRenderRequirements::new_with_required_prefix(
+            keys[0].identity(),
+            keys[0].timepoint(),
+            vec![keys[0].layer()],
+            body,
+            1,
+            1,
+        )
+        .unwrap();
+        (requirements, keys)
+    }
+
+    fn guard_request(requirements: &PreparedRenderRequirements) -> Arc<ProductRenderRequest> {
+        let intent = RenderIntent::new(
+            FrameIdentity::new(1),
+            requirements.resource_identity(),
+            requirements.timepoint(),
+            RenderViewIntent::volume(
+                CameraView::new(
+                    Projection::Orthographic,
+                    WorldPoint3::origin(),
+                    UnitQuaternion::identity(),
+                    1.0,
+                    1.0,
+                    1.0,
+                )
+                .unwrap(),
+                IsoLightState::attached_camera(),
+            ),
+            PresentationViewport::new(16.0, 16.0).unwrap(),
+            RenderExtent::new(16, 16).unwrap(),
+            vec![LayerRenderIntent::new(
+                requirements.layers()[0],
+                LayerTransfer::new(
+                    DisplayWindow::new(0.0, 1.0).unwrap(),
+                    RgbColor::new([1.0; 3]).unwrap(),
+                    Opacity::new(1.0).unwrap(),
+                    TransferCurve::linear(),
+                    false,
+                ),
+                RenderState::mip(SamplingPolicy::VoxelExact),
+            )],
+        )
+        .unwrap();
+        Arc::new(ProductRenderRequest {
+            requirements: requirements.bind(&intent).unwrap(),
+            intent,
+        })
+    }
+
+    fn guard_target(
+        requirements: &PreparedRenderRequirements,
+        satisfied: impl IntoIterator<Item = DatasetResourceKey>,
+    ) -> ProductPresentationTarget {
+        let mut target = ProductPresentationTarget::new(
+            PresentationToken::new(1).unwrap(),
+            RenderExtent::new(16, 16).unwrap(),
+        );
+        target.requirement_keys = Arc::clone(requirements.body().canonical());
+        target.lease_priority_keys = Arc::clone(requirements.body().ranked());
+        target.satisfied_requirement_keys.extend(satisfied);
+        target.request = Some(guard_request(requirements));
+        target.reset_layer_requirement_facts();
+        target
+    }
+
     #[test]
     fn display_texture_handoff_uses_linear_filtering() {
         assert_eq!(display_texture_filter(), eframe::wgpu::FilterMode::Linear);
+    }
+
+    #[test]
+    fn dormant_prefetch_is_excluded_from_layer_coverage_facts() {
+        let (requirements, keys) = guard_requirements();
+        let mut target = guard_target(&requirements, keys);
+        let facts = target.layer_requirement_facts[&keys[0].layer()];
+        assert_eq!(facts.total_requirements, 1);
+        assert_eq!(facts.available_requirements, 1);
+
+        target.satisfied_requirement_keys.remove(&keys[1]);
+        target.mark_layer_requirement_unavailable(keys[1]);
+        target.satisfied_requirement_keys.insert(keys[1]);
+        target.mark_layer_requirement_available(keys[1]);
+        assert_eq!(
+            target.layer_requirement_facts[&keys[0].layer()],
+            facts,
+            "dormant guard residency must not change current-frame coverage"
+        );
+    }
+
+    #[test]
+    fn prefetch_promotion_rebuilds_totals_and_availability_together() {
+        let (requirements, keys) = guard_requirements();
+        let mut target = guard_target(&requirements, [keys[0], keys[1]]);
+        assert_eq!(
+            target.layer_requirement_facts[&keys[0].layer()],
+            ProductLayerRequirementFacts {
+                displayed_scale_level: Some(0),
+                available_requirements: 1,
+                total_requirements: 1,
+            }
+        );
+
+        let promoted = requirements.promote_prefetch();
+        target.request = Some(guard_request(&promoted));
+        target.clear_progressive_render_request();
+        assert_eq!(
+            target.layer_requirement_facts[&keys[0].layer()],
+            ProductLayerRequirementFacts {
+                displayed_scale_level: Some(0),
+                available_requirements: 2,
+                total_requirements: 3,
+            },
+            "promotion must rebuild from the promoted semantics and exact satisfied set"
+        );
+
+        target.satisfied_requirement_keys.insert(keys[2]);
+        target.mark_layer_requirement_available(keys[2]);
+        assert_eq!(
+            target.layer_requirement_facts[&keys[0].layer()].available_requirements,
+            3
+        );
     }
 
     #[test]

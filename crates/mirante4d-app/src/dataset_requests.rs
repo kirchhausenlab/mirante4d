@@ -166,6 +166,7 @@ pub(crate) struct DatasetDemandState {
     current_playback_downshifted: bool,
     four_panel: bool,
     last_plan_error: Option<String>,
+    preserve_presentation_for_deferred_refill_fault: bool,
     staged_current_plan: Option<PreparedDatasetDemandPlan>,
     holding_previous_presentation: bool,
     source_quarantined: bool,
@@ -498,6 +499,7 @@ impl DatasetDemandState {
             current_playback_downshifted: false,
             four_panel: false,
             last_plan_error: None,
+            preserve_presentation_for_deferred_refill_fault: false,
             staged_current_plan: None,
             holding_previous_presentation: false,
             source_quarantined: false,
@@ -1762,6 +1764,28 @@ impl DatasetDemandState {
             }
         }
         Ok(submitted)
+    }
+
+    pub(crate) fn defer_interactive_admission_refill(
+        &mut self,
+        preserve_presentation_on_fault: bool,
+    ) {
+        self.dispatcher.mark_admission_blocked();
+        self.preserve_presentation_for_deferred_refill_fault |= preserve_presentation_on_fault;
+    }
+
+    pub(crate) fn take_deferred_refill_presentation_preservation(&mut self) -> bool {
+        std::mem::take(&mut self.preserve_presentation_for_deferred_refill_fault)
+    }
+
+    pub(crate) const fn deferred_refill_preserves_presentation(&self) -> bool {
+        self.preserve_presentation_for_deferred_refill_fault
+    }
+
+    pub(crate) fn finish_deferred_refill_if_unblocked(&mut self) {
+        if !self.dispatcher.admission_blocked() {
+            self.preserve_presentation_for_deferred_refill_fault = false;
+        }
     }
 
     pub(crate) fn drain_runtime_results(

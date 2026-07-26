@@ -398,6 +398,18 @@ fn build_progress(
         .map_err(|_| WgpuRenderRuntimeError::FrameProgressContract)
 }
 
+const fn retained_frame_policy_allows_render(
+    render_policy: RetainedFrameRenderPolicy,
+    completeness: Option<FrameCompleteness>,
+) -> bool {
+    match render_policy {
+        RetainedFrameRenderPolicy::EveryUsefulFrame => completeness.is_some(),
+        RetainedFrameRenderPolicy::ExactFrameOnly => {
+            matches!(completeness, Some(FrameCompleteness::Exact))
+        }
+    }
+}
+
 fn validate_requirement_contract(
     requirements: &RenderRequirements,
 ) -> Result<(), WgpuRenderRuntimeError> {
@@ -4228,9 +4240,14 @@ impl Runtime {
         catalog: &DatasetCatalog,
         intent: &RenderIntent,
         requirements: &RenderRequirements,
-        cpu_timing_start: Option<Instant>,
-        display_generation: u64,
+        setup: FrameExecutionSetup<'_>,
     ) -> Result<Option<FrameExecutionReport>, WgpuRenderRuntimeError> {
+        let FrameExecutionSetup {
+            cpu_timing_start,
+            display_generation,
+            render_policy,
+            ..
+        } = setup;
         let Some(presentation) = self.presentations.get(&presentation_token) else {
             return Err(WgpuRenderRuntimeError::PresentationNotRegistered {
                 token: presentation_token,
@@ -4269,8 +4286,12 @@ impl Runtime {
             .expect("fast-path preflight checked retained progress")
             .rebind(requirements)
             .map_err(|_| WgpuRenderRuntimeError::FrameProgressContract)?;
-        let replaces_display = presentation.display.extent != intent.extent();
-        let render = presentation.last_rendered_frame != Some(intent.frame()) || replaces_display;
+        let policy_allows_render =
+            retained_frame_policy_allows_render(render_policy, Some(progress.completeness()));
+        let replaces_display =
+            policy_allows_render && presentation.display.extent != intent.extent();
+        let render = policy_allows_render
+            && (presentation.last_rendered_frame != Some(intent.frame()) || replaces_display);
         if !render {
             return Ok(Some(FrameExecutionReport {
                 presentation: None,
@@ -4896,6 +4917,7 @@ impl Runtime {
         setup: FrameExecutionSetup<'_>,
         leases: &[&dyn ResourceLease],
     ) -> Result<FrameExecutionReport, WgpuRenderRuntimeError> {
+        let retained_navigation_setup = setup;
         let FrameExecutionSetup {
             prepared_layout,
             nonblocking_progress_collected,
@@ -4973,8 +4995,7 @@ impl Runtime {
                 catalog,
                 intent,
                 requirements,
-                cpu_timing_start,
-                display_generation,
+                retained_navigation_setup,
             )?
         {
             return Ok(report);
@@ -5261,12 +5282,10 @@ impl Runtime {
             && availability_changes
                 .iter()
                 .any(|(key, available)| !available && requirements.is_required_resource(*key));
-        let policy_allows_render = match render_policy {
-            RetainedFrameRenderPolicy::EveryUsefulFrame => progress.is_some(),
-            RetainedFrameRenderPolicy::ExactFrameOnly => progress
-                .as_ref()
-                .is_some_and(|progress| progress.completeness() == FrameCompleteness::Exact),
-        };
+        let policy_allows_render = retained_frame_policy_allows_render(
+            render_policy,
+            progress.as_ref().map(FrameProgress::completeness),
+        );
         let replaces_display =
             policy_allows_render && presentation.display.extent != intent.extent();
         let render = policy_allows_render
@@ -7502,6 +7521,26 @@ mod tests {
         assert_eq!(absent.payload_copy, None);
         assert_eq!(absent.render_pass, None);
         assert_eq!(absent.query_count, 0);
+    }
+
+    #[test]
+    fn exact_only_retained_frames_wait_for_exact_coverage() {
+        assert!(retained_frame_policy_allows_render(
+            RetainedFrameRenderPolicy::EveryUsefulFrame,
+            Some(FrameCompleteness::Progressive),
+        ));
+        assert!(!retained_frame_policy_allows_render(
+            RetainedFrameRenderPolicy::ExactFrameOnly,
+            Some(FrameCompleteness::Progressive),
+        ));
+        assert!(retained_frame_policy_allows_render(
+            RetainedFrameRenderPolicy::ExactFrameOnly,
+            Some(FrameCompleteness::Exact),
+        ));
+        assert!(!retained_frame_policy_allows_render(
+            RetainedFrameRenderPolicy::ExactFrameOnly,
+            None,
+        ));
     }
 
     #[test]

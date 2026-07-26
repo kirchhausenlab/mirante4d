@@ -289,6 +289,12 @@ pub(crate) struct VisibleBrickRequestOutcome {
     pub(crate) current_frame_ready: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct VisibleDemandPlanCurrentness {
+    pub(crate) current_3d: bool,
+    pub(crate) cross_sections: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct DemandPlanningLayerSignature {
     key: mirante4d_domain::LogicalLayerKey,
@@ -461,7 +467,29 @@ pub(crate) struct VisibleDemandPlanningSignature {
     cross_sections: CrossSectionDemandPlanningSignature,
 }
 
+fn installed_visible_demand_plan_currentness(
+    installed: Option<&VisibleDemandPlanningSignature>,
+    current: &VisibleDemandPlanningSignature,
+) -> VisibleDemandPlanCurrentness {
+    let Some(installed) = installed else {
+        return VisibleDemandPlanCurrentness::default();
+    };
+    VisibleDemandPlanCurrentness {
+        current_3d: installed.current_3d == current.current_3d,
+        cross_sections: installed.cross_sections == current.cross_sections,
+    }
+}
+
 impl MiranteWorkbenchApp {
+    pub(crate) fn visible_demand_plan_currentness(&self) -> VisibleDemandPlanCurrentness {
+        let snapshot = self.application.snapshot();
+        let current = self.visible_demand_planning_signature(&snapshot);
+        installed_visible_demand_plan_currentness(
+            self.visible_demand_planning_signature.as_ref(),
+            &current,
+        )
+    }
+
     /// Prepares the existing immutable demand body for a transient camera.
     ///
     /// This path never plans or changes application/project state. It accepts
@@ -579,10 +607,23 @@ impl MiranteWorkbenchApp {
                 return VisibleBrickRequestOutcome::default();
             }
         };
-        if let Err(fault) =
-            pump_interactive_admission_with_renderer(&mut self.dataset, &self.native_presentation)
+        let preserve_presentation = self.dataset.deferred_refill_preserves_presentation();
+        match pump_interactive_admission_with_renderer(&mut self.dataset, &self.native_presentation)
         {
-            self.record_dataset_fault(&fault);
+            Ok(_) => {
+                if let Some(fault) = self.dataset.dispatcher_mut().take_last_fault() {
+                    self.dataset
+                        .take_deferred_refill_presentation_preservation();
+                    self.record_dataset_admission_fault(&fault, preserve_presentation);
+                } else {
+                    self.dataset.finish_deferred_refill_if_unblocked();
+                }
+            }
+            Err(fault) => {
+                self.dataset
+                    .take_deferred_refill_presentation_preservation();
+                self.record_dataset_admission_fault(&fault, preserve_presentation);
+            }
         }
         let ready = scope_complete_with_renderer(
             &self.dataset,
@@ -1346,7 +1387,9 @@ impl MiranteWorkbenchApp {
             let (batch_drained, batch_installed) = match outcome {
                 Ok(outcome) => outcome,
                 Err(fault) => {
-                    drain_fault = Some(fault);
+                    let preserve_presentation =
+                        dataset.take_deferred_refill_presentation_preservation();
+                    drain_fault = Some((fault, preserve_presentation));
                     break;
                 }
             };
@@ -1354,28 +1397,37 @@ impl MiranteWorkbenchApp {
             native_presentation.dirty_progressive_lease_probes_for_keys(batch_installed.keys());
             installed_current |= batch_installed.in_scope(SCOPE_CURRENT_3D);
             installed_any |= batch_installed.any();
-            if dataset.dispatcher().admission_blocked()
-                && let Err(fault) =
-                    pump_interactive_admission_with_renderer(dataset, native_presentation)
-            {
-                drain_fault = Some(fault);
-                break;
+            if dataset.dispatcher().admission_blocked() {
+                let preserve_presentation = dataset.deferred_refill_preserves_presentation();
+                match pump_interactive_admission_with_renderer(dataset, native_presentation) {
+                    Ok(_) => {}
+                    Err(fault) => {
+                        dataset.take_deferred_refill_presentation_preservation();
+                        drain_fault = Some((fault, preserve_presentation));
+                        break;
+                    }
+                }
             }
             if batch_drained < batch {
                 break;
             }
         }
-        if let Some(fault) = drain_fault {
-            self.record_dataset_fault(&fault);
+        if let Some((fault, preserve_presentation)) = drain_fault {
+            self.record_dataset_admission_fault(&fault, preserve_presentation);
             return;
         }
         if let Some(fault) = self.dataset.dispatcher_mut().take_last_fault() {
+            let preserve_presentation = self
+                .dataset
+                .take_deferred_refill_presentation_preservation();
             let retry_after_capacity =
                 matches!(fault.code(), RuntimeFaultCode::CapacityExceeded { .. });
-            self.record_dataset_fault(&fault);
+            self.record_dataset_admission_fault(&fault, preserve_presentation);
             if !retry_after_capacity {
                 return;
             }
+        } else {
+            self.dataset.finish_deferred_refill_if_unblocked();
         }
 
         let promoted_current = match promote_ready_staged_plan_with_renderer(
@@ -1389,14 +1441,20 @@ impl MiranteWorkbenchApp {
                 return;
             }
         };
-        if self.dataset.dispatcher().admission_blocked()
-            && let Err(fault) = pump_interactive_admission_with_renderer(
+        if self.dataset.dispatcher().admission_blocked() {
+            let preserve_presentation = self.dataset.deferred_refill_preserves_presentation();
+            match pump_interactive_admission_with_renderer(
                 &mut self.dataset,
                 &self.native_presentation,
-            )
-        {
-            self.record_dataset_fault(&fault);
-            return;
+            ) {
+                Ok(_) => self.dataset.finish_deferred_refill_if_unblocked(),
+                Err(fault) => {
+                    self.dataset
+                        .take_deferred_refill_presentation_preservation();
+                    self.record_dataset_admission_fault(&fault, preserve_presentation);
+                    return;
+                }
+            }
         }
 
         for (token, error) in analysis_errors {
@@ -1542,6 +1600,25 @@ impl MiranteWorkbenchApp {
     }
 
     pub(crate) fn record_dataset_fault(&mut self, fault: &RuntimeFault) {
+        self.record_dataset_fault_with_presentation_effect(fault, true);
+    }
+
+    fn record_dataset_admission_fault(
+        &mut self,
+        fault: &RuntimeFault,
+        preserve_presentation: bool,
+    ) {
+        self.record_dataset_fault_with_presentation_effect(
+            fault,
+            admission_fault_invalidates_presentation(preserve_presentation),
+        );
+    }
+
+    fn record_dataset_fault_with_presentation_effect(
+        &mut self,
+        fault: &RuntimeFault,
+        invalidate_presentation: bool,
+    ) {
         let source_binding_invalidated = if runtime_fault_invalidates_verified_source(fault.code())
         {
             let snapshot = self.application.snapshot();
@@ -1569,7 +1646,9 @@ impl MiranteWorkbenchApp {
         let message = fault.to_string();
         self.dataset.record_plan_error(message.clone());
         self.render_coordination.frame_fidelity.last_capacity_error = Some(message);
-        self.render_coordination.frame_fidelity.completeness = FrameCompleteness::Incomplete;
+        if invalidate_presentation {
+            self.render_coordination.frame_fidelity.completeness = FrameCompleteness::Incomplete;
+        }
         if source_binding_invalidated {
             // The reducer event is consumed at the start of the next UI turn.
             // Quarantine after recording the terminal fault so the runtime's
@@ -1601,6 +1680,10 @@ impl MiranteWorkbenchApp {
             LodDecisionReason::BackendLimit
         };
     }
+}
+
+const fn admission_fault_invalidates_presentation(preserve_presentation: bool) -> bool {
+    !preserve_presentation
 }
 
 pub(crate) const fn runtime_fault_invalidates_verified_source(code: RuntimeFaultCode) -> bool {
@@ -1755,8 +1838,9 @@ mod tests {
         CrossSectionDemandPlanningSignature, Current3dDemandPlanningSignature,
         PROGRESSIVE_DISPLAY_REFRESH_INTERVAL, ProgressiveDisplayRefreshPacer, RESULT_DRAIN_BATCH,
         RESULT_DRAIN_COUNT_ENVELOPE, RESULT_DRAIN_TIME_BUDGET, VisibleDemandFailureSignature,
-        VisibleDemandPlanningSignature, completion_drain_needs_display_refresh,
-        installed_target_layer_scales, next_completion_drain_batch,
+        VisibleDemandPlanningSignature, admission_fault_invalidates_presentation,
+        completion_drain_needs_display_refresh, installed_target_layer_scales,
+        installed_visible_demand_plan_currentness, next_completion_drain_batch,
         runtime_fault_invalidates_verified_source, visible_demand_failure_is_deterministic,
     };
     use crate::DeterministicFailureLatch;
@@ -1824,6 +1908,42 @@ mod tests {
         assert_eq!(
             installed_target_layer_scales(true, Some(&current), None),
             None
+        );
+    }
+
+    #[test]
+    fn render_eligibility_requires_the_installed_signature_for_each_view_family() {
+        let installed = planning_signature(1);
+        assert_eq!(
+            installed_visible_demand_plan_currentness(Some(&installed), &installed),
+            super::VisibleDemandPlanCurrentness {
+                current_3d: true,
+                cross_sections: true,
+            }
+        );
+        assert_eq!(
+            installed_visible_demand_plan_currentness(None, &installed),
+            super::VisibleDemandPlanCurrentness::default()
+        );
+
+        let mut changed_3d = installed.clone();
+        changed_3d.current_3d.render_viewport = RenderExtent::new(32, 16).unwrap();
+        assert_eq!(
+            installed_visible_demand_plan_currentness(Some(&installed), &changed_3d),
+            super::VisibleDemandPlanCurrentness {
+                current_3d: false,
+                cross_sections: true,
+            }
+        );
+
+        let mut changed_cross = installed.clone();
+        changed_cross.cross_sections.render_extents[0] = Some(RenderExtent::new(32, 16).unwrap());
+        assert_eq!(
+            installed_visible_demand_plan_currentness(Some(&installed), &changed_cross),
+            super::VisibleDemandPlanCurrentness {
+                current_3d: true,
+                cross_sections: false,
+            }
         );
     }
 
@@ -1986,6 +2106,8 @@ mod tests {
 
     #[test]
     fn only_observed_source_integrity_faults_invalidate_a_verified_binding() {
+        assert!(!admission_fault_invalidates_presentation(true));
+        assert!(admission_fault_invalidates_presentation(false));
         for code in [
             RuntimeFaultCode::SourceRejected,
             RuntimeFaultCode::CorruptResource,

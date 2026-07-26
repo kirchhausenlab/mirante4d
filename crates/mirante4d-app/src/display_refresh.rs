@@ -197,12 +197,59 @@ pub(crate) const fn display_refresh_path_label(path: DisplayRefreshPath) -> &'st
 }
 
 fn hidden_target_ready_for_atomic_swap(
+    presented_frame: FrameIdentity,
+    presented_extent: RenderExtent,
+    request_frame: FrameIdentity,
+    request_extent: RenderExtent,
     completeness: RenderFrameCompleteness,
     total_requirements: u64,
     staged_requirement_count: usize,
 ) -> bool {
-    matches!(completeness, RenderFrameCompleteness::Exact)
+    presented_frame == request_frame
+        && presented_extent == request_extent
+        && matches!(completeness, RenderFrameCompleteness::Exact)
         && u64::try_from(staged_requirement_count).ok() == Some(total_requirements)
+}
+
+fn retained_frame_render_policy(
+    publish_to_display: bool,
+    existing_presentation: Option<RenderFrameCompleteness>,
+) -> RetainedFrameRenderPolicy {
+    let replacing_settled_pixels = existing_presentation
+        .is_some_and(|completeness| completeness != RenderFrameCompleteness::Progressive);
+    if publish_to_display && !replacing_settled_pixels {
+        RetainedFrameRenderPolicy::EveryUsefulFrame
+    } else {
+        RetainedFrameRenderPolicy::ExactFrameOnly
+    }
+}
+
+fn cross_section_schedule_for_presented_coverage(
+    mut schedule: CrossSectionPanelScheduleState,
+    completeness: RenderFrameCompleteness,
+    available_requirements: u64,
+    total_requirements: u64,
+) -> CrossSectionPanelScheduleState {
+    debug_assert!(available_requirements <= total_requirements);
+    schedule.selected_bricks = usize::try_from(total_requirements).unwrap_or(usize::MAX);
+    schedule.occupied_selected_bricks =
+        usize::try_from(available_requirements).unwrap_or(usize::MAX);
+    schedule.missing_occupied_bricks = schedule
+        .selected_bricks
+        .saturating_sub(schedule.occupied_selected_bricks);
+    if completeness == RenderFrameCompleteness::Progressive {
+        schedule.status = CrossSectionPanelScheduleStatus::Incomplete;
+    }
+    schedule
+}
+
+const fn cross_section_render_allowed(
+    matching_demand_plan_installed: bool,
+    panel_needs_render: bool,
+) -> bool {
+    matching_demand_plan_installed
+        && panel_needs_render
+        && CROSS_SECTION_PANEL_RENDER_SUBMISSIONS_PER_PANEL_REFRESH > 0
 }
 
 fn requirement_binding_is_reusable(
@@ -746,7 +793,7 @@ impl MiranteWorkbenchApp {
                     target.pending_gpu_timings.clear();
                     target.last_execution_timing = None;
                     target.partial_seen = false;
-                    target.layer_requirement_facts.clear();
+                    target.reset_layer_requirement_facts();
                     target.presented_layer_requirement_facts.clear();
                     target.set_progressive_lease_probe_state(Default::default());
                 }
@@ -795,7 +842,7 @@ impl MiranteWorkbenchApp {
                 target.pending_gpu_timings.clear();
                 target.last_execution_timing = None;
                 target.partial_seen = false;
-                target.layer_requirement_facts.clear();
+                target.reset_layer_requirement_facts();
                 target.presented_layer_requirement_facts.clear();
                 target.set_progressive_lease_probe_state(Default::default());
             }
@@ -843,9 +890,14 @@ impl MiranteWorkbenchApp {
         &mut self,
         panel_id: PanelId,
     ) -> anyhow::Result<Option<DisplayRenderTiming>> {
-        if !self.cross_section_panel_needs_display_render(panel_id)
-            || CROSS_SECTION_PANEL_RENDER_SUBMISSIONS_PER_PANEL_REFRESH == 0
-        {
+        // Cross-section requirements depend on the plane and panel viewport.
+        // Keep the previous pixels stale until the installed signature proves
+        // that the plane and viewport match the requirement body. Pending,
+        // failed, and rejected planning all deliberately fail this proof.
+        if !cross_section_render_allowed(
+            self.visible_demand_plan_currentness().cross_sections,
+            self.cross_section_panel_needs_display_render(panel_id),
+        ) {
             return Ok(None);
         }
         let snapshot = self.application.snapshot();
@@ -911,13 +963,6 @@ impl MiranteWorkbenchApp {
         if !rendered {
             return Ok(None);
         }
-        if !self.render_coordination.record_cross_section_presentation(
-            panel_id.presentation_slot(),
-            generation,
-            schedule,
-        ) {
-            anyhow::bail!("stale cross-section frame was suppressed");
-        }
         let presented = self
             .native_presentation
             .product_gpu
@@ -925,6 +970,20 @@ impl MiranteWorkbenchApp {
             .and_then(|product| product.targets.get(&panel_id))
             .and_then(|target| target.presented.clone())
             .expect("a rendered cross-section target retains its presented frame");
+        let coverage = presented.progress().coverage();
+        let schedule = cross_section_schedule_for_presented_coverage(
+            schedule,
+            presented.progress().completeness(),
+            coverage.available_requirements(),
+            coverage.total_requirements(),
+        );
+        if !self.render_coordination.record_cross_section_presentation(
+            panel_id.presentation_slot(),
+            generation,
+            schedule,
+        ) {
+            anyhow::bail!("stale cross-section frame was suppressed");
+        }
         let _ = self.record_product_frame(panel_id, &presented);
         self.record_product_layer_presentations(panel_id, scope);
         self.observe_coordinated_display_milestones(false);
@@ -973,6 +1032,10 @@ impl MiranteWorkbenchApp {
             .request
             .as_ref()
             .map_or(FrameIdentity::new(1), |request| request.intent.frame());
+        let existing_presentation = target
+            .presented
+            .as_ref()
+            .map(|frame| frame.progress().completeness());
         let same_requirement_body = Arc::ptr_eq(&target.requirement_keys, &resources);
         let reusable_requirement_binding = requirement_binding_is_reusable(
             same_requirement_body,
@@ -1174,11 +1237,7 @@ impl MiranteWorkbenchApp {
         let selected_lease_keys = lease_work.selected_lease_keys;
         let starting_requirement_cursor = lease_work.starting_requirement_cursor;
         let lease_updates = lease_work.lease_updates;
-        let render_policy = if publish_to_display {
-            RetainedFrameRenderPolicy::EveryUsefulFrame
-        } else {
-            RetainedFrameRenderPolicy::ExactFrameOnly
-        };
+        let render_policy = retained_frame_render_policy(publish_to_display, existing_presentation);
         let report = match product
             .renderer
             .execute_prepared_retained_frame_with_policy(
@@ -1315,11 +1374,7 @@ impl MiranteWorkbenchApp {
                 |key| product.renderer.resource_is_resident(key),
             );
         }
-        if retired > 0 || evicted > 0 {
-            dataset.pump_interactive_admission_with_gpu_residency(|key| {
-                product.renderer.resource_is_resident(key)
-            })?;
-        }
+        let refill_admission = retired > 0 || evicted > 0;
         if let Some(ticket) = report.gpu_timing() {
             product
                 .targets
@@ -1329,6 +1384,9 @@ impl MiranteWorkbenchApp {
                 .push_back(ticket);
         }
         let Some(presented) = report.presentation().cloned() else {
+            if refill_admission {
+                dataset.defer_interactive_admission_refill(false);
+            }
             return Ok(false);
         };
         let execution_timing = Some(ProductFrameExecutionTiming::new(
@@ -1377,6 +1435,16 @@ impl MiranteWorkbenchApp {
             self.record_product_layer_presentations(target_id, scope);
             self.observe_coordinated_display_milestones(false);
             self.record_current_layout_presentation_if_complete();
+        }
+        // Renderer execution has already committed this texture and frame.
+        // Publish the matching application metadata before the unrelated,
+        // fallible queue refill so a refill fault cannot strand or invalidate
+        // a frame that the renderer will treat as already rendered on retry.
+        // The normal dataset-service path observes admission_blocked on the
+        // next turn, performs the refill outside this presentation transaction,
+        // and reports any dataset fault through its own state machine.
+        if refill_admission {
+            self.dataset.defer_interactive_admission_refill(true);
         }
         Ok(true)
     }
@@ -1496,9 +1564,13 @@ impl MiranteWorkbenchApp {
             .product_gpu
             .as_ref()
             .and_then(|product| product.staging_3d.as_ref())
-            .and_then(|target| target.presented.as_ref())
-            .is_some_and(|frame| {
+            .and_then(|target| target.presented.as_ref().zip(target.request.as_ref()))
+            .is_some_and(|(frame, request)| {
                 hidden_target_ready_for_atomic_swap(
+                    frame.frame(),
+                    frame.extent(),
+                    request.intent.frame(),
+                    request.intent.extent(),
                     frame.progress().completeness(),
                     frame.progress().coverage().total_requirements(),
                     self.dataset
@@ -2034,7 +2106,7 @@ impl MiranteWorkbenchApp {
         let demand_started = Instant::now();
         self.request_visible_bricks();
         let visible_brick_request_ms = duration_ms(demand_started.elapsed());
-        if self.pending_current_3d_demand() {
+        if !self.visible_demand_plan_currentness().current_3d {
             return Ok(DisplayRefreshWorkTiming::new(
                 DisplayRenderTiming {
                     path: DisplayRefreshPath::UiBackground,
@@ -2421,18 +2493,63 @@ mod requirement_lease_update_tests {
 
     #[test]
     fn hidden_target_waits_across_multiple_upload_bursts_then_swaps_once_exact() {
+        let request_frame = FrameIdentity::new(2);
+        let request_extent = RenderExtent::new(640, 480).expect("test extent");
         let required_primary_count = 1_024;
         assert!(!hidden_target_ready_for_atomic_swap(
+            request_frame,
+            request_extent,
+            request_frame,
+            request_extent,
             RenderFrameCompleteness::Progressive,
             512,
             required_primary_count,
         ));
         assert!(!hidden_target_ready_for_atomic_swap(
+            request_frame,
+            request_extent,
+            request_frame,
+            request_extent,
             RenderFrameCompleteness::Progressive,
             1_024,
             required_primary_count,
         ));
         assert!(hidden_target_ready_for_atomic_swap(
+            request_frame,
+            request_extent,
+            request_frame,
+            request_extent,
+            RenderFrameCompleteness::Exact,
+            1_024,
+            required_primary_count,
+        ));
+
+        // A recycled hidden target may still hold an exact frame from the
+        // preceding request. It is promotable only when both request identity
+        // and extent still describe those completed pixels.
+        assert!(!hidden_target_ready_for_atomic_swap(
+            FrameIdentity::new(1),
+            request_extent,
+            request_frame,
+            request_extent,
+            RenderFrameCompleteness::Exact,
+            1_024,
+            required_primary_count,
+        ));
+        assert!(!hidden_target_ready_for_atomic_swap(
+            request_frame,
+            RenderExtent::new(320, 240).expect("stale test extent"),
+            request_frame,
+            request_extent,
+            RenderFrameCompleteness::Exact,
+            1_024,
+            required_primary_count,
+        ));
+        assert!(hidden_target_ready_for_atomic_swap(
+            request_frame,
+            request_extent,
+            request_frame,
+            request_extent,
             RenderFrameCompleteness::Exact,
             1_024,
             required_primary_count,
@@ -2442,15 +2559,116 @@ mod requirement_lease_update_tests {
         // proved against the enlarged scalar boundary before atomic publish.
         let promoted_requirement_count = 1_536;
         assert!(!hidden_target_ready_for_atomic_swap(
+            request_frame,
+            request_extent,
+            request_frame,
+            request_extent,
             RenderFrameCompleteness::Exact,
             1_024,
             promoted_requirement_count,
         ));
         assert!(hidden_target_ready_for_atomic_swap(
+            request_frame,
+            request_extent,
+            request_frame,
+            request_extent,
             RenderFrameCompleteness::Exact,
             1_536,
             promoted_requirement_count,
         ));
+    }
+
+    #[test]
+    fn visible_target_retains_settled_pixels_until_exact_replacement() {
+        for settled in [
+            RenderFrameCompleteness::Complete,
+            RenderFrameCompleteness::Exact,
+        ] {
+            assert_eq!(
+                retained_frame_render_policy(true, Some(settled)),
+                RetainedFrameRenderPolicy::ExactFrameOnly,
+                "linked panels and visible 3D retain settled pixels on every refresh until replacement"
+            );
+        }
+        assert_eq!(
+            retained_frame_render_policy(false, None),
+            RetainedFrameRenderPolicy::ExactFrameOnly,
+            "hidden and transient targets remain exact-only"
+        );
+    }
+
+    #[test]
+    fn initial_and_already_progressive_targets_can_publish_useful_progress() {
+        assert_eq!(
+            retained_frame_render_policy(true, None),
+            RetainedFrameRenderPolicy::EveryUsefulFrame
+        );
+        assert_eq!(
+            retained_frame_render_policy(true, Some(RenderFrameCompleteness::Progressive),),
+            RetainedFrameRenderPolicy::EveryUsefulFrame
+        );
+    }
+
+    #[test]
+    fn cross_section_currentness_uses_presented_gpu_coverage() {
+        let cpu_ready = CrossSectionPanelScheduleState {
+            generation: 7,
+            target_scale_level: Some(0),
+            render_scale_level: Some(0),
+            fallback_scale_level: None,
+            selected_bricks: 4,
+            occupied_selected_bricks: 4,
+            missing_occupied_bricks: 0,
+            estimated_decoded_bytes: 0,
+            decoded_budget_bytes: 0,
+            status: CrossSectionPanelScheduleStatus::Ready,
+            reason: CrossSectionPanelScheduleReason::TargetScaleReady,
+        };
+
+        let progressive = cross_section_schedule_for_presented_coverage(
+            cpu_ready,
+            RenderFrameCompleteness::Progressive,
+            2,
+            4,
+        )
+        .rendered();
+        assert_eq!(
+            progressive.status,
+            CrossSectionPanelScheduleStatus::Incomplete
+        );
+        assert_eq!(progressive.occupied_selected_bricks, 2);
+        assert_eq!(progressive.missing_occupied_bricks, 2);
+
+        let defensive_progressive = cross_section_schedule_for_presented_coverage(
+            cpu_ready,
+            RenderFrameCompleteness::Progressive,
+            4,
+            4,
+        )
+        .rendered();
+        assert_eq!(
+            defensive_progressive.status,
+            CrossSectionPanelScheduleStatus::Incomplete,
+            "progressive metadata is never promoted to Current from counters alone"
+        );
+
+        let exact = cross_section_schedule_for_presented_coverage(
+            cpu_ready,
+            RenderFrameCompleteness::Exact,
+            4,
+            4,
+        )
+        .rendered();
+        assert_eq!(exact.status, CrossSectionPanelScheduleStatus::Current);
+        assert_eq!(exact.occupied_selected_bricks, 4);
+        assert_eq!(exact.missing_occupied_bricks, 0);
+    }
+
+    #[test]
+    fn cross_section_render_waits_for_its_matching_demand_body() {
+        assert!(!cross_section_render_allowed(false, true));
+        assert!(cross_section_render_allowed(true, true));
+        assert!(!cross_section_render_allowed(true, false));
     }
 
     #[test]
