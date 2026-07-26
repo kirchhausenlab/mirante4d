@@ -194,96 +194,40 @@ commands used only when their boundaries change.
 
 See [testing](TESTING.md) for commands and claim language.
 
-## Viewer Performance Overhaul Status
+## Viewer Performance And Development Recovery Status
 
 The renderer, demand, scheduling, storage-read, capability-restoration, and
-small-tool implementation described above remains the current product
-baseline in the worktree. Clean predecessor-repair revision
-`90c0f200c3bbbf080648b34113bca2633ae0f820` passed all 11 PR-profile policy
-phases, all 8 Rust phases, and 1,275 selected tests. The current ignored
-trusted-Vulkan inventory contains nine renderer cases; its exact result will
-be recorded again on the clean EP-00 baseline revision. Both native-window
-viewer scenarios previously passed.
-The render-modes scenario exercised the restored mode/tool surface without a
-validation error. The no-readback resident-navigation scenario observed zero
-physical reads, decodes, dataset requests, payload uploads, or post-idle
-submissions during its warm camera move.
+small-tool implementation described above remains the normal product baseline
+on `main`. Revision `90c0f20` passed 11 policy phases, eight Rust phases, 1,275
+selected tests, and the two native viewer scenarios. Owner product testing
+nevertheless rejected it as the performance outcome: wheel zoom can lag or
+freeze, the four-panel workflow can settle at an unjustifiably coarse LOD, and
+compound-angle movement can visibly expose arriving bricks.
 
-Those runs are supporting E1/internal component evidence, not a qualified
-performance result or E4 product validation. Subsequent owner product testing
-found the baseline materially better but rejected it as the performance
-outcome: wheel zoom can lag or freeze, the four-panel workflow can use an
-unjustifiably coarse LOD, and compound-angle movement can visibly expose
-arriving bricks. No absolute performance or comparison-viewer claim follows
-from the existing evidence.
+That mismatch demonstrated that the subsequent EP-00/EP-01 development
+qualification was not proportionate or sufficiently product-directed. The
+protocol, schemas, receipts, repeated hashing, and predecessor populations
+remain present temporarily but are frozen, nonblocking, and scheduled for
+deletion or reduction. They establish no current performance claim and are no
+longer prerequisites for implementation.
 
-The active
-[viewer performance plan](plans/active/VIEWER_PERFORMANCE_OVERHAUL.md) now
-records an authorized replacement end-to-end design spanning preprocessing,
-the experimental storage profile, streaming, caching, shared GPU residency,
-arbitrary planes, MIP/DVR/ISO, LOD, interaction, and complete presentation.
-It mandates one cubic-brick spatial representation shared by 2D and 3D and
-excludes anisotropic or orientation-specific payloads.
+The damaged unpublished linked worktree has been independently preserved and
+reconstructed. Its 199 recoverable commits through `3d967f0` plus the surviving
+seven-file delta now exist as clean recovery commit `3dfe9de` in a verified
+external bundle. That branch includes real successor product experiments as
+well as a much larger qualification substrate. It is a research spike, not an
+implemented product fact, and will not be merged wholesale.
 
-EP-00 measurement authority is implemented in the current worktree. One
-strict external v5 profile binds the private representative and temporal
-packages, import source inventory, accepted hardware/display/storage tuple,
-ten exact scenarios, interaction scripts, independent LOD and numerical
-oracles, fidelity states, resource ledgers, short validated profile, oracle,
-and protocol deadline classes, and absolute thresholds without placing private
-paths or unpublished
-identities in the repository. Product diagnostics expose exact generation/
-target timing identity, per-view scale and coverage, coordinated-frame and
-structural work, canonical resource unions, bounded timing histories, source/
-import receipts, and correctly named copy/control/render intervals. Synthetic
-copy and empty-pass controls plus a Naga structural audit guard timestamp
-placement and production shader shape.
+The active [development-simplification and viewer-recovery
+plan](plans/active/DEVELOPMENT_SIMPLIFICATION.md) now owns recovery, process
+right-sizing, product-only extraction, and three independently validated
+viewer slices: resident interaction/per-view LOD, cold complete refinement,
+and MIP/DVR/ISO kernels. A storage-format rewrite is not presumed; it requires
+measurement showing that storage geometry remains a dominant blocker after
+runtime fixes.
 
-An earlier fresh normal-product IP exercise passed its exact source-
-preservation, deterministic-publication, open-ready, currentness, receipt-
-reconciliation, memory, descriptor, temporary-storage, and time gates; it is
-focused predecessor evidence rather than a v5 sample. The strict complete
-predecessor baseline still awaits one clean immutable revision. Two superseded
-v3 partial launches are preserved but never reused: the second reproduced a
-terminal RZ settlement miss in both roles and demonstrated that later required
-checkpoints could not close. A subsequent v4 launch was also stopped and
-preserved when owner observation rejected its serialized acceptance timers:
-the product actions ran, but independent long waits left the visible
-application static for minutes and made the protocol itself an unacceptable
-cost. It produced no complete sample and supports no performance claim.
-
-The v5 hard cut retains typed product outcomes and separate exact hard-safety
-termination while grouping each contiguous checkpoint's acceptance
-observations under a shared origin. Each checkpoint's wall bound is the maximum
-applicable deadline rather than
-the sum of independent timers. The predecessor development population is
-exactly three ordered samples of ten scenarios, with one fresh instrumented
-process and one fresh matched control process for every scenario and sample:
-60 role attempts, zero retries, and no substitution or post-hoc filtering.
-Typed product-gate misses continue through the complete population so every
-outcome remains attributable. The first fatal setup, process, hard-safety, or
-evidence-integrity failure instead stops immediately and preserves the exact
-partial lineage; it does not spend the rest of the population after evidence
-has become unusable. Every non-import prerequisite deadline is fixed by the
-validated profile or protocol and is at most 30 seconds, with no script-authored
-multi-minute viewer wait.
-This protocol correction is implemented evidence infrastructure, not a
-qualified viewer-performance result.
-The schema-5 runner now finalizes a durable private raw report before creating
-its fixed path-free development-receipt sibling. A separate clean-release
-publisher can replay only that projection, and EP-01 preflight rereads and
-exactly reprojects the pair before admission. The bridge revalidates the four
-external authorities, expected population, product/evidence status, privacy,
-and file currentness; it admits complete failed predecessor results while
-rejecting every integrity-invalid or incomplete envelope. Receipt replay does
-not reopen the application or repeat conformance.
-Focused predecessor evidence already reproduces the off-axis perspective DVR
-distance error, unjustifiably coarse four-panel LOD, temporal refinement
-handoff, and prepared-layout lineage defects; these are baseline findings, not
-accepted successor behavior. EP-01 representation selection and the atomic EP-02
-through EP-06 successor remain unimplemented. Final sampling and externally
-inspected EP-07 normal-product validation also remain required before
-performance completion language is appropriate.
+No absolute performance, comparison-viewer, successor-completion, or release
+claim follows from current evidence.
 
 ## Import And Preprocessing Performance
 

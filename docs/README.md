@@ -24,11 +24,13 @@ exceptions have one separate tool-owned
 
 ## Plans
 
-One high-risk corrective plan is active: the [viewer performance
-overhaul](plans/active/VIEWER_PERFORMANCE_OVERHAUL.md). Its owner-authorized
-replacement is at the EP-00 workload, fidelity, and cost-truth checkpoint.
-[Current work](planning/NOW.md) owns the exact checkpoint; Git history is the
-archive of deleted plans.
+One high-risk corrective plan is active: [development simplification and
+viewer recovery](plans/active/DEVELOPMENT_SIMPLIFICATION.md). It preserves the
+strong scientific and data-safety foundation while removing disproportionate
+development-evidence machinery and delivering viewer performance as small,
+product-validated slices. [Current work](planning/NOW.md) owns the exact
+checkpoint; Git history and the verified external recovery bundle archive the
+superseded plan and unpublished research spike.
 
 Two future outcomes remain deliberately separate from ordinary development:
 
