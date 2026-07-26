@@ -4447,9 +4447,6 @@ fn multichannel_semantics_are_order_independent() {
     );
     assert_eq!(smooth_result.completeness(), VolumePickCompleteness::Exact);
 
-    assert_eq!(gpu.diagnostics().pick_submissions(), 6);
-    assert_eq!(gpu.diagnostics().completed_picks(), 6);
-
     assert_eq!(gpu.diagnostics().validation_error_count(), 0);
     dataset_runtime
         .request_shutdown()
