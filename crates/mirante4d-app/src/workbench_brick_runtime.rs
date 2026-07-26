@@ -1,6 +1,7 @@
 //! Unified interactive dataset demand and completion delivery.
 
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -22,7 +23,8 @@ use crate::{
         ScopeDemandBaseline,
     },
     dataset_demand_plan::{
-        DatasetDemandPlanCapacityError, DatasetDemandPlanLimits, sampling_footprint_class,
+        DatasetDemandPlanCapacityError, DatasetDemandPlanLimits, current_3d_projected_layer_scales,
+        sampling_footprint_class,
     },
     dataset_requests::{
         DatasetDemandState, SCOPE_ANALYSIS, SCOPE_CROSS_SECTION_XY, SCOPE_CROSS_SECTION_XZ,
@@ -320,15 +322,19 @@ impl Current3dDemandPlanningSignature {
             && self.playback_active == other.playback_active
             && self.gpu_payload_capacity == other.gpu_payload_capacity
     }
+}
 
-    fn camera_sampling_unchanged(&self, other: &Self) -> bool {
-        self.camera.projection() == other.camera.projection()
-            && self.camera.orthographic_world_per_screen_point()
-                == other.camera.orthographic_world_per_screen_point()
-            && self.camera.perspective_focal_length_screen_points()
-                == other.camera.perspective_focal_length_screen_points()
-            && self.camera.perspective_view_distance_world()
-                == other.camera.perspective_view_distance_world()
+fn installed_target_layer_scales<'a>(
+    staging_refinement: bool,
+    current: Option<&'a BTreeMap<mirante4d_domain::LogicalLayerKey, mirante4d_domain::ScaleLevel>>,
+    refinement: Option<
+        &'a BTreeMap<mirante4d_domain::LogicalLayerKey, mirante4d_domain::ScaleLevel>,
+    >,
+) -> Option<&'a BTreeMap<mirante4d_domain::LogicalLayerKey, mirante4d_domain::ScaleLevel>> {
+    if staging_refinement {
+        refinement
+    } else {
+        current
     }
 }
 
@@ -689,7 +695,7 @@ impl MiranteWorkbenchApp {
                 })
                 .unwrap_or(false)
             });
-        let current_plan_is_reusable = current_plan_required
+        let camera_only_change = current_plan_required
             && self
                 .visible_demand_planning_signature
                 .as_ref()
@@ -697,10 +703,22 @@ impl MiranteWorkbenchApp {
                     previous
                         .current_3d
                         .same_non_camera_demand(&planning_signature.current_3d)
-                        && previous
-                            .current_3d
-                            .camera_sampling_unchanged(&planning_signature.current_3d)
-                })
+                });
+        let installed_target_scales = installed_target_layer_scales(
+            self.dataset.staging_current_refinement(),
+            self.dataset.scope_layer_scales(SCOPE_CURRENT_3D),
+            self.dataset.scope_layer_scales(SCOPE_CURRENT_3D_REFINEMENT),
+        );
+        let projected_lod_is_unchanged = camera_only_change
+            && current_3d_projected_layer_scales(
+                snapshot.catalog(),
+                application_view(&snapshot),
+                planning_signature.current_3d.presentation_viewport,
+                planning_signature.current_3d.render_viewport,
+                planning_signature.current_3d.playback_active,
+            )
+            .is_ok_and(|selected| installed_target_scales == Some(&selected));
+        let current_plan_is_reusable = projected_lod_is_unchanged
             && (self.dataset.current_covers_full_volume() || camera_is_inside_reuse_envelope);
         let camera_guard_is_reusable = !current_plan_is_reusable
             || (installed_camera_guard_bodies_are_complete(
@@ -1718,15 +1736,18 @@ fn budget_share_u64(total: u64, numerator: usize, denominator: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        collections::BTreeMap,
+        time::{Duration, Instant},
+    };
 
     use mirante4d_dataset::{
         CpuLedgerCategory, CpuLedgerError, DatasetResourceIdentity, DatasetSourceId,
     };
     use mirante4d_dataset_runtime::{RuntimeFault, RuntimeFaultCode};
     use mirante4d_domain::{
-        CameraView, CrossSectionView, LogicalLayerKey, Projection, TimeIndex, UnitQuaternion,
-        ViewerLayout, WorldPoint3,
+        CameraView, CrossSectionView, LogicalLayerKey, Projection, ScaleLevel, TimeIndex,
+        UnitQuaternion, ViewerLayout, WorldPoint3,
     };
     use mirante4d_render_api::{PresentationViewport, RenderExtent};
 
@@ -1735,8 +1756,8 @@ mod tests {
         PROGRESSIVE_DISPLAY_REFRESH_INTERVAL, ProgressiveDisplayRefreshPacer, RESULT_DRAIN_BATCH,
         RESULT_DRAIN_COUNT_ENVELOPE, RESULT_DRAIN_TIME_BUDGET, VisibleDemandFailureSignature,
         VisibleDemandPlanningSignature, completion_drain_needs_display_refresh,
-        next_completion_drain_batch, runtime_fault_invalidates_verified_source,
-        visible_demand_failure_is_deterministic,
+        installed_target_layer_scales, next_completion_drain_batch,
+        runtime_fault_invalidates_verified_source, visible_demand_failure_is_deterministic,
     };
     use crate::DeterministicFailureLatch;
 
@@ -1784,6 +1805,26 @@ mod tests {
                 gpu_payload_capacity: 1,
             },
         }
+    }
+
+    #[test]
+    fn staged_refinement_is_the_installed_lod_target_until_promotion() {
+        let layer = LogicalLayerKey::new(0);
+        let current = BTreeMap::from([(layer, ScaleLevel::new(2))]);
+        let refinement = BTreeMap::from([(layer, ScaleLevel::BASE)]);
+
+        assert_eq!(
+            installed_target_layer_scales(true, Some(&current), Some(&refinement)),
+            Some(&refinement)
+        );
+        assert_eq!(
+            installed_target_layer_scales(false, Some(&current), Some(&refinement)),
+            Some(&current)
+        );
+        assert_eq!(
+            installed_target_layer_scales(true, Some(&current), None),
+            None
+        );
     }
 
     #[test]

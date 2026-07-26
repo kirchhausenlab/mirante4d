@@ -8,10 +8,9 @@ use std::time::Instant;
 use mirante4d_application::{
     CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
     CrossSectionPanelScheduleStatus, RenderCoordinationState,
-    viewport_interaction::representative_voxel_world_size,
 };
-use mirante4d_dataset::{DatasetCatalog, DatasetResourceKey};
-use mirante4d_domain::{LogicalLayerKey, ScaleLevel, ViewerLayout};
+use mirante4d_dataset::DatasetResourceKey;
+use mirante4d_domain::{ScaleLevel, ViewerLayout};
 use mirante4d_project_model::ViewState;
 
 use crate::{retained_leases::RetainedLeases, viewer_layout::PanelId};
@@ -26,12 +25,10 @@ pub(crate) struct CrossSectionPanelSchedulePlan {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CrossSectionScheduleInput<'a> {
-    pub(crate) catalog: &'a DatasetCatalog,
     pub(crate) view: &'a ViewState,
-    pub(crate) active_layer: LogicalLayerKey,
+    pub(crate) active_layer_target: Option<ScaleLevel>,
     pub(crate) requirements: &'a [DatasetResourceKey],
     pub(crate) retained_leases: &'a RetainedLeases,
-    pub(crate) render_scale: ScaleLevel,
     pub(crate) dataset_failed: bool,
 }
 
@@ -78,11 +75,7 @@ fn build_cross_section_panel_schedule(
         return Ok(CrossSectionPanelScheduleState::missing_viewport(generation));
     }
 
-    let target_scale_level =
-        cross_section_target_scale(input.catalog, input.view, input.active_layer)?;
-    let render_scale_level = input.render_scale.get();
-    let fallback_scale_level =
-        (render_scale_level > target_scale_level).then_some(render_scale_level);
+    let active_layer_scale_level = input.active_layer_target.map(ScaleLevel::get);
     let required = input.requirements.len();
     let retained = input
         .requirements
@@ -96,14 +89,13 @@ fn build_cross_section_panel_schedule(
         gpu_display_available,
         required,
         missing,
-        fallback_scale_level.is_some(),
     );
 
     Ok(CrossSectionPanelScheduleState {
         generation,
-        target_scale_level: Some(target_scale_level),
-        render_scale_level: Some(render_scale_level),
-        fallback_scale_level,
+        target_scale_level: active_layer_scale_level,
+        render_scale_level: active_layer_scale_level,
+        fallback_scale_level: None,
         selected_bricks: required,
         occupied_selected_bricks: retained,
         missing_occupied_bricks: missing,
@@ -119,7 +111,6 @@ fn classify_schedule(
     gpu_display_available: bool,
     required: usize,
     missing: usize,
-    fallback: bool,
 ) -> (
     CrossSectionPanelScheduleStatus,
     CrossSectionPanelScheduleReason,
@@ -144,11 +135,6 @@ fn classify_schedule(
             CrossSectionPanelScheduleStatus::Loading,
             CrossSectionPanelScheduleReason::MissingSelectedBricks,
         )
-    } else if fallback {
-        (
-            CrossSectionPanelScheduleStatus::Coarse,
-            CrossSectionPanelScheduleReason::ResidentScaleCoarserThanTarget,
-        )
     } else {
         (
             CrossSectionPanelScheduleStatus::Ready,
@@ -157,37 +143,21 @@ fn classify_schedule(
     }
 }
 
-pub(crate) fn cross_section_target_scale(
-    catalog: &DatasetCatalog,
-    view: &ViewState,
-    layer_key: LogicalLayerKey,
-) -> anyhow::Result<u32> {
-    let layer = catalog
-        .layer(layer_key)
-        .ok_or_else(|| anyhow::anyhow!("active layer is absent from the dataset catalog"))?;
-    let world_per_point = view
-        .cross_section()
-        .scale_world_per_screen_point()
-        .max(f64::EPSILON);
-    let mut selected = 0;
-    for scale in layer.scales() {
-        let scale_level = scale.level().get();
-        let voxel_size = representative_voxel_world_size(scale.grid_to_world());
-        if voxel_size <= world_per_point {
-            selected = scale_level;
-        }
-    }
-    Ok(selected)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn empty_cross_section_demand_is_terminal_not_loading() {
-        let (status, reason) = classify_schedule(false, true, 0, 0, false);
+        let (status, reason) = classify_schedule(false, true, 0, 0);
         assert_eq!(status, CrossSectionPanelScheduleStatus::Empty);
         assert_eq!(reason, CrossSectionPanelScheduleReason::NoSelectedData);
+    }
+
+    #[test]
+    fn complete_cross_section_demand_has_no_coarse_fallback_classification() {
+        let (status, reason) = classify_schedule(false, true, 4, 0);
+        assert_eq!(status, CrossSectionPanelScheduleStatus::Ready);
+        assert_eq!(reason, CrossSectionPanelScheduleReason::TargetScaleReady);
     }
 }

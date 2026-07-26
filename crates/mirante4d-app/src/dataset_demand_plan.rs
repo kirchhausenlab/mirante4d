@@ -7,7 +7,6 @@ use std::{
     sync::Arc,
 };
 
-use mirante4d_application::viewport_interaction::representative_voxel_world_size;
 use mirante4d_dataset::{
     CpuByteLease, CpuByteLedger, CpuLedgerCategory, DatasetCatalog, DatasetResourceKey,
     ResourceRegion,
@@ -22,6 +21,7 @@ use mirante4d_render_api::{
 };
 
 use crate::{
+    projected_lod::{select_cross_section_level, select_volume_level},
     semantic_demand::{
         CrossSectionPlane, SemanticCameraReuseEnvelope, SemanticPlanError, SemanticPlanLimits,
         SemanticRegionGridSpec, plan_cross_section_resource_regions_cancellable,
@@ -731,11 +731,11 @@ impl Default for PlanAccumulator {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SelectedCurrent3dLevel {
+#[derive(Debug, Clone)]
+struct SelectedCurrent3dLevels {
     camera: CameraFrame,
     active_level: ScaleLevel,
-    target_resolution: f64,
+    layer_scales: BTreeMap<LogicalLayerKey, ScaleLevel>,
     effective_limits: DatasetDemandPlanLimits,
     playback_downshifted: bool,
 }
@@ -776,7 +776,7 @@ pub(crate) fn plan_current_3d(
     limits: DatasetDemandPlanLimits,
     playback_active: bool,
 ) -> anyhow::Result<DatasetDemandPlan> {
-    let selected = select_current_3d_level(
+    let selected = select_current_3d_levels(
         catalog,
         view,
         presentation,
@@ -792,7 +792,7 @@ pub(crate) fn plan_current_3d(
         None,
         viewport,
         selected.active_level,
-        selected.target_resolution,
+        &selected.layer_scales,
         selected.effective_limits,
         selected.playback_downshifted,
         None,
@@ -811,57 +811,87 @@ pub(crate) fn plan_current_3d(
     }
 }
 
-fn select_current_3d_level(
+fn select_current_3d_levels(
     catalog: &DatasetCatalog,
     view: &ViewState,
     presentation: PresentationViewport,
     viewport: RenderExtent,
     limits: DatasetDemandPlanLimits,
     playback_active: bool,
-) -> anyhow::Result<SelectedCurrent3dLevel> {
+) -> anyhow::Result<SelectedCurrent3dLevels> {
+    let (camera, active_level, layer_scales, playback_downshifted) =
+        projected_current_3d_levels(catalog, view, presentation, viewport, playback_active)?;
+    let effective_limits = limits.reserve_playback_half(playback_active);
+    Ok(SelectedCurrent3dLevels {
+        camera,
+        active_level,
+        layer_scales,
+        effective_limits,
+        playback_downshifted,
+    })
+}
+
+pub(crate) fn current_3d_projected_layer_scales(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    presentation: PresentationViewport,
+    viewport: RenderExtent,
+    playback_active: bool,
+) -> anyhow::Result<BTreeMap<LogicalLayerKey, ScaleLevel>> {
+    projected_current_3d_levels(catalog, view, presentation, viewport, playback_active)
+        .map(|(_, _, layer_scales, _)| layer_scales)
+}
+
+fn projected_current_3d_levels(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    presentation: PresentationViewport,
+    viewport: RenderExtent,
+    playback_active: bool,
+) -> anyhow::Result<(
+    CameraFrame,
+    ScaleLevel,
+    BTreeMap<LogicalLayerKey, ScaleLevel>,
+    bool,
+)> {
     let active = catalog
         .layer(view.active_layer())
         .ok_or_else(|| anyhow::anyhow!("active layer is absent from the dataset catalog"))?;
     let camera = CameraFrame::new(*view.camera(), presentation)?;
-    let world_per_point = camera.world_per_screen_point_at_target()?.max(f64::EPSILON);
-    let points_per_render_pixel_x =
-        presentation.width_points() / f64::from(viewport.width_pixels());
-    let points_per_render_pixel_y =
-        presentation.height_points() / f64::from(viewport.height_pixels());
-    // Use the more densely sampled axis. An aspect clamp or HiDPI target must
-    // never select data coarser than a physical render pixel on either axis.
-    let world_per_render_pixel = world_per_point
-        * points_per_render_pixel_x
-            .min(points_per_render_pixel_y)
-            .max(f64::EPSILON);
-    let mut scales = active
-        .scales()
-        .map(|scale| {
-            (
-                representative_voxel_world_size(scale.grid_to_world()),
-                scale.level(),
+    let ideal_active = select_volume_level(active, camera, viewport)?;
+    let active_level = playback_level(active, ideal_active, playback_active);
+    let mut playback_downshifted = active_level != ideal_active;
+    let mut layer_scales = BTreeMap::new();
+    for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
+        let key = view_layer.layer_key();
+        let layer = catalog.layer(key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "visible layer {} is absent from the dataset catalog",
+                key.ordinal()
             )
-        })
-        .collect::<Vec<_>>();
-    scales.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
-    let mut target_index = scales
-        .iter()
-        .rposition(|(resolution, _)| *resolution <= world_per_render_pixel)
-        .unwrap_or(0);
-    let playback_downshifted = playback_active && target_index + 1 < scales.len();
-    if playback_downshifted {
-        target_index += 1;
+        })?;
+        let ideal = select_volume_level(layer, camera, viewport)?;
+        let selected = playback_level(layer, ideal, playback_active);
+        playback_downshifted |= selected != ideal;
+        layer_scales.insert(key, selected);
     }
+    Ok((camera, active_level, layer_scales, playback_downshifted))
+}
 
-    let (target_resolution, active_level) = scales[target_index];
-    let effective_limits = limits.reserve_playback_half(playback_active);
-    Ok(SelectedCurrent3dLevel {
-        camera,
-        active_level,
-        target_resolution,
-        effective_limits,
-        playback_downshifted,
-    })
+fn playback_level(
+    layer: &mirante4d_dataset::DatasetLayer,
+    ideal: ScaleLevel,
+    playback_active: bool,
+) -> ScaleLevel {
+    if !playback_active {
+        return ideal;
+    }
+    layer
+        .scales()
+        .map(|scale| scale.level())
+        .filter(|level| *level > ideal)
+        .min()
+        .unwrap_or(ideal)
 }
 
 /// Plans the target view plus an optional complete coarse cohort that fits in
@@ -992,7 +1022,7 @@ fn plan_progressive_current_3d_with_visibility_cancellable(
     if cancelled() {
         return Ok(None);
     }
-    let selected = select_current_3d_level(
+    let selected = select_current_3d_levels(
         catalog,
         view,
         presentation,
@@ -1007,7 +1037,7 @@ fn plan_progressive_current_3d_with_visibility_cancellable(
         priority_camera,
         viewport,
         selected.active_level,
-        selected.target_resolution,
+        &selected.layer_scales,
         selected.effective_limits,
         selected.playback_downshifted,
         scratch_ledger,
@@ -1060,6 +1090,7 @@ fn plan_progressive_current_3d_with_visibility_cancellable(
         viewport,
         remaining,
         target.plan.scale,
+        &target.plan.layer_scales,
         scratch_ledger,
         coarse_visibility_camera,
         coarse_priority_camera,
@@ -1154,6 +1185,7 @@ fn plan_complete_coarse_3d(
     viewport: RenderExtent,
     limits: DatasetDemandPlanLimits,
     target_active_level: ScaleLevel,
+    target_layer_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
     scratch_ledger: Option<&dyn CpuByteLedger>,
     visibility_camera: Option<CameraFrame>,
     priority_camera: Option<CameraFrame>,
@@ -1170,14 +1202,28 @@ fn plan_complete_coarse_3d(
             "active layer is absent from the dataset catalog"
         ))
     })?;
-    let Some(coarsest) = active.scales().max_by(|left, right| {
-        representative_voxel_world_size(left.grid_to_world())
-            .total_cmp(&representative_voxel_world_size(right.grid_to_world()))
-            .then(left.level().cmp(&right.level()))
-    }) else {
-        return Ok(None);
-    };
-    if coarsest.level() == target_active_level {
+    let active_level = active
+        .scales()
+        .map(|scale| scale.level())
+        .max()
+        .expect("DatasetLayer always has at least one scale");
+    let mut layer_scales = BTreeMap::new();
+    for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
+        let key = view_layer.layer_key();
+        let layer = catalog.layer(key).ok_or_else(|| {
+            PlanAttemptError::Other(anyhow::anyhow!(
+                "visible layer {} is absent from the dataset catalog",
+                key.ordinal()
+            ))
+        })?;
+        let level = layer
+            .scales()
+            .map(|scale| scale.level())
+            .max()
+            .expect("DatasetLayer always has at least one scale");
+        layer_scales.insert(key, level);
+    }
+    if active_level == target_active_level && &layer_scales == target_layer_scales {
         return Ok(None);
     }
     let camera = visibility_camera
@@ -1189,8 +1235,8 @@ fn plan_complete_coarse_3d(
         camera,
         priority_camera,
         viewport,
-        coarsest.level(),
-        representative_voxel_world_size(coarsest.grid_to_world()),
+        active_level,
+        &layer_scales,
         limits,
         false,
         scratch_ledger,
@@ -1221,40 +1267,14 @@ pub(crate) fn plan_cross_section_panel_cancellable(
     let active = catalog
         .layer(view.active_layer())
         .ok_or_else(|| anyhow::anyhow!("active layer is absent from the dataset catalog"))?;
-    let points_per_render_pixel_x =
-        presentation.width_points() / f64::from(viewport.width_pixels());
-    let points_per_render_pixel_y =
-        presentation.height_points() / f64::from(viewport.height_pixels());
-    let world_per_render_pixel = view.cross_section().scale_world_per_screen_point()
-        * points_per_render_pixel_x
-            .min(points_per_render_pixel_y)
-            .max(f64::EPSILON);
-    let active_scale = active
-        .scales()
-        .filter(|scale| {
-            representative_voxel_world_size(scale.grid_to_world()) <= world_per_render_pixel
-        })
-        .max_by(|left, right| {
-            representative_voxel_world_size(left.grid_to_world())
-                .total_cmp(&representative_voxel_world_size(right.grid_to_world()))
-                .then(left.level().cmp(&right.level()))
-        })
-        .or_else(|| {
-            active.scales().min_by(|left, right| {
-                representative_voxel_world_size(left.grid_to_world())
-                    .total_cmp(&representative_voxel_world_size(right.grid_to_world()))
-                    .then(left.level().cmp(&right.level()))
-            })
-        })
-        .expect("DatasetLayer always has at least one scale");
-    let active_level = active_scale.level();
-    let target_resolution = representative_voxel_world_size(active_scale.grid_to_world());
-    let panel = match panel {
+    let semantic_panel = match panel {
         PanelId::Xy => CrossSectionPlane::Xy,
         PanelId::Xz => CrossSectionPlane::Xz,
         PanelId::Yz => CrossSectionPlane::Yz,
         PanelId::ThreeD => anyhow::bail!("the 3D panel is not a cross-section demand target"),
     };
+    let active_level =
+        select_cross_section_level(active, *view.cross_section(), panel, presentation, viewport)?;
     let mut plan = PlanAccumulator::default();
     for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
         let key = view_layer.layer_key();
@@ -1264,17 +1284,22 @@ pub(crate) fn plan_cross_section_panel_cancellable(
                 key.ordinal()
             )
         })?;
-        let scale = if key == view.active_layer() {
-            active_scale
-        } else {
-            scale_for_target_resolution(layer, target_resolution)
-        };
+        let level = select_cross_section_level(
+            layer,
+            *view.cross_section(),
+            panel,
+            presentation,
+            viewport,
+        )?;
+        let scale = layer
+            .scale(level)
+            .expect("the projected LOD selector returns a catalog scale");
         if cancelled() {
             return Ok(None);
         }
         let region_plan = plan_cross_section_resource_regions_cancellable(
             *view.cross_section(),
-            panel,
+            semantic_panel,
             presentation,
             SemanticRegionGridSpec {
                 volume_shape: scale.shape(),
@@ -1368,7 +1393,7 @@ fn plan_level(
     priority_camera: Option<CameraFrame>,
     viewport: RenderExtent,
     active_level: ScaleLevel,
-    target_resolution: f64,
+    layer_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
     limits: DatasetDemandPlanLimits,
     playback_downshifted: bool,
     scratch_ledger: Option<&dyn CpuByteLedger>,
@@ -1386,16 +1411,19 @@ fn plan_level(
                 key.ordinal()
             ))
         })?;
-        let scale = if key == view.active_layer() {
-            layer.scale(active_level).ok_or_else(|| {
-                PlanAttemptError::Other(anyhow::anyhow!(
-                    "active layer has no selected scale {}",
-                    active_level.get()
-                ))
-            })?
-        } else {
-            scale_for_target_resolution(layer, target_resolution)
-        };
+        let level = layer_scales.get(&key).copied().ok_or_else(|| {
+            PlanAttemptError::Other(anyhow::anyhow!(
+                "visible layer {} has no projected LOD selection",
+                key.ordinal()
+            ))
+        })?;
+        let scale = layer.scale(level).ok_or_else(|| {
+            PlanAttemptError::Other(anyhow::anyhow!(
+                "visible layer {} has no selected scale {}",
+                key.ordinal(),
+                level.get()
+            ))
+        })?;
         let resource_shape = semantic_resource_shape(scale.shape());
         let region_plan = plan_prioritized_visible_resource_regions_cancellable(
             camera,
@@ -1694,29 +1722,6 @@ fn plan_attempt_from_semantic_error(error: SemanticPlanError) -> PlanAttemptErro
     }
 }
 
-fn scale_for_target_resolution(
-    layer: &mirante4d_dataset::DatasetLayer,
-    target_resolution: f64,
-) -> &mirante4d_dataset::DatasetScale {
-    let mut finest = None;
-    let mut at_or_below_target = None;
-    for scale in layer.scales() {
-        let resolution = representative_voxel_world_size(scale.grid_to_world());
-        if finest.is_none_or(|(current, _)| resolution < current) {
-            finest = Some((resolution, scale));
-        }
-        if resolution <= target_resolution
-            && at_or_below_target.is_none_or(|(current, _)| resolution > current)
-        {
-            at_or_below_target = Some((resolution, scale));
-        }
-    }
-    at_or_below_target
-        .or(finest)
-        .map(|(_, scale)| scale)
-        .expect("DatasetLayer always has at least one scale")
-}
-
 pub(crate) fn semantic_resource_shape(volume: Shape3D) -> Shape3D {
     Shape3D::new(
         volume.z().min(SEMANTIC_TILE_SIDE),
@@ -1956,6 +1961,126 @@ mod tests {
                 .map(|key| (key.layer(), key.scale()))
                 .collect::<std::collections::BTreeSet<_>>(),
             plan.layer_scales.into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn visible_layers_select_projected_affine_lod_independently() {
+        let active = LogicalLayerKey::new(0);
+        let sheared = LogicalLayerKey::new(1);
+        let base = |level, transform| {
+            DatasetScale::new(
+                level,
+                if level == ScaleLevel::BASE {
+                    Shape3D::new(64, 64, 64).unwrap()
+                } else {
+                    Shape3D::new(32, 32, 32).unwrap()
+                },
+                transform,
+                ResourceValidity::AllValid,
+            )
+        };
+        let active_layer = DatasetLayer::new_multiscale(
+            active,
+            "axis aligned",
+            1,
+            IntensityDType::Uint16,
+            vec![
+                base(
+                    ScaleLevel::BASE,
+                    GridToWorld::scale(0.25, 0.25, 0.25).unwrap(),
+                ),
+                base(
+                    ScaleLevel::new(1),
+                    GridToWorld::scale(1.0, 1.0, 1.0).unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let sheared_layer = DatasetLayer::new_multiscale(
+            sheared,
+            "sheared",
+            1,
+            IntensityDType::Uint16,
+            vec![
+                base(
+                    ScaleLevel::BASE,
+                    GridToWorld::scale(0.25, 0.25, 0.25).unwrap(),
+                ),
+                base(
+                    ScaleLevel::new(1),
+                    GridToWorld::from_row_major([
+                        0.7, 0.7, 0.0, 0.0, 0.0, 0.7, 0.0, 0.0, 0.0, 0.0, 0.7, 0.0, 0.0, 0.0, 0.0,
+                        1.0,
+                    ])
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let catalog = DatasetCatalog::new(
+            "independent projected LOD",
+            ScientificIdentityStatus::Unverified(DatasetSourceId::new(1)),
+            vec![active_layer, sheared_layer],
+        )
+        .unwrap();
+        let view = ViewState::new(
+            vec![view_layer(active), view_layer(sheared)],
+            active,
+            TimeIndex::new(0),
+            CameraView::new(
+                Projection::Orthographic,
+                WorldPoint3::new(32.0, 32.0, 32.0).unwrap(),
+                UnitQuaternion::identity(),
+                1.0,
+                320.0,
+                200.0,
+            )
+            .unwrap(),
+            ViewerLayout::Single3d,
+            CrossSectionView::new(
+                WorldPoint3::new(32.0, 32.0, 32.0).unwrap(),
+                UnitQuaternion::identity(),
+                1.0,
+                1.0,
+            )
+            .unwrap(),
+            IsoLightState::attached_camera(),
+        )
+        .unwrap();
+
+        let plan = plan_current_3d(
+            &catalog,
+            &view,
+            PresentationViewport::new(64.0, 64.0).unwrap(),
+            RenderExtent::new(64, 64).unwrap(),
+            DatasetDemandPlanLimits::new(4_096, 64, 64 * 1_048_576),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.scale, ScaleLevel::new(1));
+        assert_eq!(
+            plan.layer_scales,
+            BTreeMap::from([(active, ScaleLevel::new(1)), (sheared, ScaleLevel::BASE),])
+        );
+
+        let progressive = plan_progressive_current_3d(
+            &catalog,
+            &view,
+            PresentationViewport::new(64.0, 64.0).unwrap(),
+            RenderExtent::new(64, 64).unwrap(),
+            DatasetDemandPlanLimits::new(4_096, 64, 64 * 1_048_576),
+            false,
+        )
+        .unwrap();
+        assert_eq!(progressive.target.layer_scales, plan.layer_scales);
+        assert_eq!(
+            progressive
+                .coarse
+                .expect("the independently coarser sheared layer fits")
+                .layer_scales,
+            BTreeMap::from([(active, ScaleLevel::new(1)), (sheared, ScaleLevel::new(1)),])
         );
     }
 

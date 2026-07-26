@@ -28,6 +28,7 @@ mod native_presentation;
 mod playback;
 mod product_automation;
 mod product_render_intent;
+mod projected_lod;
 mod render_state;
 mod retained_leases;
 mod runtime_diagnostics_panel;

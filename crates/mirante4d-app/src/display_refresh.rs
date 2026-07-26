@@ -12,7 +12,7 @@ use crate::{
     },
     native_presentation::{
         ProductFrameExecutionTiming, ProductGpuExecutionIdentity, ProductGpuExecutionTiming,
-        ProductPresentationTarget,
+        ProductLayerRequirementFacts, ProductPresentationTarget,
     },
     product_render_intent::{ProductRenderRequest, cross_section_intent, volume_intent},
     viewer_layout::PanelId,
@@ -853,16 +853,19 @@ impl MiranteWorkbenchApp {
         let scope = cross_section_scope(panel_id)?;
         let requirements = self.dataset.scope_requirement_handle(scope);
         let lease_priority = self.dataset.scope_gpu_priority_handle(scope);
+        let active_layer_target = self
+            .dataset
+            .scope_layer_scales(scope)
+            .and_then(|scales| scales.get(&view.active_layer()))
+            .copied();
         let gpu_available = self.native_presentation.product_gpu.is_some();
         let schedule = schedule_cross_section_panel(
             &mut self.render_coordination,
             CrossSectionScheduleInput {
-                catalog: snapshot.catalog(),
                 view,
-                active_layer: view.active_layer(),
+                active_layer_target,
                 requirements: requirements.as_ref(),
                 retained_leases: self.dataset.retained_leases(),
-                render_scale: self.dataset.current_scale(),
                 dataset_failed: self.dataset.dispatcher().scope_failure(scope).is_some(),
             },
             panel_id,
@@ -1955,14 +1958,6 @@ impl MiranteWorkbenchApp {
                 .surface(target_id.presentation_slot())
                 .display_current()
         };
-        let cross_section_displayed_scale = (target_id != PanelId::ThreeD)
-            .then(|| {
-                self.render_coordination
-                    .surface(target_id.presentation_slot())
-                    .cross_section_schedule()
-                    .and_then(|schedule| schedule.render_scale_level)
-            })
-            .flatten();
         let layers = expected
             .into_iter()
             .flat_map(|scales| scales.keys())
@@ -1979,24 +1974,12 @@ impl MiranteWorkbenchApp {
                     .presented_layer_requirement_facts
                     .get(&layer)
                     .copied();
-                // A cross-section target may be executing a complete coarse
-                // fallback body while its target intent already names the
-                // finer replacement scale. The schedule is the authority for
-                // the body actually rendered; using intent/resource facts
-                // here would falsely label fallback pixels as target pixels.
-                let displayed_scale_level = observed_product_layer_scale(
-                    target_id,
-                    cross_section_displayed_scale,
-                    facts.and_then(|facts| facts.displayed_scale_level),
-                );
-                mirante4d_application::LayerPresentationStatus {
-                    layer_ordinal: layer.ordinal(),
+                product_layer_presentation_status(
+                    layer.ordinal(),
                     expected_scale_level,
-                    displayed_scale_level,
-                    available_requirements: facts.map_or(0, |facts| facts.available_requirements),
-                    total_requirements: facts.map_or(0, |facts| facts.total_requirements),
-                    current: current && expected_scale_level == displayed_scale_level,
-                }
+                    facts,
+                    current,
+                )
             })
             .collect::<Vec<_>>();
         if let Err(overflow) = self
@@ -2212,15 +2195,20 @@ fn build_product_intent(
     }
 }
 
-fn observed_product_layer_scale(
-    target_id: PanelId,
-    cross_section_schedule_scale: Option<u32>,
-    presented_resource_scale: Option<u32>,
-) -> Option<u32> {
-    if target_id == PanelId::ThreeD {
-        presented_resource_scale
-    } else {
-        cross_section_schedule_scale.or(presented_resource_scale)
+fn product_layer_presentation_status(
+    layer_ordinal: u32,
+    expected_scale_level: Option<u32>,
+    presented_facts: Option<ProductLayerRequirementFacts>,
+    panel_current: bool,
+) -> mirante4d_application::LayerPresentationStatus {
+    let displayed_scale_level = presented_facts.and_then(|facts| facts.displayed_scale_level);
+    mirante4d_application::LayerPresentationStatus {
+        layer_ordinal,
+        expected_scale_level,
+        displayed_scale_level,
+        available_requirements: presented_facts.map_or(0, |facts| facts.available_requirements),
+        total_requirements: presented_facts.map_or(0, |facts| facts.total_requirements),
+        current: panel_current && expected_scale_level == displayed_scale_level,
     }
 }
 
@@ -2251,15 +2239,23 @@ mod requirement_lease_update_tests {
     use super::*;
 
     #[test]
-    fn cross_section_layer_evidence_names_the_body_actually_rendered() {
-        assert_eq!(
-            observed_product_layer_scale(PanelId::Xy, Some(1), Some(0)),
-            Some(1)
+    fn layer_evidence_uses_the_presented_resource_scale() {
+        let status = product_layer_presentation_status(
+            7,
+            Some(1),
+            Some(ProductLayerRequirementFacts {
+                displayed_scale_level: Some(0),
+                available_requirements: 3,
+                total_requirements: 4,
+            }),
+            true,
         );
-        assert_eq!(
-            observed_product_layer_scale(PanelId::ThreeD, None, Some(0)),
-            Some(0)
-        );
+        assert_eq!(status.layer_ordinal, 7);
+        assert_eq!(status.expected_scale_level, Some(1));
+        assert_eq!(status.displayed_scale_level, Some(0));
+        assert_eq!(status.available_requirements, 3);
+        assert_eq!(status.total_requirements, 4);
+        assert!(!status.current);
     }
 
     #[test]
