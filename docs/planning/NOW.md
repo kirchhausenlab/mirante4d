@@ -16,9 +16,10 @@ visible brick assembly. The owner therefore authorized the
 [development-simplification and viewer-recovery plan](../plans/active/DEVELOPMENT_SIMPLIFICATION.md)
 on 2026-07-26. It supersedes EP-00 through EP-07.
 
-EP-00 and EP-01 evidence protocols are frozen, nonblocking, and being deleted.
-They establish no current performance claim and are not prerequisites for
-implementation.
+EP-00 and EP-01 evidence protocols are retired and nonblocking. Their command,
+schema, selection, receipt, replay, and harness roots are deleted. Remaining
+qualification-only counters in shared product automation are being removed
+without disturbing useful product scripting.
 
 ## Active Checkpoint
 
@@ -38,9 +39,9 @@ the six deep cases also passed independently.
 
 The immediate ordered actions are:
 
-1. remove EP-00/EP-01 schemas, receipts, replay, repeated hashing,
-   and parallel successor implementations;
-2. classify and retain only useful successor product mechanisms; and
+1. finish removing qualification-only automation counters and repeated
+   internal hashing;
+2. retain only useful successor product mechanisms; and
 3. deliver resident interaction/LOD, cold complete refinement, and MIP/DVR/ISO
    improvements as separately product-validated slices.
 

@@ -1,6 +1,6 @@
 # Development Simplification And Viewer Recovery Plan
 
-Status: ACTIVE — RECOVERY AND PROCESS CUTOVER
+Status: ACTIVE — QUALIFICATION CLEANUP AND PRODUCT DELIVERY
 Planning authorization: OWNER GRANTED 2026-07-26
 Implementation authorization: OWNER GRANTED 2026-07-26
 Last reviewed: 2026-07-26
@@ -190,7 +190,7 @@ demoted deep cases remain explicitly runnable and passed independently.
 
 ### R3 — Qualification Apparatus Deletion
 
-Status: ACTIVE
+Status: ACTIVE — ROOT CUT COMPLETE; SHARED AUTOMATION CLEANUP PENDING
 
 - Delete the EP-01 selection authority and its bound schemas.
 - Delete development raw-report-to-receipt projection, replay, and admission
@@ -206,6 +206,13 @@ Status: ACTIVE
 
 Exit: performance tooling is materially smaller than the product code it
 exercises and is not on the edit or merge critical path.
+
+The live command/schema root cut deleted five viewer qualification commands,
+the selection authority, nine schemas, receipt/replay/harness implementations,
+the unused schema-validator pin, and a test-only shader evidence generator:
+about 37,700 lines in total. Ordinary product validation, bounded subprocess
+handling, asynchronous GPU timings, and independent numerical/LOD oracles
+remain.
 
 ### R4 — Recover Product Work
 

@@ -9,6 +9,7 @@ const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [targe
      [target_fixture_camera_smoke|target_fixture_render_modes|target_fixture_resident_navigation_no_readback|target_source_verification|import_preprocessing|b4_project_persistence]";
 
 mod arch;
+#[cfg(test)]
 mod build_contract;
 mod deps;
 mod dev;
@@ -25,7 +26,6 @@ mod reports;
 mod t5_sentinel_oracle;
 mod target_fixture;
 mod verification;
-mod viewer_performance;
 mod workflow_audit;
 
 fn main() -> anyhow::Result<()> {
@@ -91,13 +91,6 @@ fn main() -> anyhow::Result<()> {
             .map(|path| println!("{}", path.display())),
         "import-performance-t5-oracle-audit" => {
             import_performance_t5::run_oracle_audit(args.collect())
-        }
-        "viewer-performance-preflight" => viewer_performance::run(args.collect()),
-        "viewer-performance-run" => viewer_performance::run_measurement(args.collect()),
-        "viewer-performance-publish" => viewer_performance::publish_receipt(args.collect()),
-        "viewer-performance-ep01-preflight" => viewer_performance::preflight_ep01(args.collect()),
-        "viewer-performance-build-runner" => {
-            viewer_performance::build_qualification_runner(args.collect())
         }
         "__import-performance-t2-worker" => import_performance::run_worker(args.collect()),
         "docs-check" => documentation::docs_check(),
@@ -189,11 +182,6 @@ Mirante4D developer tasks
   cargo run --release -p xtask -- import-performance-t5 --config /absolute/private/config.json [--performance | --diagnostic]
   cargo run --release -p xtask -- import-performance-t5-publish --config /absolute/private/config.json --raw-report /absolute/private/raw-private-report.json
   cargo run --release -p xtask -- import-performance-t5-oracle-audit --config /absolute/private/config.json
-  cargo run --release -p xtask -- viewer-performance-preflight --qualification-profile /absolute/private/viewer-profile.json --workload-bundle /absolute/private/workload.json --interaction-script-bundle /absolute/private/scripts.json --independent-oracle /absolute/private/oracle.json --cache-condition warm --competing-activity none --power-state balanced --compositor-scale-milli 1000
-  cargo run --release -p xtask -- viewer-performance-run --help
-  cargo run --release -p xtask -- viewer-performance-publish --qualification-profile ABS --workload-bundle ABS --interaction-script-bundle ABS --independent-oracle ABS --raw-report ABS
-  cargo run --release -p xtask -- viewer-performance-ep01-preflight --qualification-profile ABS --workload-bundle ABS --interaction-script-bundle ABS --independent-oracle ABS --raw-report ABS --receipt ABS
-  cargo xtask viewer-performance-build-runner
   cargo xtask docs-check
   cargo xtask run-dev
 

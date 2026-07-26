@@ -198,9 +198,8 @@ checkpoints, or signing ordinary test output is not a default requirement.
 The EP-00 and EP-01 viewer-performance protocols are frozen historical
 development artifacts. Their raw-report, receipt, replay, population,
 selection, and per-role provenance machinery is not a current development
-prerequisite and must not block product work. The transitional commands may
-remain in a checkout until the active simplification plan removes them, but
-new work must not extend or depend on them.
+prerequisite and must not block product work. Their command, schema, selection,
+receipt, replay, and harness roots have been removed from the live repository.
 
 Viewer-performance work now proceeds in small product slices:
 

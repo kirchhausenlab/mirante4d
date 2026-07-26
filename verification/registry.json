@@ -5,8 +5,7 @@
     { "id": "actions-checkout", "version": "4.2.2", "action_commit": "11bd71901bbe5b1630ceea73d27597364c9af683" },
     { "id": "cargo-nextest", "version": "0.9.138", "artifact_sha256": "3793bf0c27607b196f502c39b2108f571de89fcda7586ae6beefa11ee177b216" },
     { "id": "rumdl", "version": "0.2.30", "artifact_sha256": "eb51e28ef9dff2b2d29b4527bc40123e840bb997dc8bae39d99496b898ee9f72" },
-    { "id": "cargo-deny", "version": "0.20.2", "artifact_sha256": "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f" },
-    { "id": "sourcemeta-jsonschema", "version": "16.1.0", "artifact_sha256": "96b214be67bf25c6184f1d009a94e082d1eaa83787a8f1878607aebf3185668e", "binary_sha256": "4aa8ba3f4bc0b1ef4f8d82b109676b186fa66603d1953be25fde22b2854190d5" }
+    { "id": "cargo-deny", "version": "0.20.2", "artifact_sha256": "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f" }
   ],
   "property_groups": [
     { "id": "domain-display", "owner": "mirante4d-domain", "seed": "0x4d34444f4d444953", "cases": 64, "max_shrink_iters": 1024, "persistence": false, "replay": "fixed-seed" },
@@ -262,21 +261,6 @@
         {
           "package": "mirante4d-app",
           "test_prefix": "camera_demand_cache::tests::large_oblique_grid_moves_full_planning_off_the_caller"
-        }
-      ],
-      "expected_ignored_cases": 1
-    },
-    {
-      "id": "EP00-ADAPTER-PRODUCTION-SHADER-STRUCTURAL-AUDIT",
-      "lane": "developer-local",
-      "owner": "mirante4d-render-wgpu",
-      "requirements": ["EP-00-workload-fidelity-and-cost-truth"],
-      "fixture_tier": "none",
-      "capability": "local-cpu",
-      "matches": [
-        {
-          "package": "mirante4d-render-wgpu",
-          "test_prefix": "shader_audit::emit_production_shader_structural_audit_json"
         }
       ],
       "expected_ignored_cases": 1

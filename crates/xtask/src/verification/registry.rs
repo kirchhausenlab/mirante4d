@@ -428,15 +428,6 @@ fn validate_tool_pins(tools: &[ToolPin]) -> anyhow::Result<()> {
                 None,
             ),
         ),
-        (
-            "sourcemeta-jsonschema",
-            (
-                "16.1.0",
-                Some("96b214be67bf25c6184f1d009a94e082d1eaa83787a8f1878607aebf3185668e"),
-                Some("4aa8ba3f4bc0b1ef4f8d82b109676b186fa66603d1953be25fde22b2854190d5"),
-                None,
-            ),
-        ),
     ]);
     if tools.len() != expected.len() {
         bail!("verification registry tool pin set drifted");

@@ -1,17 +1,21 @@
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::Read,
     os::unix::fs::{MetadataExt, PermissionsExt},
-    path::{Component, Path, PathBuf},
+    path::{Component, Path},
 };
+
+#[cfg(test)]
+use std::io::Write;
 
 use anyhow::{Context, bail};
 use mirante4d_identity::Sha256Hasher;
-use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, fchmod, openat2};
+#[cfg(test)]
+use rustix::fs::fchmod;
+use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
 
 #[derive(Debug)]
 pub(crate) struct FinalizedPrivateFile {
-    pub(crate) canonical_path: PathBuf,
     pub(crate) bytes: Vec<u8>,
     pub(crate) sha256: String,
 }
@@ -83,13 +87,10 @@ pub(crate) fn read_finalized_private_file(
         bail!("{label} changed while read");
     }
     let sha256 = Sha256Hasher::digest(&bytes).to_string();
-    Ok(FinalizedPrivateFile {
-        canonical_path,
-        bytes,
-        sha256,
-    })
+    Ok(FinalizedPrivateFile { bytes, sha256 })
 }
 
+#[cfg(test)]
 pub(crate) fn write_new_synced_private_file(
     path: &Path,
     bytes: &[u8],

@@ -7,10 +7,9 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
 use serde::Deserialize;
 use serde_json::{Map, Value};
-
-use crate::viewer_performance::read_bounded_regular_file;
 
 pub(crate) const PROGRESS_PATH_ENV: &str = "MIRANTE4D_AUTOMATION_PROGRESS_PATH";
 pub(crate) const PROGRESS_NONCE_ENV: &str = "MIRANTE4D_AUTOMATION_PROGRESS_NONCE";
@@ -35,6 +34,43 @@ const DEFAULT_COMMAND_BUDGET: Duration = Duration::from_secs(30);
 const SEQUENCE_BASE_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SEQUENCE_DURATION_MS: u64 = 120_000;
 const MAX_SLEEP_FRAMES: u64 = 600;
+
+fn read_bounded_regular_file(path: &Path, max_bytes: u64, label: &str) -> anyhow::Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("{label} is unavailable or unreadable"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("{label} must be a nonsymlink regular file")
+    }
+    if metadata.len() > max_bytes {
+        bail!("{label} exceeds its {max_bytes}-byte bound")
+    }
+    let descriptor = openat2(
+        CWD,
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .with_context(|| format!("{label} is unavailable, unreadable, or contains a symbolic link"))?;
+    let file = File::from(descriptor);
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("{label} is unavailable or unreadable"))?;
+    if !opened_metadata.is_file() {
+        bail!("{label} must be a nonsymlink regular file")
+    }
+    if opened_metadata.len() > max_bytes {
+        bail!("{label} exceeds its {max_bytes}-byte bound")
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(opened_metadata.len()).unwrap_or(0));
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("{label} is unavailable or unreadable"))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        bail!("{label} exceeds its {max_bytes}-byte bound")
+    }
+    Ok(bytes)
+}
 
 #[derive(Clone)]
 struct CommandPlan {
@@ -68,25 +104,7 @@ impl ProductAutomationProgressPlan {
         Ok(Self { commands })
     }
 
-    pub(crate) fn set_command_budget(
-        &mut self,
-        index: usize,
-        budget: Duration,
-    ) -> anyhow::Result<()> {
-        let command = self
-            .commands
-            .get_mut(index)
-            .with_context(|| format!("progress budget command index {index} is out of range"))?;
-        if command.kind != "observe_gate_batch" {
-            bail!("only observe_gate_batch accepts a derived progress budget");
-        }
-        if budget.is_zero() {
-            bail!("observe_gate_batch progress budget must be positive");
-        }
-        command.budget = Some(budget);
-        Ok(())
-    }
-
+    #[cfg(test)]
     pub(crate) fn command_count(&self) -> usize {
         self.commands.len()
     }
@@ -319,6 +337,7 @@ impl ProductAutomationProgressLaunch {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -711,32 +730,6 @@ fn elapsed_since(now: Instant, earlier: Instant) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
-pub(crate) fn safe_progress_line(
-    sample: usize,
-    scenario: &str,
-    role: &str,
-    snapshot: &SafeProgressSnapshot,
-) -> anyhow::Result<String> {
-    validate_safe_token(scenario, "scenario")?;
-    validate_safe_token(role, "role")?;
-    let state = match &snapshot.state {
-        SafeProgressState::Command {
-            index,
-            command_kind,
-            elapsed_ms,
-        } => format!(
-            "state=command command_index={index} command_kind={command_kind} elapsed_ms={elapsed_ms}"
-        ),
-        SafeProgressState::Closeout { elapsed_ms } => {
-            format!("state=closeout elapsed_ms={elapsed_ms}")
-        }
-    };
-    Ok(format!(
-        "viewer_progress sample={sample} scenario={scenario} role={role} heartbeat_sequence={} command_count={} {state}",
-        snapshot.heartbeat_sequence, snapshot.command_count,
-    ))
-}
-
 pub(crate) fn safe_automation_progress_line(
     scope: &str,
     scenario: &str,
@@ -1070,11 +1063,6 @@ mod tests {
                 elapsed_ms: 500,
             },
         };
-        let line = safe_progress_line(3, "scenario-1", "cold", &snapshot).unwrap();
-        assert!(line.contains("command_kind=wait_for"));
-        assert!(!line.contains(NONCE));
-        assert!(!line.contains('/'));
-        assert!(safe_progress_line(3, "private scenario", "cold", &snapshot).is_err());
         let suite_line =
             safe_automation_progress_line("product_validate", "fixture", &snapshot).unwrap();
         assert!(suite_line.starts_with("automation_progress scope=product_validate"));

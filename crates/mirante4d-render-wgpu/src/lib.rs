@@ -7,9 +7,6 @@
 
 mod runtime;
 
-#[cfg(test)]
-mod shader_audit;
-
 pub use runtime::{
     MAX_INCREMENTAL_STATIC_KEY_CHANGES, PreparedStaticPresentationLayout,
     StaticPresentationLayoutPreflight, preflight_static_presentation_layout,

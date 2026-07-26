@@ -213,10 +213,11 @@ compound-angle movement can visibly expose arriving bricks.
 
 That mismatch demonstrated that the subsequent EP-00/EP-01 development
 qualification was not proportionate or sufficiently product-directed. The
-protocol, schemas, receipts, repeated hashing, and predecessor populations
-remain present temporarily but are frozen, nonblocking, and scheduled for
-deletion or reduction. They establish no current performance claim and are no
-longer prerequisites for implementation.
+five qualification commands, selection authority, nine schemas, receipt and
+replay implementation, harness, and test-only shader evidence generator are
+deleted. Remaining qualification-only counters in shared product automation
+are frozen for focused cleanup. The retired protocol establishes no current
+performance claim and is not a prerequisite for implementation.
 
 The damaged unpublished linked worktree has been independently preserved and
 reconstructed. Its 199 recoverable commits through `3d967f0` plus the surviving
