@@ -24,7 +24,7 @@ pub use numerical_oracle::{
 use std::collections::{BTreeMap, HashSet};
 
 use mirante4d_dataset::{
-    DatasetCatalog, DatasetResourceKey, ResourceContractError, ResourceLease, ResourcePayloadView,
+    BrickKey, DatasetCatalog, ResourceContractError, ResourceLease, ResourcePayloadView,
 };
 use mirante4d_domain::{
     GridToWorld, IntensityDType, IsoLightState, IsoShadingPolicy, LayerTransfer, LogicalLayerKey,
@@ -97,18 +97,18 @@ pub enum ReferenceRenderError {
     #[error("reference render has no catalog scale for intent layer {layer:?}")]
     IntentLayerScaleMissing { layer: LogicalLayerKey },
     #[error("reference lease does not belong to this render intent")]
-    LeaseNotInIntent { key: DatasetResourceKey },
+    LeaseNotInIntent { key: BrickKey },
     #[error("reference render received the same resource lease more than once")]
-    DuplicateLease { key: DatasetResourceKey },
+    DuplicateLease { key: BrickKey },
     #[error("reference render received overlapping resources at one semantic scale")]
     OverlappingLeases {
         layer: LogicalLayerKey,
         scale: ScaleLevel,
     },
     #[error("reference lease violates the catalog payload contract")]
-    InvalidLease { key: DatasetResourceKey },
+    InvalidLease { key: BrickKey },
     #[error("reference lease contains a non-finite Float32 sample")]
-    NonFiniteFloatSample { key: DatasetResourceKey, index: u64 },
+    NonFiniteFloatSample { key: BrickKey, index: u64 },
     #[error("reference grid-to-world transform is singular")]
     SingularGridTransform { layer: LogicalLayerKey },
     #[error("reference camera or projection math failed")]
@@ -213,7 +213,7 @@ impl ReferenceRenderer {
 
 #[derive(Clone, Copy)]
 struct LeaseView<'a> {
-    key: DatasetResourceKey,
+    key: BrickKey,
     payload: ResourcePayloadView<'a>,
 }
 
@@ -379,7 +379,7 @@ fn prepare_layers<'a>(
         .collect()
 }
 
-fn regions_overlap(first: DatasetResourceKey, second: DatasetResourceKey) -> bool {
+fn regions_overlap(first: BrickKey, second: BrickKey) -> bool {
     let first_start = first.region().origin();
     let first_end = first.region().end_exclusive();
     let second_start = second.region().origin();
@@ -1300,8 +1300,8 @@ mod tests {
         )
     }
 
-    fn key(shape: Shape3D) -> DatasetResourceKey {
-        DatasetResourceKey::new(
+    fn key(shape: Shape3D) -> BrickKey {
+        BrickKey::new(
             DatasetResourceIdentity::Unverified(DatasetSourceId::new(7)),
             LogicalLayerKey::new(0),
             mirante4d_domain::TimeIndex::new(0),

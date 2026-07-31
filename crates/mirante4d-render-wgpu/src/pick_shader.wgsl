@@ -1,12 +1,18 @@
 // One bounded asynchronous scientific pick over the same control/page/payload
-// representation used by the product render pass. This file is compiled
-// together with shader.wgsl; bindings 0--4 and all traversal helpers are
-// therefore shared rather than reimplemented through a second residency path.
+// representation used by the product render pass. This file is compiled with
+// the accepted binding/sampling, volume traversal, DVR optical, and ISO
+// gradient primitives; bindings 0--6 are shared rather than reimplemented
+// through a second residency path.
 
-@group(0) @binding(5)
-var<storage, read> pick_query: array<u32>;
+struct PickQuery {
+    primary: vec4<u32>,
+    reserved: vec4<u32>,
+};
 
-@group(0) @binding(6)
+@group(0) @binding(7)
+var<uniform> pick_query: PickQuery;
+
+@group(0) @binding(8)
 var<storage, read_write> pick_output: array<u32>;
 
 const PICK_OUTPUT_MAGIC: u32 = 0x4d34504bu;
@@ -125,15 +131,15 @@ fn write_voxel_pick(
 
 @compute @workgroup_size(1)
 fn pick_main() {
-    let layer_index = pick_layer_index(pick_query[2u]);
+    let layer_index = pick_layer_index(pick_query.primary.z);
     if layer_index == 0xffffffffu || control[3u] != 0u {
         write_empty_pick(true);
         return;
     }
 
     let render_pixel = vec2<f32>(
-        bitcast<f32>(pick_query[0u]),
-        bitcast<f32>(pick_query[1u]),
+        bitcast<f32>(pick_query.primary.x),
+        bitcast<f32>(pick_query.primary.y),
     );
     let world_origin = vec3<f32>(control_f32(8u), control_f32(9u), control_f32(10u))
         + vec3<f32>(control_f32(11u), control_f32(12u), control_f32(13u))
@@ -155,7 +161,7 @@ fn pick_main() {
     let direction = ray.direction;
     let step = 1.0 / ray.grid_speed;
     let count = max(u32(ceil((ray.exit - ray.entry) / step)), 1u);
-    let policy = pick_query[3u];
+    let policy = pick_query.primary.w;
     var incomplete = false;
     var has_hit = false;
     var best_value = 0.0;

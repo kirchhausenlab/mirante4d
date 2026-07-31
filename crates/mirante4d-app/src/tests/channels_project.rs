@@ -1,21 +1,20 @@
+use crate::histogram::active_layer_histogram_summary;
 use crate::retained_leases::RetainedLeases;
 use crate::viewer_layout::PanelId;
-use crate::histogram::active_layer_histogram_summary;
 use mirante4d_dataset::{
-    DatasetResourceIdentity, DatasetResourceKey, DatasetSourceId, ResourceLease,
-    ResourcePayloadDescriptor, ResourcePayloadFacts, ResourcePayloadView, ResourceRegion,
-    ResourceValidity,
+    BrickKey, DatasetResourceIdentity, DatasetSourceId, ResourceLease, ResourcePayloadDescriptor,
+    ResourcePayloadFacts, ResourcePayloadView, ResourceRegion, ResourceValidity,
 };
 use mirante4d_domain::{LogicalLayerKey, ScaleLevel};
 
 struct HistogramTestLease {
-    key: DatasetResourceKey,
+    key: BrickKey,
     descriptor: ResourcePayloadDescriptor,
     bytes: Vec<u8>,
 }
 
 impl ResourceLease for HistogramTestLease {
-    fn key(&self) -> DatasetResourceKey {
+    fn key(&self) -> BrickKey {
         self.key
     }
 
@@ -35,14 +34,8 @@ impl ResourceLease for HistogramTestLease {
     }
 }
 
-fn histogram_key(
-    layer: u32,
-    timepoint: u64,
-    scale: u32,
-    origin_x: u64,
-    samples: u64,
-) -> DatasetResourceKey {
-    DatasetResourceKey::new(
+fn histogram_key(layer: u32, timepoint: u64, scale: u32, origin_x: u64, samples: u64) -> BrickKey {
+    BrickKey::new(
         DatasetResourceIdentity::Unverified(DatasetSourceId::new(77)),
         LogicalLayerKey::new(layer),
         TimeIndex::new(timepoint),
@@ -52,7 +45,7 @@ fn histogram_key(
 }
 
 fn u16_histogram_lease(
-    key: DatasetResourceKey,
+    key: BrickKey,
     values: &[u16],
     validity: Option<u8>,
 ) -> Arc<dyn ResourceLease> {
@@ -336,8 +329,7 @@ fn application_playback_commands_reconcile_transient_state_and_timepoint() {
     assert!(snapshot.transient().playback_active());
     assert_eq!(snapshot.transient().last_playback_tick(), None);
     assert!(
-        !app
-            .dataset
+        !app.dataset
             .scope_requirements(dataset_requests::SCOPE_PLAYBACK)
             .is_empty()
     );
@@ -415,22 +407,20 @@ fn timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
     )
     .unwrap();
     for panel_id in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
-        assert!(
-            app.render_coordination
-                .record_viewports(panel_id.presentation_slot(), presentation, render)
-        );
+        assert!(app.render_coordination.record_viewports(
+            panel_id.presentation_slot(),
+            presentation,
+            render
+        ));
         let generation = app
             .render_coordination
             .surface(panel_id.presentation_slot())
             .generation();
-        assert!(
-            app.render_coordination
-                .record_cross_section_presentation(
-                    panel_id.presentation_slot(),
-                    generation,
-                    CrossSectionPanelScheduleState::missing_viewport(generation),
-                )
-        );
+        assert!(app.render_coordination.record_cross_section_presentation(
+            panel_id.presentation_slot(),
+            generation,
+            CrossSectionPanelScheduleState::missing_viewport(generation),
+        ));
     }
     let generations_before =
         [PanelId::Xy, PanelId::Xz, PanelId::ThreeD, PanelId::Yz].map(|panel_id| {

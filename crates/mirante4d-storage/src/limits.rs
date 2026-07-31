@@ -592,11 +592,12 @@ mod tests {
             Err(StorageProfileError::InconsistentCount { .. })
         ));
 
-        let mut wrong_exact_scale = minimal_package_counts(ProfileKind::Ds3);
-        wrong_exact_scale.maximum_scales_per_image = 1;
+        let mut excessive_scale_count = minimal_package_counts(ProfileKind::Ds3);
+        excessive_scale_count.maximum_scales_per_image =
+            profile_limits(ProfileKind::Ds3).scales.maximum() + 1;
         assert!(matches!(
-            wrong_exact_scale.validate(ProfileKind::Ds3),
-            Err(StorageProfileError::ExactCountMismatch {
+            excessive_scale_count.validate(ProfileKind::Ds3),
+            Err(StorageProfileError::CeilingExceeded {
                 metric: "scales per image",
                 ..
             })

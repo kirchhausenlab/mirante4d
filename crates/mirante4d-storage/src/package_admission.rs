@@ -687,14 +687,25 @@ mod tests {
                 &six_scale_profile,
                 minimal_counts(6, above_ds0_bytes),
                 &mut || false,
+            )
+            .unwrap()
+            .profile(),
+            ProfileKind::Ds1
+        );
+        assert_eq!(
+            select_supported_dataset_profile(
+                &six_scale_profile,
+                minimal_counts(65, above_ds0_bytes),
+                &mut || false,
             ),
-            Err(PackageAdmissionError::NoSupportedProfile)
+            Err(PackageAdmissionError::NoSupportedProfile),
+            "every current dataset profile must reject a scale count above the 64-level bound"
         );
     }
 
     #[test]
-    fn scale_rules_apply_to_every_image_without_summing() {
-        let images = [7_u32, 6]
+    fn variable_scale_rules_apply_to_every_image_without_summing() {
+        let images = [40_u32, 40]
             .into_iter()
             .enumerate()
             .map(|(image, levels)| {
@@ -718,16 +729,10 @@ mod tests {
             validate_scale_rules(&profile, ProfileKind::Ds0, &mut || false),
             Ok(())
         );
-        assert!(matches!(
+        assert_eq!(
             validate_scale_rules(&profile, ProfileKind::Ds3, &mut || false),
-            Err(PackageAdmissionError::Profile(
-                StorageProfileError::ExactCountMismatch {
-                    actual: 6,
-                    expected: 7,
-                    ..
-                }
-            ))
-        ));
+            Ok(())
+        );
     }
 
     #[test]

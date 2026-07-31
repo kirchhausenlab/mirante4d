@@ -68,6 +68,7 @@ pub(crate) fn cross_section_schedule_status_label(
         CrossSectionPanelScheduleStatus::Loading => "loading",
         CrossSectionPanelScheduleStatus::Empty => "outside selected data",
         CrossSectionPanelScheduleStatus::Ready => "ready",
+        CrossSectionPanelScheduleStatus::Provisional => "interactive preview",
         CrossSectionPanelScheduleStatus::Current => "current",
         CrossSectionPanelScheduleStatus::Coarse => "coarse",
         CrossSectionPanelScheduleStatus::Incomplete => "incomplete",

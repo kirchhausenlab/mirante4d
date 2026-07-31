@@ -9,8 +9,8 @@ use std::{
 use eframe::egui;
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationSnapshot, CommandEffect, CrossSectionPanelId,
-    OperationToken, PresentationSlot, ProjectStoreLifecycle, SourceVerificationSnapshot,
-    WorkspaceSnapshot,
+    OperationToken, PresentationSlot, ProjectStoreLifecycle, RenderGestureKind, RenderIntentBase,
+    RenderIntentSample, RenderIntentTarget, SourceVerificationSnapshot, WorkspaceSnapshot,
     import_workflow::{
         ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportWorkflowSnapshot,
     },
@@ -32,15 +32,15 @@ use mirante4d_import_pipeline::{ImportReceipt, ImportStatistics, TiffSource};
 use mirante4d_project_model::{LayerViewState, ProjectRevisionId};
 use mirante4d_render_api::{RenderExtent, VolumePickQuery};
 use mirante4d_storage::ScientificPublicationTransferEvidence;
-use mirante4d_ui_egui::{ViewerPickPurpose, ViewerPickRequest};
+use mirante4d_ui_egui::{RenderIntentInteraction, ViewerPickPurpose, ViewerPickRequest};
 use rustix::time::{ClockId, clock_gettime};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{
-    DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
-    MiranteWorkbenchApp, application_view, import_worker_service::ImportWorkerTimingOrigin,
-    set_render_viewport, viewer_layout::PanelId,
+    CoordinatedPresentationGroup, DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN,
+    DisplayedFrameFreshness, FrameCompleteness, MiranteWorkbenchApp, application_view,
+    import_worker_service::ImportWorkerTimingOrigin, viewer_layout::PanelId,
 };
 
 mod capture;
@@ -48,10 +48,10 @@ mod diagnostics;
 mod model;
 mod progress;
 
+pub(crate) use capture::product_target_capture;
 use capture::{
     ProductAutomationArtifact, ProductAutomationImageStats, capture_color_image,
-    current_display_image_stats, product_target_capture, sanitize_artifact_label,
-    write_color_image_ppm,
+    current_display_image_stats, sanitize_artifact_label, write_color_image_ppm,
 };
 use diagnostics::{
     dataset_runtime_diagnostics_json, gpu_adapter_diagnostics_json,
@@ -68,13 +68,64 @@ const AUTOMATION_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTOMATION_DATASET_SWITCH_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn sequence_sample_target_ns(sample: u32, samples: u32, duration_ms: u64) -> u64 {
-    if samples <= 1 {
+    if samples == 0 {
         return 0;
     }
     let numerator = u128::from(duration_ms)
         .saturating_mul(1_000_000)
-        .saturating_mul(u128::from(sample));
-    u64::try_from(numerator / u128::from(samples - 1)).unwrap_or(u64::MAX)
+        .saturating_mul(u128::from(sample.saturating_add(1)));
+    u64::try_from(numerator / u128::from(samples)).unwrap_or(u64::MAX)
+}
+
+fn input_sequence_latest_pixels_are_current(
+    app: &MiranteWorkbenchApp,
+    required_group: CoordinatedPresentationGroup,
+    three_d_revision: mirante4d_render_api::FrameIdentity,
+    linked_2d_revision: mirante4d_render_api::FrameIdentity,
+) -> bool {
+    let target_is_current =
+        |slot: PresentationSlot, revision: mirante4d_render_api::FrameIdentity| {
+            let surface = app.render_coordination.surface(slot);
+            surface.display_current()
+                && surface
+                    .presented_frame()
+                    .is_some_and(|frame| frame.frame() == revision)
+        };
+    let three_d = || target_is_current(PresentationSlot::ThreeD, three_d_revision);
+    let linked = || {
+        [
+            PresentationSlot::Xy,
+            PresentationSlot::Xz,
+            PresentationSlot::Yz,
+        ]
+        .into_iter()
+        .all(|slot| target_is_current(slot, linked_2d_revision))
+    };
+    match required_group {
+        CoordinatedPresentationGroup::ThreeD => three_d(),
+        CoordinatedPresentationGroup::Linked2d => linked(),
+        CoordinatedPresentationGroup::FullLayout => three_d() && linked(),
+    }
+}
+
+fn egui_deadline_repaint_delay(ctx: &egui::Context, remaining: Duration) -> Duration {
+    let predicted_frame_time = ctx
+        .input(|input| Duration::try_from_secs_f32(input.predicted_dt).unwrap_or(Duration::ZERO));
+    // egui subtracts one predicted frame from every nonzero delayed repaint
+    // request before handing it to eframe. Add that frame back so `remaining`
+    // is an absolute input deadline measured from this UI turn rather than an
+    // instruction to keep the FIFO surface continuously full.
+    remaining.saturating_add(predicted_frame_time)
+}
+
+fn observed_native_viewport_pixels(ctx: &egui::Context) -> Option<[u32; 2]> {
+    let pixels_per_point = ctx.pixels_per_point();
+    let size_points = ctx.input(|input| input.viewport_rect().size());
+    let to_pixels = |points: f32| {
+        let pixels = (points * pixels_per_point).round();
+        (pixels.is_finite() && pixels > 0.0 && pixels <= u32::MAX as f32).then_some(pixels as u32)
+    };
+    Some([to_pixels(size_points.x)?, to_pixels(size_points.y)?])
 }
 
 fn application_cross_section_panel(panel: ProductAutomationPanelId) -> CrossSectionPanelId {
@@ -97,13 +148,9 @@ fn product_presentation(
     app: &MiranteWorkbenchApp,
     panel: PanelId,
 ) -> Option<&mirante4d_render_api::PresentedFrame> {
-    app.native_presentation
-        .product_gpu
-        .as_ref()?
-        .targets
-        .get(&panel)?
-        .presented
-        .as_ref()
+    app.render_coordination
+        .surface(panel.presentation_slot())
+        .presented_frame()
 }
 
 fn product_presentations_ready(
@@ -121,26 +168,29 @@ fn product_capture_state(app: &MiranteWorkbenchApp, panels: &[PanelId]) -> Strin
     panels
         .iter()
         .map(|panel| {
-            let target = app
+            let target = panel.presentation_slot();
+            let presented = app.render_coordination.surface(target).presented_frame();
+            let pending = app
                 .native_presentation
                 .product_gpu
                 .as_ref()
-                .and_then(|product| product.targets.get(panel));
-            match target {
-                None => format!("{panel:?}:missing-target"),
-                Some(target) => format!(
-                    "{panel:?}:presented={:?},pending={:?},completed={:?}",
-                    target.presented.as_ref().map(|frame| frame.frame()),
-                    target
-                        .pending_capture
-                        .as_ref()
-                        .map(|(frame, _)| frame.frame()),
-                    target
-                        .completed_capture
-                        .as_ref()
-                        .map(|(frame, _)| frame.frame()),
-                ),
-            }
+                .and_then(|product| {
+                    product
+                        .pending_validation_captures
+                        .iter()
+                        .find(|capture| capture.ticket.target() == target)
+                });
+            let completed = app
+                .native_presentation
+                .product_gpu
+                .as_ref()
+                .and_then(|product| product.completed_validation_capture(target));
+            format!(
+                "{panel:?}:presented={:?},pending={:?},completed={:?}",
+                presented.map(|frame| frame.frame()),
+                pending.map(|capture| capture.frame.frame()),
+                completed.map(|capture| capture.frame.frame()),
+            )
         })
         .collect::<Vec<_>>()
         .join("; ")
@@ -148,7 +198,9 @@ fn product_capture_state(app: &MiranteWorkbenchApp, panels: &[PanelId]) -> Strin
 
 fn assertion_capture_panels(condition: &ProductAutomationAssertCondition) -> Vec<PanelId> {
     match condition {
-        ProductAutomationAssertCondition::NonblankFrame => vec![PanelId::ThreeD],
+        ProductAutomationAssertCondition::NonblankPanel { target } => {
+            vec![PanelId::from(*target)]
+        }
         ProductAutomationAssertCondition::FourPanelImagesDistinct { .. } => {
             vec![PanelId::ThreeD, PanelId::Xy, PanelId::Xz, PanelId::Yz]
         }
@@ -157,8 +209,8 @@ fn assertion_capture_panels(condition: &ProductAutomationAssertCondition) -> Vec
 }
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-const AUTOMATION_SCHEMA_VERSION: u32 = 6;
-const AUTOMATION_REPORT_SCHEMA_VERSION: u32 = 7;
+const AUTOMATION_SCHEMA_VERSION: u32 = 7;
+const AUTOMATION_REPORT_SCHEMA_VERSION: u32 = 8;
 
 fn dispatch_application_command(
     app: &mut MiranteWorkbenchApp,
@@ -169,18 +221,34 @@ fn dispatch_application_command(
         .map_err(|fault| format!("application command was rejected: {fault:?}"))
 }
 
-fn dispatch_effective_interaction_sample(
+fn dispatch_render_intent_sample(
     app: &mut MiranteWorkbenchApp,
     ctx: &egui::Context,
-    command: ApplicationCommand,
+    sample: RenderIntentSample,
 ) -> Result<(), String> {
-    match dispatch_application_command(app, ctx, command)? {
-        CommandEffect::Changed => Ok(()),
-        CommandEffect::NoChange => Err(
-            "automation interaction sample produced no semantic change; refusing coalesced evidence"
-                .to_owned(),
-        ),
-    }
+    app.apply_render_intent_interaction(RenderIntentInteraction::Sample(sample), ctx)
+}
+
+fn finish_render_intent(
+    app: &mut MiranteWorkbenchApp,
+    ctx: &egui::Context,
+    target: RenderIntentTarget,
+) -> Result<(), String> {
+    app.apply_render_intent_interaction(RenderIntentInteraction::Finish(target), ctx)
+}
+
+fn effective_interaction_camera(app: &MiranteWorkbenchApp) -> CameraView {
+    let snapshot = app.application.snapshot();
+    let base = RenderIntentBase::from_snapshot(&snapshot);
+    app.render_intent_mailbox
+        .effective_camera(base, *application_view(&snapshot).camera())
+}
+
+fn effective_interaction_cross_section(app: &MiranteWorkbenchApp) -> CrossSectionView {
+    let snapshot = app.application.snapshot();
+    let base = RenderIntentBase::from_snapshot(&snapshot);
+    app.render_intent_mailbox
+        .effective_cross_section(base, *application_view(&snapshot).cross_section())
 }
 
 fn layer_command(
@@ -322,6 +390,12 @@ fn automation_pick_request(
     if app.native_presentation.product_gpu.is_none() {
         return Err("native GPU presentation is unavailable for product picking".to_owned());
     }
+    if app.render_coordination.frame_fidelity.three_d_preview {
+        // A provisional preview is intentionally not exact pick authority.
+        // Automation follows the same product route as the UI and waits for
+        // the atomic exact swap instead of relabelling coarse data as exact.
+        return Ok(None);
+    }
 
     // Product presentation frames are native-renderer state projected into the
     // UI snapshot; the reducer snapshot alone intentionally carries no live
@@ -410,15 +484,23 @@ fn coordinated_visible_layout_current_complete_with_snapshot(
     app: &MiranteWorkbenchApp,
     snapshot: &ApplicationSnapshot,
 ) -> bool {
+    if !app
+        .native_presentation
+        .initial_render_pipeline_is_ready()
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let base = RenderIntentBase::from_snapshot(snapshot);
+    let demand_currentness = app.visible_demand_plan_currentness();
     let generation = app.render_coordination.display_generation();
     if generation.current_presentation_generation != Some(generation.input_generation)
+        || app.render_intent_mailbox.active_target(base).is_some()
+        || app.resident_cross_section_coverage.is_some()
+        || !demand_currentness.current_3d
         || app.dataset.staging_current_refinement()
         || app.dataset.current_scale().get()
             != app.render_coordination.frame_fidelity.target_scale_level
-        || app
-            .display_performance_milestones
-            .target_settled_ms()
-            .is_none()
     {
         return false;
     }
@@ -432,7 +514,9 @@ fn coordinated_visible_layout_current_complete_with_snapshot(
         .into_iter()
         .all(|slot| {
             let surface = app.render_coordination.surface(slot);
+            let panel = PanelId::from_presentation_slot(slot);
             surface.display_current()
+                && demand_currentness.cross_section(panel)
                 && surface.cross_section_schedule().is_some_and(|schedule| {
                     schedule.status == crate::CrossSectionPanelScheduleStatus::Current
                 })
@@ -543,6 +627,67 @@ fn automation_pick_json(
     })
 }
 
+fn assert_native_pick_evidence(
+    evidence: &Value,
+    expected_policy: ProductAutomationPickPolicy,
+) -> Result<(), String> {
+    if evidence.get("native_gpu_pick").and_then(Value::as_bool) != Some(true) {
+        return Err("pick evidence did not come from the native GPU pick path".to_owned());
+    }
+    if evidence.get("placeholder_sampled").and_then(Value::as_bool) != Some(false) {
+        return Err("pick evidence sampled a placeholder".to_owned());
+    }
+    if evidence.get("status").and_then(Value::as_str) != Some("sampled")
+        || !matches!(
+            evidence.get("kind").and_then(Value::as_str),
+            Some("voxel" | "interpolated_sample")
+        )
+    {
+        return Err("pick evidence did not contain a nonempty sampled hit".to_owned());
+    }
+    if evidence.get("completeness").and_then(Value::as_str) != Some("exact") {
+        return Err("pick evidence was not exact".to_owned());
+    }
+    let observed_policy = evidence.get("policy").and_then(Value::as_str);
+    if observed_policy != Some(expected_policy.name()) {
+        return Err(format!(
+            "pick policy was {:?}, expected {}",
+            observed_policy,
+            expected_policy.name()
+        ));
+    }
+    let value = evidence
+        .get("value")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "pick evidence has no sampled intensity value".to_owned())?;
+    if !matches!(
+        value.get("dtype").and_then(Value::as_str),
+        Some("uint8" | "uint16" | "float32")
+    ) || !value
+        .get("value")
+        .and_then(Value::as_f64)
+        .is_some_and(f64::is_finite)
+    {
+        return Err("pick evidence has no finite typed intensity value".to_owned());
+    }
+    for (field, expected_len) in [("world_position", 3), ("render_pixel", 2)] {
+        let coordinates = evidence
+            .get(field)
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("pick evidence has no {field} coordinates"))?;
+        if coordinates.len() != expected_len
+            || !coordinates
+                .iter()
+                .all(|coordinate| coordinate.as_f64().is_some_and(f64::is_finite))
+        {
+            return Err(format!(
+                "pick evidence {field} coordinates are incomplete or non-finite"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct ProductAutomationController {
     script: ProductAutomationScript,
     script_path: PathBuf,
@@ -553,6 +698,7 @@ pub(crate) struct ProductAutomationController {
     active_wait_started: Option<Instant>,
     sleep_frames_remaining: Option<u32>,
     active_input_sequence: Option<ActiveInputSequence>,
+    automation_frame_nr: u64,
     started_at_epoch_ms: u128,
     started_at: Instant,
     started_process_cpu_time_ns: Option<u64>,
@@ -710,14 +856,30 @@ struct ActiveInputSequence {
     next_sample: u32,
     samples: u32,
     duration_ms: u64,
+    required_group: CoordinatedPresentationGroup,
     origin_generation: u64,
     origin_durable_commits: u64,
+    origin_render_intent_revision: u64,
+    origin_render_intent_samples: u64,
+    origin_render_intent_coalesced_samples: u64,
+    origin_render_intent_finished_gestures: u64,
+    dispatched_samples: u32,
+    distinct_dispatch_updates: u32,
+    first_dispatch_elapsed_ns: Option<u64>,
+    last_dispatch_elapsed_ns: Option<u64>,
+    last_evaluated_frame_nr: Option<u64>,
+    last_dispatch_frame_nr: Option<u64>,
+    maximum_dispatch_interval_ns: u64,
+    maximum_dispatch_lateness_ns: u64,
+    nonmonotonic_dispatches: u32,
+    same_update_dispatches: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputSequenceStep {
     Wait(Duration),
     Dispatch(u32),
+    Finish,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -866,21 +1028,31 @@ impl ProductAutomationController {
         let Some(mut automation) = app.product_automation.take() else {
             return;
         };
+        // This remains stable across egui multipass re-entry and advances
+        // exactly once per Context::run.
+        automation.automation_frame_nr = ctx.cumulative_frame_nr();
         let status = match automation.publish_progress_if_due() {
             Ok(()) => automation.step(app, ctx),
             Err(reason) => AutomationStatus::Failed(reason),
         };
         // Automation submits through the same one-pending/one-latest native
-        // pick queue as interactive UI input. The normal pump ran before the
-        // automation command in this frame, so pump once more to submit a new
-        // request without waiting an extra frame or introducing another path.
+        // pick queue as interactive UI input. Pump a newly queued request now
+        // so the same UI turn can observe it without introducing another path;
+        // the normal post-UI pump is then an idle second observation.
         app.pump_viewer_pick(ctx);
         match status {
             AutomationStatus::Continue => {
                 ctx.request_repaint();
             }
             AutomationStatus::Waiting { repaint_after } => {
-                if let Some(delay) = automation.progress_repaint_after(repaint_after) {
+                if automation.active_input_sequence.is_some() {
+                    // Real pointer input wakes the event loop independently.
+                    // Model that fixed 60 Hz source with an absolute deadline
+                    // instead of saturating eframe's FIFO presentation loop.
+                    if let Some(remaining) = repaint_after {
+                        ctx.request_repaint_after(egui_deadline_repaint_delay(ctx, remaining));
+                    }
+                } else if let Some(delay) = automation.progress_repaint_after(repaint_after) {
                     ctx.request_repaint_after(delay);
                 }
             }
@@ -891,6 +1063,7 @@ impl ProductAutomationController {
                 }
             },
             AutomationStatus::Failed(mut reason) => {
+                automation.close_active_input_sequence_window(app);
                 if let Err(progress_reason) = automation.publish_progress_closeout() {
                     reason.push_str("; ");
                     reason.push_str(&progress_reason);
@@ -928,6 +1101,7 @@ impl ProductAutomationController {
             active_wait_started: None,
             sleep_frames_remaining: None,
             active_input_sequence: None,
+            automation_frame_nr: 0,
             started_at_epoch_ms: epoch_ms(),
             started_at: Instant::now(),
             started_process_cpu_time_ns: checked_process_cpu_time_ns(),
@@ -997,27 +1171,88 @@ impl ProductAutomationController {
         self.script.requires_gpu_timing()
     }
 
+    fn close_active_input_sequence_window(&mut self, app: &mut MiranteWorkbenchApp) {
+        if self.active_input_sequence.take().is_none() {
+            return;
+        }
+        let now_ns = app.display_instrumentation_now_ns();
+        app.render_coordination
+            .end_active_publication_window(now_ns);
+    }
+
     fn input_sequence_step(
         &mut self,
-        app: &MiranteWorkbenchApp,
+        app: &mut MiranteWorkbenchApp,
         samples: u32,
         duration_ms: u64,
+        required_group: CoordinatedPresentationGroup,
     ) -> InputSequenceStep {
-        let sequence = self.active_input_sequence.get_or_insert_with(|| {
+        if self.active_input_sequence.is_none() {
             let generation = app.render_coordination.display_generation();
-            ActiveInputSequence {
+            let mailbox = app.render_intent_mailbox.snapshot();
+            let now_ns = app.display_instrumentation_now_ns();
+            app.render_coordination
+                .begin_active_publication_window(now_ns, required_group);
+            self.active_input_sequence = Some(ActiveInputSequence {
                 command_index: self.command_index,
                 started_at: Instant::now(),
                 next_sample: 0,
                 samples,
                 duration_ms,
+                required_group,
                 origin_generation: generation.input_generation,
                 origin_durable_commits: generation.durable_gesture_commits,
-            }
-        });
+                origin_render_intent_revision: mailbox.latest_revision.get(),
+                origin_render_intent_samples: mailbox.raw_samples,
+                origin_render_intent_coalesced_samples: mailbox.coalesced_samples,
+                origin_render_intent_finished_gestures: mailbox.finished_gestures,
+                dispatched_samples: 0,
+                distinct_dispatch_updates: 0,
+                first_dispatch_elapsed_ns: None,
+                last_dispatch_elapsed_ns: None,
+                last_evaluated_frame_nr: None,
+                last_dispatch_frame_nr: None,
+                maximum_dispatch_interval_ns: 0,
+                maximum_dispatch_lateness_ns: 0,
+                nonmonotonic_dispatches: 0,
+                same_update_dispatches: 0,
+            });
+        }
+        let frame_nr = self.automation_frame_nr;
+        let sequence = self
+            .active_input_sequence
+            .as_mut()
+            .expect("an initialized input sequence retains active state");
         debug_assert_eq!(sequence.command_index, self.command_index);
         debug_assert_eq!(sequence.samples, samples);
         debug_assert_eq!(sequence.duration_ms, duration_ms);
+        debug_assert_eq!(sequence.required_group, required_group);
+        if sequence.last_evaluated_frame_nr == Some(frame_nr) {
+            return InputSequenceStep::Wait(Duration::ZERO);
+        }
+        sequence.last_evaluated_frame_nr = Some(frame_nr);
+        if sequence.next_sample == sequence.samples {
+            if sequence.last_dispatch_frame_nr == Some(frame_nr) {
+                return InputSequenceStep::Wait(Duration::ZERO);
+            }
+            let generation = app.render_coordination.display_generation();
+            let mailbox = app.render_intent_mailbox.snapshot();
+            let last_sample_is_current = input_sequence_latest_pixels_are_current(
+                app,
+                required_group,
+                mailbox.three_d_revision,
+                mailbox.linked_2d_revision,
+            ) || app
+                .render_coordination
+                .coordinated_publication_diagnostics()
+                .current_presentation_generation()
+                == Some(generation.input_generation);
+            return if last_sample_is_current {
+                InputSequenceStep::Finish
+            } else {
+                InputSequenceStep::Wait(Duration::from_millis(1))
+            };
+        }
         let target_ns =
             sequence_sample_target_ns(sequence.next_sample, sequence.samples, sequence.duration_ms);
         let elapsed_ns =
@@ -1025,15 +1260,34 @@ impl ProductAutomationController {
         if elapsed_ns < target_ns {
             InputSequenceStep::Wait(Duration::from_nanos(target_ns - elapsed_ns))
         } else {
-            InputSequenceStep::Dispatch(sequence.next_sample)
+            let sample = sequence.next_sample;
+            sequence.dispatched_samples = sequence.dispatched_samples.saturating_add(1);
+            sequence.first_dispatch_elapsed_ns.get_or_insert(elapsed_ns);
+            if let Some(previous_elapsed_ns) = sequence.last_dispatch_elapsed_ns {
+                if elapsed_ns < previous_elapsed_ns {
+                    sequence.nonmonotonic_dispatches =
+                        sequence.nonmonotonic_dispatches.saturating_add(1);
+                }
+                sequence.maximum_dispatch_interval_ns = sequence
+                    .maximum_dispatch_interval_ns
+                    .max(elapsed_ns.saturating_sub(previous_elapsed_ns));
+            }
+            if sequence.last_dispatch_frame_nr != Some(frame_nr) {
+                sequence.distinct_dispatch_updates =
+                    sequence.distinct_dispatch_updates.saturating_add(1);
+            } else {
+                sequence.same_update_dispatches = sequence.same_update_dispatches.saturating_add(1);
+            }
+            sequence.last_dispatch_elapsed_ns = Some(elapsed_ns);
+            sequence.last_dispatch_frame_nr = Some(frame_nr);
+            sequence.maximum_dispatch_lateness_ns = sequence
+                .maximum_dispatch_lateness_ns
+                .max(elapsed_ns.saturating_sub(target_ns));
+            InputSequenceStep::Dispatch(sample)
         }
     }
 
-    fn complete_input_sequence_sample(
-        &mut self,
-        app: &MiranteWorkbenchApp,
-        workload: Value,
-    ) -> CommandProgress {
+    fn complete_input_sequence_sample(&mut self) -> CommandProgress {
         let sequence = self
             .active_input_sequence
             .as_mut()
@@ -1051,25 +1305,64 @@ impl ProductAutomationController {
                 target_ns.saturating_sub(elapsed_ns),
             )));
         }
+        CommandProgress::PassiveWaiting(Some(Duration::ZERO))
+    }
+
+    fn complete_input_sequence_finish(
+        &mut self,
+        app: &mut MiranteWorkbenchApp,
+        workload: Value,
+    ) -> CommandProgress {
         let sequence = self
             .active_input_sequence
             .take()
             .expect("the completed automation sequence retains its state");
+        let now_ns = app.display_instrumentation_now_ns();
+        app.render_coordination
+            .end_active_publication_window(now_ns);
         let generation = app.render_coordination.display_generation();
+        let mailbox = app.render_intent_mailbox.snapshot();
+        let actual_duration_ns =
+            u64::try_from(sequence.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let scheduled_span_ns = sequence_sample_target_ns(
+            sequence.samples.saturating_sub(1),
+            sequence.samples,
+            sequence.duration_ms,
+        );
+        let dispatch_span_ns = sequence
+            .last_dispatch_elapsed_ns
+            .zip(sequence.first_dispatch_elapsed_ns)
+            .map(|(last, first)| last.saturating_sub(first));
         CommandProgress::Done(json!({
             "workload": workload,
             "samples": sequence.samples,
             "requested_duration_ms": sequence.duration_ms,
-            "actual_duration_ns": u64::try_from(sequence.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            "actual_duration_ns": actual_duration_ns,
             "input_evidence": {
-                "automation_level": "E1_semantic_application_commands",
+                "automation_level": "transient_render_intent_mailbox",
                 "os_input_injected": false,
                 "os_input_claimed": false,
-                "time_distributed_across_app_updates": true,
+                "dispatch_timing": {
+                    "clock": "std_instant_monotonic",
+                    "scheduled_span_ns": scheduled_span_ns,
+                    "dispatched_samples": sequence.dispatched_samples,
+                    "distinct_app_updates": sequence.distinct_dispatch_updates,
+                    "first_dispatch_elapsed_ns": sequence.first_dispatch_elapsed_ns,
+                    "last_dispatch_elapsed_ns": sequence.last_dispatch_elapsed_ns,
+                    "dispatch_span_ns": dispatch_span_ns,
+                    "maximum_dispatch_interval_ns": sequence.maximum_dispatch_interval_ns,
+                    "maximum_dispatch_lateness_ns": sequence.maximum_dispatch_lateness_ns,
+                    "nonmonotonic_dispatches": sequence.nonmonotonic_dispatches,
+                    "same_update_dispatches": sequence.same_update_dispatches,
+                },
             },
             "observed_counter_delta": {
                 "input_generations": generation.input_generation.saturating_sub(sequence.origin_generation),
                 "durable_gesture_commits": generation.durable_gesture_commits.saturating_sub(sequence.origin_durable_commits),
+                "render_intent_revisions": mailbox.latest_revision.get().saturating_sub(sequence.origin_render_intent_revision),
+                "render_intent_samples": mailbox.raw_samples.saturating_sub(sequence.origin_render_intent_samples),
+                "render_intent_coalesced_samples": mailbox.coalesced_samples.saturating_sub(sequence.origin_render_intent_coalesced_samples),
+                "render_intent_finished_gestures": mailbox.finished_gestures.saturating_sub(sequence.origin_render_intent_finished_gestures),
             },
         }))
     }
@@ -1114,9 +1407,21 @@ impl ProductAutomationController {
             .active_input_sequence
             .is_some_and(|sequence| sequence.command_index != command_index)
         {
-            self.active_input_sequence = None;
+            self.close_active_input_sequence_window(app);
         }
         let command_started = Instant::now();
+        if let Some(Err(error)) = app.native_presentation.product_pipeline_readiness() {
+            let mut reason = format!("GPU renderer initialization failed: {error}");
+            if let Some(cancellation) = self.cancel_active_dataset_switch(app) {
+                reason.push_str(&format!("; dataset_switch_cancellation={cancellation}"));
+            }
+            return self.record_fatal_command_failure(
+                command_index,
+                command.name(),
+                command_started.elapsed(),
+                reason,
+            );
+        }
         // Validation readback is asynchronous renderer work. Drive it before
         // evaluating waits so `runtime_idle` can settle even when the next
         // script command, rather than another render, is the first consumer.
@@ -2002,10 +2307,11 @@ impl ProductAutomationController {
                     ));
                 }
                 self.render_target_override = Some(viewport);
-                if set_render_viewport(&mut app.render_coordination, viewport) {
-                    app.render_coordination.request_refresh();
-                    ctx.request_repaint();
-                }
+                // The viewer widgets publish this override through the same
+                // coalesced viewport-observation boundary as native geometry.
+                // That boundary owns both the coordination mutation and its
+                // single new render frame identity.
+                ctx.request_repaint();
                 Ok(CommandProgress::Done(json!({
                     "requested_render_target_pixels": {
                         "width": viewport.width_pixels(),
@@ -2395,32 +2701,40 @@ impl ProductAutomationController {
                 duration_ms,
                 yaw_points_per_sample,
                 pitch_points_per_sample,
-            } => match self.input_sequence_step(app, *samples, *duration_ms) {
+            } => match self.input_sequence_step(
+                app,
+                *samples,
+                *duration_ms,
+                CoordinatedPresentationGroup::ThreeD,
+            ) {
                 InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
-                InputSequenceStep::Dispatch(sample_index) => {
+                InputSequenceStep::Dispatch(_) => {
                     let viewport_side = 800.0;
                     let start = [viewport_side * 0.5, viewport_side * 0.5];
                     let current = [
                         start[0] + *yaw_points_per_sample,
                         start[1] + *pitch_points_per_sample,
                     ];
-                    let snapshot = app.application.snapshot();
                     let camera = orbit_camera(
-                        *application_view(&snapshot).camera(),
+                        effective_interaction_camera(app),
                         start,
                         current,
                         [viewport_side, viewport_side],
                     );
-                    dispatch_effective_interaction_sample(
+                    dispatch_render_intent_sample(
                         app,
                         ctx,
-                        ApplicationCommand::SetCamera(camera),
+                        RenderIntentSample::camera(RenderGestureKind::Drag, camera),
                     )?;
-                    Ok(self.complete_input_sequence_sample(
+                    Ok(self.complete_input_sequence_sample())
+                }
+                InputSequenceStep::Finish => {
+                    finish_render_intent(app, ctx, RenderIntentTarget::ThreeD)?;
+                    Ok(self.complete_input_sequence_finish(
                         app,
                         json!({
                             "kind": "camera_orbit",
-                            "last_sample_index": sample_index,
+                            "last_sample_index": samples.saturating_sub(1),
                             "yaw_points_per_sample": yaw_points_per_sample,
                             "pitch_points_per_sample": pitch_points_per_sample,
                         }),
@@ -2432,24 +2746,32 @@ impl ProductAutomationController {
                 duration_ms,
                 x_points_per_sample,
                 y_points_per_sample,
-            } => match self.input_sequence_step(app, *samples, *duration_ms) {
+            } => match self.input_sequence_step(
+                app,
+                *samples,
+                *duration_ms,
+                CoordinatedPresentationGroup::ThreeD,
+            ) {
                 InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
-                InputSequenceStep::Dispatch(sample_index) => {
-                    let snapshot = app.application.snapshot();
+                InputSequenceStep::Dispatch(_) => {
                     let camera = pan_camera(
-                        *application_view(&snapshot).camera(),
+                        effective_interaction_camera(app),
                         [*x_points_per_sample, *y_points_per_sample],
                     );
-                    dispatch_effective_interaction_sample(
+                    dispatch_render_intent_sample(
                         app,
                         ctx,
-                        ApplicationCommand::SetCamera(camera),
+                        RenderIntentSample::camera(RenderGestureKind::Drag, camera),
                     )?;
-                    Ok(self.complete_input_sequence_sample(
+                    Ok(self.complete_input_sequence_sample())
+                }
+                InputSequenceStep::Finish => {
+                    finish_render_intent(app, ctx, RenderIntentTarget::ThreeD)?;
+                    Ok(self.complete_input_sequence_finish(
                         app,
                         json!({
                             "kind": "camera_pan",
-                            "last_sample_index": sample_index,
+                            "last_sample_index": samples.saturating_sub(1),
                             "x_points_per_sample": x_points_per_sample,
                             "y_points_per_sample": y_points_per_sample,
                         }),
@@ -2460,24 +2782,32 @@ impl ProductAutomationController {
                 samples,
                 duration_ms,
                 scroll_y_points_per_sample,
-            } => match self.input_sequence_step(app, *samples, *duration_ms) {
+            } => match self.input_sequence_step(
+                app,
+                *samples,
+                *duration_ms,
+                CoordinatedPresentationGroup::ThreeD,
+            ) {
                 InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
-                InputSequenceStep::Dispatch(sample_index) => {
-                    let snapshot = app.application.snapshot();
+                InputSequenceStep::Dispatch(_) => {
                     let camera = zoom_camera(
-                        *application_view(&snapshot).camera(),
+                        effective_interaction_camera(app),
                         *scroll_y_points_per_sample,
                     );
-                    dispatch_effective_interaction_sample(
+                    dispatch_render_intent_sample(
                         app,
                         ctx,
-                        ApplicationCommand::SetCamera(camera),
+                        RenderIntentSample::camera(RenderGestureKind::Scroll, camera),
                     )?;
-                    Ok(self.complete_input_sequence_sample(
+                    Ok(self.complete_input_sequence_sample())
+                }
+                InputSequenceStep::Finish => {
+                    finish_render_intent(app, ctx, RenderIntentTarget::ThreeD)?;
+                    Ok(self.complete_input_sequence_finish(
                         app,
                         json!({
                             "kind": "camera_zoom",
-                            "last_sample_index": sample_index,
+                            "last_sample_index": samples.saturating_sub(1),
                             "scroll_y_points_per_sample": scroll_y_points_per_sample,
                         }),
                     ))
@@ -2536,15 +2866,22 @@ impl ProductAutomationController {
                 x_points_per_sample,
                 y_points_per_sample,
                 radians_per_point,
-            } => match self.input_sequence_step(app, *samples, *duration_ms) {
+            } => match self.input_sequence_step(
+                app,
+                *samples,
+                *duration_ms,
+                CoordinatedPresentationGroup::Linked2d,
+            ) {
                 InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
-                InputSequenceStep::Dispatch(sample_index) => {
+                InputSequenceStep::Dispatch(_) => {
                     let snapshot = app.application.snapshot();
                     let view = application_view(&snapshot);
                     if view.layout() != ViewerLayout::FourPanel {
                         return Err("cross-section sequence requires four-panel layout".to_owned());
                     }
-                    let mut state = CrossSectionViewState::from_canonical(*view.cross_section());
+                    let mut state = CrossSectionViewState::from_canonical(
+                        effective_interaction_cross_section(app),
+                    );
                     state.rotate_oblique_by_panel_drag(
                         interaction_cross_section_panel(*panel),
                         *x_points_per_sample,
@@ -2554,27 +2891,30 @@ impl ProductAutomationController {
                     let cross_section = state
                         .into_canonical()
                         .map_err(|error| format!("cross-section rotation was rejected: {error}"))?;
-                    dispatch_application_command(
+                    let application_panel = application_cross_section_panel(*panel);
+                    dispatch_render_intent_sample(
                         app,
                         ctx,
-                        ApplicationCommand::SetActiveCrossSectionPanel(Some(
-                            application_cross_section_panel(*panel),
-                        )),
-                    )?;
-                    dispatch_effective_interaction_sample(
-                        app,
-                        ctx,
-                        ApplicationCommand::SetLayout {
-                            layout: ViewerLayout::FourPanel,
+                        RenderIntentSample::cross_section(
+                            application_panel,
+                            RenderGestureKind::Drag,
                             cross_section,
-                        },
+                        ),
                     )?;
-                    Ok(self.complete_input_sequence_sample(
+                    Ok(self.complete_input_sequence_sample())
+                }
+                InputSequenceStep::Finish => {
+                    finish_render_intent(
+                        app,
+                        ctx,
+                        RenderIntentTarget::CrossSection(application_cross_section_panel(*panel)),
+                    )?;
+                    Ok(self.complete_input_sequence_finish(
                         app,
                         json!({
                             "kind": "cross_section_rotate",
                             "panel": PanelId::from(*panel).label(),
-                            "last_sample_index": sample_index,
+                            "last_sample_index": samples.saturating_sub(1),
                         }),
                     ))
                 }
@@ -2585,15 +2925,22 @@ impl ProductAutomationController {
                 duration_ms,
                 x_points_per_sample,
                 y_points_per_sample,
-            } => match self.input_sequence_step(app, *samples, *duration_ms) {
+            } => match self.input_sequence_step(
+                app,
+                *samples,
+                *duration_ms,
+                CoordinatedPresentationGroup::Linked2d,
+            ) {
                 InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
-                InputSequenceStep::Dispatch(sample_index) => {
+                InputSequenceStep::Dispatch(_) => {
                     let snapshot = app.application.snapshot();
                     let view = application_view(&snapshot);
                     if view.layout() != ViewerLayout::FourPanel {
                         return Err("cross-section sequence requires four-panel layout".to_owned());
                     }
-                    let mut state = CrossSectionViewState::from_canonical(*view.cross_section());
+                    let mut state = CrossSectionViewState::from_canonical(
+                        effective_interaction_cross_section(app),
+                    );
                     state.pan_by_panel_points(
                         interaction_cross_section_panel(*panel),
                         *x_points_per_sample,
@@ -2602,27 +2949,30 @@ impl ProductAutomationController {
                     let cross_section = state
                         .into_canonical()
                         .map_err(|error| format!("cross-section pan was rejected: {error}"))?;
-                    dispatch_application_command(
+                    let application_panel = application_cross_section_panel(*panel);
+                    dispatch_render_intent_sample(
                         app,
                         ctx,
-                        ApplicationCommand::SetActiveCrossSectionPanel(Some(
-                            application_cross_section_panel(*panel),
-                        )),
-                    )?;
-                    dispatch_effective_interaction_sample(
-                        app,
-                        ctx,
-                        ApplicationCommand::SetLayout {
-                            layout: ViewerLayout::FourPanel,
+                        RenderIntentSample::cross_section(
+                            application_panel,
+                            RenderGestureKind::Drag,
                             cross_section,
-                        },
+                        ),
                     )?;
-                    Ok(self.complete_input_sequence_sample(
+                    Ok(self.complete_input_sequence_sample())
+                }
+                InputSequenceStep::Finish => {
+                    finish_render_intent(
+                        app,
+                        ctx,
+                        RenderIntentTarget::CrossSection(application_cross_section_panel(*panel)),
+                    )?;
+                    Ok(self.complete_input_sequence_finish(
                         app,
                         json!({
                             "kind": "cross_section_pan",
                             "panel": PanelId::from(*panel).label(),
-                            "last_sample_index": sample_index,
+                            "last_sample_index": samples.saturating_sub(1),
                         }),
                     ))
                 }
@@ -2634,9 +2984,14 @@ impl ProductAutomationController {
                 x_fraction,
                 y_fraction,
                 factor_per_sample,
-            } => match self.input_sequence_step(app, *samples, *duration_ms) {
+            } => match self.input_sequence_step(
+                app,
+                *samples,
+                *duration_ms,
+                CoordinatedPresentationGroup::Linked2d,
+            ) {
                 InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
-                InputSequenceStep::Dispatch(sample_index) => {
+                InputSequenceStep::Dispatch(_) => {
                     let snapshot = app.application.snapshot();
                     let view = application_view(&snapshot);
                     if view.layout() != ViewerLayout::FourPanel {
@@ -2650,7 +3005,9 @@ impl ProductAutomationController {
                         .ok_or_else(|| {
                             format!("{} presentation viewport is unavailable", panel_id.label())
                         })?;
-                    let mut state = CrossSectionViewState::from_canonical(*view.cross_section());
+                    let mut state = CrossSectionViewState::from_canonical(
+                        effective_interaction_cross_section(app),
+                    );
                     state.zoom_around_panel_point(
                         interaction_cross_section_panel(*panel),
                         viewport,
@@ -2661,27 +3018,30 @@ impl ProductAutomationController {
                     let cross_section = state
                         .into_canonical()
                         .map_err(|error| format!("cross-section zoom was rejected: {error}"))?;
-                    dispatch_application_command(
+                    let application_panel = application_cross_section_panel(*panel);
+                    dispatch_render_intent_sample(
                         app,
                         ctx,
-                        ApplicationCommand::SetActiveCrossSectionPanel(Some(
-                            application_cross_section_panel(*panel),
-                        )),
-                    )?;
-                    dispatch_effective_interaction_sample(
-                        app,
-                        ctx,
-                        ApplicationCommand::SetLayout {
-                            layout: ViewerLayout::FourPanel,
+                        RenderIntentSample::cross_section(
+                            application_panel,
+                            RenderGestureKind::Scroll,
                             cross_section,
-                        },
+                        ),
                     )?;
-                    Ok(self.complete_input_sequence_sample(
+                    Ok(self.complete_input_sequence_sample())
+                }
+                InputSequenceStep::Finish => {
+                    finish_render_intent(
+                        app,
+                        ctx,
+                        RenderIntentTarget::CrossSection(application_cross_section_panel(*panel)),
+                    )?;
+                    Ok(self.complete_input_sequence_finish(
                         app,
                         json!({
                             "kind": "cross_section_zoom",
-                            "panel": panel_id.label(),
-                            "last_sample_index": sample_index,
+                            "panel": PanelId::from(*panel).label(),
+                            "last_sample_index": samples.saturating_sub(1),
                         }),
                     ))
                 }
@@ -2691,15 +3051,22 @@ impl ProductAutomationController {
                 samples,
                 duration_ms,
                 distance_world_per_sample,
-            } => match self.input_sequence_step(app, *samples, *duration_ms) {
+            } => match self.input_sequence_step(
+                app,
+                *samples,
+                *duration_ms,
+                CoordinatedPresentationGroup::Linked2d,
+            ) {
                 InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
-                InputSequenceStep::Dispatch(sample_index) => {
+                InputSequenceStep::Dispatch(_) => {
                     let snapshot = app.application.snapshot();
                     let view = application_view(&snapshot);
                     if view.layout() != ViewerLayout::FourPanel {
                         return Err("cross-section sequence requires four-panel layout".to_owned());
                     }
-                    let mut state = CrossSectionViewState::from_canonical(*view.cross_section());
+                    let mut state = CrossSectionViewState::from_canonical(
+                        effective_interaction_cross_section(app),
+                    );
                     state.slice_by_world_distance(
                         interaction_cross_section_panel(*panel),
                         *distance_world_per_sample,
@@ -2707,27 +3074,30 @@ impl ProductAutomationController {
                     let cross_section = state
                         .into_canonical()
                         .map_err(|error| format!("cross-section slice was rejected: {error}"))?;
-                    dispatch_application_command(
+                    let application_panel = application_cross_section_panel(*panel);
+                    dispatch_render_intent_sample(
                         app,
                         ctx,
-                        ApplicationCommand::SetActiveCrossSectionPanel(Some(
-                            application_cross_section_panel(*panel),
-                        )),
-                    )?;
-                    dispatch_effective_interaction_sample(
-                        app,
-                        ctx,
-                        ApplicationCommand::SetLayout {
-                            layout: ViewerLayout::FourPanel,
+                        RenderIntentSample::cross_section(
+                            application_panel,
+                            RenderGestureKind::Scroll,
                             cross_section,
-                        },
+                        ),
                     )?;
-                    Ok(self.complete_input_sequence_sample(
+                    Ok(self.complete_input_sequence_sample())
+                }
+                InputSequenceStep::Finish => {
+                    finish_render_intent(
+                        app,
+                        ctx,
+                        RenderIntentTarget::CrossSection(application_cross_section_panel(*panel)),
+                    )?;
+                    Ok(self.complete_input_sequence_finish(
                         app,
                         json!({
                             "kind": "cross_section_slice",
                             "panel": PanelId::from(*panel).label(),
-                            "last_sample_index": sample_index,
+                            "last_sample_index": samples.saturating_sub(1),
                         }),
                     ))
                 }
@@ -2762,18 +3132,19 @@ impl ProductAutomationController {
                 self.diagnostics.push(diagnostics.clone());
                 Ok(CommandProgress::Done(diagnostics))
             }
-            ProductAutomationCommand::CaptureScreenshot { name } => {
-                if !product_presentations_ready(app, &[PanelId::ThreeD])? {
+            ProductAutomationCommand::CaptureScreenshot { target, name } => {
+                let panel = PanelId::from(*target);
+                if !product_presentations_ready(app, &[panel])? {
                     let started = *self.active_wait_started.get_or_insert_with(Instant::now);
                     if started.elapsed() >= AUTOMATION_CAPTURE_TIMEOUT {
                         return Err(format!(
                             "timed out waiting for current GPU validation capture: {}",
-                            product_capture_state(app, &[PanelId::ThreeD])
+                            product_capture_state(app, &[panel])
                         ));
                     }
                     return Ok(CommandProgress::Waiting);
                 }
-                let artifact = self.capture_viewport_artifact(app, name.as_deref())?;
+                let artifact = self.capture_viewport_artifact(app, *target, name.as_deref())?;
                 if artifact.pixel_stats.is_blank() {
                     return Err(format!(
                         "viewport capture {} is blank: nonzero_rgb_pixels={}, max_rgb={}",
@@ -2807,9 +3178,14 @@ impl ProductAutomationController {
                 })))
             }
             ProductAutomationCommand::SleepFrames { frames } => {
+                let started = *self.active_wait_started.get_or_insert_with(Instant::now);
                 let remaining = self.sleep_frames_remaining.get_or_insert(*frames);
                 if *remaining == 0 {
-                    return Ok(CommandProgress::Done(json!({ "frames": frames })));
+                    return Ok(CommandProgress::Done(json!({
+                        "frames": frames,
+                        "monotonic_elapsed_ns": u64::try_from(started.elapsed().as_nanos())
+                            .unwrap_or(u64::MAX),
+                    })));
                 }
                 *remaining -= 1;
                 Ok(CommandProgress::Waiting)
@@ -2824,6 +3200,7 @@ impl ProductAutomationController {
     fn capture_viewport_artifact(
         &self,
         app: &mut MiranteWorkbenchApp,
+        target: ProductAutomationPresentationTarget,
         requested_name: Option<&str>,
     ) -> Result<ProductAutomationArtifact, String> {
         let artifact_dir = self.artifact_dir();
@@ -2838,7 +3215,15 @@ impl ProductAutomationController {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| format!("viewport-{:03}", self.command_index));
         let path = artifact_dir.join(format!("{label}.ppm"));
-        let (capture_source, image) = capture_color_image(app)?;
+        let panel = PanelId::from(target);
+        let surface = app.render_coordination.surface(panel.presentation_slot());
+        let frame_identity = surface
+            .presented_frame()
+            .ok_or_else(|| format!("{} has no presented frame", panel.label()))?
+            .frame()
+            .get();
+        let surface_generation = surface.generation();
+        let (capture_source, image) = capture_color_image(app, panel)?;
         let pixel_stats = ProductAutomationImageStats::from_color_image(&image);
         write_color_image_ppm(&path, &image)
             .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
@@ -2849,6 +3234,9 @@ impl ProductAutomationController {
             width: image.size[0],
             height: image.size[1],
             command_index: self.command_index,
+            target: target.name(),
+            frame_identity,
+            surface_generation,
             capture_source,
             pixel_stats,
         })
@@ -2880,6 +3268,16 @@ impl ProductAutomationController {
             return Ok(CommandProgress::Done(automation_pick_json(
                 request, &hit, x_fraction, y_fraction,
             )));
+        }
+        match app.native_presentation.pick_pipeline_is_ready() {
+            Ok(true) => {}
+            Ok(false) => return Ok(CommandProgress::Waiting),
+            Err(error) => {
+                return Err(format!(
+                    "{} cannot start because GPU renderer initialization failed: {error}",
+                    automation_pick_purpose_name(purpose)
+                ));
+            }
         }
         let started = *self.active_wait_started.get_or_insert_with(Instant::now);
         if started.elapsed() > AUTOMATION_PICK_TIMEOUT {
@@ -2923,9 +3321,15 @@ impl ProductAutomationController {
             ProductAutomationWaitCondition::RuntimeIdle => {
                 let progressive_render_work =
                     crate::workbench_playback_runtime::progressive_render_submission_work(
-                        &app.dataset,
                         &app.native_presentation,
                     );
+                let demand_currentness = app.visible_demand_plan_currentness();
+                let exact_visible_demand = demand_currentness.current_3d
+                    && match application_view(snapshot).layout() {
+                        ViewerLayout::Single3d => true,
+                        ViewerLayout::FourPanel => demand_currentness.cross_sections,
+                    };
+                let base = RenderIntentBase::from_snapshot(snapshot);
                 automation_runtime_is_idle(
                     crate::workbench_playback_runtime::background_work_active(
                         snapshot,
@@ -2935,9 +3339,11 @@ impl ProductAutomationController {
                         &app.native_presentation,
                         progressive_render_work.any_required,
                     ),
-                    app.camera_demand_planner.has_outstanding_request(),
+                    app.dataset.visible_demand_plan_outstanding(),
                     app.pending_visible_demand_plan.is_some(),
-                )
+                ) && app.render_intent_mailbox.active_target(base).is_none()
+                    && app.resident_cross_section_coverage.is_none()
+                    && exact_visible_demand
             }
             ProductAutomationWaitCondition::FrameFreshnessCurrent => {
                 frame_freshness_is_current(&app.render_coordination.frame_fidelity)
@@ -3001,6 +3407,23 @@ impl ProductAutomationController {
         }
     }
 
+    fn assert_latest_probe_pick_evidence(
+        &self,
+        expected_policy: ProductAutomationPickPolicy,
+    ) -> Result<(), String> {
+        let event = self
+            .events
+            .last()
+            .ok_or_else(|| "pick evidence assertion has no preceding command event".to_owned())?;
+        if event.command != "probe_hover" || event.status != "passed" {
+            return Err(format!(
+                "pick evidence assertion must immediately follow a passed probe_hover command, found {} ({})",
+                event.command, event.status
+            ));
+        }
+        assert_native_pick_evidence(&event.details, expected_policy)
+    }
+
     fn assert_condition(
         &self,
         app: &MiranteWorkbenchApp,
@@ -3009,14 +3432,17 @@ impl ProductAutomationController {
         let snapshot = app.application.snapshot();
         let view = application_view(&snapshot);
         match condition {
-            ProductAutomationAssertCondition::NonblankFrame => {
-                let (source, stats) = current_display_image_stats(app)?;
+            ProductAutomationAssertCondition::NonblankPanel { target } => {
+                let panel = PanelId::from(*target);
+                let (source, stats) = current_display_image_stats(app, panel)?;
                 if !stats.is_blank() {
                     Ok(())
                 } else {
                     Err(format!(
-                        "current product frame is blank from {source}: nonzero_rgb_pixels={}, max_rgb={}",
-                        stats.nonzero_rgb_pixels, stats.max_rgb
+                        "current {} product frame is blank from {source}: nonzero_rgb_pixels={}, max_rgb={}",
+                        panel.label(),
+                        stats.nonzero_rgb_pixels,
+                        stats.max_rgb
                     ))
                 }
             }
@@ -3037,20 +3463,25 @@ impl ProductAutomationController {
             ProductAutomationAssertCondition::FrameFidelity {
                 scale_level,
                 complete,
+                exact,
             } => {
                 let fidelity = &app.render_coordination.frame_fidelity;
                 let scale_matches = fidelity.displayed_scale_level == Some(*scale_level)
                     && fidelity.target_scale_level == *scale_level;
-                let completeness_matches = !*complete
-                    || matches!(
-                        fidelity.completeness,
-                        FrameCompleteness::Exact | FrameCompleteness::Complete
-                    );
+                let completeness_matches = if *exact {
+                    fidelity.completeness == FrameCompleteness::Exact
+                } else {
+                    !*complete
+                        || matches!(
+                            fidelity.completeness,
+                            FrameCompleteness::Exact | FrameCompleteness::Complete
+                        )
+                };
                 if scale_matches && completeness_matches {
                     Ok(())
                 } else {
                     Err(format!(
-                        "frame fidelity mismatch: displayed={:?}, target=s{}, completeness={:?}",
+                        "frame fidelity mismatch: displayed={:?}, target=s{}, completeness={:?}, exact_required={exact}",
                         fidelity.displayed_scale_level,
                         fidelity.target_scale_level,
                         fidelity.completeness,
@@ -3072,6 +3503,26 @@ impl ProductAutomationController {
                         actual, expected
                     ))
                 }
+            }
+            ProductAutomationAssertCondition::LayerRenderMode { layer_index, mode } => {
+                let expected: RenderMode = (*mode).into();
+                let actual = view
+                    .layers()
+                    .get(*layer_index)
+                    .ok_or_else(|| format!("layer index {layer_index} is out of range"))?
+                    .render_state()
+                    .mode();
+                if actual == expected {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "layer {layer_index} render mode is {:?}, expected {:?}",
+                        actual, expected
+                    ))
+                }
+            }
+            ProductAutomationAssertCondition::PickEvidence { policy } => {
+                self.assert_latest_probe_pick_evidence(*policy)
             }
             ProductAutomationAssertCondition::Projection { projection } => {
                 let expected: Projection = (*projection).into();
@@ -3456,6 +3907,32 @@ impl ProductAutomationController {
             .catalog()
             .layer(view.active_layer())
             .expect("application view closes over the dataset catalog");
+        let layer_states = view
+            .layers()
+            .iter()
+            .enumerate()
+            .map(|(order_index, layer)| {
+                let transfer = layer.transfer();
+                json!({
+                    "order_index": order_index,
+                    "logical_layer": layer.layer_key().ordinal(),
+                    "active": layer.layer_key() == view.active_layer(),
+                    "visible": layer.visible(),
+                    "render_mode": format!("{:?}", layer.render_state().mode()),
+                    "sampling_policy": format!("{:?}", layer.render_state().sampling_policy()),
+                    "transfer": {
+                        "window": {
+                            "low": transfer.window().low(),
+                            "high": transfer.window().high(),
+                        },
+                        "color_rgb": transfer.color().rgb(),
+                        "opacity": transfer.opacity().get(),
+                        "gamma": transfer.curve().gamma_value(),
+                        "invert": transfer.invert(),
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
         let typed_render_error = app
             .render_coordination
             .frame_fidelity
@@ -3491,11 +3968,20 @@ impl ProductAutomationController {
             },
             "render": {
                 "active_render_mode": format!("{:?}", view.layer(view.active_layer()).expect("active layer").render_state().mode()),
+                "active_sampling_policy": format!("{:?}", view.layer(view.active_layer()).expect("active layer").render_state().sampling_policy()),
+                "layers": layer_states,
                 "projection": format!("{:?}", view.camera().projection()),
                 "backend": format!("{:?}", app.render_coordination.frame_fidelity.backend),
+                "pipeline_readiness": app
+                    .native_presentation
+                    .product_pipeline_readiness()
+                    .map(|readiness| match readiness {
+                        Ok(readiness) => format!("{readiness:?}"),
+                        Err(error) => format!("Failed: {error}"),
+                    }),
                 "adapter": app.startup_diagnostics.gpu_adapter.clone(),
                 "native_surface_configuration_contract": {
-                    "present_mode": "Fifo",
+                    "present_mode": "AutoVsync",
                     "desired_maximum_frame_latency": 1,
                     "evidence_scope": "configured_product_contract_not_queried_compositor_observation",
                 },
@@ -3504,6 +3990,17 @@ impl ProductAutomationController {
                 "frame_fidelity": {
                     "target_scale_level": app.render_coordination.frame_fidelity.target_scale_level,
                     "displayed_scale_level": app.render_coordination.frame_fidelity.displayed_scale_level,
+                    "logical_output_extent": {
+                        "width": app.render_coordination.frame_fidelity.viewport.width_pixels(),
+                        "height": app.render_coordination.frame_fidelity.viewport.height_pixels(),
+                    },
+                    "three_d_render_extent": {
+                        "width": app.render_coordination.frame_fidelity.three_d_render_viewport.width_pixels(),
+                        "height": app.render_coordination.frame_fidelity.three_d_render_viewport.height_pixels(),
+                    },
+                    "three_d_preview": app.render_coordination.frame_fidelity.three_d_preview,
+                    "three_d_refinement_strips_completed": app.render_coordination.frame_fidelity.three_d_refinement_strips_completed,
+                    "three_d_refinement_strips_total": app.render_coordination.frame_fidelity.three_d_refinement_strips_total,
                     "completeness": format!("{:?}", app.render_coordination.frame_fidelity.completeness),
                     "reason": format!("{:?}", app.render_coordination.frame_fidelity.reason),
                     "display_freshness": format!("{:?}", app.render_coordination.frame_fidelity.display_freshness),
@@ -3514,13 +4011,18 @@ impl ProductAutomationController {
                     "current_partial_frames_presented": product.current_partial_frames_presented,
                     "partial_to_settled_transitions": product.partial_to_settled_transitions,
                     "stale_frames_rejected": product.stale_frames_rejected,
-                    "last_3d_cpu_timing": product.targets.get(&PanelId::ThreeD).and_then(|target| {
-                        target.last_execution_timing.and_then(|execution| execution.cpu.map(|timing| json!({
-                            "frame": execution.frame.get(),
-                            "planning_ns": timing.planning_ns(),
-                            "queue_submit_ns": timing.queue_submit_ns(),
-                        })))
-                    }),
+                    "last_coordinated_cpu_timing": product.last_coordinated_cpu_timing.map(|timing| json!({
+                        "planning_ns": timing.planning_ns(),
+                        "queue_submit_ns": timing.queue_submit_ns(),
+                    })),
+                    "last_coordinated_recorded_targets": product
+                        .last_coordinated_recorded_targets
+                        .iter()
+                        .map(|target| format!("{target:?}"))
+                        .collect::<Vec<_>>(),
+                    "last_coordinated_color_submissions": product.last_coordinated_color_submissions,
+                    "total_coordinated_color_submissions": product.total_coordinated_color_submissions,
+                    "last_coordinated_residency_submissions": product.last_coordinated_residency_submissions,
                     "presented_frame_intervals": {
                         "enabled": product.presented_frame_interval_timing_enabled(),
                         "measurement_scope": "per_visible_panel_app_frame_publication_interval_not_os_compositor_present",
@@ -3534,15 +4036,6 @@ impl ProductAutomationController {
                             "interval_ns": sample.interval_ns,
                             "cpu_planning_ns": sample.cpu_planning_ns,
                             "cpu_queue_submit_ns": sample.cpu_queue_submit_ns,
-                            "gpu_execution_id": sample.gpu_execution.map(|execution| execution.execution_id),
-                            "gpu_target": sample.gpu_execution.map(|execution| execution.target.get()),
-                            "gpu_generation": sample.gpu_execution.map(|execution| execution.display_generation),
-                            "gpu_renderer_frame": sample.gpu_execution.map(|execution| execution.renderer_frame.get()),
-                            "gpu_pass_kind": sample.gpu_execution.map(|execution| format!("{:?}", execution.pass_kind)),
-                            "gpu_timing_complete": sample.gpu_timing.is_some(),
-                            "gpu_batch_envelope_ns": sample.gpu_timing.and_then(|timing| timing.batch_gpu_envelope_ns),
-                            "gpu_payload_copy_ns": sample.gpu_timing.and_then(|timing| timing.payload_copy_ns),
-                            "gpu_render_pass_ns": sample.gpu_timing.and_then(|timing| timing.render_pass_ns),
                         })).collect::<Vec<_>>(),
                     },
                 })),
@@ -3573,7 +4066,10 @@ impl ProductAutomationController {
             "gpu_adapter": app
                 .native_presentation.product_gpu
                 .as_ref()
-                .map(|product| gpu_adapter_diagnostics_json(product.renderer.diagnostics())),
+                .map(|product| gpu_adapter_diagnostics_json(
+                    product.renderer.diagnostics(),
+                    &app.selected_adapter_memory,
+                )),
             "camera": {
                 "projection": format!("{:?}", view.camera().projection()),
                 "canonical_source": "ApplicationSnapshot_ViewState_camera",
@@ -3641,6 +4137,9 @@ impl ProductAutomationController {
             .requested_mapped_client_pixels
             .map(|(width, height)| json!({ "width": width, "height": height }))
             .unwrap_or(Value::Null);
+        let observed_native_viewport_pixels = observed_native_viewport_pixels(ctx)
+            .map(|[width, height]| json!({ "width": width, "height": height }))
+            .unwrap_or(Value::Null);
         let finished_process_cpu_time_ns = checked_process_cpu_time_ns();
         let process_cpu_time = match (
             self.started_process_cpu_time_ns,
@@ -3667,6 +4166,8 @@ impl ProductAutomationController {
             "viewport_evidence": {
                 "requested_window_inner_size_points": requested_window_inner_size_points,
                 "requested_mapped_client_pixels": requested_mapped_client_pixels,
+                "observed_native_viewport_pixels": observed_native_viewport_pixels,
+                "observed_native_viewport_scope": "egui_root_viewport_rect_at_report_close",
                 "pixels_per_point": ctx.pixels_per_point(),
                 "render_target_pixels": render_target_pixels,
             },
@@ -3746,7 +4247,11 @@ impl ProductAutomationController {
     }
 
     fn capture_failure_artifact(&mut self, app: &mut MiranteWorkbenchApp) -> Result<(), String> {
-        let artifact = self.capture_viewport_artifact(app, Some("failure-final-frame"))?;
+        let artifact = self.capture_viewport_artifact(
+            app,
+            ProductAutomationPresentationTarget::ThreeD,
+            Some("failure-final-frame"),
+        )?;
         self.artifacts.push(artifact);
         Ok(())
     }
@@ -4004,15 +4509,15 @@ fn lease_cohort_status_json(status: crate::retained_leases::RetainedLeaseStatus)
 
 fn retained_leases_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     let bridge = app.dataset.retained_leases();
-    let gpu_only = app.dataset.gpu_only_display_payloads();
-    let unavailable = bridge.missing_len().saturating_sub(gpu_only);
     json!({
         "required": bridge.required_len(),
         "retained": bridge.retained_len(),
         "cpu_absent": bridge.missing_len(),
-        "gpu_only_display": gpu_only,
-        "unavailable": unavailable,
-        "complete_cpu_or_gpu": bridge.required_len() != 0 && unavailable == 0,
+        "renderer_pending_residency_work": app
+            .native_presentation
+            .product_gpu
+            .as_ref()
+            .is_some_and(|product| product.renderer.has_pending_residency_work()),
         "active_cohort": active_lease_cohort_status(app).map(lease_cohort_status_json),
     })
 }
@@ -4049,34 +4554,101 @@ fn assert_gpu_display_images_distinct(
     min_different_pixels: usize,
 ) -> Result<(), String> {
     let min_different_pixels = min_different_pixels.max(1);
+    for (label, width, height, rgba) in images {
+        let expected_bytes = width
+            .checked_mul(*height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| format!("{image_group} {label} dimensions overflowed"))?;
+        if *width == 0 || *height == 0 || rgba.len() != expected_bytes {
+            return Err(format!(
+                "{image_group} {label} has invalid RGBA dimensions: {width}x{height}, {} bytes",
+                rgba.len()
+            ));
+        }
+        if !rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel[..3].iter().any(|channel| *channel != 0))
+        {
+            return Err(format!("{image_group} {label} is RGB-blank"));
+        }
+    }
+
     let mut compared_pairs = 0usize;
     for left_index in 0..images.len() {
         for right_index in (left_index + 1)..images.len() {
             let (left_label, left_width, left_height, left_rgba) = &images[left_index];
             let (right_label, right_width, right_height, right_rgba) = &images[right_index];
-            if left_width != right_width || left_height != right_height {
-                continue;
-            }
             compared_pairs += 1;
-            let different_pixels = left_rgba
-                .chunks_exact(4)
-                .zip(right_rgba.chunks_exact(4))
-                .filter(|(left, right)| left != right)
-                .count();
+            let (different_pixels, comparison) =
+                if left_width == right_width && left_height == right_height {
+                    (
+                        left_rgba
+                            .chunks_exact(4)
+                            .zip(right_rgba.chunks_exact(4))
+                            .filter(|(left, right)| left[..3] != right[..3])
+                            .count(),
+                        "direct",
+                    )
+                } else {
+                    (
+                        count_normalized_different_pixels(
+                            (*left_width, *left_height, left_rgba),
+                            (*right_width, *right_height, right_rgba),
+                        ),
+                        "normalized-coordinate",
+                    )
+                };
             if different_pixels < min_different_pixels {
                 return Err(format!(
-                    "{image_group} {left_label} and {right_label} differ in {} pixels, expected at least {}",
-                    different_pixels, min_different_pixels
+                    "{image_group} {left_label} and {right_label} differ in {different_pixels} {comparison} pixels, expected at least {min_different_pixels}"
                 ));
             }
         }
     }
-    if compared_pairs == 0 {
+    let expected_pairs = images.len().saturating_mul(images.len().saturating_sub(1)) / 2;
+    if compared_pairs != expected_pairs || expected_pairs == 0 {
         return Err(format!(
-            "{image_group} assertion did not find any same-sized frame pairs to compare"
+            "{image_group} assertion compared {compared_pairs} pairs, expected {expected_pairs}"
         ));
     }
     Ok(())
+}
+
+fn count_normalized_different_pixels(
+    left: (usize, usize, &[u8]),
+    right: (usize, usize, &[u8]),
+) -> usize {
+    let sample_width = left.0.min(right.0);
+    let sample_height = left.1.min(right.1);
+    let mut different = 0usize;
+    for sample_y in 0..sample_height {
+        let left_y = normalized_sample_index(sample_y, sample_height, left.1);
+        let right_y = normalized_sample_index(sample_y, sample_height, right.1);
+        for sample_x in 0..sample_width {
+            let left_x = normalized_sample_index(sample_x, sample_width, left.0);
+            let right_x = normalized_sample_index(sample_x, sample_width, right.0);
+            let left_offset = (left_y * left.0 + left_x) * 4;
+            let right_offset = (right_y * right.0 + right_x) * 4;
+            if left.2[left_offset..left_offset + 3] != right.2[right_offset..right_offset + 3] {
+                different += 1;
+            }
+        }
+    }
+    different
+}
+
+fn normalized_sample_index(
+    sample_index: usize,
+    sample_extent: usize,
+    image_extent: usize,
+) -> usize {
+    debug_assert!(sample_extent > 0);
+    debug_assert!(image_extent > 0);
+    let numerator = (sample_index as u128 * 2 + 1) * image_extent as u128;
+    let denominator = sample_extent as u128 * 2;
+    usize::try_from(numerator / denominator)
+        .unwrap_or(usize::MAX)
+        .min(image_extent - 1)
 }
 
 fn assert_cross_section_retired(app: &MiranteWorkbenchApp) -> Result<(), String> {
@@ -4099,26 +4671,27 @@ fn assert_cross_section_retired(app: &MiranteWorkbenchApp) -> Result<(), String>
             ));
         }
     }
-    let active_targets = app
-        .native_presentation
-        .product_gpu
-        .as_ref()
-        .map_or(0, |product| {
-            [PanelId::Xy, PanelId::Xz, PanelId::Yz]
-                .into_iter()
-                .filter(|panel| {
-                    product
-                        .targets
-                        .get(panel)
-                        .and_then(|target| target.presented.as_ref())
-                        .is_some()
-                })
-                .count()
-        });
-    if active_targets != 0 {
+    let active_presentations = [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+        .into_iter()
+        .filter(|panel| product_presentation(app, *panel).is_some())
+        .count();
+    if active_presentations != 0 {
         return Err(format!(
             "cross-section display frames are still active: {}",
-            active_targets
+            active_presentations
+        ));
+    }
+    let retained_native_bindings = [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+        .into_iter()
+        .filter(|panel| {
+            app.native_presentation
+                .texture_id(panel.presentation_slot())
+                .is_some()
+        })
+        .count();
+    if retained_native_bindings != 0 {
+        return Err(format!(
+            "retired cross-section native texture bindings are still alive: {retained_native_bindings}"
         ));
     }
     Ok(())
@@ -4129,6 +4702,14 @@ fn timing_samples_json(samples: &mirante4d_application::DisplayTimingSamples) ->
         .filter_map(|index| samples.sample(index))
         .collect::<Vec<_>>();
     retained.sort_unstable();
+    let median_ns = (!retained.is_empty()).then(|| {
+        let upper = retained.len() / 2;
+        if retained.len() % 2 == 0 {
+            retained[upper - 1].saturating_add(retained[upper]) / 2
+        } else {
+            retained[upper]
+        }
+    });
     let p95_ns = (!retained.is_empty()).then(|| {
         let rank = retained.len().saturating_mul(95).div_ceil(100);
         retained[rank.saturating_sub(1)]
@@ -4139,6 +4720,7 @@ fn timing_samples_json(samples: &mirante4d_application::DisplayTimingSamples) ->
         "retained_count": samples.retained_count(),
         "overwritten_count": samples.overwritten_count(),
         "maximum_ns": samples.maximum_ns(),
+        "median_ns": median_ns,
         "p95_ns": p95_ns,
         "retained_samples_ns_oldest_first": (0..samples.retained_count())
             .filter_map(|index| samples.sample(index))
@@ -4202,7 +4784,7 @@ fn display_performance_milestones_json(app: &MiranteWorkbenchApp) -> Value {
 }
 
 fn planned_scope_accounting_json(app: &MiranteWorkbenchApp) -> Value {
-    let planner = app.camera_demand_planner.diagnostics();
+    let planner = app.dataset.visible_demand_diagnostics();
     let scopes = app
         .prepared_scope_render_plans
         .iter()
@@ -4218,10 +4800,39 @@ fn planned_scope_accounting_json(app: &MiranteWorkbenchApp) -> Value {
             json!({
                 "scope": scope,
                 "label": label,
+                "render_payload_bytes": plan.render_payload_bytes,
                 "planned_payload_bytes": plan.planned_payload_bytes,
                 "primary_resource_count": plan.primary_resource_count,
                 "total_requirements": plan.requirements.body().canonical().len(),
+                "resident_guard_resource_count": plan
+                    .requirements
+                    .body()
+                    .canonical()
+                    .len()
+                    .saturating_sub(plan.primary_resource_count),
+                "plane_reuse_guard_present": plan.plane_reuse_envelope.is_some(),
                 "payload_fact": "exact_semantic_planned_payload_for_this_requirement_body",
+            })
+        })
+        .collect::<Vec<_>>();
+    let navigation_candidates = app
+        .volume_presentation
+        .latest_candidate_facts()
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            json!({
+                "index": index,
+                "kind": candidate.kind.label(),
+                "active_scale_level": candidate.active_scale.get(),
+                "resource_count": candidate.resource_count,
+                "payload_bytes": candidate.payload_bytes,
+                "native_work_units": candidate.native_work_units,
+                "complete_and_resident": candidate.complete_and_resident,
+                "target_quality_eligible": candidate.target_quality_eligible,
+                "interaction_safe": candidate.interaction_safe,
+                "full_volume": candidate.full_volume,
+                "disposition": candidate.disposition.label(),
             })
         })
         .collect::<Vec<_>>();
@@ -4235,6 +4846,13 @@ fn planned_scope_accounting_json(app: &MiranteWorkbenchApp) -> Value {
         // explicit zero fact beside the traversals it qualifies.
         "ui_wait_for_demand_preparation_count": 0_u64,
         "demand_work": planner.submitted,
+        "completed_guarded_rebuilds": planner.completed_guarded_rebuilds,
+        "completed_exact_rebuilds": planner.completed_exact_rebuilds,
+        "resident_plane_guard_reuses": app.resident_plane_guard_reuses,
+        "resident_plane_async_plan_submissions": app.resident_plane_async_plan_submissions,
+        "resident_plane_guard_body_installs": app.resident_plane_guard_body_installs,
+        "resident_plane_exact_body_installs": app.resident_plane_exact_body_installs,
+        "three_d_preview_candidates": navigation_candidates,
         "scopes": scopes,
     })
 }
@@ -4242,74 +4860,44 @@ fn planned_scope_accounting_json(app: &MiranteWorkbenchApp) -> Value {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefinementHandoffPhase {
     Inactive,
-    AwaitingHiddenTargetRegistration,
-    AwaitingHiddenTargetRequest,
-    HiddenTargetStreaming,
-    HiddenTargetPresented,
+    AwaitingCoordinatedExactPresentation,
 }
 
 impl RefinementHandoffPhase {
     const fn name(self) -> &'static str {
         match self {
             Self::Inactive => "inactive",
-            Self::AwaitingHiddenTargetRegistration => "awaiting_hidden_target_registration",
-            Self::AwaitingHiddenTargetRequest => "awaiting_hidden_target_request",
-            Self::HiddenTargetStreaming => "hidden_target_streaming",
-            Self::HiddenTargetPresented => "hidden_target_presented",
+            Self::AwaitingCoordinatedExactPresentation => "awaiting_coordinated_exact_presentation",
         }
     }
 }
 
-const fn refinement_handoff_phase(
-    staged_plan_installed: bool,
-    hidden_target_registered: bool,
-    hidden_target_request_bound: bool,
-    hidden_presentation_matches_request: bool,
-) -> RefinementHandoffPhase {
-    if !staged_plan_installed {
-        RefinementHandoffPhase::Inactive
-    } else if !hidden_target_registered {
-        RefinementHandoffPhase::AwaitingHiddenTargetRegistration
-    } else if !hidden_target_request_bound {
-        RefinementHandoffPhase::AwaitingHiddenTargetRequest
-    } else if !hidden_presentation_matches_request {
-        RefinementHandoffPhase::HiddenTargetStreaming
+const fn refinement_handoff_phase(staged_plan_installed: bool) -> RefinementHandoffPhase {
+    if staged_plan_installed {
+        RefinementHandoffPhase::AwaitingCoordinatedExactPresentation
     } else {
-        RefinementHandoffPhase::HiddenTargetPresented
+        RefinementHandoffPhase::Inactive
     }
 }
 
 fn refinement_handoff_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     let staged_plan_installed = app.dataset.staging_current_refinement();
-    let hidden_target = app
-        .native_presentation
-        .product_gpu
-        .as_ref()
-        .and_then(|product| product.staging_3d.as_ref());
-    let hidden_request = hidden_target.and_then(|target| target.request.as_ref());
-    let hidden_presentation_matches_request =
-        hidden_target
-            .zip(hidden_request)
-            .is_some_and(|(target, request)| {
-                target.presented.as_ref().is_some_and(|frame| {
-                    frame.frame() == request.intent.frame()
-                        && frame.extent() == request.intent.extent()
-                })
+    let phase = refinement_handoff_phase(staged_plan_installed);
+    let coordinated_requires_execution =
+        app.native_presentation
+            .product_gpu
+            .as_ref()
+            .and_then(|product| {
+                product
+                    .renderer
+                    .coordinated_target_requires_execution(PresentationSlot::ThreeD)
+                    .ok()
             });
-    let phase = refinement_handoff_phase(
-        staged_plan_installed,
-        hidden_target.is_some(),
-        hidden_request.is_some(),
-        hidden_presentation_matches_request,
-    );
-    let visible = app
-        .native_presentation
-        .product_gpu
-        .as_ref()
-        .and_then(|product| product.targets.get(&PanelId::ThreeD));
+    let visible = product_presentation(app, PanelId::ThreeD);
     json!({
         "phase": phase.name(),
         "staged_plan_installed": staged_plan_installed,
+        "candidate_owner": "render_wgpu_fixed_target_exact_frame_only",
         "holding_previous_presentation": app.dataset.holding_previous_presentation(),
         "refinement_scope_requirement_count": app
             .dataset
@@ -4322,21 +4910,14 @@ fn refinement_handoff_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
             .prepared_scope_render_plans
             .contains_key(&crate::dataset_requests::SCOPE_CURRENT_3D_REFINEMENT),
         "pending_visible_demand_install": app.pending_visible_demand_plan.is_some(),
-        "camera_demand_planner_active": app.camera_demand_planner.has_outstanding_request(),
-        "hidden_target_registered": hidden_target.is_some(),
-        "hidden_target_request_bound": hidden_request.is_some(),
-        "hidden_target_request_requirement_count": hidden_request
-            .map(|request| request.requirements.resource_keys().len()),
-        "hidden_target_satisfied_requirement_count": hidden_target
-            .map(|target| target.satisfied_requirement_keys.len()),
-        "hidden_target_last_renderer_available_resources": hidden_target
-            .map(|target| target.last_renderer_available_resources),
-        "hidden_target_presentation_matches_request": hidden_presentation_matches_request,
-        "hidden_target_last_execution_present": hidden_target
-            .is_some_and(|target| target.last_execution_timing.is_some()),
-        "progressive_probe_can_evaluate_hidden_target": hidden_request.is_some(),
+        "visible_demand_planner_active": app.dataset.visible_demand_plan_outstanding(),
+        "coordinated_target_requires_execution": coordinated_requires_execution,
+        "renderer_pending_residency_work": app
+            .native_presentation
+            .product_gpu
+            .as_ref()
+            .is_some_and(|product| product.renderer.has_pending_residency_work()),
         "visible_3d_presentation_completeness": visible
-            .and_then(|target| target.presented.as_ref())
             .map(|frame| format!("{:?}", frame.progress().completeness())),
     })
 }
@@ -4378,43 +4959,65 @@ fn source_verification_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
 
 fn display_coordination_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     let generation = app.render_coordination.display_generation();
+    let coordinated = app
+        .render_coordination
+        .coordinated_publication_diagnostics();
+    let measurement_valid = coordinated.samples_complete()
+        && coordinated.window_well_formed()
+        && coordinated.window_started_at_ns().is_some()
+        && coordinated.window_ended_at_ns().is_some()
+        && coordinated.active_publication_count() > 0;
     json!({
         "instrumentation_epoch": "app_private_monotonic_epoch",
         "input_generation": generation.input_generation,
-        "current_presentation_generation": generation.current_presentation_generation,
-        "presentation_generation_gap": generation.presentation_generation_gap(),
+        "full_layout_current_presentation_generation": generation.current_presentation_generation,
+        "full_layout_presentation_generation_gap": generation.presentation_generation_gap(),
         "main_loop_heartbeat": generation.main_loop_heartbeat,
-        "heartbeat_at_input_generation": generation.heartbeat_at_input_generation,
-        "heartbeat_at_current_presentation": generation.heartbeat_at_current_presentation,
-        "current_presentation_gap_heartbeats": generation.current_presentation_gap_heartbeats,
-        "maximum_presentation_gap_heartbeats": generation.maximum_presentation_gap_heartbeats,
         "input_generation_at_ns": generation.input_generation_at_ns,
-        "current_presentation_at_ns": generation.current_presentation_at_ns,
-        "current_presentation_gap_ns": generation.current_presentation_gap_ns,
-        "maximum_presentation_gap_ns": generation.maximum_presentation_gap_ns,
-        "active_input_main_loop_gap_ns": {
-            "current": generation.current_main_loop_heartbeat_gap_ns,
-            "maximum": generation.maximum_main_loop_heartbeat_gap_ns,
-            "samples": timing_samples_json(
-                app.render_coordination.active_main_loop_gap_samples(),
+        "full_layout_current_presentation_at_ns": generation.current_presentation_at_ns,
+        "coordinated_publication": {
+            "required_group": coordinated.required_group().name(),
+            "current_presentation_generation": coordinated.current_presentation_generation(),
+            "current_presentation_at_ns": coordinated.current_presentation_at_ns(),
+            "presentation_generation_gap": generation.input_generation.saturating_sub(
+                coordinated.current_presentation_generation().unwrap_or_default()
             ),
-            "scope": "only_while_newest_input_not_current",
-        },
-        "active_input_presentation_gap_ns": {
-            "current": generation.current_presentation_gap_ns,
-            "maximum": generation.maximum_presentation_gap_ns,
-            "samples": timing_samples_json(
-                app.render_coordination.active_presentation_gap_samples(),
+            "total_current_publications": coordinated.total_current_publications(),
+            "total_superseded_before_current_publication":
+                coordinated.total_superseded_before_current_publication(),
+            "window_group": coordinated.window_group().map(CoordinatedPresentationGroup::name),
+            "window_started_at_ns": coordinated.window_started_at_ns(),
+            "window_ended_at_ns": coordinated.window_ended_at_ns(),
+            "window_active": coordinated.window_active(),
+            "final_input_generation": coordinated.final_input_generation(),
+            "final_input_is_current": coordinated.final_input_generation().is_some()
+                && coordinated.final_input_generation()
+                    == coordinated.current_presentation_generation(),
+            "active_publication_count": coordinated.active_publication_count(),
+            "maximum_active_publication_gap_ns":
+                coordinated.maximum_active_publication_gap_ns(),
+            "window_group_mismatches": coordinated.window_group_mismatches(),
+            "window_transition_errors": coordinated.window_transition_errors(),
+            "samples_complete": coordinated.samples_complete(),
+            "window_well_formed": coordinated.window_well_formed(),
+            "measurement_valid": measurement_valid,
+            "zero_active_publications_is_failure": true,
+            "admission_to_current_latency": timing_samples_json(
+                coordinated.admission_latency_samples(),
             ),
-            "scope": "only_while_newest_input_not_current",
+            "active_group_publication_interval": timing_samples_json(
+                coordinated.publication_interval_samples(),
+            ),
+            "active_gap_scope":
+                "gesture_start_or_previous_current_group_publication_to_next_publication_or_gesture_end",
         },
         "raw_main_loop_gap_ns": {
             "current": generation.raw_current_main_loop_heartbeat_gap_ns,
             "maximum": generation.raw_maximum_main_loop_heartbeat_gap_ns,
-            "scope": "includes_settled_event_driven_idle",
+            "scope": "diagnostic_callback_spacing_includes_settled_event_driven_idle",
         },
         "durable_gesture_commits": generation.durable_gesture_commits,
-        "admitted_generation_latency": timing_samples_json(
+        "full_layout_settlement_latency": timing_samples_json(
             app.render_coordination.presentation_latency_samples(),
         ),
         "semantic_interaction_task_duration": {
@@ -4441,6 +5044,8 @@ fn display_coordination_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
 fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     let snapshot = app.application.snapshot();
     let view = application_view(&snapshot);
+    let demand_currentness = app.visible_demand_plan_currentness();
+    let demand_renderability = app.visible_demand_renderability();
     let canonical_cross_section = *view.cross_section();
     let cross_section_state = CrossSectionViewState::from_canonical(canonical_cross_section);
     let panels = app
@@ -4448,6 +5053,14 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
         .iter()
         .map(|(slot, panel)| {
             let panel_id = PanelId::from_presentation_slot(slot);
+            let display_current = if slot == PresentationSlot::ThreeD {
+                panel.display_current()
+                    && app.render_coordination.frame_fidelity.display_freshness
+                        == DisplayedFrameFreshness::Current
+                    && demand_currentness.current_3d
+            } else {
+                panel.display_current() && demand_currentness.cross_section(panel_id)
+            };
             let canonical_plane = panel_id.cross_section_panel().map(|panel| {
                 let panel_view = cross_section_state.view(panel);
                 json!({
@@ -4459,12 +5072,62 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
                     "world_per_screen_point": panel_view.scale_world_per_screen_point(),
                 })
             });
+            let demand_scope = match panel_id {
+                PanelId::Xy => Some(crate::dataset_requests::SCOPE_CROSS_SECTION_XY),
+                PanelId::Xz => Some(crate::dataset_requests::SCOPE_CROSS_SECTION_XZ),
+                PanelId::Yz => Some(crate::dataset_requests::SCOPE_CROSS_SECTION_YZ),
+                PanelId::ThreeD => None,
+            };
+            let installed_layer_scales = demand_scope
+                .and_then(|scope| app.dataset.scope_layer_scales(scope))
+                .map(|scales| {
+                    scales
+                        .iter()
+                        .map(|(layer, scale)| {
+                            json!({
+                                "layer_ordinal": layer.ordinal(),
+                                "scale_level": scale.get(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+            let ideal_layer_scales = panel_id.cross_section_panel().and_then(|_| {
+                Some(crate::dataset_demand_plan::cross_section_projected_layer_scales(
+                    snapshot.catalog(),
+                    view,
+                    panel_id,
+                    panel.presentation_viewport()?,
+                    panel.render_viewport()?,
+                ))
+            })
+            .and_then(Result::ok)
+            .map(|scales| {
+                scales
+                    .iter()
+                    .map(|(layer, scale)| {
+                        json!({
+                            "layer_ordinal": layer.ordinal(),
+                            "scale_level": scale.get(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
             json!({
                 "panel_id": panel_id.label(),
                 "canonical_plane_geometry": canonical_plane,
                 "generation": panel.generation(),
                 "displayed_generation": panel.displayed_generation(),
-                "display_current": panel.display_current(),
+                "display_current": display_current,
+                "exact_demand_current": if panel_id == PanelId::ThreeD {
+                    demand_currentness.current_3d
+                } else {
+                    demand_currentness.cross_section(panel_id)
+                },
+                "resident_interaction_renderable": panel_id != PanelId::ThreeD
+                    && demand_renderability.cross_section(panel_id)
+                    && !demand_currentness.cross_section(panel_id),
+                "ideal_layer_scales": ideal_layer_scales,
+                "installed_selected_layer_scales": installed_layer_scales,
                 "presentation_viewport": panel.presentation_viewport().map(|viewport| {
                     json!({
                         "width_points": viewport.width_points(),
@@ -4486,16 +5149,17 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
                     "layer_ordinal": layer.layer_ordinal,
                     "expected_scale_level": layer.expected_scale_level,
                     "displayed_scale_level": layer.displayed_scale_level,
+                    "target_scale_level": layer.target_scale_level,
+                    "finest_fallback_scale_level": layer.finest_fallback_scale_level,
+                    "fallback_scale_level": layer.fallback_scale_level,
+                    "target_available_requirements": layer.target_available_requirements,
+                    "target_total_requirements": layer.target_total_requirements,
                     "available_requirements": layer.available_requirements,
                     "total_requirements": layer.total_requirements,
+                    "mixed": layer.mixed,
                     "current": layer.current,
                 })).collect::<Vec<_>>(),
-                "display_frame": app
-                    .native_presentation
-                    .product_gpu
-                    .as_ref()
-                    .and_then(|product| product.targets.get(&panel_id))
-                    .and_then(|target| target.presented.as_ref())
+                "display_frame": product_presentation(app, panel_id)
                     .map(|displayed| {
                         let progress = displayed.progress();
                         let coverage = progress.coverage();
@@ -4518,7 +5182,7 @@ fn cross_section_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
         .count();
     json!({
         "schema": "mirante4d-cross-section-panel-diagnostics",
-        "schema_version": 1,
+        "schema_version": 2,
         "layout": format!("{:?}", view.layout()),
         "canonical_linked_view": {
             "source": "ApplicationSnapshot_ViewState_cross_section",

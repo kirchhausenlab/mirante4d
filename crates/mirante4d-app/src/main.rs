@@ -130,9 +130,6 @@ fn main() -> anyhow::Result<()> {
             .with_title("Mirante4D")
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([900.0, 600.0]),
-        // The blocking viewer qualification contract is defined at one
-        // physical 60 Hz display cadence. Keep the product default explicit
-        // so a framework-default change cannot silently alter that contract.
         vsync: true,
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: wgpu_options(),
@@ -247,7 +244,7 @@ fn adapter_preference_score(info: &eframe::wgpu::AdapterInfo) -> u8 {
 
 fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     let mut options = eframe::egui_wgpu::WgpuConfiguration {
-        present_mode: eframe::wgpu::PresentMode::Fifo,
+        present_mode: eframe::wgpu::PresentMode::AutoVsync,
         desired_maximum_frame_latency: Some(1),
         ..Default::default()
     };
@@ -323,9 +320,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn product_surface_contract_uses_fifo_with_low_latency_queueing() {
+    fn product_surface_contract_bounds_vsynced_presentation_latency() {
         let options = wgpu_options();
-        assert_eq!(options.present_mode, eframe::wgpu::PresentMode::Fifo);
+        assert_eq!(options.present_mode, eframe::wgpu::PresentMode::AutoVsync);
         assert_eq!(options.desired_maximum_frame_latency, Some(1));
     }
 

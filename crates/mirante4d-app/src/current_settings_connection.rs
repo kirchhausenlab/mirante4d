@@ -10,7 +10,6 @@ use mirante4d_application::{
 use mirante4d_settings::{
     ResourcePolicy, SettingsActor, SettingsDocument, SettingsError, SettingsEvent, SettingsIoStage,
     SettingsLoadOutcome, SettingsRequestId, default_linux_settings_path,
-    recommended_for_current_system,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,8 +30,7 @@ pub(crate) struct CurrentSettingsConnection {
 impl CurrentSettingsConnection {
     /// Starts settings before UI construction. Filesystem work runs on the
     /// actor; this composition call only waits for its typed initial outcome.
-    pub(crate) fn start() -> (Self, ResourcePolicy) {
-        let defaults = recommended_for_current_system(None).unwrap_or_default();
+    pub(crate) fn start(defaults: ResourcePolicy) -> (Self, ResourcePolicy) {
         let path = match default_linux_settings_path() {
             Ok(path) => path,
             Err(error) => {

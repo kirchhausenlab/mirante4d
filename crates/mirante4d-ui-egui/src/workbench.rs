@@ -62,7 +62,7 @@ fn synchronize_viewer_tool(
         state.viewer_tools.set_active_tool(canonical);
     }
     if !matches!(canonical, ViewerTool::Navigate | ViewerTool::Inspect) {
-        state.cancel_viewport_camera_interaction();
+        state.cancel_viewport_drag();
     }
     state
         .viewer_tools

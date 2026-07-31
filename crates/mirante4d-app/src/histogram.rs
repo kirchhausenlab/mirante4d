@@ -1,4 +1,4 @@
-use mirante4d_dataset::{DatasetResourceIdentity, DatasetResourceKey, ResourcePayloadView};
+use mirante4d_dataset::{BrickKey, DatasetResourceIdentity, ResourcePayloadView};
 use mirante4d_domain::{IntensityDType, LogicalLayerKey, ScaleLevel, TimeIndex};
 
 use crate::retained_leases::RetainedLeases;
@@ -9,7 +9,7 @@ const LEASE_HISTOGRAM_SAMPLE_LIMIT: u64 = 65_536;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ActiveLayerHistogramInput<'a> {
-    pub(crate) requirements: &'a [DatasetResourceKey],
+    pub(crate) requirements: &'a [BrickKey],
     pub(crate) identity: DatasetResourceIdentity,
     pub(crate) layer: LogicalLayerKey,
     pub(crate) layer_name: &'a str,

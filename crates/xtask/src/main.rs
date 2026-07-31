@@ -6,7 +6,7 @@ use crate::product_validate::{is_product_validation_scenario_name, product_valid
 use crate::workflow_audit::workflow_audit;
 
 const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [target-package] \
-     [target_fixture_camera_smoke|target_fixture_render_modes|target_fixture_resident_navigation_no_readback|target_source_verification|import_preprocessing|b4_project_persistence]";
+     [target_fixture_camera_smoke|target_fixture_render_modes|representative_native_navigation|target_source_verification|import_preprocessing|b4_project_persistence]";
 
 mod arch;
 #[cfg(test)]
@@ -26,6 +26,7 @@ mod reports;
 mod t5_sentinel_oracle;
 mod target_fixture;
 mod verification;
+mod viewer_oblique_continuity;
 mod workflow_audit;
 
 fn main() -> anyhow::Result<()> {
@@ -81,6 +82,8 @@ fn main() -> anyhow::Result<()> {
             }
         },
         "workflow-audit" => workflow_audit().map(|path| println!("{}", path.display())),
+        "viewer-oblique-continuity" => viewer_oblique_continuity::run(args.collect())
+            .map(|path| println!("{}", path.display())),
         "import-performance-t2" => {
             import_performance::run(args.collect()).map(|path| println!("{}", path.display()))
         }
@@ -148,13 +151,15 @@ under target/mirante4d/product-validation/. With no package argument, the
 bounded promoted target U16 fixture is extracted locally.
 
 The ordinary bounded scenarios are target_fixture_camera_smoke,
-target_fixture_render_modes, target_fixture_resident_navigation_no_readback,
-target_source_verification, and import_preprocessing. The resident-navigation
-scenario proves warm camera reuse without framebuffer readback. The import scenario generates a bounded public TIFF
-fixture, cancels and resumes preprocessing, waits for verified publication,
-then renders the imported package. The retained b4_project_persistence
-scenario checks project save, recovery, and reopen behavior across three
-application launches.
+target_fixture_render_modes, representative_native_navigation,
+target_source_verification, and import_preprocessing.
+representative_native_navigation requires an explicit package and exercises
+native 3D navigation, all volume modes, smooth sampling, four-panel linked
+input, exact settlement, and return to standalone 3D. The import scenario
+generates a bounded public TIFF fixture, cancels and resumes preprocessing,
+waits for verified publication, then renders the imported package. The
+retained b4_project_persistence scenario checks project save, recovery, and
+reopen behavior across three application launches.
 
 Useful controls:
   MIRANTE4D_PRODUCT_VALIDATE_TIMEOUT_SECS=<seconds>
@@ -178,6 +183,7 @@ Mirante4D developer tasks
   cargo xtask package-linux-release
   cargo xtask product-validate [target-package] [scenario]
   cargo xtask workflow-audit
+  cargo xtask viewer-oblique-continuity [--workflow oblique|linked-zoom|zoom|combined] [--dataset /absolute/package.m4d] [--duration-secs 30] [--runs 1]
   cargo run --release -p xtask -- import-performance-t2 [--samples 5] [--qualification-profile PATH]
   cargo run --release -p xtask -- import-performance-t5 --config /absolute/private/config.json [--performance | --diagnostic]
   cargo run --release -p xtask -- import-performance-t5-publish --config /absolute/private/config.json --raw-report /absolute/private/raw-private-report.json
@@ -219,14 +225,6 @@ mod tests {
             ProductValidateArgs::Run {
                 package: None,
                 scenario: Some("target_fixture_render_modes".to_owned())
-            }
-        );
-        assert_eq!(
-            product_validate_args(args(&["target_fixture_resident_navigation_no_readback",]))
-                .unwrap(),
-            ProductValidateArgs::Run {
-                package: None,
-                scenario: Some("target_fixture_resident_navigation_no_readback".to_owned())
             }
         );
         assert_eq!(

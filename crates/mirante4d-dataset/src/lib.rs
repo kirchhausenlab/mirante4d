@@ -116,13 +116,14 @@ impl ResourceRegion {
     }
 }
 
-/// Semantic identity for one decoded multiscale resource.
+/// Canonical logical identity for one decoded multiscale brick.
 ///
 /// Before verification the key is stable only within its exact opened source;
 /// afterward it is rooted in scientific content. Physical package identity,
 /// paths, arrays, chunks, shards, and codec details are intentionally absent.
+/// The exact logical region, including its shape, remains part of the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DatasetResourceKey {
+pub struct BrickKey {
     identity: DatasetResourceIdentity,
     layer: LogicalLayerKey,
     timepoint: TimeIndex,
@@ -130,7 +131,7 @@ pub struct DatasetResourceKey {
     region: ResourceRegion,
 }
 
-impl DatasetResourceKey {
+impl BrickKey {
     pub const fn new(
         identity: DatasetResourceIdentity,
         layer: LogicalLayerKey,
@@ -575,7 +576,7 @@ pub trait CpuByteLedger: Send + Sync {
 /// payload accessor, or accounting bypass. The dataset runtime owns concrete
 /// lease issuance and lifetime; consumers only borrow the immutable view.
 pub trait ResourceLease: Send + Sync {
-    fn key(&self) -> DatasetResourceKey;
+    fn key(&self) -> BrickKey;
     fn payload(&self) -> ResourcePayloadView<'_>;
     fn payload_facts(&self) -> ResourcePayloadFacts;
 }
@@ -591,7 +592,7 @@ pub trait ResourceLease: Send + Sync {
 /// completion, and cancellation. Storage never returns an owning decoded
 /// buffer.
 pub trait ReservedDecodeSink {
-    fn resource_key(&self) -> DatasetResourceKey;
+    fn resource_key(&self) -> BrickKey;
     fn payload_descriptor(&self) -> ResourcePayloadDescriptor;
     fn reserved_bytes(&self) -> u64 {
         self.payload_descriptor().byte_len()
@@ -657,7 +658,7 @@ pub trait DatasetSource: Send + Sync {
     /// when it runs alone. Cohort sharing may reduce the actual live total.
     fn minimum_decode_working_bytes(
         &self,
-        _key: DatasetResourceKey,
+        _key: BrickKey,
         _descriptor: ResourcePayloadDescriptor,
     ) -> Result<u64, DatasetSourceFault> {
         Ok(0)
@@ -738,35 +739,35 @@ pub enum DatasetSourceFault {
     CatalogUnavailable,
     #[error("invalid semantic resource request: {reason}")]
     InvalidResource {
-        key: DatasetResourceKey,
+        key: BrickKey,
         reason: Box<ResourceContractError>,
     },
     #[error("semantic resource is unavailable")]
-    ResourceUnavailable { key: DatasetResourceKey },
+    ResourceUnavailable { key: BrickKey },
     #[error("semantic resource is corrupt")]
-    CorruptResource { key: DatasetResourceKey },
+    CorruptResource { key: BrickKey },
     #[error("semantic resource uses an unsupported representation")]
-    UnsupportedResource { key: DatasetResourceKey },
+    UnsupportedResource { key: BrickKey },
     #[error("semantic resource decoding was cancelled")]
-    Cancelled { key: DatasetResourceKey },
+    Cancelled { key: BrickKey },
     #[error("CPU capacity cannot satisfy the semantic resource reservation")]
     CapacityExceeded {
-        key: DatasetResourceKey,
+        key: BrickKey,
         category: CpuLedgerCategory,
         requested_bytes: u64,
         available_bytes: u64,
     },
     #[error("the dataset resource authority is shutting down")]
     ShuttingDown {
-        key: DatasetResourceKey,
+        key: BrickKey,
         category: CpuLedgerCategory,
         requested_bytes: u64,
     },
     #[error("semantic resource decoding failed")]
-    DecodeFailed { key: DatasetResourceKey },
+    DecodeFailed { key: BrickKey },
     #[error("decode sink rejected semantic resource: {reason}")]
     SinkRejected {
-        key: DatasetResourceKey,
+        key: BrickKey,
         reason: Box<DecodeSinkError>,
     },
 }
@@ -1086,7 +1087,7 @@ impl DatasetCatalog {
     /// layer dtype needed to reserve and interpret its decoded payload.
     pub fn validate_resource_key(
         &self,
-        key: DatasetResourceKey,
+        key: BrickKey,
     ) -> Result<IntensityDType, ResourceContractError> {
         if self.resource_identity != key.identity() {
             return Err(ResourceContractError::ResourceIdentityMismatch);
@@ -1118,7 +1119,7 @@ impl DatasetCatalog {
 
     pub fn resource_payload_descriptor(
         &self,
-        key: DatasetResourceKey,
+        key: BrickKey,
     ) -> Result<ResourcePayloadDescriptor, ResourceContractError> {
         let dtype = self.validate_resource_key(key)?;
         let validity = self
@@ -1130,7 +1131,7 @@ impl DatasetCatalog {
 
     pub fn resource_validity(
         &self,
-        key: DatasetResourceKey,
+        key: BrickKey,
     ) -> Result<ResourceValidity, ResourceContractError> {
         self.validate_resource_key(key)?;
         Ok(self
@@ -1430,8 +1431,8 @@ mod tests {
         )
     }
 
-    fn resource_key(identity: ScientificContentId) -> DatasetResourceKey {
-        DatasetResourceKey::new(
+    fn resource_key(identity: ScientificContentId) -> BrickKey {
+        BrickKey::new(
             DatasetResourceIdentity::Verified(identity),
             LogicalLayerKey::new(3),
             TimeIndex::new(1),
@@ -1441,13 +1442,13 @@ mod tests {
     }
 
     #[test]
-    fn semantic_resource_keys_are_stable_hashable_and_storage_independent() {
+    fn brick_keys_hash_by_semantic_identity_scale_and_region() {
         use std::collections::HashSet;
 
         let identity = scientific_id('1');
         let key = resource_key(identity);
         let equal = resource_key(identity);
-        let different_scale = DatasetResourceKey::new(
+        let different_scale = BrickKey::new(
             DatasetResourceIdentity::Verified(identity),
             key.layer(),
             key.timepoint(),
@@ -1718,7 +1719,7 @@ mod tests {
             vec![ScaleLevel::BASE, ScaleLevel::new(1)]
         );
 
-        let base_key = DatasetResourceKey::new(
+        let base_key = BrickKey::new(
             DatasetResourceIdentity::Verified(identity),
             key.layer(),
             key.timepoint(),
@@ -1730,7 +1731,7 @@ mod tests {
             Ok(ResourceValidity::AllValid)
         );
 
-        let wrong_identity = DatasetResourceKey::new(
+        let wrong_identity = BrickKey::new(
             DatasetResourceIdentity::Verified(scientific_id('3')),
             key.layer(),
             key.timepoint(),
@@ -1753,7 +1754,7 @@ mod tests {
             Err(ResourceContractError::ResourceIdentityMismatch)
         );
 
-        let late = DatasetResourceKey::new(
+        let late = BrickKey::new(
             DatasetResourceIdentity::Verified(identity),
             key.layer(),
             TimeIndex::new(3),
@@ -1768,7 +1769,7 @@ mod tests {
             })
         );
 
-        let unknown_layer = DatasetResourceKey::new(
+        let unknown_layer = BrickKey::new(
             DatasetResourceIdentity::Verified(identity),
             LogicalLayerKey::new(99),
             key.timepoint(),
@@ -1780,7 +1781,7 @@ mod tests {
             Err(ResourceContractError::UnknownLayer { ordinal: 99 })
         );
 
-        let unknown_scale = DatasetResourceKey::new(
+        let unknown_scale = BrickKey::new(
             DatasetResourceIdentity::Verified(identity),
             key.layer(),
             key.timepoint(),
@@ -1792,7 +1793,7 @@ mod tests {
             Err(ResourceContractError::UnknownScale { level: 99 })
         );
 
-        let outside = DatasetResourceKey::new(
+        let outside = BrickKey::new(
             DatasetResourceIdentity::Verified(identity),
             key.layer(),
             key.timepoint(),
@@ -1894,7 +1895,7 @@ mod tests {
     }
 
     struct TestSink {
-        key: DatasetResourceKey,
+        key: BrickKey,
         descriptor: ResourcePayloadDescriptor,
         bytes: Box<[u8]>,
         written: usize,
@@ -1904,7 +1905,7 @@ mod tests {
     }
 
     impl TestSink {
-        fn new(key: DatasetResourceKey, descriptor: ResourcePayloadDescriptor) -> Self {
+        fn new(key: BrickKey, descriptor: ResourcePayloadDescriptor) -> Self {
             let byte_len = usize::try_from(descriptor.byte_len()).unwrap();
             Self {
                 key,
@@ -1930,7 +1931,7 @@ mod tests {
     }
 
     impl ReservedDecodeSink for TestSink {
-        fn resource_key(&self) -> DatasetResourceKey {
+        fn resource_key(&self) -> BrickKey {
             self.key
         }
 
@@ -1995,7 +1996,7 @@ mod tests {
         }
     }
 
-    fn sink_fault(key: DatasetResourceKey, reason: DecodeSinkError) -> DatasetSourceFault {
+    fn sink_fault(key: BrickKey, reason: DecodeSinkError) -> DatasetSourceFault {
         match reason {
             DecodeSinkError::Cancelled => DatasetSourceFault::Cancelled { key },
             reason => DatasetSourceFault::SinkRejected {
@@ -2007,7 +2008,7 @@ mod tests {
 
     struct TableSource {
         catalog: Arc<DatasetCatalog>,
-        resources: BTreeMap<DatasetResourceKey, Arc<[u8]>>,
+        resources: BTreeMap<BrickKey, Arc<[u8]>>,
     }
 
     impl DatasetSource for TableSource {
@@ -2139,7 +2140,7 @@ mod tests {
 
     fn decode_from(
         source: &dyn DatasetSource,
-        key: DatasetResourceKey,
+        key: BrickKey,
     ) -> (ResourcePayloadDescriptor, Vec<u8>) {
         let catalog = source.catalog().unwrap();
         let descriptor = catalog.resource_payload_descriptor(key).unwrap();
@@ -2191,7 +2192,7 @@ mod tests {
             .unwrap(),
         );
         let verified_key = resource_key(scientific_id('4'));
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(source_id),
             verified_key.layer(),
             verified_key.timepoint(),

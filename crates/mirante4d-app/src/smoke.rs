@@ -14,7 +14,8 @@ use std::{
 };
 
 use mirante4d_application::{
-    ApplicationCommand, ApplicationState, SourceSessionGeneration, stepped_timepoint,
+    ApplicationCommand, ApplicationState, RenderIntentMailbox, SourceSessionGeneration,
+    stepped_timepoint,
 };
 use mirante4d_dataset::{CpuLedgerCategory, ResourcePayloadView};
 use mirante4d_domain::IntensityDType;
@@ -25,7 +26,7 @@ use mirante4d_settings::recommended_for_current_system;
 use crate::{
     application_view,
     camera_demand_cache::{
-        CameraDemandPlanner, CameraDemandRequest, Current3dDemandBaselines, Current3dDemandRequest,
+        CameraDemandRequest, Current3dDemandBaselines, Current3dDemandRequest,
         PreparedRendererRequirementUpdate, PreparedVisibleDemand, ScopeDemandBaseline,
     },
     dataset_demand_plan::DatasetDemandPlanLimits,
@@ -99,7 +100,7 @@ pub fn run_headless_smoke(
     let gpu_adapter_summary = if options.disable_gpu {
         None
     } else {
-        Some(successor_gpu_adapter_summary()?)
+        Some(gpu_adapter_summary()?)
     };
 
     load_current_requirements(&application, &mut opened, options.timeout)?;
@@ -169,7 +170,7 @@ pub fn run_headless_smoke(
     Ok(report)
 }
 
-fn successor_gpu_adapter_summary() -> anyhow::Result<String> {
+fn gpu_adapter_summary() -> anyhow::Result<String> {
     wait_for_future(async {
         let instance = eframe::wgpu::Instance::new(eframe::wgpu::InstanceDescriptor {
             backends: eframe::wgpu::Backends::VULKAN,
@@ -232,21 +233,22 @@ fn load_current_requirements(
             opened.dataset.scope_admitted_prefix_len(scope),
         )
     };
+    let intent_revision = RenderIntentMailbox::new().snapshot().latest_revision;
+    let global_limits = DatasetDemandPlanLimits::new(
+        MAX_RENDER_REQUIREMENTS,
+        MAX_RENDER_REQUIREMENTS,
+        diagnostics.category_cap_bytes(CpuLedgerCategory::DecodedResidency),
+    );
     let request = CameraDemandRequest::new(
+        intent_revision,
         Arc::clone(snapshot.catalog()),
         opened.dataset.cpu_ledger_arc(),
         application_view(&snapshot).clone(),
+        global_limits,
         Some(Current3dDemandRequest::new(
             opened.render_coordination.presentation_viewport,
             opened.render_coordination.render_viewport,
-            DatasetDemandPlanLimits::new(
-                MAX_RENDER_REQUIREMENTS,
-                MAX_RENDER_REQUIREMENTS,
-                diagnostics.category_cap_bytes(CpuLedgerCategory::DecodedResidency),
-            ),
-            false,
-            None,
-            false,
+            global_limits,
             Current3dDemandBaselines::new(
                 baseline(SCOPE_CURRENT_3D),
                 baseline(SCOPE_CURRENT_3D_REFINEMENT),
@@ -258,10 +260,11 @@ fn load_current_requirements(
         vec![opened.dataset.scope_prepared_body_handle(SCOPE_ANALYSIS)],
         None,
     );
-    let mut planner = CameraDemandPlanner::new()?;
-    planner.submit(request)?;
+    if !opened.dataset.submit_visible_demand_plan(request) {
+        anyhow::bail!("headless demand used a stale render-intent revision");
+    }
     let prepared = loop {
-        if let Some(result) = planner.take_result() {
+        if let Some(result) = opened.dataset.take_visible_demand_plan_result() {
             break result.outcome?;
         }
         if Instant::now() >= deadline {
@@ -273,6 +276,7 @@ fn load_current_requirements(
         current_3d,
         cross_sections,
         renderer_requirement_update,
+        renderer_requirement_payload_bytes: _,
         post_refinement_promotion_update,
         candidates_visited: _,
     } = prepared;

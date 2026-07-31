@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use mirante4d_dataset::{
-    DatasetCatalog, DatasetLayer, DatasetResourceIdentity, DatasetResourceKey, DatasetSourceId,
+    BrickKey, DatasetCatalog, DatasetLayer, DatasetResourceIdentity, DatasetSourceId,
     ResourceRegion, ScientificIdentityStatus,
 };
 use mirante4d_domain::{
@@ -19,7 +19,7 @@ use mirante4d_project_model::{
 };
 use mirante4d_render_api::{
     FrameCompleteness, FrameCoverage, FrameIdentity, FrameProgress, LayerRenderIntent,
-    PresentationPaintRequest, PresentationToken, PresentationViewport, PresentedFrame,
+    PresentationPaintRequest, PresentationTarget, PresentationViewport, PresentedFrame,
     RenderExtent, RenderIntent, RenderRequirement, RenderRequirementRole, RenderRequirements,
     RenderViewIntent,
 };
@@ -41,7 +41,7 @@ fn snapshot_carries_four_fixed_backend_neutral_presentation_slots() {
         ))
         .unwrap(),
     );
-    let key = DatasetResourceKey::new(
+    let key = BrickKey::new(
         resource_identity,
         LogicalLayerKey::new(0),
         TimeIndex::new(0),
@@ -78,21 +78,17 @@ fn snapshot_carries_four_fixed_backend_neutral_presentation_slots() {
     )
     .unwrap();
     let viewport = PresentationViewport::new(32.0, 24.0).unwrap();
-    let surface = |token| {
+    let surface = |target| {
         PresentationSurface::new(
             viewport,
-            Some(PresentedFrame::new(
-                PresentationToken::new(token).unwrap(),
-                extent,
-                progress.clone(),
-            )),
+            Some(PresentedFrame::new(target, extent, progress.clone())),
         )
     };
     let presentations = PresentationSnapshot::new(
-        Some(surface(1)),
-        Some(surface(2)),
-        Some(surface(3)),
-        Some(surface(4)),
+        Some(surface(PresentationTarget::ThreeD)),
+        Some(surface(PresentationTarget::Xy)),
+        Some(surface(PresentationTarget::Xz)),
+        Some(surface(PresentationTarget::Yz)),
     );
     let projected = snapshot.with_presentations(presentations);
 
@@ -104,17 +100,16 @@ fn snapshot_carries_four_fixed_backend_neutral_presentation_slots() {
             .collect::<Vec<_>>(),
         PresentationSlot::ALL
     );
-    for (index, slot) in PresentationSlot::ALL.into_iter().enumerate() {
+    for slot in PresentationSlot::ALL {
         let surface = projected.presentations().get(slot).unwrap();
-        let token = PresentationToken::new(u64::try_from(index + 1).unwrap()).unwrap();
-        assert_eq!(surface.frame().unwrap().token(), token);
+        assert_eq!(surface.frame().unwrap().target(), slot);
         assert_eq!(
             surface.paint_request(),
-            Some(PresentationPaintRequest::new(token, viewport))
+            Some(PresentationPaintRequest::new(slot, viewport))
         );
     }
 
-    let retained = surface(5);
+    let retained = surface(PresentationTarget::ThreeD);
     let stale =
         PresentationSurface::with_frame_currentness(viewport, retained.frame().cloned(), false);
     assert!(stale.frame().is_some());

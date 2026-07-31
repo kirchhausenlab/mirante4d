@@ -30,6 +30,7 @@ repository = "https://github.com/kirchhausenlab/mirante4d"
 
 [workspace.dependencies]
 anyhow = "1.0.103"
+ash = "0.38.0"
 bytemuck = "1.25.0"
 crc32c = "=0.6.8"
 eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "default_fonts", "wayland", "web_screen_reader", "wgpu", "x11"] }

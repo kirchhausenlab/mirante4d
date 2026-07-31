@@ -6,6 +6,10 @@ use super::diagnostics::{dataset_runtime_diagnostics_json, local_dataset_source_
 use super::*;
 use std::{fs, path::PathBuf};
 
+use crate::tests::{
+    open_dataset_and_render_first_frame, test_workbench_app_without_background_runtime,
+    write_target_fixture,
+};
 use mirante4d_dataset_runtime::{DatasetRuntimeConfig, DatasetRuntimeDiagnostics};
 
 #[test]
@@ -20,6 +24,48 @@ fn freshness_wait_never_certifies_a_stale_exact_frame() {
 
     fidelity.display_freshness = crate::DisplayedFrameFreshness::Current;
     assert!(frame_freshness_is_current(&fidelity));
+}
+
+#[test]
+fn native_pick_evidence_requires_a_sampled_exact_hit_with_the_mode_policy() {
+    let evidence = json!({
+        "purpose": "probe_hover",
+        "status": "sampled",
+        "kind": "voxel",
+        "completeness": "exact",
+        "policy": "mip_argmax",
+        "value": { "dtype": "uint16", "value": 1234 },
+        "world_position": [1.0, 2.0, 3.0],
+        "render_pixel": [10.0, 20.0],
+        "placeholder_sampled": false,
+        "native_gpu_pick": true,
+    });
+
+    assert!(assert_native_pick_evidence(&evidence, ProductAutomationPickPolicy::MipArgmax).is_ok());
+    assert!(
+        assert_native_pick_evidence(
+            &evidence,
+            ProductAutomationPickPolicy::MaximumOpacityContribution
+        )
+        .unwrap_err()
+        .contains("pick policy")
+    );
+
+    for (field, invalid) in [
+        ("native_gpu_pick", json!(false)),
+        ("placeholder_sampled", json!(true)),
+        ("status", json!("empty")),
+        ("completeness", json!("incomplete")),
+        ("value", Value::Null),
+    ] {
+        let mut invalid_evidence = evidence.clone();
+        invalid_evidence[field] = invalid;
+        assert!(
+            assert_native_pick_evidence(&invalid_evidence, ProductAutomationPickPolicy::MipArgmax)
+                .is_err(),
+            "{field} must remain part of the pick acceptance contract"
+        );
+    }
 }
 
 #[test]
@@ -198,26 +244,14 @@ fn passed_imported_open_ready_adds_full_clocks_to_the_same_publication_evidence(
 }
 
 #[test]
-fn refinement_handoff_diagnostics_name_an_uninitialized_hidden_target() {
+fn refinement_handoff_diagnostics_follow_the_dataset_cutoff() {
     assert_eq!(
-        refinement_handoff_phase(false, false, false, false),
+        refinement_handoff_phase(false),
         RefinementHandoffPhase::Inactive
     );
     assert_eq!(
-        refinement_handoff_phase(true, false, false, false),
-        RefinementHandoffPhase::AwaitingHiddenTargetRegistration
-    );
-    assert_eq!(
-        refinement_handoff_phase(true, true, false, false),
-        RefinementHandoffPhase::AwaitingHiddenTargetRequest
-    );
-    assert_eq!(
-        refinement_handoff_phase(true, true, true, false),
-        RefinementHandoffPhase::HiddenTargetStreaming
-    );
-    assert_eq!(
-        refinement_handoff_phase(true, true, true, true),
-        RefinementHandoffPhase::HiddenTargetPresented
+        refinement_handoff_phase(true),
+        RefinementHandoffPhase::AwaitingCoordinatedExactPresentation
     );
 }
 
@@ -391,10 +425,361 @@ fn input_sequence_bounds_are_validated() {
 
 #[test]
 fn input_sequence_schedule_spans_the_requested_monotonic_duration() {
-    assert_eq!(sequence_sample_target_ns(0, 5, 100), 0);
-    assert_eq!(sequence_sample_target_ns(1, 5, 100), 25_000_000);
+    assert_eq!(sequence_sample_target_ns(0, 5, 100), 20_000_000);
+    assert_eq!(sequence_sample_target_ns(1, 5, 100), 40_000_000);
     assert_eq!(sequence_sample_target_ns(4, 5, 100), 100_000_000);
-    assert_eq!(sequence_sample_target_ns(0, 1, 100), 0);
+    assert_eq!(sequence_sample_target_ns(0, 1, 100), 100_000_000);
+    assert_eq!(sequence_sample_target_ns(0, 300, 5_000), 16_666_666);
+    assert_eq!(sequence_sample_target_ns(299, 300, 5_000), 5_000_000_000);
+}
+
+#[test]
+fn input_sequence_deadline_reaches_eframe_without_egui_frame_time_subtraction() {
+    use std::sync::{Arc, Mutex};
+
+    let context = egui::Context::default();
+    let _ = context.run_ui(egui::RawInput::default(), |_| {});
+    let callback_delays = Arc::new(Mutex::new(Vec::new()));
+    let observed_delays = Arc::clone(&callback_delays);
+    context.set_request_repaint_callback(move |request| {
+        observed_delays.lock().unwrap().push(request.delay);
+    });
+    let input = egui::RawInput {
+        predicted_dt: 0.020,
+        ..Default::default()
+    };
+    let expected_deadline = Duration::from_millis(7);
+    let _ = context.run_ui(input, |ui| {
+        ui.ctx()
+            .request_repaint_after(egui_deadline_repaint_delay(ui.ctx(), expected_deadline));
+    });
+
+    assert_eq!(
+        callback_delays.lock().unwrap().last().copied(),
+        Some(expected_deadline),
+        "the backend must receive the absolute input deadline, not an immediate animation wake"
+    );
+}
+
+#[test]
+fn camera_sequence_uses_three_mailbox_samples_and_one_durable_commit() {
+    use std::sync::{Arc, Mutex};
+
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "mailbox_sequence_test",
+        "commands": [{
+            "command": "camera_pan_sequence",
+            "samples": 3,
+            "duration_ms": 1,
+            "x_points_per_sample": 1.0,
+            "y_points_per_sample": 0.0
+        }]
+    }))
+    .unwrap();
+    script.validate().unwrap();
+    let command = script.commands[0].clone();
+    let mut controller = ProductAutomationController::new(
+        script,
+        temp.path().join("script.json"),
+        temp.path().join("report.json"),
+    );
+    let context = egui::Context::default();
+    let _ = context.run_ui(egui::RawInput::default(), |_| {});
+    let repaint_delays = Arc::new(Mutex::new(Vec::new()));
+    let observed_repaint_delays = Arc::clone(&repaint_delays);
+    context.set_request_repaint_callback(move |request| {
+        observed_repaint_delays.lock().unwrap().push(request.delay);
+    });
+    let original_camera = *application_view(&app.application.snapshot()).camera();
+    let expected_camera = (0..3).fold(original_camera, |camera, _| pan_camera(camera, [1.0, 0.0]));
+    let currentness_before = app.application.snapshot().currentness();
+    let commits_before = app
+        .render_coordination
+        .display_generation()
+        .durable_gesture_commits;
+
+    assert!(matches!(
+        controller.execute_command(&mut app, &context, &command),
+        Ok(CommandProgress::PassiveWaiting(_))
+    ));
+    controller
+        .active_input_sequence
+        .as_mut()
+        .unwrap()
+        .started_at = Instant::now() - Duration::from_millis(2);
+    assert!(matches!(
+        controller.execute_command(&mut app, &context, &command),
+        Ok(CommandProgress::PassiveWaiting(_))
+    ));
+    assert_eq!(
+        app.render_intent_mailbox.snapshot().raw_samples,
+        0,
+        "egui multipass re-entry in one frame must not dispatch a newly due sample"
+    );
+
+    assert_eq!(
+        *application_view(&app.application.snapshot()).camera(),
+        original_camera
+    );
+    assert_eq!(app.application.snapshot().currentness(), currentness_before);
+    assert_eq!(
+        app.render_coordination
+            .display_generation()
+            .durable_gesture_commits,
+        commits_before
+    );
+
+    controller.automation_frame_nr += 1;
+    assert!(matches!(
+        controller.execute_command(&mut app, &context, &command),
+        Ok(CommandProgress::PassiveWaiting(_))
+    ));
+    assert!(
+        repaint_delays.lock().unwrap().is_empty(),
+        "a synchronously published resident sample must not request a redundant immediate frame"
+    );
+    controller.automation_frame_nr += 1;
+    assert!(matches!(
+        controller.execute_command(&mut app, &context, &command),
+        Ok(CommandProgress::PassiveWaiting(_))
+    ));
+    controller.automation_frame_nr += 1;
+    assert!(matches!(
+        controller.execute_command(&mut app, &context, &command),
+        Ok(CommandProgress::PassiveWaiting(_))
+    ));
+    assert_eq!(
+        *application_view(&app.application.snapshot()).camera(),
+        original_camera,
+        "the final transient sample must not commit durable state in its dispatch update"
+    );
+    assert_eq!(
+        effective_interaction_camera(&app),
+        expected_camera,
+        "the mailbox must retain the accumulated transient result while finish waits"
+    );
+    assert_eq!(
+        app.render_coordination
+            .display_generation()
+            .durable_gesture_commits,
+        commits_before,
+        "the durable commit must remain separate from the final sample"
+    );
+    let transient_mailbox = app.render_intent_mailbox.snapshot();
+    assert_eq!(transient_mailbox.raw_samples, 3);
+    assert_eq!(transient_mailbox.coalesced_samples, 2);
+    assert_eq!(transient_mailbox.finished_gestures, 0);
+    assert!(transient_mailbox.active_gesture.is_some());
+    let transient_generation = app
+        .render_coordination
+        .display_generation()
+        .input_generation;
+    assert_eq!(
+        app.render_coordination
+            .coordinated_publication_diagnostics()
+            .current_presentation_generation(),
+        None
+    );
+
+    controller.automation_frame_nr += 1;
+    assert!(matches!(
+        controller.execute_command(&mut app, &context, &command),
+        Ok(CommandProgress::PassiveWaiting(_))
+    ));
+    assert_eq!(
+        app.render_coordination
+            .display_generation()
+            .durable_gesture_commits,
+        commits_before,
+        "finish must keep waiting while the final transient generation is not current"
+    );
+    let now_ns = app.display_instrumentation_now_ns();
+    app.render_coordination.record_current_presentation(now_ns);
+    app.render_coordination
+        .record_current_group_presentation(now_ns);
+    assert_eq!(
+        app.render_coordination
+            .coordinated_publication_diagnostics()
+            .current_presentation_generation(),
+        Some(transient_generation)
+    );
+
+    controller.automation_frame_nr += 1;
+    let details = match controller.execute_command(&mut app, &context, &command) {
+        Ok(CommandProgress::Done(details)) => details,
+        _ => panic!("a separate current-generation update must finish the automation sequence"),
+    };
+
+    assert_eq!(
+        *application_view(&app.application.snapshot()).camera(),
+        expected_camera,
+        "automation must accumulate every sample before committing the latest camera"
+    );
+    assert_eq!(
+        app.render_coordination
+            .display_generation()
+            .durable_gesture_commits,
+        commits_before + 1
+    );
+    let mailbox = app.render_intent_mailbox.snapshot();
+    assert_eq!(mailbox.raw_samples, 3);
+    assert_eq!(mailbox.coalesced_samples, 2);
+    assert_eq!(mailbox.finished_gestures, 1);
+    assert!(mailbox.active_gesture.is_none());
+    assert_eq!(details["samples"], 3);
+    assert_eq!(details["observed_counter_delta"]["input_generations"], 4);
+    assert_eq!(
+        details["observed_counter_delta"]["durable_gesture_commits"],
+        1
+    );
+    assert_eq!(
+        details["observed_counter_delta"]["render_intent_revisions"], 3,
+        "durable finish commits the latest transient body without allocating a second frame"
+    );
+    assert_eq!(
+        details["observed_counter_delta"]["render_intent_samples"],
+        3
+    );
+    assert_eq!(
+        details["observed_counter_delta"]["render_intent_coalesced_samples"],
+        2
+    );
+    assert_eq!(
+        details["observed_counter_delta"]["render_intent_finished_gestures"],
+        1
+    );
+    assert_eq!(
+        details["input_evidence"]["dispatch_timing"]["dispatched_samples"],
+        3
+    );
+    assert_eq!(
+        details["input_evidence"]["dispatch_timing"]["distinct_app_updates"], 3,
+        "each sample must belong to a distinct egui frame"
+    );
+    assert_eq!(
+        details["input_evidence"]["dispatch_timing"]["same_update_dispatches"],
+        0
+    );
+    assert!(
+        details["input_evidence"]["dispatch_timing"]["maximum_dispatch_lateness_ns"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "dispatch timing must be derived from the delayed samples, not a static claim"
+    );
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn automation_command_updates_the_same_ui_turn_snapshot() {
+    use egui_kittest::kittest;
+
+    fn accesskit_tree_contains_label(node: kittest::AccessKitNode<'_>, expected: &str) -> bool {
+        node.label().as_deref() == Some(expected)
+            || node
+                .children()
+                .any(|child| accesskit_tree_contains_label(child, expected))
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "same_ui_turn_snapshot",
+        "commands": [{
+            "command": "set_viewer_layout",
+            "layout": "four_panel"
+        }]
+    }))
+    .unwrap();
+    script.validate().unwrap();
+    let controller = ProductAutomationController::new(
+        script,
+        temp.path().join("script.json"),
+        temp.path().join("report.json"),
+    );
+    let context = egui::Context::default();
+    mirante4d_ui_egui::configure_visuals(&context);
+    context.enable_accesskit();
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 720.0),
+        )),
+        ..Default::default()
+    };
+    input
+        .viewports
+        .get_mut(&egui::ViewportId::ROOT)
+        .unwrap()
+        .native_pixels_per_point = Some(1.0);
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    assert_eq!(
+        application_view(&app.application.snapshot()).layout(),
+        ViewerLayout::Single3d
+    );
+    for slot in [
+        PresentationSlot::Xy,
+        PresentationSlot::Xz,
+        PresentationSlot::Yz,
+    ] {
+        assert!(
+            app.render_coordination
+                .surface(slot)
+                .presentation_viewport()
+                .is_none(),
+            "the Single3d control must begin without a {slot:?} panel viewport"
+        );
+    }
+    app.product_automation = Some(controller);
+    let mut frame = eframe::Frame::_new_kittest();
+
+    let mut output = context.run_ui(input, |ui| {
+        eframe::App::logic(&mut app, ui.ctx(), &mut frame);
+        #[expect(deprecated)]
+        eframe::App::update(&mut app, ui.ctx(), &mut frame);
+        eframe::App::ui(&mut app, ui, &mut frame);
+    });
+
+    assert_eq!(
+        application_view(&app.application.snapshot()).layout(),
+        ViewerLayout::FourPanel,
+        "the automation command must execute in the sole UI turn"
+    );
+    let accesskit = kittest::State::new(
+        output
+            .platform_output
+            .accesskit_update
+            .take()
+            .expect("the sole UI pass must publish an AccessKit tree"),
+    );
+    for (slot, label) in [
+        (PresentationSlot::Xy, "XY cross-section panel"),
+        (PresentationSlot::Xz, "XZ cross-section panel"),
+        (PresentationSlot::Yz, "YZ cross-section panel"),
+    ] {
+        assert!(
+            app.render_coordination
+                .surface(slot)
+                .presentation_viewport()
+                .is_some(),
+            "the sole UI pass must observe the new {slot:?} panel viewport"
+        );
+        assert!(
+            accesskit_tree_contains_label(accesskit.root(), label),
+            "the sole UI pass must expose {label}"
+        );
+    }
 }
 
 #[test]
@@ -402,7 +787,7 @@ fn automation_alone_does_not_enable_validation_capture() {
     let navigation: ProductAutomationScript = serde_json::from_str(
         r#"{
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 6,
+          "schema_version": 7,
           "hard_safety_limits": {},
           "scenario": "performance_navigation",
           "commands": [
@@ -417,8 +802,10 @@ fn automation_alone_does_not_enable_validation_capture() {
     assert!(!navigation.requires_validation_capture());
 
     for pixel_command in [
-        r#"{ "command": "capture_screenshot", "name": "mode-proof" }"#,
-        r#"{ "command": "assert", "condition": "nonblank_frame" }"#,
+        r#"{ "command": "capture_screenshot", "target": "three_d", "name": "mode-proof" }"#,
+        r#"{ "command": "assert", "condition": {
+          "nonblank_panel": { "target": "three_d" }
+        } }"#,
         r#"{ "command": "assert", "condition": {
           "four_panel_images_distinct": { "min_different_pixels": 1 }
         } }"#,
@@ -426,7 +813,7 @@ fn automation_alone_does_not_enable_validation_capture() {
         let raw = format!(
             r#"{{
               "schema": "mirante4d-product-automation-script",
-              "schema_version": 6,
+              "schema_version": 7,
               "hard_safety_limits": {{}},
               "scenario": "render_correctness",
               "commands": [{pixel_command}]
@@ -436,6 +823,31 @@ fn automation_alone_does_not_enable_validation_capture() {
         script.validate().unwrap();
         assert!(script.requires_validation_capture());
     }
+}
+
+#[test]
+fn automation_v7_rejects_implicit_capture_and_legacy_nonblank_frame() {
+    let implicit_capture = serde_json::from_value::<ProductAutomationScript>(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "scenario": "implicit_capture",
+        "hard_safety_limits": {},
+        "commands": [
+            { "command": "capture_screenshot", "name": "missing-target" }
+        ]
+    }));
+    assert!(implicit_capture.is_err());
+
+    let legacy_nonblank = serde_json::from_value::<ProductAutomationScript>(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "scenario": "legacy_nonblank",
+        "hard_safety_limits": {},
+        "commands": [
+            { "command": "assert", "condition": "nonblank_frame" }
+        ]
+    }));
+    assert!(legacy_nonblank.is_err());
 }
 
 #[test]
@@ -523,7 +935,7 @@ fn automation_script_parses_the_b4_project_store_contract() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 6,
+          "schema_version": 7,
           "hard_safety_limits": {},
           "scenario": "b4_project_store",
           "commands": [
@@ -655,7 +1067,7 @@ fn automation_script_parses_semantic_camera_commands() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 6,
+          "schema_version": 7,
           "hard_safety_limits": {
             "max_cpu_total_bytes": 1024,
             "max_runtime_queued_requests": 128
@@ -680,7 +1092,7 @@ fn automation_script_parses_semantic_camera_commands() {
             { "command": "set_active_tool", "tool": "inspect" },
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
             { "command": "primary_click", "x_fraction": 0.5, "y_fraction": 0.5 },
-            { "command": "capture_screenshot", "name": "unit screenshot" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "unit screenshot" },
             { "command": "assert", "condition": { "projection": { "projection": "perspective" } } },
             { "command": "assert", "condition": { "layer_sampling": { "layer_index": 1, "sampling": "smooth_linear" } } },
             { "command": "assert", "condition": { "layer_iso_shading": { "layer_index": 1, "shading": "gradient_lighting" } } },
@@ -723,11 +1135,67 @@ fn automation_script_parses_semantic_camera_commands() {
 }
 
 #[test]
+fn automation_script_parses_exact_fidelity_layer_mode_and_pick_assertions() {
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "kernel_acceptance",
+        "commands": [
+            { "command": "assert", "condition": {
+                "frame_fidelity": {
+                    "scale_level": 0,
+                    "complete": true,
+                    "exact": true
+                }
+            } },
+            { "command": "assert", "condition": {
+                "layer_render_mode": { "layer_index": 1, "mode": "dvr" }
+            } },
+            { "command": "assert", "condition": {
+                "pick_evidence": { "policy": "maximum_opacity_contribution" }
+            } }
+        ]
+    }))
+    .unwrap();
+
+    script.validate().unwrap();
+    let ProductAutomationCommand::Assert {
+        condition:
+            ProductAutomationAssertCondition::FrameFidelity {
+                exact, complete, ..
+            },
+    } = &script.commands[0]
+    else {
+        panic!("expected exact frame-fidelity assertion");
+    };
+    assert!(*exact && *complete);
+    let ProductAutomationCommand::Assert {
+        condition: ProductAutomationAssertCondition::LayerRenderMode { layer_index, mode },
+    } = &script.commands[1]
+    else {
+        panic!("expected layer-mode assertion");
+    };
+    assert_eq!(*layer_index, 1);
+    assert!(matches!(mode, ProductAutomationRenderMode::Dvr));
+    let ProductAutomationCommand::Assert {
+        condition: ProductAutomationAssertCondition::PickEvidence { policy },
+    } = &script.commands[2]
+    else {
+        panic!("expected pick-evidence assertion");
+    };
+    assert_eq!(
+        *policy,
+        ProductAutomationPickPolicy::MaximumOpacityContribution
+    );
+}
+
+#[test]
 fn automation_script_parses_source_verification_evidence_workflow() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 6,
+          "schema_version": 7,
           "hard_safety_limits": {},
           "scenario": "b3_source_verification",
           "commands": [
@@ -783,7 +1251,7 @@ fn automation_script_parses_normal_import_cancel_resume_workflow() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 6,
+          "schema_version": 7,
           "hard_safety_limits": {},
           "scenario": "import_preprocessing",
           "commands": [
@@ -826,7 +1294,7 @@ fn automation_script_parses_retained_four_panel_assertions() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 6,
+          "schema_version": 7,
           "hard_safety_limits": {},
           "scenario": "unit_four_panel",
           "commands": [
@@ -1123,6 +1591,86 @@ fn color_image_stats_detect_blank_and_nonblank_rgb_content() {
 }
 
 #[test]
+fn panel_image_comparison_rejects_blank_targets_and_compares_unequal_extents() {
+    let rgba = |pixels: &[[u8; 4]]| {
+        pixels
+            .iter()
+            .flat_map(|pixel| pixel.iter().copied())
+            .collect::<Vec<_>>()
+    };
+    let small = rgba(&[[255, 0, 0, 255], [0, 0, 255, 255]]);
+    let normalized_equal = rgba(&[
+        [255, 0, 0, 255],
+        [255, 0, 0, 255],
+        [0, 0, 255, 255],
+        [0, 0, 255, 255],
+        [255, 0, 0, 255],
+        [255, 0, 0, 255],
+        [0, 0, 255, 255],
+        [0, 0, 255, 255],
+    ]);
+    let equal_error = assert_gpu_display_images_distinct(
+        "unequal",
+        &[
+            ("small".to_owned(), 2, 1, small.clone()),
+            ("large".to_owned(), 4, 2, normalized_equal.clone()),
+        ],
+        1,
+    )
+    .unwrap_err();
+    assert!(equal_error.contains("0 normalized-coordinate pixels"));
+
+    let mut normalized_different = normalized_equal;
+    normalized_different[(1 * 4 + 3) * 4] = 255;
+    assert!(
+        assert_gpu_display_images_distinct(
+            "unequal",
+            &[
+                ("small".to_owned(), 2, 1, small.clone()),
+                ("large".to_owned(), 4, 2, normalized_different),
+            ],
+            1,
+        )
+        .is_ok()
+    );
+
+    let blank_error = assert_gpu_display_images_distinct(
+        "blank",
+        &[
+            ("visible".to_owned(), 2, 1, small),
+            ("blank-target".to_owned(), 1, 1, vec![0, 0, 0, 255]),
+        ],
+        1,
+    )
+    .unwrap_err();
+    assert!(blank_error.contains("blank-target is RGB-blank"));
+
+    let alpha_only_error = assert_gpu_display_images_distinct(
+        "visible-rgb",
+        &[
+            ("opaque".to_owned(), 1, 1, vec![255, 0, 0, 255]),
+            ("transparent".to_owned(), 1, 1, vec![255, 0, 0, 1]),
+        ],
+        1,
+    )
+    .unwrap_err();
+    assert!(alpha_only_error.contains("0 direct pixels"));
+
+    let final_pair_error = assert_gpu_display_images_distinct(
+        "six-pairs",
+        &[
+            ("3D".to_owned(), 1, 1, vec![255, 0, 0, 255]),
+            ("XY".to_owned(), 1, 1, vec![0, 255, 0, 255]),
+            ("XZ".to_owned(), 1, 1, vec![0, 0, 255, 255]),
+            ("YZ".to_owned(), 1, 1, vec![0, 0, 255, 255]),
+        ],
+        1,
+    )
+    .unwrap_err();
+    assert!(final_pair_error.contains("XZ and YZ"));
+}
+
+#[test]
 fn viewport_artifact_json_includes_capture_source_and_pixel_stats() {
     let artifact = ProductAutomationArtifact {
         kind: "viewport_capture",
@@ -1131,6 +1679,9 @@ fn viewport_artifact_json_includes_capture_source_and_pixel_stats() {
         width: 2,
         height: 1,
         command_index: 3,
+        target: "xy",
+        frame_identity: 42,
+        surface_generation: 9,
         capture_source: "loading_reference_color_image",
         pixel_stats: ProductAutomationImageStats {
             pixel_count: 2,
@@ -1144,6 +1695,9 @@ fn viewport_artifact_json_includes_capture_source_and_pixel_stats() {
     let value = artifact.json();
 
     assert_eq!(value["capture_source"], "loading_reference_color_image");
+    assert_eq!(value["target"], "xy");
+    assert_eq!(value["frame_identity"], 42);
+    assert_eq!(value["surface_generation"], 9);
     assert_eq!(value["pixel_stats"]["pixel_count"], 2);
     assert_eq!(value["pixel_stats"]["nonzero_rgb_pixels"], 1);
     assert_eq!(value["pixel_stats"]["max_rgb"], 30);

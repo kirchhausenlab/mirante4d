@@ -10,9 +10,10 @@ use std::{
     sync::Arc,
 };
 
+use mirante4d_application::RenderIntentRevision;
 use mirante4d_dataset::{
-    CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError, DatasetResourceIdentity,
-    DatasetResourceKey, ResourceLease,
+    BrickKey, CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError,
+    DatasetResourceIdentity, ResourceLease,
 };
 use mirante4d_dataset_runtime::{
     AccountedCpuLease, CancellationGeneration, DatasetRuntime, DatasetRuntimeConfig,
@@ -24,6 +25,10 @@ use mirante4d_render_api::PreparedResourceBody;
 use mirante4d_storage::{LocalDatasetSource, LocalDatasetSourceDiagnostics};
 
 use crate::{
+    camera_demand_cache::{
+        CameraDemandDiagnostics, CameraDemandPlanner, CameraDemandPlannerError,
+        CameraDemandRequest, CameraDemandResult,
+    },
     dataset_demand_plan::{
         PreparedDatasetDemandPlan, PreparedDemandRequirements, PreparedProgressiveDatasetDemandPlan,
     },
@@ -41,7 +46,7 @@ pub(crate) const SCOPE_PLAYBACK: u64 = 5;
 pub(crate) const SCOPE_ANALYSIS: u64 = 6;
 pub(crate) const SCOPE_CURRENT_3D_REFINEMENT: u64 = 7;
 
-const INTERACTIVE_DEMAND_SCOPES: [u64; 6] = [
+const DATASET_DEMAND_SCOPES: [u64; 6] = [
     SCOPE_CURRENT_3D,
     SCOPE_CURRENT_3D_REFINEMENT,
     SCOPE_CROSS_SECTION_XY,
@@ -50,13 +55,20 @@ const INTERACTIVE_DEMAND_SCOPES: [u64; 6] = [
     SCOPE_PLAYBACK,
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveVisibleDemand {
+    revision: RenderIntentRevision,
+    scope: u64,
+    installed: bool,
+}
+
 /// A small deterministic sample per current layer remains CPU-authoritative
 /// for histogram/readout consumers. Full 3D display cohorts stream through
 /// CPU residency into the larger GPU arena.
 const HISTOGRAM_CPU_RESOURCES_PER_LAYER: usize = 8;
 
 fn histogram_quota_complete(
-    histogram_by_layer: &BTreeMap<mirante4d_domain::LogicalLayerKey, Vec<DatasetResourceKey>>,
+    histogram_by_layer: &BTreeMap<mirante4d_domain::LogicalLayerKey, Vec<BrickKey>>,
     selected_layers: &BTreeSet<mirante4d_domain::LogicalLayerKey>,
 ) -> bool {
     selected_layers.iter().all(|layer| {
@@ -69,7 +81,7 @@ fn histogram_quota_complete(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PendingKey {
     scope: u64,
-    resource: DatasetResourceKey,
+    resource: BrickKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +92,7 @@ struct PendingRequest {
 
 #[derive(Default)]
 pub(crate) struct ScopeReconciliationTargets {
-    requirements_by_scope: BTreeMap<u64, Arc<[DatasetResourceKey]>>,
+    requirements_by_scope: BTreeMap<u64, Arc<[BrickKey]>>,
     rewind_cancelled_scopes: BTreeSet<u64>,
 }
 
@@ -94,7 +106,7 @@ impl ScopeReconciliationTargets {
         self.requirements_by_scope.insert(scope, Arc::default());
     }
 
-    fn replace_handle(&mut self, scope: u64, requirements: Arc<[DatasetResourceKey]>) {
+    fn replace_handle(&mut self, scope: u64, requirements: Arc<[BrickKey]>) {
         self.requirements_by_scope.insert(scope, requirements);
     }
 
@@ -121,25 +133,28 @@ pub(crate) struct DatasetRequestDispatcher {
     generations: BTreeMap<u64, CancellationGeneration>,
     pending_by_id: HashMap<RuntimeRequestId, PendingRequest>,
     pending_by_key: HashMap<PendingKey, RequestTicket>,
-    failed_by_scope: BTreeMap<u64, BTreeMap<DatasetResourceKey, RuntimeFault>>,
+    failed_by_scope: BTreeMap<u64, BTreeMap<BrickKey, RuntimeFault>>,
     admission_blocked: bool,
     last_fault: Option<RuntimeFault>,
     #[cfg(test)]
-    submitted_requests: Vec<(u64, DatasetResourceKey, RequestPriority)>,
+    submitted_requests: Vec<(u64, BrickKey, RequestPriority)>,
     #[cfg(test)]
-    promoted_requests: Vec<(u64, DatasetResourceKey, RequestPriority)>,
+    promoted_requests: Vec<(u64, BrickKey, RequestPriority)>,
 }
 
 /// Bounded demand and retained-resource state for one opened source.
 pub(crate) struct DatasetDemandState {
     dispatcher: DatasetRequestDispatcher,
+    visible_demand_planner: CameraDemandPlanner,
+    latest_visible_intent_revision: RenderIntentRevision,
+    active_visible_demand: Option<ActiveVisibleDemand>,
     retained_leases: RetainedLeases,
     cpu_ledger: Arc<dyn CpuByteLedger>,
     resource_identity: DatasetResourceIdentity,
     selected_path: PathBuf,
     local_source: Option<Arc<LocalDatasetSource>>,
-    requirements_by_scope: BTreeMap<u64, Arc<[DatasetResourceKey]>>,
-    gpu_priority_order_by_scope: BTreeMap<u64, Arc<[DatasetResourceKey]>>,
+    requirements_by_scope: BTreeMap<u64, Arc<[BrickKey]>>,
+    gpu_priority_order_by_scope: BTreeMap<u64, Arc<[BrickKey]>>,
     /// Required current-view prefix within each contribution-ranked body.
     /// The suffix is admitted only by the final speculative-prefetch pass.
     required_prefix_len_by_scope: BTreeMap<u64, usize>,
@@ -148,20 +163,19 @@ pub(crate) struct DatasetDemandState {
     admission_cursor_by_scope: BTreeMap<u64, usize>,
     readiness_by_scope: BTreeMap<u64, ScopeReadiness>,
     retained_requirements_dirty: bool,
-    linked_cpu_authoritative_keys: HashSet<DatasetResourceKey>,
+    linked_cpu_authoritative_keys: HashSet<BrickKey>,
     linked_cpu_authoritative_keys_dirty: bool,
-    histogram_cpu_authoritative_keys: HashSet<DatasetResourceKey>,
+    histogram_cpu_authoritative_keys: HashSet<BrickKey>,
     histogram_cpu_authoritative_keys_dirty: bool,
-    histogram_requirements_by_layer:
-        BTreeMap<mirante4d_domain::LogicalLayerKey, Arc<[DatasetResourceKey]>>,
+    histogram_requirements_by_layer: BTreeMap<mirante4d_domain::LogicalLayerKey, Arc<[BrickKey]>>,
     histogram_generation_by_layer: BTreeMap<mirante4d_domain::LogicalLayerKey, u64>,
-    gpu_only_display_keys: HashSet<DatasetResourceKey>,
-    exact_gpu_recovery_by_scope: BTreeMap<u64, HashSet<DatasetResourceKey>>,
     /// CPU-authority removals that may now be released immediately when the
     /// exact payload is already resident through another presentation target.
-    released_cpu_authority_candidates: HashSet<DatasetResourceKey>,
-    last_gpu_residency_invalidation_epoch: Option<u64>,
+    released_cpu_authority_candidates: HashSet<BrickKey>,
     current_scale: ScaleLevel,
+    current_ideal_scale: ScaleLevel,
+    current_ideal_layer_scales: BTreeMap<mirante4d_domain::LogicalLayerKey, ScaleLevel>,
+    current_capacity_constrained: bool,
     current_covers_full_volume: bool,
     current_playback_downshifted: bool,
     four_panel: bool,
@@ -186,24 +200,21 @@ pub(crate) struct DatasetDemandState {
     prepared_scope_commits: u64,
     #[cfg(test)]
     prepared_scope_commit_requirement_visits: u64,
-    #[cfg(test)]
-    exact_recovery_membership_lookups: u64,
 }
 
 #[derive(Debug, Default)]
 struct ScopeReadiness {
-    cursor: Cell<usize>,
-    residency_invalidation_epoch: Cell<Option<u64>>,
-    /// Cursor position known before exact renderer removals opened bounded
-    /// holes. Once those exact holes recover, the already-proven suffix can
-    /// be restored without rescanning it.
-    exact_recovery_restore_cursor: Cell<Option<usize>>,
+    /// Monotone positions into the contribution-ranked body. The visible
+    /// readiness boundary and the full camera-guard body are independent
+    /// proofs; neither stores renderer residency membership.
+    required_cursor: Cell<usize>,
+    all_resources_cursor: Cell<usize>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct InstalledLeaseChanges {
     scopes: BTreeSet<u64>,
-    keys: Vec<DatasetResourceKey>,
+    leases: Vec<Arc<dyn ResourceLease>>,
 }
 
 impl InstalledLeaseChanges {
@@ -215,9 +226,16 @@ impl InstalledLeaseChanges {
         !self.scopes.is_empty()
     }
 
-    pub(crate) fn keys(&self) -> &[DatasetResourceKey] {
-        &self.keys
+    pub(crate) fn leases(&self) -> &[Arc<dyn ResourceLease>] {
+        &self.leases
     }
+}
+
+pub(crate) enum RendererEvictionDisposition {
+    Reoffer(Arc<dyn ResourceLease>),
+    Submitted,
+    NoLongerDemanded,
+    Deferred,
 }
 
 impl DatasetRequestDispatcher {
@@ -267,7 +285,7 @@ impl DatasetRequestDispatcher {
     pub(crate) fn submit_if_missing(
         &mut self,
         scope: u64,
-        resource: DatasetResourceKey,
+        resource: BrickKey,
         priority: RequestPriority,
         already_resident: bool,
         retry_cursor: Option<usize>,
@@ -396,14 +414,15 @@ impl DatasetRequestDispatcher {
     }
 
     #[cfg(test)]
-    pub(crate) fn pending_ticket(
-        &self,
-        scope: u64,
-        resource: DatasetResourceKey,
-    ) -> Option<RequestTicket> {
+    pub(crate) fn pending_ticket(&self, scope: u64, resource: BrickKey) -> Option<RequestTicket> {
         self.pending_by_key
             .get(&PendingKey { scope, resource })
             .copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submitted_request_records(&self) -> &[(u64, BrickKey, RequestPriority)] {
+        &self.submitted_requests
     }
 
     pub(crate) const fn admission_blocked(&self) -> bool {
@@ -452,7 +471,7 @@ impl DatasetDemandState {
         resource_identity: DatasetResourceIdentity,
         selected_path: PathBuf,
         local_source: Arc<LocalDatasetSource>,
-    ) -> Self {
+    ) -> Result<Self, CameraDemandPlannerError> {
         Self::new_with_local_source(
             runtime,
             cpu_ledger,
@@ -468,9 +487,12 @@ impl DatasetDemandState {
         resource_identity: DatasetResourceIdentity,
         selected_path: PathBuf,
         local_source: Option<Arc<LocalDatasetSource>>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, CameraDemandPlannerError> {
+        Ok(Self {
             dispatcher: DatasetRequestDispatcher::new(runtime),
+            visible_demand_planner: CameraDemandPlanner::new()?,
+            latest_visible_intent_revision: RenderIntentRevision::initial(),
+            active_visible_demand: None,
             retained_leases: RetainedLeases::new(),
             cpu_ledger,
             resource_identity,
@@ -490,11 +512,11 @@ impl DatasetDemandState {
             histogram_cpu_authoritative_keys_dirty: true,
             histogram_requirements_by_layer: BTreeMap::new(),
             histogram_generation_by_layer: BTreeMap::new(),
-            gpu_only_display_keys: HashSet::new(),
-            exact_gpu_recovery_by_scope: BTreeMap::new(),
             released_cpu_authority_candidates: HashSet::new(),
-            last_gpu_residency_invalidation_epoch: None,
             current_scale: ScaleLevel::BASE,
+            current_ideal_scale: ScaleLevel::BASE,
+            current_ideal_layer_scales: BTreeMap::new(),
+            current_capacity_constrained: false,
             current_covers_full_volume: false,
             current_playback_downshifted: false,
             four_panel: false,
@@ -519,9 +541,7 @@ impl DatasetDemandState {
             prepared_scope_commits: 0,
             #[cfg(test)]
             prepared_scope_commit_requirement_visits: 0,
-            #[cfg(test)]
-            exact_recovery_membership_lookups: 0,
-        }
+        })
     }
 
     pub(crate) fn selected_path(&self) -> &Path {
@@ -530,6 +550,144 @@ impl DatasetDemandState {
 
     pub(crate) fn dispatcher(&self) -> &DatasetRequestDispatcher {
         &self.dispatcher
+    }
+
+    /// Observes the mailbox-owned revision and its currently interactive
+    /// scope. Advancing the revision invalidates planner work before a
+    /// replacement can publish; the data plane copies but never allocates the
+    /// revision.
+    pub(crate) fn observe_visible_intent(
+        &mut self,
+        revision: RenderIntentRevision,
+        active_scope: Option<u64>,
+    ) -> bool {
+        if !self.can_observe_visible_intent(revision, active_scope) {
+            return false;
+        }
+        self.commit_preflighted_visible_intent(revision, active_scope);
+        true
+    }
+
+    pub(crate) fn can_observe_visible_intent(
+        &self,
+        revision: RenderIntentRevision,
+        active_scope: Option<u64>,
+    ) -> bool {
+        revision >= self.latest_visible_intent_revision
+            && active_scope.is_none_or(|scope| DATASET_DEMAND_SCOPES.contains(&scope))
+    }
+
+    /// Infallible mutation half of visible-intent observation. Callers that
+    /// coordinate this with other scope state preflight every participant
+    /// before entering this commit.
+    pub(crate) fn commit_preflighted_visible_intent(
+        &mut self,
+        revision: RenderIntentRevision,
+        active_scope: Option<u64>,
+    ) {
+        debug_assert!(self.can_observe_visible_intent(revision, active_scope));
+        if revision > self.latest_visible_intent_revision {
+            self.visible_demand_planner.invalidate(revision);
+            self.latest_visible_intent_revision = revision;
+        }
+        let previous_active = self.active_visible_demand;
+        self.active_visible_demand = active_scope.map(|scope| {
+            let installed = previous_active.is_some_and(|active| {
+                active.revision == revision && active.scope == scope && active.installed
+            });
+            ActiveVisibleDemand {
+                revision,
+                scope,
+                installed,
+            }
+        });
+    }
+
+    pub(crate) fn can_install_visible_intent(
+        &self,
+        revision: RenderIntentRevision,
+        scope: u64,
+    ) -> bool {
+        self.can_observe_visible_intent(revision, Some(scope)) && self.scope_is_installed(scope)
+    }
+
+    /// Atomically observes and marks one already-installed interactive scope
+    /// active after the app has preflighted the matching signature/body.
+    pub(crate) fn commit_preflighted_installed_visible_intent(
+        &mut self,
+        revision: RenderIntentRevision,
+        scope: u64,
+    ) {
+        debug_assert!(self.can_install_visible_intent(revision, scope));
+        self.commit_preflighted_visible_intent(revision, Some(scope));
+        self.active_visible_demand
+            .as_mut()
+            .expect("the preflighted active scope was just installed")
+            .installed = true;
+    }
+
+    /// Enables foreground admission only after the app has proved that the
+    /// active mailbox revision's panel signature owns the installed scope
+    /// body. A newer sample therefore cannot promote its predecessor's pending
+    /// keys while replacement planning is still in flight.
+    pub(crate) fn activate_installed_visible_intent(
+        &mut self,
+        revision: RenderIntentRevision,
+        scope: u64,
+    ) -> bool {
+        let Some(active) = self.active_visible_demand.as_mut() else {
+            return false;
+        };
+        if revision != self.latest_visible_intent_revision
+            || active.revision != revision
+            || active.scope != scope
+        {
+            return false;
+        }
+        active.installed = true;
+        true
+    }
+
+    pub(crate) fn submit_visible_demand_plan(&mut self, request: CameraDemandRequest) -> bool {
+        if request.revision() != self.latest_visible_intent_revision {
+            return false;
+        }
+        self.visible_demand_planner.submit(request)
+    }
+
+    pub(crate) fn take_visible_demand_plan_result(&mut self) -> Option<CameraDemandResult> {
+        self.visible_demand_planner
+            .take_result()
+            .filter(|result| result.revision == self.latest_visible_intent_revision)
+    }
+
+    pub(crate) fn visible_demand_plan_outstanding(&self) -> bool {
+        self.visible_demand_planner.has_outstanding_request()
+    }
+
+    pub(crate) fn invalidate_visible_demand_plan(&mut self, revision: RenderIntentRevision) {
+        if revision < self.latest_visible_intent_revision {
+            return;
+        }
+        self.latest_visible_intent_revision = revision;
+        self.active_visible_demand = None;
+        self.visible_demand_planner.invalidate(revision);
+    }
+
+    pub(crate) fn visible_demand_diagnostics(&self) -> CameraDemandDiagnostics {
+        self.visible_demand_planner.diagnostics()
+    }
+
+    pub(crate) fn record_contained_visible_demand_reuse(&self, reusable_candidates: usize) {
+        self.visible_demand_planner
+            .record_contained_reuse(reusable_candidates);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_next_visible_demand_result_publication(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.visible_demand_planner.block_next_result_publication()
     }
 
     pub(crate) fn cpu_ledger_arc(&self) -> Arc<dyn CpuByteLedger> {
@@ -571,6 +729,11 @@ impl DatasetDemandState {
 
     pub(crate) fn retained_leases(&self) -> &RetainedLeases {
         &self.retained_leases
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retire_cpu_payload_for_foreground_test(&mut self, key: BrickKey) -> bool {
+        self.retained_leases.retire_payload_handle(key)
     }
 
     fn refresh_cpu_authoritative_keys(&mut self) {
@@ -623,7 +786,7 @@ impl DatasetDemandState {
                     .saturating_mul(HISTOGRAM_CPU_RESOURCES_PER_LAYER),
             );
             let mut histogram_by_layer =
-                BTreeMap::<mirante4d_domain::LogicalLayerKey, Vec<DatasetResourceKey>>::new();
+                BTreeMap::<mirante4d_domain::LogicalLayerKey, Vec<BrickKey>>::new();
             for scope in [SCOPE_CURRENT_3D, SCOPE_CURRENT_3D_REFINEMENT] {
                 if histogram_quota_complete(&histogram_by_layer, &selected_layers) {
                     break;
@@ -687,12 +850,12 @@ impl DatasetDemandState {
         }
     }
 
-    fn cpu_authoritative(&self, key: DatasetResourceKey) -> bool {
+    fn cpu_authoritative(&self, key: BrickKey) -> bool {
         self.linked_cpu_authoritative_keys.contains(&key)
             || self.histogram_cpu_authoritative_keys.contains(&key)
     }
 
-    fn current_demands_key(&self, key: DatasetResourceKey) -> bool {
+    fn current_demands_key(&self, key: BrickKey) -> bool {
         [SCOPE_CURRENT_3D, SCOPE_CURRENT_3D_REFINEMENT]
             .into_iter()
             .any(|scope| {
@@ -708,7 +871,7 @@ impl DatasetDemandState {
     /// current requirement cohort.
     pub(crate) fn retire_released_cpu_authority_payloads(
         &mut self,
-        mut gpu_resident: impl FnMut(DatasetResourceKey) -> bool,
+        mut gpu_resident: impl FnMut(BrickKey) -> bool,
     ) -> usize {
         self.refresh_cpu_authoritative_keys();
         let candidates = std::mem::take(&mut self.released_cpu_authority_candidates);
@@ -720,8 +883,8 @@ impl DatasetDemandState {
     /// playback, analysis, and the bounded histogram sample remain retained.
     pub(crate) fn retire_gpu_resident_current_payloads(
         &mut self,
-        candidates: impl IntoIterator<Item = DatasetResourceKey>,
-        mut gpu_resident: impl FnMut(DatasetResourceKey) -> bool,
+        candidates: impl IntoIterator<Item = BrickKey>,
+        mut gpu_resident: impl FnMut(BrickKey) -> bool,
     ) -> usize {
         self.refresh_cpu_authoritative_keys();
         let mut retired = 0_usize;
@@ -730,132 +893,16 @@ impl DatasetDemandState {
                 continue;
             }
             if self.retained_leases.retire_payload_handle(key) {
-                self.gpu_only_display_keys.insert(key);
                 retired = retired.saturating_add(1);
             }
         }
         retired
     }
 
-    /// Reopens exact admission for GPU-only payloads lost by a destructive
-    /// residency change. Additions never call this path; one eviction epoch
-    /// causes at most one scan of the small GPU-only key set.
-    pub(crate) fn reconcile_gpu_residency_invalidation(
-        &mut self,
-        invalidation_epoch: u64,
-        mut gpu_resident: impl FnMut(DatasetResourceKey) -> bool,
-    ) -> usize {
-        if self.last_gpu_residency_invalidation_epoch == Some(invalidation_epoch) {
-            return 0;
-        }
-        self.last_gpu_residency_invalidation_epoch = Some(invalidation_epoch);
-        let missing = self
-            .gpu_only_display_keys
-            .iter()
-            .copied()
-            .filter(|key| self.retained_leases.payload(*key).is_none() && !gpu_resident(*key))
-            .collect::<Vec<_>>();
-        for key in missing.iter().copied() {
-            self.rewind_unknown_evicted_gpu_only_key(key);
-        }
-        missing.len()
-    }
-
-    /// Applies the renderer's bounded exact removal delta. Recording the
-    /// accompanying epoch keeps the fallback guard zero-scan on the next
-    /// admission pump.
-    pub(crate) fn reconcile_exact_gpu_evictions(
-        &mut self,
-        invalidation_epoch: u64,
-        evicted: impl IntoIterator<Item = DatasetResourceKey>,
-    ) -> usize {
-        self.last_gpu_residency_invalidation_epoch = Some(invalidation_epoch);
-        let recovered = evicted
-            .into_iter()
-            .filter(|key| self.enqueue_exact_evicted_gpu_only_key(*key))
-            .count();
-        // The renderer supplied the complete removal delta for this epoch.
-        // Keep every unaffected monotonic readiness proof; only exact holes
-        // were rewound by `enqueue_exact_evicted_gpu_only_key`.
-        for readiness in self.readiness_by_scope.values() {
-            readiness
-                .residency_invalidation_epoch
-                .set(Some(invalidation_epoch));
-        }
-        recovered
-    }
-
-    fn enqueue_exact_evicted_gpu_only_key(&mut self, key: DatasetResourceKey) -> bool {
-        if !self.gpu_only_display_keys.remove(&key) || self.retained_leases.payload(key).is_some() {
-            return false;
-        }
-        self.open_exact_gpu_recovery(key);
-        true
-    }
-
-    fn open_exact_gpu_recovery(&mut self, key: DatasetResourceKey) {
-        for scope in [SCOPE_CURRENT_3D, SCOPE_CURRENT_3D_REFINEMENT] {
-            #[cfg(test)]
-            {
-                self.exact_recovery_membership_lookups =
-                    self.exact_recovery_membership_lookups.saturating_add(1);
-            }
-            if let Some(index) = self
-                .requirements_by_scope
-                .get(&scope)
-                .and_then(|requirements| requirements.binary_search(&key).ok())
-            {
-                self.exact_gpu_recovery_by_scope
-                    .entry(scope)
-                    .or_default()
-                    .insert(key);
-                if let Some(readiness) = self.readiness_by_scope.get(&scope) {
-                    if readiness.exact_recovery_restore_cursor.get().is_none() {
-                        readiness
-                            .exact_recovery_restore_cursor
-                            .set(Some(readiness.cursor.get()));
-                    }
-                    readiness.cursor.set(readiness.cursor.get().min(index));
-                }
-            }
-        }
-    }
-
-    fn rewind_unknown_evicted_gpu_only_key(&mut self, key: DatasetResourceKey) -> bool {
-        if !self.gpu_only_display_keys.remove(&key) || self.retained_leases.payload(key).is_some() {
-            return false;
-        }
-        self.open_exact_gpu_recovery(key);
-        true
-    }
-
-    fn finish_exact_gpu_recovery(&mut self, scope: u64, key: DatasetResourceKey) {
-        let emptied = self
-            .exact_gpu_recovery_by_scope
-            .get_mut(&scope)
-            .is_some_and(|recovery| {
-                recovery.remove(&key);
-                recovery.is_empty()
-            });
-        if !emptied {
-            return;
-        }
-        self.exact_gpu_recovery_by_scope.remove(&scope);
-        if let Some(readiness) = self.readiness_by_scope.get(&scope)
-            && let Some(restore) = readiness.exact_recovery_restore_cursor.take()
-        {
-            readiness.cursor.set(restore);
-        }
-    }
-
-    pub(crate) fn gpu_only_display_payloads(&self) -> usize {
-        self.gpu_only_display_keys.len()
-    }
-
     pub(crate) fn histogram_requirements(
         &self,
         layer: mirante4d_domain::LogicalLayerKey,
-    ) -> &[DatasetResourceKey] {
+    ) -> &[BrickKey] {
         self.histogram_requirements_by_layer
             .get(&layer)
             .map_or(&[], |requirements| requirements.as_ref())
@@ -877,12 +924,26 @@ impl DatasetDemandState {
         self.current_scale
     }
 
+    pub(crate) const fn current_ideal_scale(&self) -> ScaleLevel {
+        self.current_ideal_scale
+    }
+
+    pub(crate) fn current_ideal_layer_scales(
+        &self,
+    ) -> &BTreeMap<mirante4d_domain::LogicalLayerKey, ScaleLevel> {
+        &self.current_ideal_layer_scales
+    }
+
+    pub(crate) const fn current_capacity_constrained(&self) -> bool {
+        self.current_capacity_constrained
+    }
+
     pub(crate) const fn current_playback_downshifted(&self) -> bool {
         self.current_playback_downshifted
     }
 
     pub(crate) const fn current_covers_full_volume(&self) -> bool {
-        self.current_covers_full_volume && self.staged_current_plan.is_none()
+        self.current_covers_full_volume
     }
 
     /// Adds every 3D scope replacement to a pure aggregate reconciliation.
@@ -902,7 +963,10 @@ impl DatasetDemandState {
             targets.replace(SCOPE_CURRENT_3D, &target.requirements);
             targets.remove(SCOPE_CURRENT_3D_REFINEMENT);
         } else if preserve_complete_presentation {
-            targets.remove(SCOPE_CURRENT_3D);
+            // The installed complete scope is the navigation front. Keep it
+            // admitted and globally accounted while the finer replacement is
+            // prepared privately; later camera samples can rebind this body
+            // instead of waiting behind cold refinement work.
             targets.replace(SCOPE_CURRENT_3D_REFINEMENT, &target.requirements);
         } else if let Some(coarse) = plan.coarse.as_ref() {
             targets.replace(SCOPE_CURRENT_3D, &coarse.requirements);
@@ -932,10 +996,16 @@ impl DatasetDemandState {
         preserve_complete_presentation: bool,
     ) -> bool {
         let PreparedProgressiveDatasetDemandPlan {
+            ideal_scale,
+            ideal_layer_scales,
             target,
             coarse,
+            navigation_candidates: _,
             reuse_envelope: _,
         } = plan;
+        self.current_ideal_scale = ideal_scale;
+        self.current_capacity_constrained = target.layer_scales != ideal_layer_scales;
+        self.current_ideal_layer_scales = ideal_layer_scales;
         if self.current_prepared_plan_matches(&target) {
             self.commit_clear_staged_current_plan();
             let changed = self.commit_four_panel_state(four_panel);
@@ -952,7 +1022,6 @@ impl DatasetDemandState {
         }
 
         let presentation_changed = if preserve_complete_presentation {
-            self.commit_preflighted_scope_removal(SCOPE_CURRENT_3D);
             self.holding_previous_presentation = true;
             false
         } else if let Some(coarse) = coarse {
@@ -1134,7 +1203,7 @@ impl DatasetDemandState {
             && self.staged_current_plan.is_none()
     }
 
-    /// Pure scope-target preparation for hidden-GPU promotion. Ticket
+    /// Pure scope-target preparation for renderer-candidate promotion. Ticket
     /// cancellation is aggregated with the retained-union and renderer
     /// preflights by the display transaction.
     pub(crate) fn prepare_staged_current_promotion_scope_targets(
@@ -1219,14 +1288,6 @@ impl DatasetDemandState {
             .remove(&SCOPE_CURRENT_3D_REFINEMENT)
             .expect("a staged plan owns readiness state");
         self.readiness_by_scope.insert(SCOPE_CURRENT_3D, readiness);
-        self.exact_gpu_recovery_by_scope.remove(&SCOPE_CURRENT_3D);
-        if let Some(recovery) = self
-            .exact_gpu_recovery_by_scope
-            .remove(&SCOPE_CURRENT_3D_REFINEMENT)
-        {
-            self.exact_gpu_recovery_by_scope
-                .insert(SCOPE_CURRENT_3D, recovery);
-        }
         self.retained_requirements_dirty = true;
         self.histogram_cpu_authoritative_keys_dirty = true;
         self.holding_previous_presentation = false;
@@ -1244,12 +1305,16 @@ impl DatasetDemandState {
     pub(crate) fn commit_reconciled_gpu_prefilled_staged_current_plan(&mut self) {
         assert!(
             self.promote_staged_current_plan(),
-            "a reconciled hidden-GPU promotion retains its staged plan until commit"
+            "a reconciled renderer-candidate promotion retains its staged plan until commit"
         );
     }
 
     pub(crate) fn record_plan_error(&mut self, error: impl Into<String>) {
         self.last_plan_error = Some(error.into());
+    }
+
+    pub(crate) fn clear_plan_error(&mut self) {
+        self.last_plan_error = None;
     }
 
     pub(crate) fn last_plan_error(&self) -> Option<&str> {
@@ -1302,16 +1367,17 @@ impl DatasetDemandState {
         self.admission_cursor_by_scope
             .insert(scope, admitted_prefix_len.min(canonical.len()));
         if !canonical_unchanged {
-            self.exact_gpu_recovery_by_scope.remove(&scope);
+            self.retained_requirements_dirty = true;
+        }
+        if !body_unchanged {
             self.readiness_by_scope
                 .insert(scope, ScopeReadiness::default());
-            self.retained_requirements_dirty = true;
         } else if !required_prefix_unchanged
             && let Some(readiness) = self.readiness_by_scope.get(&scope)
         {
             readiness
-                .cursor
-                .set(readiness.cursor.get().min(required_prefix_len));
+                .required_cursor
+                .set(readiness.required_cursor.get().min(required_prefix_len));
         }
         if matches!(scope, SCOPE_CURRENT_3D | SCOPE_CURRENT_3D_REFINEMENT) {
             self.histogram_cpu_authoritative_keys_dirty = true;
@@ -1349,17 +1415,9 @@ impl DatasetDemandState {
         self.layer_scales_by_scope.remove(&scope);
         self.admission_cursor_by_scope.remove(&scope);
         self.readiness_by_scope.remove(&scope);
-        self.exact_gpu_recovery_by_scope.remove(&scope);
         self.retained_requirements_dirty |= removed;
         if matches!(scope, SCOPE_CURRENT_3D | SCOPE_CURRENT_3D_REFINEMENT) {
             self.histogram_cpu_authoritative_keys_dirty |= removed;
-            let current = self.requirements_by_scope.get(&SCOPE_CURRENT_3D);
-            let refinement = self.requirements_by_scope.get(&SCOPE_CURRENT_3D_REFINEMENT);
-            self.gpu_only_display_keys.retain(|key| {
-                current.is_some_and(|requirements| requirements.binary_search(key).is_ok())
-                    || refinement
-                        .is_some_and(|requirements| requirements.binary_search(key).is_ok())
-            });
         } else if matches!(
             scope,
             SCOPE_CROSS_SECTION_XY
@@ -1379,15 +1437,15 @@ impl DatasetDemandState {
 
     pub(crate) fn preflight_prepared_renderer_requirement_union(
         &self,
-        requirements: &Arc<[DatasetResourceKey]>,
+        requirements: &Arc<[BrickKey]>,
     ) -> Result<(), RetainedLeaseError> {
         RetainedLeases::preflight_prepared_requirements(requirements)
     }
 
     pub(crate) fn preflight_prepared_renderer_requirement_update(
         &self,
-        previous: &Arc<[DatasetResourceKey]>,
-        next: &Arc<[DatasetResourceKey]>,
+        previous: &Arc<[BrickKey]>,
+        next: &Arc<[BrickKey]>,
     ) -> Result<(), RetainedLeaseError> {
         self.retained_leases
             .preflight_prepared_requirement_update(previous, next)
@@ -1397,9 +1455,9 @@ impl DatasetDemandState {
     /// capacity and old-Arc identity checks must precede any scope mutation.
     pub(crate) fn commit_preflighted_renderer_requirement_update(
         &mut self,
-        previous: Arc<[DatasetResourceKey]>,
-        next: Arc<[DatasetResourceKey]>,
-        removals: &[DatasetResourceKey],
+        previous: Arc<[BrickKey]>,
+        next: Arc<[BrickKey]>,
+        removals: &[BrickKey],
         charge: Arc<dyn CpuByteLease>,
     ) -> usize {
         let retired = self
@@ -1410,7 +1468,7 @@ impl DatasetDemandState {
     }
 
     #[cfg(test)]
-    pub(crate) fn renderer_requirements(&self) -> Vec<DatasetResourceKey> {
+    pub(crate) fn renderer_requirements(&self) -> Vec<BrickKey> {
         let mut resources = self
             .requirements_by_scope
             .values()
@@ -1421,7 +1479,7 @@ impl DatasetDemandState {
         resources
     }
 
-    pub(crate) fn scope_requirements(&self, scope: u64) -> &[DatasetResourceKey] {
+    pub(crate) fn scope_requirements(&self, scope: u64) -> &[BrickKey] {
         self.requirements_by_scope
             .get(&scope)
             .map_or(&[], |resources| resources.as_ref())
@@ -1429,7 +1487,7 @@ impl DatasetDemandState {
 
     /// O(1) immutable handle used to preserve renderer requirement identity
     /// across camera-only frames without cloning the semantic key body.
-    pub(crate) fn scope_requirement_handle(&self, scope: u64) -> Arc<[DatasetResourceKey]> {
+    pub(crate) fn scope_requirement_handle(&self, scope: u64) -> Arc<[BrickKey]> {
         self.requirements_by_scope
             .get(&scope)
             .cloned()
@@ -1445,7 +1503,7 @@ impl DatasetDemandState {
     /// Ranked/interleaved upload order is independent of the canonical
     /// renderer requirement body. Keeping both preserves stable GPU slots
     /// while the first useful upload cohort follows screen contribution.
-    pub(crate) fn scope_gpu_priority_handle(&self, scope: u64) -> Arc<[DatasetResourceKey]> {
+    pub(crate) fn scope_gpu_priority_handle(&self, scope: u64) -> Arc<[BrickKey]> {
         self.gpu_priority_order_by_scope
             .get(&scope)
             .cloned()
@@ -1464,25 +1522,39 @@ impl DatasetDemandState {
             )
     }
 
-    /// Promotes a resident camera-guard suffix into current-view demand by
-    /// changing one scalar boundary. Existing immutable key bodies, admission
-    /// cursors, and monotonic readiness proofs remain in place.
-    pub(crate) fn promote_scope_prefetch_tail(&mut self, scope: u64) -> bool {
+    /// Promotes a suffix only after its complete body has independently been
+    /// proven resident. No admission scan is needed: every ranked key is
+    /// already ready, so both scalar frontiers advance directly to the end.
+    pub(crate) fn can_commit_complete_scope_prefetch_tail(&self, scope: u64) -> bool {
         let total = self
             .gpu_priority_order_by_scope
             .get(&scope)
             .map_or(0, |requirements| requirements.len());
-        let Some(required) = self.required_prefix_len_by_scope.get_mut(&scope) else {
-            return false;
-        };
-        if *required >= total {
-            return false;
-        }
-        let previous_required = *required;
+        self.required_prefix_len_by_scope.contains_key(&scope)
+            && self
+                .readiness_by_scope
+                .get(&scope)
+                .is_some_and(|readiness| readiness.all_resources_cursor.get() == total)
+    }
+
+    pub(crate) fn commit_complete_scope_prefetch_tail(&mut self, scope: u64) {
+        debug_assert!(self.can_commit_complete_scope_prefetch_tail(scope));
+        let total = self
+            .gpu_priority_order_by_scope
+            .get(&scope)
+            .map_or(0, |requirements| requirements.len());
+        let required = self
+            .required_prefix_len_by_scope
+            .get_mut(&scope)
+            .expect("a preflighted complete scope owns a required-prefix boundary");
         *required = total;
-        let cursor = self.admission_cursor_by_scope.entry(scope).or_default();
-        *cursor = (*cursor).min(previous_required);
-        true
+        self.admission_cursor_by_scope.insert(scope, total);
+        let readiness = self
+            .readiness_by_scope
+            .get(&scope)
+            .expect("a preflighted complete scope owns readiness cursors");
+        debug_assert_eq!(readiness.all_resources_cursor.get(), total);
+        readiness.required_cursor.set(total);
     }
 
     /// Exact immutable planning authority for one installed scope. Prepared
@@ -1528,7 +1600,7 @@ impl DatasetDemandState {
         &mut self,
         scope: u64,
         priority: RequestPriority,
-        mut gpu_resident: impl FnMut(DatasetResourceKey) -> bool,
+        mut gpu_resident: impl FnMut(BrickKey) -> bool,
     ) -> Result<usize, RuntimeFault> {
         let required_prefix_len = self.scope_required_prefix_len(scope);
         self.submit_scope_until_with_gpu_residency(
@@ -1544,7 +1616,7 @@ impl DatasetDemandState {
         scope: u64,
         priority: RequestPriority,
         end: usize,
-        mut gpu_resident: impl FnMut(DatasetResourceKey) -> bool,
+        mut gpu_resident: impl FnMut(BrickKey) -> bool,
     ) -> Result<usize, RuntimeFault> {
         if let Some(fault) = self.dispatcher.scope_failure(scope) {
             return Err(fault.clone());
@@ -1583,9 +1655,6 @@ impl DatasetDemandState {
                 && !histogram_cpu_authoritative_keys.contains(&resource)
                 && !cpu_ready
                 && gpu_resident(resource);
-            if gpu_ready {
-                self.gpu_only_display_keys.insert(resource);
-            }
             let already_ready = cpu_ready || gpu_ready;
             match self.dispatcher.submit_if_missing(
                 scope,
@@ -1609,51 +1678,6 @@ impl DatasetDemandState {
         Ok(submitted)
     }
 
-    fn submit_exact_gpu_recovery_with_residency(
-        &mut self,
-        scope: u64,
-        priority: RequestPriority,
-        mut gpu_resident: impl FnMut(DatasetResourceKey) -> bool,
-    ) -> Result<usize, RuntimeFault> {
-        let candidates = self
-            .exact_gpu_recovery_by_scope
-            .get(&scope)
-            .map(|recovery| recovery.iter().copied().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let mut submitted = 0_usize;
-        for resource in candidates {
-            if !self.dispatcher.has_submission_capacity() {
-                self.dispatcher.mark_admission_blocked();
-                break;
-            }
-            let cpu_ready = self.retained_leases.payload(resource).is_some();
-            let gpu_ready =
-                !self.cpu_authoritative(resource) && !cpu_ready && gpu_resident(resource);
-            if cpu_ready || gpu_ready {
-                if gpu_ready {
-                    self.gpu_only_display_keys.insert(resource);
-                }
-                self.finish_exact_gpu_recovery(scope, resource);
-                continue;
-            }
-            match self
-                .dispatcher
-                .submit_if_missing(scope, resource, priority, false, None)
-            {
-                Ok(Some(_)) => submitted = submitted.saturating_add(1),
-                // A pending waiter keeps the exact key in the recovery set
-                // until its completion installs the payload.
-                Ok(None) => {}
-                Err(fault) if fault.code() == RuntimeFaultCode::QueueFull => {
-                    self.dispatcher.mark_admission_blocked();
-                    break;
-                }
-                Err(fault) => return Err(fault),
-            }
-        }
-        Ok(submitted)
-    }
-
     #[cfg(test)]
     pub(crate) const fn admission_requirement_visits(&self) -> u64 {
         self.admission_requirement_visits
@@ -1662,11 +1686,6 @@ impl DatasetDemandState {
     #[cfg(test)]
     pub(crate) fn readiness_requirement_visits(&self) -> u64 {
         self.readiness_requirement_visits.get()
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn exact_recovery_membership_lookups(&self) -> u64 {
-        self.exact_recovery_membership_lookups
     }
 
     #[cfg(test)]
@@ -1693,21 +1712,34 @@ impl DatasetDemandState {
         )
     }
 
-    /// Refills the bounded runtime queue from persistent per-scope cursors.
-    /// This is deliberately independent of semantic demand planning: draining
-    /// one batch of completions must not rebuild the view/frustum plan or
-    /// rescan already-admitted prefixes of a large requirement set.
-    pub(crate) fn pump_interactive_admission(&mut self) -> Result<usize, RuntimeFault> {
-        self.pump_interactive_admission_with_gpu_residency(|_| false)
-    }
-
-    pub(crate) fn pump_interactive_admission_with_gpu_residency(
+    /// Resolves one exact renderer eviction through the CPU data plane without
+    /// retaining a second GPU-residency set. The renderer's
+    /// sequenced event remains the retry authority until this method returns
+    /// an acknowledgeable disposition.
+    pub(crate) fn resolve_renderer_eviction(
         &mut self,
-        mut gpu_resident: impl FnMut(DatasetResourceKey) -> bool,
-    ) -> Result<usize, RuntimeFault> {
-        self.begin_submission_pass();
-        self.refresh_cpu_authoritative_keys();
-        let mut submitted = 0_usize;
+        resource: BrickKey,
+    ) -> Result<RendererEvictionDisposition, RuntimeFault> {
+        if !self.retained_leases.requires(resource) {
+            return Ok(RendererEvictionDisposition::NoLongerDemanded);
+        }
+        if let Some(lease) = self.retained_leases.lease_handle(resource) {
+            return Ok(RendererEvictionDisposition::Reoffer(lease));
+        }
+
+        let active_cross_scope = self.active_visible_demand.and_then(|active| {
+            (active.installed
+                && active.revision == self.latest_visible_intent_revision
+                && matches!(
+                    active.scope,
+                    SCOPE_CROSS_SECTION_XY | SCOPE_CROSS_SECTION_XZ | SCOPE_CROSS_SECTION_YZ
+                ))
+            .then_some(active.scope)
+        });
+        let mut ordered_scopes = Vec::with_capacity(DATASET_DEMAND_SCOPES.len());
+        if let Some(scope) = active_cross_scope {
+            ordered_scopes.push((scope, RequestPriority::CurrentView));
+        }
         for (scope, priority) in [
             (SCOPE_CURRENT_3D, RequestPriority::CurrentView),
             (
@@ -1719,13 +1751,126 @@ impl DatasetDemandState {
             (SCOPE_CROSS_SECTION_YZ, RequestPriority::LinkedView),
             (SCOPE_PLAYBACK, RequestPriority::Playback),
         ] {
-            submitted = submitted.saturating_add(self.submit_exact_gpu_recovery_with_residency(
+            if Some(scope) != active_cross_scope {
+                ordered_scopes.push((scope, priority));
+            }
+        }
+
+        let mut owning_scopes = Vec::new();
+        for (scope, priority) in ordered_scopes {
+            if self
+                .requirements_by_scope
+                .get(&scope)
+                .is_none_or(|requirements| requirements.binary_search(&resource).is_err())
+            {
+                continue;
+            }
+            let index = self
+                .gpu_priority_order_by_scope
+                .get(&scope)
+                .and_then(|requirements| {
+                    requirements
+                        .iter()
+                        .position(|candidate| *candidate == resource)
+                })
+                .expect("canonical and ranked scope bodies contain the same resources");
+            let cursor = self.admission_cursor_by_scope.entry(scope).or_insert(index);
+            *cursor = (*cursor).min(index);
+            if let Some(readiness) = self.readiness_by_scope.get(&scope) {
+                readiness
+                    .required_cursor
+                    .set(readiness.required_cursor.get().min(index));
+                readiness
+                    .all_resources_cursor
+                    .set(readiness.all_resources_cursor.get().min(index));
+            }
+            owning_scopes.push((scope, priority, index));
+        }
+        let Some((scope, priority, retry_cursor)) = owning_scopes.first().copied() else {
+            debug_assert!(
+                false,
+                "a retained renderer requirement belongs to an interactive scope"
+            );
+            return Ok(RendererEvictionDisposition::NoLongerDemanded);
+        };
+        let already_pending = self
+            .dispatcher
+            .pending_by_key
+            .contains_key(&PendingKey { scope, resource });
+        if !already_pending && !self.dispatcher.has_submission_capacity() {
+            self.dispatcher.mark_admission_blocked();
+            return Ok(RendererEvictionDisposition::Deferred);
+        }
+        match self.dispatcher.submit_if_missing(
+            scope,
+            resource,
+            priority,
+            false,
+            Some(retry_cursor),
+        ) {
+            Ok(_) => Ok(RendererEvictionDisposition::Submitted),
+            Err(fault) if fault.code() == RuntimeFaultCode::QueueFull => {
+                self.dispatcher.mark_admission_blocked();
+                Ok(RendererEvictionDisposition::Deferred)
+            }
+            Err(fault) => Err(fault),
+        }
+    }
+
+    /// Refills the bounded runtime queue from persistent per-scope cursors.
+    /// This is deliberately independent of semantic demand planning: draining
+    /// one batch of completions must not rebuild the view/frustum plan or
+    /// rescan already-admitted prefixes of a large requirement set.
+    pub(crate) fn pump_interactive_admission(&mut self) -> Result<usize, RuntimeFault> {
+        self.pump_interactive_admission_with_gpu_residency(|_| false)
+    }
+
+    pub(crate) fn pump_interactive_admission_with_gpu_residency(
+        &mut self,
+        gpu_resident: impl FnMut(BrickKey) -> bool,
+    ) -> Result<usize, RuntimeFault> {
+        self.begin_submission_pass();
+        self.pump_interactive_admission_after_begin_with_gpu_residency(gpu_resident)
+    }
+
+    pub(crate) fn pump_interactive_admission_after_begin_with_gpu_residency(
+        &mut self,
+        mut gpu_resident: impl FnMut(BrickKey) -> bool,
+    ) -> Result<usize, RuntimeFault> {
+        self.refresh_cpu_authoritative_keys();
+        let mut submitted = 0_usize;
+        let active_cross_scope = self.active_visible_demand.and_then(|active| {
+            (active.installed
+                && active.revision == self.latest_visible_intent_revision
+                && matches!(
+                    active.scope,
+                    SCOPE_CROSS_SECTION_XY | SCOPE_CROSS_SECTION_XZ | SCOPE_CROSS_SECTION_YZ
+                ))
+            .then_some(active.scope)
+        });
+        if let Some(scope) = active_cross_scope {
+            submitted = submitted.saturating_add(self.submit_scope_with_gpu_residency(
                 scope,
-                priority,
+                RequestPriority::CurrentView,
                 &mut gpu_resident,
             )?);
+        }
+        for (scope, priority) in [
+            (SCOPE_CURRENT_3D, RequestPriority::CurrentView),
+            (
+                SCOPE_CURRENT_3D_REFINEMENT,
+                RequestPriority::VisibleRefinement,
+            ),
+            (SCOPE_CROSS_SECTION_XY, RequestPriority::LinkedView),
+            (SCOPE_CROSS_SECTION_XZ, RequestPriority::LinkedView),
+            (SCOPE_CROSS_SECTION_YZ, RequestPriority::LinkedView),
+            (SCOPE_PLAYBACK, RequestPriority::Playback),
+        ] {
             if self.dispatcher.admission_blocked() {
                 break;
+            }
+            if Some(scope) == active_cross_scope {
+                continue;
             }
             submitted = submitted.saturating_add(self.submit_scope_with_gpu_residency(
                 scope,
@@ -1796,11 +1941,9 @@ impl DatasetDemandState {
         let dispatcher = &mut self.dispatcher;
         let retained_leases = &mut self.retained_leases;
         let admission_cursor_by_scope = &mut self.admission_cursor_by_scope;
-        let exact_gpu_recovery_by_scope = &self.exact_gpu_recovery_by_scope;
         let histogram_requirements_by_layer = &self.histogram_requirements_by_layer;
         let histogram_generation_by_layer = &mut self.histogram_generation_by_layer;
         let mut installed = InstalledLeaseChanges::default();
-        let mut recovered_exact = Vec::new();
         let drained =
             dispatcher.drain_with_retry_cursor(maximum, |ticket, outcome, retry_cursor| {
                 if ticket.generation().scope() == SCOPE_ANALYSIS {
@@ -1810,10 +1953,7 @@ impl DatasetDemandState {
                         &outcome,
                         RuntimeOutcome::Failed(fault)
                             if runtime_failure_needs_capacity_retry(fault.code())
-                    ) && !exact_gpu_recovery_by_scope
-                        .get(&ticket.generation().scope())
-                        .is_some_and(|recovery| recovery.contains(&ticket.resource()))
-                        && let Some(index) = retry_cursor
+                    ) && let Some(index) = retry_cursor
                     {
                         let cursor = admission_cursor_by_scope
                             .entry(ticket.generation().scope())
@@ -1823,13 +1963,12 @@ impl DatasetDemandState {
                     if let RuntimeOutcome::Ready(lease) = outcome
                         && retained_leases.requires(ticket.resource())
                     {
-                        recovered_exact.push((ticket.generation().scope(), ticket.resource()));
                         let lease: Arc<dyn ResourceLease> = Arc::new(lease);
-                        match retained_leases.install(lease) {
+                        match retained_leases.install(Arc::clone(&lease)) {
                             Ok(true) => {
                                 installed.scopes.insert(ticket.generation().scope());
                                 let resource = ticket.resource();
-                                installed.keys.push(resource);
+                                installed.leases.push(lease);
                                 if histogram_requirements_by_layer
                                     .get(&resource.layer())
                                     .is_some_and(|requirements| requirements.contains(&resource))
@@ -1849,9 +1988,6 @@ impl DatasetDemandState {
                     }
                 }
             })?;
-        for (scope, resource) in recovered_exact {
-            self.finish_exact_gpu_recovery(scope, resource);
-        }
         Ok((drained, installed))
     }
 
@@ -1878,19 +2014,19 @@ impl DatasetDemandState {
         self.histogram_cpu_authoritative_keys_dirty = true;
         self.histogram_requirements_by_layer.clear();
         self.histogram_generation_by_layer.clear();
-        self.gpu_only_display_keys.clear();
-        self.exact_gpu_recovery_by_scope.clear();
         self.released_cpu_authority_candidates.clear();
-        self.last_gpu_residency_invalidation_epoch = None;
         self.staged_current_plan = None;
         self.holding_previous_presentation = false;
         self.current_playback_downshifted = false;
+        self.current_ideal_scale = ScaleLevel::BASE;
+        self.current_ideal_layer_scales.clear();
+        self.current_capacity_constrained = false;
         self.current_covers_full_volume = false;
         self.dispatcher.begin_submission_pass();
         self.last_plan_error = None;
 
         let mut first_fault = None;
-        for scope in INTERACTIVE_DEMAND_SCOPES {
+        for scope in DATASET_DEMAND_SCOPES {
             if let Err(fault) = self.dispatcher.advance_scope(scope)
                 && first_fault.is_none()
             {
@@ -1912,25 +2048,12 @@ impl DatasetDemandState {
     pub(crate) fn scope_complete_with_gpu_residency(
         &self,
         scope: u64,
-        gpu_resident: impl FnMut(DatasetResourceKey) -> bool,
-    ) -> bool {
-        self.scope_complete_with_gpu_residency_at_invalidation_epoch(scope, 0, gpu_resident)
-    }
-
-    pub(crate) fn scope_complete_with_gpu_residency_at_invalidation_epoch(
-        &self,
-        scope: u64,
-        residency_invalidation_epoch: u64,
-        gpu_resident: impl FnMut(DatasetResourceKey) -> bool,
+        gpu_resident: impl FnMut(BrickKey) -> bool,
     ) -> bool {
         if scope == SCOPE_CURRENT_3D && self.staged_current_plan.is_some() {
             return false;
         }
-        self.scope_resources_complete_with_gpu_residency_at_invalidation_epoch(
-            scope,
-            residency_invalidation_epoch,
-            gpu_resident,
-        )
+        self.scope_resources_complete_with_gpu_residency(scope, gpu_resident)
     }
 
     pub(crate) fn scope_resources_complete(&self, scope: u64) -> bool {
@@ -1940,20 +2063,7 @@ impl DatasetDemandState {
     pub(crate) fn scope_resources_complete_with_gpu_residency(
         &self,
         scope: u64,
-        gpu_resident: impl FnMut(DatasetResourceKey) -> bool,
-    ) -> bool {
-        self.scope_resources_complete_with_gpu_residency_at_invalidation_epoch(
-            scope,
-            0,
-            gpu_resident,
-        )
-    }
-
-    pub(crate) fn scope_resources_complete_with_gpu_residency_at_invalidation_epoch(
-        &self,
-        scope: u64,
-        residency_invalidation_epoch: u64,
-        mut gpu_resident: impl FnMut(DatasetResourceKey) -> bool,
+        gpu_resident: impl FnMut(BrickKey) -> bool,
     ) -> bool {
         let Some(resources) = self.gpu_priority_order_by_scope.get(&scope) else {
             return false;
@@ -1968,33 +2078,59 @@ impl DatasetDemandState {
             debug_assert!(false, "every installed scope has readiness state");
             return false;
         };
-        if readiness.residency_invalidation_epoch.get() != Some(residency_invalidation_epoch) {
-            readiness.cursor.set(0);
-            readiness.exact_recovery_restore_cursor.set(None);
-            readiness
-                .residency_invalidation_epoch
-                .set(Some(residency_invalidation_epoch));
-        }
-        if self
-            .exact_gpu_recovery_by_scope
-            .get(&scope)
-            .is_some_and(|recovery| !recovery.is_empty())
-        {
+        self.advance_scope_readiness_cursor(
+            resources,
+            required_prefix_len,
+            &readiness.required_cursor,
+            gpu_resident,
+        )
+    }
+
+    pub(crate) fn scope_all_resources_complete(&self, scope: u64) -> bool {
+        self.scope_all_resources_complete_with_gpu_residency(scope, |_| false)
+    }
+
+    pub(crate) fn scope_all_resources_complete_with_gpu_residency(
+        &self,
+        scope: u64,
+        gpu_resident: impl FnMut(BrickKey) -> bool,
+    ) -> bool {
+        let Some(resources) = self.gpu_priority_order_by_scope.get(&scope) else {
             return false;
-        }
-        let mut cursor = readiness.cursor.get().min(required_prefix_len);
-        while cursor < required_prefix_len {
+        };
+        let Some(readiness) = self.readiness_by_scope.get(&scope) else {
+            debug_assert!(false, "every installed scope has readiness state");
+            return false;
+        };
+        self.advance_scope_readiness_cursor(
+            resources,
+            resources.len(),
+            &readiness.all_resources_cursor,
+            gpu_resident,
+        )
+    }
+
+    fn advance_scope_readiness_cursor(
+        &self,
+        resources: &[BrickKey],
+        end: usize,
+        readiness_cursor: &Cell<usize>,
+        mut gpu_resident: impl FnMut(BrickKey) -> bool,
+    ) -> bool {
+        let end = end.min(resources.len());
+        let mut cursor = readiness_cursor.get().min(end);
+        while cursor < end {
             #[cfg(test)]
             self.readiness_requirement_visits
                 .set(self.readiness_requirement_visits.get().saturating_add(1));
             let resource = resources[cursor];
             if self.retained_leases.payload(resource).is_none() && !gpu_resident(resource) {
-                readiness.cursor.set(cursor);
+                readiness_cursor.set(cursor);
                 return false;
             }
             cursor += 1;
         }
-        readiness.cursor.set(cursor);
+        readiness_cursor.set(cursor);
         true
     }
 
@@ -2012,10 +2148,14 @@ impl DatasetDemandState {
             .is_some_and(|resources| resources.is_empty())
     }
 
+    pub(crate) fn scope_is_installed(&self, scope: u64) -> bool {
+        self.requirements_by_scope.contains_key(&scope)
+    }
+
     pub(crate) fn scope_ready_prefix(&self, scope: u64) -> usize {
         self.readiness_by_scope
             .get(&scope)
-            .map_or(0, |readiness| readiness.cursor.get())
+            .map_or(0, |readiness| readiness.required_cursor.get())
     }
 
     pub(crate) fn request_shutdown(&self) -> Result<(), RuntimeFault> {
@@ -2055,15 +2195,15 @@ const fn runtime_failure_needs_capacity_retry(code: RuntimeFaultCode) -> bool {
 
 #[cfg(test)]
 fn scope_requirements_complete(
-    resources: Option<&[DatasetResourceKey]>,
-    mut ready: impl FnMut(DatasetResourceKey) -> bool,
+    resources: Option<&[BrickKey]>,
+    mut ready: impl FnMut(BrickKey) -> bool,
 ) -> bool {
     resources.is_some_and(|resources| resources.iter().copied().all(&mut ready))
 }
 
 #[cfg(test)]
 fn requirement_layer_scales(
-    resources: &[DatasetResourceKey],
+    resources: &[BrickKey],
 ) -> Result<BTreeMap<mirante4d_domain::LogicalLayerKey, ScaleLevel>, RuntimeFault> {
     let mut scales = BTreeMap::new();
     for resource in resources {
@@ -2080,7 +2220,7 @@ fn requirement_layer_scales(
 #[cfg(test)]
 fn prepare_test_renderer_requirement_update(
     state: &DatasetDemandState,
-    bodies: &[Arc<[DatasetResourceKey]>],
+    bodies: &[Arc<[BrickKey]>],
 ) -> anyhow::Result<crate::camera_demand_cache::PreparedRendererRequirementUpdate> {
     let previous = state.renderer_requirement_handle();
     let mut union_reservations = PreparedAllocationReservations::new(state.cpu_ledger.as_ref());
@@ -2116,7 +2256,7 @@ fn prepare_test_renderer_requirement_update(
 fn final_test_union_bodies(
     state: &DatasetDemandState,
     targets: &ScopeReconciliationTargets,
-) -> Vec<Arc<[DatasetResourceKey]>> {
+) -> Vec<Arc<[BrickKey]>> {
     state
         .requirements_by_scope
         .iter()
@@ -2139,7 +2279,7 @@ fn final_test_union_bodies(
 pub(crate) fn install_prepared_scope_test_fixture(
     state: &mut DatasetDemandState,
     scope: u64,
-    resources: Vec<DatasetResourceKey>,
+    resources: Vec<BrickKey>,
 ) -> anyhow::Result<bool> {
     let required_prefix_len = resources.len();
     install_prepared_scope_test_fixture_with_required_prefix(
@@ -2151,10 +2291,42 @@ pub(crate) fn install_prepared_scope_test_fixture(
 }
 
 #[cfg(test)]
+fn remove_prepared_scope_test_fixture(
+    state: &mut DatasetDemandState,
+    scope: u64,
+) -> anyhow::Result<bool> {
+    let was_installed = state.scope_is_installed(scope);
+    let mut targets = ScopeReconciliationTargets::default();
+    targets.remove(scope);
+    let update =
+        prepare_test_renderer_requirement_update(state, &final_test_union_bodies(state, &targets))?;
+    state.preflight_prepared_renderer_requirement_update(
+        &update.previous.requirements,
+        &update.next.requirements,
+    )?;
+    let reconciliation = state.prepare_scope_reconciliation(targets)?;
+    state.commit_prepared_scope_reconciliation(reconciliation)?;
+    state.commit_preflighted_scope_removal(scope);
+    let crate::camera_demand_cache::PreparedRendererRequirementUpdate {
+        previous,
+        next,
+        removals,
+        removal_charge: _removal_charge,
+    } = update;
+    state.commit_preflighted_renderer_requirement_update(
+        previous.requirements,
+        next.requirements,
+        &removals,
+        next.charge,
+    );
+    Ok(was_installed)
+}
+
+#[cfg(test)]
 fn install_prepared_scope_test_fixture_with_required_prefix(
     state: &mut DatasetDemandState,
     scope: u64,
-    resources: Vec<DatasetResourceKey>,
+    resources: Vec<BrickKey>,
     required_prefix_len: usize,
 ) -> anyhow::Result<bool> {
     let layer_scales = requirement_layer_scales(&resources)?;
@@ -2410,6 +2582,231 @@ mod tests {
     }
 
     #[test]
+    fn completion_leases_support_lossless_renderer_eviction_resolution() {
+        let source_id = DatasetSourceId::new(110);
+        let layer_key = mirante4d_domain::LogicalLayerKey::new(0);
+        let layer = DatasetLayer::new(
+            layer_key,
+            "renderer-eviction-resolution",
+            Shape4D::new(1, 1, 1, 9).unwrap(),
+            IntensityDType::Uint8,
+            GridToWorld::identity(),
+            ResourceValidity::AllValid,
+        )
+        .unwrap();
+        let catalog = Arc::new(
+            DatasetCatalog::new(
+                "renderer-eviction-resolution",
+                ScientificIdentityStatus::Unverified(source_id),
+                vec![layer],
+            )
+            .unwrap(),
+        );
+        let source: Arc<dyn DatasetSource> = Arc::new(ZeroSource {
+            catalog: Arc::clone(&catalog),
+        });
+        let config = DatasetRuntimeConfig::new(1 << 20, 2, 16, 16).unwrap();
+        let (runtime, _) = <dyn DatasetRuntime>::start(config, move |_| Ok(source)).unwrap();
+        let identity = DatasetResourceIdentity::Unverified(source_id);
+        let resources = (0..9)
+            .map(|x| {
+                BrickKey::new(
+                    identity,
+                    layer_key,
+                    TimeIndex::new(0),
+                    ScaleLevel::BASE,
+                    ResourceRegion::new([0, 0, x], Shape3D::new(1, 1, 1).unwrap()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut state = DatasetDemandState::new_with_local_source(
+            runtime,
+            Arc::new(NoopLedger),
+            identity,
+            PathBuf::from("renderer-eviction-resolution"),
+            None,
+        )
+        .unwrap();
+        install_prepared_scope_test_fixture_with_required_prefix(
+            &mut state,
+            SCOPE_CURRENT_3D,
+            resources.clone(),
+            HISTOGRAM_CPU_RESOURCES_PER_LAYER,
+        )
+        .unwrap();
+
+        assert_eq!(state.pump_interactive_admission().unwrap(), resources.len());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut delivered = Vec::new();
+        while !state.scope_all_resources_complete(SCOPE_CURRENT_3D) {
+            let (drained, installed) = state.drain_runtime_results(16, |_, _| {}).unwrap();
+            delivered.extend(installed.leases().iter().map(|lease| lease.key()));
+            assert!(
+                Instant::now() < deadline,
+                "the eviction-resolution fixture did not finish decoding"
+            );
+            if drained == 0 {
+                std::thread::yield_now();
+            }
+        }
+        delivered.sort_unstable();
+        assert_eq!(
+            delivered, resources,
+            "every newly installed CPU lease must cross the completion boundary exactly once"
+        );
+        assert!(state.scope_all_resources_complete(SCOPE_CURRENT_3D));
+        let headless_presentation =
+            crate::native_presentation::NativePresentationBridge::unavailable();
+        assert!(state.scope_is_installed(SCOPE_CURRENT_3D));
+        assert!(!state.scope_is_installed(SCOPE_CURRENT_3D_REFINEMENT));
+        assert!(
+            crate::workbench_brick_runtime::installed_camera_guard_bodies_are_complete(
+                &state,
+                &headless_presentation,
+            ),
+            "a complete current-only progressive state must pass the guard gate"
+        );
+
+        let gpu_only = *resources
+            .last()
+            .expect("the fixture has one key beyond the CPU histogram quota");
+        match state.resolve_renderer_eviction(gpu_only).unwrap() {
+            RendererEvictionDisposition::Reoffer(lease) => assert_eq!(lease.key(), gpu_only),
+            _ => panic!("a retained CPU handle must be reoffered without another decode"),
+        }
+        assert_eq!(
+            state.retire_gpu_resident_current_payloads([gpu_only], |key| key == gpu_only),
+            1,
+            "the ninth current brick is display-only and may become GPU-authoritative"
+        );
+
+        let submissions_before_refetch = state.dispatcher.submitted_requests.len();
+        assert!(matches!(
+            state.resolve_renderer_eviction(gpu_only).unwrap(),
+            RendererEvictionDisposition::Submitted
+        ));
+        assert_eq!(
+            state.dispatcher.submitted_requests.len(),
+            submissions_before_refetch + 1
+        );
+        assert_eq!(
+            state.dispatcher.submitted_requests.last().copied(),
+            Some((SCOPE_CURRENT_3D, gpu_only, RequestPriority::CurrentView))
+        );
+
+        assert!(matches!(
+            state.resolve_renderer_eviction(gpu_only).unwrap(),
+            RendererEvictionDisposition::Submitted
+        ));
+        assert_eq!(
+            state.dispatcher.submitted_requests.len(),
+            submissions_before_refetch + 1,
+            "replaying an unacknowledged eviction must reuse the pending decode"
+        );
+        assert!(
+            !state.scope_all_resources_complete_with_gpu_residency(SCOPE_CURRENT_3D, |_| false,),
+            "the exact eviction must rewind the full-body readiness proof"
+        );
+        assert!(
+            state.scope_resources_complete(SCOPE_CURRENT_3D),
+            "the visible prefix remains complete while its guard tail is missing"
+        );
+        assert!(
+            !crate::workbench_brick_runtime::installed_camera_guard_bodies_are_complete(
+                &state,
+                &headless_presentation,
+            ),
+            "headless product readiness must inspect the full CPU guard body"
+        );
+        let promoted_while_guard_missing = false;
+        assert!(!promoted_while_guard_missing);
+        assert_eq!(
+            state.scope_required_prefix_len(SCOPE_CURRENT_3D),
+            HISTOGRAM_CPU_RESOURCES_PER_LAYER,
+            "the product gate must leave a missing guard tail unpromoted"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.retained_leases().payload(gpu_only).is_none() {
+            let (drained, installed) = state.drain_runtime_results(1, |_, _| {}).unwrap();
+            if drained != 0 {
+                assert_eq!(installed.leases().len(), 1);
+                assert_eq!(installed.leases()[0].key(), gpu_only);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the exact eviction refetch did not complete"
+            );
+            if drained == 0 {
+                std::thread::yield_now();
+            }
+        }
+        assert!(
+            state.scope_all_resources_complete(SCOPE_CURRENT_3D),
+            "full-body readiness must resume only after the missing payload returns"
+        );
+        assert!(
+            crate::workbench_brick_runtime::installed_camera_guard_bodies_are_complete(
+                &state,
+                &headless_presentation,
+            ),
+            "the product guard gate must reopen after the exact CPU payload returns"
+        );
+
+        install_prepared_scope_test_fixture(
+            &mut state,
+            SCOPE_CURRENT_3D_REFINEMENT,
+            resources.clone(),
+        )
+        .unwrap();
+        assert!(
+            crate::workbench_brick_runtime::installed_camera_guard_bodies_are_complete(
+                &state,
+                &headless_presentation,
+            ),
+            "two installed complete 3D bodies must pass the guard gate"
+        );
+
+        assert!(remove_prepared_scope_test_fixture(&mut state, SCOPE_CURRENT_3D).unwrap());
+        assert!(!state.scope_is_installed(SCOPE_CURRENT_3D));
+        assert!(state.scope_is_installed(SCOPE_CURRENT_3D_REFINEMENT));
+        assert!(
+            crate::workbench_brick_runtime::installed_camera_guard_bodies_are_complete(
+                &state,
+                &headless_presentation,
+            ),
+            "a complete refinement-only progressive state must pass the guard gate"
+        );
+
+        install_prepared_scope_test_fixture(&mut state, SCOPE_CURRENT_3D_REFINEMENT, Vec::new())
+            .unwrap();
+        assert!(state.scope_is_installed(SCOPE_CURRENT_3D_REFINEMENT));
+        assert!(state.scope_is_empty(SCOPE_CURRENT_3D_REFINEMENT));
+        assert!(
+            crate::workbench_brick_runtime::installed_camera_guard_bodies_are_complete(
+                &state,
+                &headless_presentation,
+            ),
+            "an installed empty 3D scope is complete rather than absent"
+        );
+        assert!(matches!(
+            state.resolve_renderer_eviction(gpu_only).unwrap(),
+            RendererEvictionDisposition::NoLongerDemanded
+        ));
+        assert!(
+            remove_prepared_scope_test_fixture(&mut state, SCOPE_CURRENT_3D_REFINEMENT).unwrap()
+        );
+        assert!(
+            !crate::workbench_brick_runtime::installed_camera_guard_bodies_are_complete(
+                &state,
+                &headless_presentation,
+            ),
+            "no installed 3D body cannot authorize resident camera reuse"
+        );
+        state.request_shutdown().unwrap();
+    }
+
+    #[test]
     fn camera_guard_is_admitted_after_visible_scopes_and_promotes_in_constant_time() {
         let source_id = DatasetSourceId::new(93);
         let layer_key = mirante4d_domain::LogicalLayerKey::new(0);
@@ -2439,7 +2836,7 @@ mod tests {
         let (runtime, _) = <dyn DatasetRuntime>::start(config, move |_| Ok(source)).unwrap();
         let identity = DatasetResourceIdentity::Unverified(source_id);
         let resource = |x| {
-            DatasetResourceKey::new(
+            BrickKey::new(
                 identity,
                 layer_key,
                 TimeIndex::new(0),
@@ -2456,7 +2853,8 @@ mod tests {
             identity,
             PathBuf::from("guard-priority"),
             None,
-        );
+        )
+        .unwrap();
         install_prepared_scope_test_fixture_with_required_prefix(
             &mut state,
             SCOPE_CURRENT_3D,
@@ -2471,18 +2869,57 @@ mod tests {
             state.scope_resources_complete_with_gpu_residency(SCOPE_CURRENT_3D, |key| primary
                 .contains(&key),)
         );
+        assert!(
+            !state.scope_all_resources_complete_with_gpu_residency(SCOPE_CURRENT_3D, |key| primary
+                .contains(&key),),
+            "a complete visible prefix must not hide a missing camera-guard tail"
+        );
+        assert!(
+            state.scope_all_resources_complete_with_gpu_residency(SCOPE_CURRENT_3D, |_| true,),
+            "the full body becomes reusable only when the guard tail is resident"
+        );
+        let readiness_after_full_body = state.readiness_requirement_visits();
+        assert!(
+            state.scope_all_resources_complete_with_gpu_residency(SCOPE_CURRENT_3D, |_| panic!(
+                "a completed full-body proof must not rescan resources"
+            ),)
+        );
+        assert_eq!(
+            state.readiness_requirement_visits(),
+            readiness_after_full_body,
+            "repeated full-body readiness checks must perform zero additional key visits"
+        );
         let readiness_before_promotion = state.readiness_requirement_visits();
-        assert!(state.promote_scope_prefetch_tail(SCOPE_CURRENT_3D));
+        let admission_before_promotion = state.admission_requirement_visits();
+        assert!(state.can_commit_complete_scope_prefetch_tail(SCOPE_CURRENT_3D));
+        state.commit_complete_scope_prefetch_tail(SCOPE_CURRENT_3D);
         assert_eq!(
             state.readiness_requirement_visits(),
             readiness_before_promotion,
-            "promotion changes only the scalar required-prefix boundary"
+            "promotion advances already-proven cursors without visiting keys"
         );
         assert!(
-            !state.scope_resources_complete_with_gpu_residency(SCOPE_CURRENT_3D, |key| primary
-                .contains(&key),)
+            state.scope_resources_complete_with_gpu_residency(SCOPE_CURRENT_3D, |_| panic!(
+                "the promoted required cursor must already be complete"
+            ),)
         );
-        assert!(state.scope_resources_complete_with_gpu_residency(SCOPE_CURRENT_3D, |_| true,));
+        assert!(
+            state.scope_all_resources_complete_with_gpu_residency(SCOPE_CURRENT_3D, |_| panic!(
+                "the full-body cursor must remain complete"
+            ),)
+        );
+        assert_eq!(
+            state.readiness_requirement_visits(),
+            readiness_before_promotion
+        );
+        assert_eq!(
+            state.admission_requirement_visits(),
+            admission_before_promotion
+        );
+        assert_eq!(
+            state.scope_admitted_prefix_len(SCOPE_CURRENT_3D),
+            primary.len() + guard.len()
+        );
 
         // Restore an unpromoted boundary to exercise admission ordering in
         // the same compact fixture; this is test setup, not a product path.
@@ -2506,18 +2943,144 @@ mod tests {
             ]
         );
         gate.wait_until_entered();
-        assert!(state.promote_scope_prefetch_tail(SCOPE_CURRENT_3D));
-        let promotions_before = state.dispatcher.promoted_requests.len();
-        assert_eq!(state.pump_interactive_admission().unwrap(), 0);
-        assert_eq!(
-            &state.dispatcher.promoted_requests[promotions_before..],
-            &[
-                (SCOPE_CURRENT_3D, guard[0], RequestPriority::CurrentView),
-                (SCOPE_CURRENT_3D, guard[1], RequestPriority::CurrentView),
-            ],
-            "promotion must raise already-queued guard I/O without duplicate decode"
-        );
         gate.release();
+
+        let previous_body = state.scope_prepared_body_handle(SCOPE_CURRENT_3D);
+        let canonical = Arc::clone(previous_body.canonical());
+        let mut reranked = previous_body.ranked().to_vec();
+        reranked.reverse();
+        let replacement = PreparedDemandRequirements::from_prepared_body_for_test(
+            PreparedResourceBody::new(canonical, reranked.into(), None).unwrap(),
+            state.scope_admitted_prefix_len(SCOPE_CURRENT_3D),
+            state.scope_required_prefix_len(SCOPE_CURRENT_3D),
+        );
+        let layer_scales = state
+            .scope_layer_scales(SCOPE_CURRENT_3D)
+            .cloned()
+            .expect("the installed current scope has per-layer scales");
+        assert!(!state.renderer_requirement_union_needs_preparation());
+        let visits_before_rerank = state.readiness_requirement_visits();
+        assert!(state.commit_preflighted_scope_replacement(
+            SCOPE_CURRENT_3D,
+            replacement,
+            layer_scales,
+        ));
+        assert!(
+            !state.renderer_requirement_union_needs_preparation(),
+            "a ranked-only replacement must not dirty the canonical renderer union"
+        );
+        assert!(state.scope_all_resources_complete_with_gpu_residency(SCOPE_CURRENT_3D, |_| true,));
+        assert_eq!(
+            state.readiness_requirement_visits() - visits_before_rerank,
+            (primary.len() + guard.len()) as u64,
+            "ranked-body replacement must reset the position-based full readiness cursor"
+        );
+        state.request_shutdown().unwrap();
+    }
+
+    #[test]
+    fn replacement_plane_does_not_promote_its_predecessor_before_install() {
+        let source_id = DatasetSourceId::new(94);
+        let layer_key = mirante4d_domain::LogicalLayerKey::new(0);
+        let layer = DatasetLayer::new(
+            layer_key,
+            "replacement-plane-priority",
+            Shape4D::new(1, 1, 1, 2).unwrap(),
+            IntensityDType::Uint8,
+            GridToWorld::identity(),
+            ResourceValidity::AllValid,
+        )
+        .unwrap();
+        let catalog = Arc::new(
+            DatasetCatalog::new(
+                "replacement-plane-priority",
+                ScientificIdentityStatus::Unverified(source_id),
+                vec![layer],
+            )
+            .unwrap(),
+        );
+        let gate = Arc::new(DecodeGate::default());
+        let source: Arc<dyn DatasetSource> = Arc::new(GatedZeroSource {
+            catalog: Arc::clone(&catalog),
+            gate: Arc::clone(&gate),
+        });
+        let config = DatasetRuntimeConfig::new(1 << 20, 1, 1, 1).unwrap();
+        let (runtime, _) = <dyn DatasetRuntime>::start(config, move |_| Ok(source)).unwrap();
+        let identity = DatasetResourceIdentity::Unverified(source_id);
+        let predecessor = |x| {
+            BrickKey::new(
+                identity,
+                layer_key,
+                TimeIndex::new(0),
+                ScaleLevel::BASE,
+                ResourceRegion::new([0, 0, x], Shape3D::new(1, 1, 1).unwrap()).unwrap(),
+            )
+        };
+        let first = predecessor(0);
+        let obsolete_successor = predecessor(1);
+        let mut state = DatasetDemandState::new_with_local_source(
+            runtime,
+            Arc::new(NoopLedger),
+            identity,
+            PathBuf::from("replacement-plane-priority"),
+            None,
+        )
+        .unwrap();
+        install_prepared_scope_test_fixture(
+            &mut state,
+            SCOPE_CROSS_SECTION_XY,
+            vec![first, obsolete_successor],
+        )
+        .unwrap();
+
+        assert_eq!(state.pump_interactive_admission().unwrap(), 1);
+        assert_eq!(
+            state.dispatcher.submitted_requests,
+            vec![(SCOPE_CROSS_SECTION_XY, first, RequestPriority::LinkedView)]
+        );
+        gate.wait_until_entered();
+
+        let revision = RenderIntentRevision::initial();
+        assert!(state.observe_visible_intent(revision, Some(SCOPE_CROSS_SECTION_XY)));
+        let foreground_submissions_before = state
+            .dispatcher
+            .submitted_requests
+            .iter()
+            .filter(|(_, _, priority)| *priority == RequestPriority::CurrentView)
+            .count();
+        assert_eq!(state.pump_interactive_admission().unwrap(), 0);
+        gate.release();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (drained, _) = state.drain_runtime_results(1, |_, _| {}).unwrap();
+            if drained == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the predecessor decode did not free the bounded queue"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(state.pump_interactive_admission().unwrap(), 1);
+        assert_eq!(
+            state.dispatcher.submitted_requests.last().copied(),
+            Some((
+                SCOPE_CROSS_SECTION_XY,
+                obsolete_successor,
+                RequestPriority::LinkedView,
+            )),
+            "the old body's next key must not become foreground while its replacement plan is pending"
+        );
+        assert_eq!(
+            state
+                .dispatcher
+                .submitted_requests
+                .iter()
+                .filter(|(_, _, priority)| *priority == RequestPriority::CurrentView)
+                .count(),
+            foreground_submissions_before
+        );
         state.request_shutdown().unwrap();
     }
 
@@ -2551,7 +3114,7 @@ mod tests {
         let identity = DatasetResourceIdentity::Unverified(source_id);
         let resources = (0..100)
             .map(|x| {
-                DatasetResourceKey::new(
+                BrickKey::new(
                     identity,
                     mirante4d_domain::LogicalLayerKey::new(0),
                     TimeIndex::new(0),
@@ -2566,7 +3129,8 @@ mod tests {
             identity,
             PathBuf::from("linear-admission"),
             None,
-        );
+        )
+        .unwrap();
         install_prepared_scope_test_fixture(&mut state, SCOPE_CURRENT_3D, resources.clone())
             .unwrap();
         let mut reranked = resources;
@@ -2668,49 +3232,6 @@ mod tests {
             "resident linked-panel reuse must not submit another read/decode"
         );
 
-        let evicted = canonical[50];
-        assert_eq!(
-            state.retire_gpu_resident_current_payloads([evicted], |key| key == evicted),
-            1
-        );
-        assert!(state.retained_leases().payload(evicted).is_none());
-        assert_eq!(
-            state.gpu_only_display_payloads(),
-            2,
-            "both display-only payloads must stay indexed for exact eviction recovery"
-        );
-        assert_eq!(state.reconcile_gpu_residency_invalidation(1, |_| true), 0);
-        assert_eq!(
-            state.reconcile_gpu_residency_invalidation(2, |key| key == shared),
-            1
-        );
-        let submitted_before_recovery = state
-            .dispatcher()
-            .diagnostics()
-            .unwrap()
-            .submitted_requests();
-        state
-            .pump_interactive_admission_with_gpu_residency(|_| false)
-            .unwrap();
-        assert_eq!(
-            state
-                .dispatcher()
-                .diagnostics()
-                .unwrap()
-                .submitted_requests(),
-            submitted_before_recovery + 1,
-            "one destructive eviction requeues exactly one GPU-only payload"
-        );
-        let recovery_deadline = Instant::now() + Duration::from_secs(5);
-        while state.retained_leases().payload(evicted).is_none() {
-            state.drain_runtime_results(1, |_, _| {}).unwrap();
-            assert!(
-                Instant::now() < recovery_deadline,
-                "evicted payload recovery timed out"
-            );
-            std::thread::yield_now();
-        }
-
         let staged_resources = canonical[..99].to_vec();
         let mut staged_reservations =
             PreparedAllocationReservations::new(state.cpu_ledger.as_ref());
@@ -2718,6 +3239,11 @@ mod tests {
             crate::dataset_demand_plan::PreparedProgressiveDatasetDemandPlan::from_planning_accounted(
                 crate::dataset_demand_plan::ProgressiveDatasetDemandPlanning {
                     plan: crate::dataset_demand_plan::ProgressiveDatasetDemandPlan {
+                        ideal_scale: ScaleLevel::BASE,
+                        ideal_layer_scales: BTreeMap::from([(
+                            mirante4d_domain::LogicalLayerKey::new(0),
+                            ScaleLevel::BASE,
+                        )]),
                         target: DatasetDemandPlan {
                             scale: ScaleLevel::BASE,
                             layer_scales: BTreeMap::from([(
@@ -2731,8 +3257,10 @@ mod tests {
                             playback_downshifted: false,
                             covers_full_volume: false,
                             primary_resource_count: 98,
+                            playback_resource_count: 99,
                         },
                         coarse: None,
+                        navigation_candidates: Vec::new(),
                     },
                     candidates_visited: 99,
                     reuse_envelope: None,
@@ -2765,6 +3293,14 @@ mod tests {
         );
         let staged_canonical = state.scope_requirement_handle(SCOPE_CURRENT_3D_REFINEMENT);
         let staged_priority = state.scope_gpu_priority_handle(SCOPE_CURRENT_3D_REFINEMENT);
+        assert!(
+            state.scope_all_resources_complete_with_gpu_residency(
+                SCOPE_CURRENT_3D_REFINEMENT,
+                |key| key == shared,
+            ),
+            "the staged full-body proof includes the one GPU-only shared brick"
+        );
+        let readiness_visits_before_staged_promotion = state.readiness_requirement_visits();
         let pending_guard = staged_priority[98];
         state
             .admission_cursor_by_scope
@@ -2807,6 +3343,16 @@ mod tests {
             &staged_priority,
             &state.scope_gpu_priority_handle(SCOPE_CURRENT_3D)
         ));
+        assert!(
+            state.scope_all_resources_complete_with_gpu_residency(SCOPE_CURRENT_3D, |_| panic!(
+                "staged promotion must move the completed full-body cursor"
+            ),)
+        );
+        assert_eq!(
+            state.readiness_requirement_visits(),
+            readiness_visits_before_staged_promotion,
+            "staged promotion must move readiness without rescanning the ranked body"
+        );
         assert_eq!(
             state.scope_admitted_prefix_len(SCOPE_CURRENT_3D),
             98,
@@ -2833,6 +3379,11 @@ mod tests {
             crate::dataset_demand_plan::PreparedProgressiveDatasetDemandPlan::from_planning_accounted(
                 crate::dataset_demand_plan::ProgressiveDatasetDemandPlanning {
                     plan: crate::dataset_demand_plan::ProgressiveDatasetDemandPlan {
+                        ideal_scale: ScaleLevel::BASE,
+                        ideal_layer_scales: BTreeMap::from([(
+                            mirante4d_domain::LogicalLayerKey::new(0),
+                            ScaleLevel::BASE,
+                        )]),
                         target: DatasetDemandPlan {
                             scale: ScaleLevel::BASE,
                             layer_scales: BTreeMap::from([(
@@ -2844,8 +3395,10 @@ mod tests {
                             playback_downshifted: false,
                             covers_full_volume: false,
                             primary_resource_count: 98,
+                            playback_resource_count: 98,
                         },
                         coarse: None,
+                        navigation_candidates: Vec::new(),
                     },
                     candidates_visited: 98,
                     reuse_envelope: None,
@@ -2923,7 +3476,7 @@ mod tests {
         let (runtime, _) = <dyn DatasetRuntime>::start(config, move |_| Ok(source)).unwrap();
         let identity = DatasetResourceIdentity::Unverified(source_id);
         let resource = |x| {
-            DatasetResourceKey::new(
+            BrickKey::new(
                 identity,
                 mirante4d_domain::LogicalLayerKey::new(0),
                 TimeIndex::new(0),
@@ -2939,7 +3492,8 @@ mod tests {
             identity,
             PathBuf::from("atomic-reconciliation"),
             None,
-        );
+        )
+        .unwrap();
         install_prepared_scope_test_fixture(&mut state, SCOPE_CURRENT_3D, vec![current]).unwrap();
         install_prepared_scope_test_fixture(&mut state, SCOPE_CROSS_SECTION_XY, vec![cross])
             .unwrap();
@@ -3002,107 +3556,6 @@ mod tests {
                 .cancelled_requests(),
             0,
             "a later union rejection must not cancel useful old waiters"
-        );
-        state.request_shutdown().unwrap();
-    }
-
-    #[test]
-    fn full_envelope_multi_eviction_rewind_uses_only_exact_index_lookups() {
-        const RESOURCE_COUNT: u64 = 65_000;
-        let source_id = DatasetSourceId::new(92);
-        let layer = DatasetLayer::new(
-            mirante4d_domain::LogicalLayerKey::new(0),
-            "eviction-index",
-            Shape4D::new(1, 1, 1, RESOURCE_COUNT * 64).unwrap(),
-            IntensityDType::Uint8,
-            GridToWorld::identity(),
-            ResourceValidity::AllValid,
-        )
-        .unwrap();
-        let catalog = Arc::new(
-            DatasetCatalog::new(
-                "eviction-index",
-                ScientificIdentityStatus::Unverified(source_id),
-                vec![layer],
-            )
-            .unwrap(),
-        );
-        let source: Arc<dyn DatasetSource> = Arc::new(ZeroSource {
-            catalog: Arc::clone(&catalog),
-        });
-        let config = DatasetRuntimeConfig::new(1 << 20, 2, 8, 8).unwrap();
-        let (runtime, _) = <dyn DatasetRuntime>::start(config, move |_| Ok(source)).unwrap();
-        let identity = DatasetResourceIdentity::Unverified(source_id);
-        let resources = (0..RESOURCE_COUNT)
-            .map(|x| {
-                DatasetResourceKey::new(
-                    identity,
-                    mirante4d_domain::LogicalLayerKey::new(0),
-                    TimeIndex::new(0),
-                    ScaleLevel::BASE,
-                    ResourceRegion::new([0, 0, x * 64], Shape3D::new(1, 1, 1).unwrap()).unwrap(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut state = DatasetDemandState::new_with_local_source(
-            runtime,
-            Arc::new(NoopLedger),
-            identity,
-            PathBuf::from("eviction-index"),
-            None,
-        );
-        install_prepared_scope_test_fixture(&mut state, SCOPE_CURRENT_3D, resources.clone())
-            .unwrap();
-        state
-            .admission_cursor_by_scope
-            .insert(SCOPE_CURRENT_3D, resources.len());
-        state
-            .readiness_by_scope
-            .get(&SCOPE_CURRENT_3D)
-            .unwrap()
-            .cursor
-            .set(resources.len());
-        state
-            .gpu_only_display_keys
-            .extend(resources.iter().copied());
-        let evicted = resources
-            .iter()
-            .skip(317)
-            .step_by(641)
-            .take(100)
-            .copied()
-            .collect::<Vec<_>>();
-        let lookups_before = state.exact_recovery_membership_lookups();
-
-        assert_eq!(
-            state.reconcile_exact_gpu_evictions(2, evicted.iter().copied()),
-            evicted.len()
-        );
-        assert_eq!(
-            state.exact_recovery_membership_lookups() - lookups_before,
-            (evicted.len() * 2) as u64,
-        );
-        let readiness_visits = state.readiness_requirement_visits();
-        assert!(
-            !state.scope_resources_complete_with_gpu_residency_at_invalidation_epoch(
-                SCOPE_CURRENT_3D,
-                2,
-                |_| false,
-            )
-        );
-        assert_eq!(state.readiness_requirement_visits(), readiness_visits);
-        let admission_visits = state.admission_requirement_visits();
-        assert_eq!(
-            state
-                .pump_interactive_admission_with_gpu_residency(|_| false)
-                .unwrap(),
-            8,
-            "the bounded queue admits exact recovery keys first"
-        );
-        assert_eq!(
-            state.admission_requirement_visits(),
-            admission_visits,
-            "exact middle evictions must not revisit the 65k admitted suffix"
         );
         state.request_shutdown().unwrap();
     }

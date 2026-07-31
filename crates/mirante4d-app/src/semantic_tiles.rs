@@ -1,14 +1,11 @@
 //! Storage-independent semantic tiling shared by every interactive consumer.
 
-#[cfg(test)]
 use mirante4d_dataset::{ResourceContractError, ResourceRegion};
-#[cfg(test)]
 use mirante4d_domain::Shape3D;
 
-pub(crate) const SEMANTIC_TILE_SIDE: u64 = 64;
+pub(crate) use mirante4d_render_api::DEFAULT_LOGICAL_BRICK_SIDE as SEMANTIC_TILE_SIDE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg(test)]
 pub(crate) struct SemanticTileIndex {
     pub(crate) z: u64,
     pub(crate) y: u64,
@@ -16,13 +13,11 @@ pub(crate) struct SemanticTileIndex {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[cfg(test)]
 pub(crate) struct SemanticTileGrid {
     volume_shape: Shape3D,
     grid_shape: Shape3D,
 }
 
-#[cfg(test)]
 impl SemanticTileGrid {
     pub(crate) fn new(volume_shape: Shape3D) -> Self {
         let grid_shape = Shape3D::new(

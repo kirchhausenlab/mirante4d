@@ -358,7 +358,7 @@ fn project_destination_check_resolves_a_symlinked_existing_parent() {
     );
 }
 
-fn open_dataset_and_render_first_frame(
+pub(crate) fn open_dataset_and_render_first_frame(
     path: impl AsRef<std::path::Path>,
 ) -> anyhow::Result<unified_source_open::UnifiedOpenedSource> {
     crate::unified_source_open::open(path, ResourcePolicy::default(), DatasetSourceId::new(1))
@@ -376,7 +376,7 @@ fn test_application_for_opened_source(
     .expect("the opened test source must satisfy the canonical application model")
 }
 
-fn test_workbench_app_without_background_runtime(
+pub(crate) fn test_workbench_app_without_background_runtime(
     opened: unified_source_open::UnifiedOpenedSource,
 ) -> MiranteWorkbenchApp {
     let application = test_application_for_opened_source(&opened);
@@ -394,7 +394,7 @@ fn test_workbench_app_without_background_runtime(
         resource_policy.gpu_budget_bytes(),
     );
     let (mut settings_connection, _) =
-        current_settings_connection::CurrentSettingsConnection::start();
+        current_settings_connection::CurrentSettingsConnection::start(ResourcePolicy::default());
     settings_connection
         .shutdown()
         .expect("the test settings connection must stop before the harness starts");
@@ -406,25 +406,32 @@ fn test_workbench_app_without_background_runtime(
         render_coordination,
         native_presentation: native_presentation::NativePresentationBridge::unavailable(),
         viewer_pick_queue: viewer_pick_runtime::ViewerPickQueue::default(),
+        volume_presentation: volume_presentation::VolumePresentationController::default(),
         progressive_display_pacer: workbench_brick_runtime::ProgressiveDisplayRefreshPacer::default(
         ),
         display_performance_milestones: display_refresh::DisplayPerformanceMilestones::default(),
         display_instrumentation_epoch: std::time::Instant::now(),
-        camera_demand_planner: camera_demand_cache::CameraDemandPlanner::new()
-            .expect("the test camera-demand worker must start"),
         pending_visible_demand_plan: None,
         visible_demand_failure_latch: None,
-        viewer_render_failure_latches: std::collections::BTreeMap::new(),
-        viewer_runtime_recovery_epoch: 0,
+        visible_demand_placeability_limit: None,
+        viewer_render_failure_latch: None,
+        dataset_runtime_epoch: 0,
         prepared_scope_render_plans: std::collections::BTreeMap::new(),
+        navigation_render_plans: Vec::new(),
         last_visible_demand_candidates_visited: None,
         staged_post_promotion_renderer_update: None,
         last_camera_demand_planning_duration: None,
         current_camera_reuse_envelope: None,
         visible_demand_planning_signature: None,
+        installed_cross_section_exact_bodies: std::array::from_fn(|_| None),
+        resident_cross_section_coverage: None,
+        resident_plane_guard_reuses: 0,
+        resident_plane_async_plan_submissions: 0,
+        resident_plane_guard_body_installs: 0,
+        resident_plane_exact_body_installs: 0,
         viewer_verification_busy_until: None,
         active_histogram_cache: histogram::ActiveLayerHistogramCache::default(),
-        camera_preview: None,
+        render_intent_mailbox: RenderIntentMailbox::new(),
         egui_ui,
         import: ImportWorkflow::new(),
         analysis_runtime,
@@ -436,6 +443,7 @@ fn test_workbench_app_without_background_runtime(
         visible_demand_plan_calls: 0,
         cross_section_demand_plan_calls: 0,
         product_render_attempts: 0,
+        refresh_frame_calls: 0,
         project_store: None,
         project_recovery_root: None,
         project_recovery_candidates: Vec::new(),
@@ -455,6 +463,7 @@ fn test_workbench_app_without_background_runtime(
         pending_viewport_close: false,
         pending_source_install: None,
         settings_connection,
+        selected_adapter_memory: gpu_memory::SelectedAdapterMemoryFacts::unavailable_for_tests(),
         source_open_service: None,
         source_verification_service: None,
         pending_automatic_source_verification: None,
@@ -479,6 +488,7 @@ fn await_visible_demand_plan(
     loop {
         let outcome = app.request_visible_bricks();
         aggregate.current_plan_installed |= outcome.current_plan_installed;
+        aggregate.cross_section_plan_installed |= outcome.cross_section_plan_installed;
         aggregate.current_changed |= outcome.current_changed;
         aggregate.resident_changed |= outcome.resident_changed;
         aggregate.current_frame_ready |= outcome.current_frame_ready;
@@ -487,9 +497,53 @@ fn await_visible_demand_plan(
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "camera-demand worker did not publish its latest plan"
+            "camera-demand worker did not publish its latest plan: diagnostics={:?}",
+            app.dataset.visible_demand_diagnostics()
         );
         std::thread::yield_now();
+    }
+}
+
+fn test_wgpu_renderer(
+    config: mirante4d_render_wgpu::WgpuRenderRuntimeConfig,
+) -> mirante4d_render_wgpu::WgpuRenderRuntime {
+    let instance = eframe::wgpu::Instance::new(eframe::wgpu::InstanceDescriptor {
+        backends: eframe::wgpu::Backends::VULKAN,
+        ..eframe::wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(
+        &eframe::wgpu::RequestAdapterOptions {
+            power_preference: eframe::wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        },
+    ))
+    .expect("the trusted workstation exposes a Vulkan adapter");
+    let descriptor =
+        mirante4d_render_wgpu::renderer_device_descriptor(&adapter, "mirante4d-app-test-device")
+            .expect("the trusted adapter satisfies renderer limits");
+    let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))
+        .expect("trusted app-test device creation succeeds");
+    let mut renderer = mirante4d_render_wgpu::WgpuRenderRuntime::from_existing_device(
+        &adapter, device, queue, config,
+    )
+    .expect("fixed resources and the bounded compiler worker initialize");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match renderer
+            .poll_pipeline_readiness()
+            .expect("app-test pipeline compilation succeeds")
+        {
+            mirante4d_render_wgpu::PipelineReadiness::Ready => return renderer,
+            mirante4d_render_wgpu::PipelineReadiness::CompilingInitial
+            | mirante4d_render_wgpu::PipelineReadiness::InitialRenderReady => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "app-test pipeline compilation timed out"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }
 

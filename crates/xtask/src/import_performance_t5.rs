@@ -2927,9 +2927,9 @@ fn automation_script(
             { "command": "camera_fit_data" },
             { "command": "camera_orbit", "yaw_points": 48.0, "pitch_points": 16.0 },
             { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 120_000 },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "capture_screenshot", "name": "t5-open-ready-navigation" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "t5-open-ready-navigation" },
             { "command": "copy_diagnostics" },
             { "command": "quit" }
         ]
@@ -4854,7 +4854,7 @@ mod tests {
     }
 
     #[test]
-    fn t5_automation_v6_binds_the_exact_canonical_hard_safety_echo() {
+    fn t5_automation_v7_binds_the_exact_canonical_hard_safety_echo() {
         let tempdir = tempfile::tempdir().unwrap();
         let config: T5Config = serde_json::from_value(valid_config_json(tempdir.path())).unwrap();
         let script = automation_script(
@@ -4866,8 +4866,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(script["schema"], PRODUCT_AUTOMATION_SCRIPT_SCHEMA);
-        assert_eq!(SCRIPT_SCHEMA_VERSION, 6);
-        assert_eq!(script["schema_version"], 6);
+        assert_eq!(SCRIPT_SCHEMA_VERSION, 7);
+        assert_eq!(script["schema_version"], 7);
         assert!(script.get("limits").is_none());
         let hard_safety_limits = script["hard_safety_limits"].as_object().unwrap();
         assert_eq!(

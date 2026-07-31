@@ -40,7 +40,7 @@ fn frame_fidelity_label_keeps_exact_source_lod_concise() {
 
     assert_eq!(
         ui_kit::frame_fidelity_label(&fidelity),
-        "shown s0 exact | GPU MIP | 998x1024 px; 512x512 pt | render pending"
+        "shown s0 exact | GPU MIP | direct 998x1024 | 998x1024 px; 512x512 pt | render pending"
     );
 }
 

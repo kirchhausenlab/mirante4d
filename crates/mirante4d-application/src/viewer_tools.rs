@@ -72,8 +72,7 @@ pub struct PickHit {
 
 impl PickHit {
     /// Adapts a renderer result only after the composition root has validated
-    /// its presentation token and frame against the currently displayed
-    /// surface.
+    /// its fixed target and frame against the currently displayed surface.
     pub fn from_volume_result(
         source_generation: SourceSessionGeneration,
         screen_position: ScreenPosition,

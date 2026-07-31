@@ -1,80 +1,58 @@
 //! Native egui/WGPU presentation owned by the process composition root.
 
 use std::{
-    cell::Cell,
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::Arc,
     time::Instant,
 };
 
 use eframe::egui;
-use mirante4d_dataset::DatasetResourceKey;
-use mirante4d_domain::LogicalLayerKey;
-use mirante4d_render_api::{
-    FrameIdentity, PresentationToken, PresentedFrame, RenderExtent, RenderPassKind,
-    RenderRequirementRole, RenderRequirements,
-};
+use mirante4d_dataset::DatasetCatalog;
+use mirante4d_render_api::{FrameIdentity, PresentationTarget, PresentedFrame};
 use mirante4d_render_wgpu::{
-    CpuFrameTiming, GpuFrameTiming, GpuResidencyInvalidationEpoch, GpuTimingTicket,
-    ValidationCapture, ValidationCaptureTicket, WgpuRenderRuntime,
+    CoordinatedValidationCaptureTicket, CpuFrameTiming, GpuTimingTicket, PipelineCapability,
+    PipelineReadiness, RendererDeviceGeneration, TargetTextureRevision, ValidationCapture,
+    WgpuRenderRuntime, WgpuRenderRuntimeError,
 };
 use mirante4d_ui_egui::EguiPresentationPaint;
 
-use crate::{product_render_intent::ProductRenderRequest, viewer_layout::PanelId};
+use crate::viewer_layout::PanelId;
 
 const MAX_PRESENTED_FRAME_INTERVAL_SAMPLES: usize = 256;
+
+pub(crate) fn texture_revision_is_current(
+    current: Option<(u64, u64)>,
+    device_generation: u64,
+    texture_revision: u64,
+) -> bool {
+    current == Some((device_generation, texture_revision))
+}
+
+pub(crate) fn install_if_current_texture_revision<T>(
+    current: Option<(u64, u64)>,
+    device_generation: u64,
+    texture_revision: u64,
+    destination: &mut Option<T>,
+    candidate: T,
+) -> bool {
+    if !texture_revision_is_current(current, device_generation, texture_revision) {
+        return false;
+    }
+    *destination = Some(candidate);
+    true
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ProductLayerRequirementFacts {
     pub(crate) displayed_scale_level: Option<u32>,
+    pub(crate) target_scale_level: Option<u32>,
+    pub(crate) finest_fallback_scale_level: Option<u32>,
+    pub(crate) fallback_scale_level: Option<u32>,
+    pub(crate) target_available_requirements: u64,
+    pub(crate) target_total_requirements: u64,
     pub(crate) available_requirements: u64,
     pub(crate) total_requirements: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProductGpuExecutionIdentity {
-    pub(crate) execution_id: u64,
-    pub(crate) target: PresentationToken,
-    pub(crate) renderer_frame: FrameIdentity,
-    pub(crate) display_generation: u64,
-    pub(crate) pass_kind: RenderPassKind,
-}
-
-impl ProductGpuExecutionIdentity {
-    pub(crate) fn from_ticket(ticket: GpuTimingTicket) -> Self {
-        Self {
-            execution_id: ticket.execution_id(),
-            target: ticket.target(),
-            renderer_frame: ticket.generation(),
-            display_generation: ticket.display_generation(),
-            pass_kind: ticket.pass_kind(),
-        }
-    }
-
-    fn matches_ticket(self, ticket: GpuTimingTicket) -> bool {
-        self.execution_id == ticket.execution_id()
-            && self.target == ticket.target()
-            && self.renderer_frame == ticket.generation()
-            && self.display_generation == ticket.display_generation()
-            && self.pass_kind == ticket.pass_kind()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProductGpuExecutionTiming {
-    pub(crate) batch_gpu_envelope_ns: Option<u64>,
-    pub(crate) payload_copy_ns: Option<u64>,
-    pub(crate) render_pass_ns: Option<u64>,
-}
-
-impl From<GpuFrameTiming> for ProductGpuExecutionTiming {
-    fn from(timing: GpuFrameTiming) -> Self {
-        Self {
-            batch_gpu_envelope_ns: timing.batch_gpu_envelope_ns(),
-            payload_copy_ns: timing.payload_copy_ns(),
-            render_pass_ns: timing.render_pass_ns(),
-        }
-    }
+    pub(crate) mixed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,8 +63,6 @@ pub(crate) struct PresentedFrameIntervalSample {
     pub(crate) interval_ns: Option<u64>,
     pub(crate) cpu_planning_ns: Option<u64>,
     pub(crate) cpu_queue_submit_ns: Option<u64>,
-    pub(crate) gpu_execution: Option<ProductGpuExecutionIdentity>,
-    pub(crate) gpu_timing: Option<ProductGpuExecutionTiming>,
 }
 
 struct PresentedFrameIntervalDiagnostics {
@@ -113,8 +89,6 @@ impl PresentedFrameIntervalDiagnostics {
         panel: PanelId,
         frame: FrameIdentity,
         cpu_timing: Option<CpuFrameTiming>,
-        gpu_execution: Option<ProductGpuExecutionIdentity>,
-        gpu_timing: Option<ProductGpuExecutionTiming>,
         now: Instant,
     ) {
         if !self.enabled {
@@ -136,8 +110,6 @@ impl PresentedFrameIntervalDiagnostics {
             interval_ns,
             cpu_planning_ns: cpu_timing.map(CpuFrameTiming::planning_ns),
             cpu_queue_submit_ns: cpu_timing.map(CpuFrameTiming::queue_submit_ns),
-            gpu_execution,
-            gpu_timing,
         });
         self.previous_by_panel.insert(panel, now);
     }
@@ -146,295 +118,34 @@ impl PresentedFrameIntervalDiagnostics {
         self.previous_by_panel.clear();
         self.samples.clear();
     }
-
-    /// Completes the exact publication that owns this renderer execution.
-    /// Returns true only when that publication is still the newest one, which
-    /// prevents an older progressive submission for the same FrameIdentity
-    /// from overwriting the current display timing.
-    fn complete_gpu_timing(&mut self, ticket: GpuTimingTicket, timing: GpuFrameTiming) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        let latest_sequence = self.total_publications;
-        let Some(sample) = self.samples.iter_mut().find(|sample| {
-            sample
-                .gpu_execution
-                .is_some_and(|execution| execution.matches_ticket(ticket))
-        }) else {
-            return false;
-        };
-        sample.gpu_timing = Some(timing.into());
-        sample.sequence == latest_sequence
-    }
-
-    #[cfg(test)]
-    fn complete_gpu_timing_value(
-        &mut self,
-        execution: ProductGpuExecutionIdentity,
-        timing: ProductGpuExecutionTiming,
-    ) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        let latest_sequence = self.total_publications;
-        let Some(sample) = self
-            .samples
-            .iter_mut()
-            .find(|sample| sample.gpu_execution == Some(execution))
-        else {
-            return false;
-        };
-        sample.gpu_timing = Some(timing);
-        sample.sequence == latest_sequence
-    }
-
-    #[cfg(test)]
-    fn complete_gpu_timing_for_test(
-        &mut self,
-        execution: ProductGpuExecutionIdentity,
-        timing: ProductGpuExecutionTiming,
-    ) -> bool {
-        self.complete_gpu_timing_value(execution, timing)
-    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProductFrameExecutionTiming {
-    pub(crate) target: PresentationToken,
-    pub(crate) frame: FrameIdentity,
-    pub(crate) display_generation: u64,
-    pub(crate) pass_kind: RenderPassKind,
-    pub(crate) cpu: Option<CpuFrameTiming>,
-    pub(crate) gpu_ticket: Option<GpuTimingTicket>,
-    pub(crate) gpu: Option<GpuFrameTiming>,
+#[derive(Debug, Clone)]
+pub(crate) struct PendingCoordinatedValidationCapture {
+    pub(crate) frame: PresentedFrame,
+    pub(crate) ticket: CoordinatedValidationCaptureTicket,
 }
 
-impl ProductFrameExecutionTiming {
-    pub(crate) fn new(
-        target: PresentationToken,
-        frame: FrameIdentity,
-        display_generation: u64,
-        pass_kind: RenderPassKind,
-        cpu: Option<CpuFrameTiming>,
-        gpu_ticket: Option<GpuTimingTicket>,
-    ) -> Self {
-        assert!(
-            gpu_ticket.is_none_or(|ticket| ticket.display_generation() == display_generation),
-            "renderer timing ticket must retain the exact display generation"
-        );
-        Self {
-            target,
-            frame,
-            display_generation,
-            pass_kind,
-            cpu,
-            gpu_ticket,
-            gpu: None,
-        }
-    }
-
-    pub(crate) fn complete_gpu(&mut self, ticket: GpuTimingTicket, timing: GpuFrameTiming) {
-        if self.gpu_ticket == Some(ticket) {
-            self.gpu = Some(timing);
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProgressiveLeaseProbeState {
-    pub(crate) next_requirement: usize,
-    pub(crate) requirements_remaining: usize,
-    pub(crate) render_requested: bool,
-}
-
-pub(crate) struct ProductPresentationTarget {
-    pub(crate) token: PresentationToken,
-    pub(crate) extent: RenderExtent,
-    pub(crate) request: Option<Arc<ProductRenderRequest>>,
-    pub(crate) requirement_keys: Arc<[DatasetResourceKey]>,
-    pub(crate) lease_priority_keys: Arc<[DatasetResourceKey]>,
-    pub(crate) satisfied_requirement_keys: HashSet<DatasetResourceKey>,
-    pub(crate) next_unsatisfied_requirement: usize,
-    pub(crate) last_residency_invalidation_epoch: Option<GpuResidencyInvalidationEpoch>,
-    /// Physical resources proved available by the latest renderer report,
-    /// including dormant prefetch. Unlike `presented`, this advances on
-    /// control-only and exact-policy executions that intentionally paint no
-    /// frame, so background polling can remain O(1) and settle truthfully.
-    pub(crate) last_renderer_available_resources: u64,
-    pub(crate) presented: Option<PresentedFrame>,
-    pub(crate) pending_capture: Option<(PresentedFrame, ValidationCaptureTicket)>,
-    pub(crate) completed_capture: Option<(PresentedFrame, ValidationCapture)>,
-    pub(crate) pending_gpu_timings: VecDeque<GpuTimingTicket>,
-    pub(crate) last_execution_timing: Option<ProductFrameExecutionTiming>,
-    pub(crate) partial_seen: bool,
-    pub(crate) layer_requirement_facts: BTreeMap<LogicalLayerKey, ProductLayerRequirementFacts>,
-    pub(crate) presented_layer_requirement_facts:
-        BTreeMap<LogicalLayerKey, ProductLayerRequirementFacts>,
-    layer_requirement_facts_requirements: Option<RenderRequirements>,
-    progressive_lease_probe: Cell<ProgressiveLeaseProbeState>,
-}
-
-impl ProductPresentationTarget {
-    pub(crate) fn new(token: PresentationToken, extent: RenderExtent) -> Self {
-        Self {
-            token,
-            extent,
-            request: None,
-            requirement_keys: Arc::from([]),
-            lease_priority_keys: Arc::from([]),
-            satisfied_requirement_keys: HashSet::new(),
-            next_unsatisfied_requirement: 0,
-            last_residency_invalidation_epoch: None,
-            last_renderer_available_resources: 0,
-            presented: None,
-            pending_capture: None,
-            completed_capture: None,
-            pending_gpu_timings: VecDeque::new(),
-            last_execution_timing: None,
-            partial_seen: false,
-            layer_requirement_facts: BTreeMap::new(),
-            presented_layer_requirement_facts: BTreeMap::new(),
-            layer_requirement_facts_requirements: None,
-            progressive_lease_probe: Cell::new(ProgressiveLeaseProbeState {
-                next_requirement: 0,
-                requirements_remaining: 0,
-                render_requested: false,
-            }),
-        }
-    }
-
-    pub(crate) fn reset(&mut self) {
-        let token = self.token;
-        let extent = self.extent;
-        *self = Self::new(token, extent);
-    }
-
-    pub(crate) fn reset_layer_requirement_facts(&mut self) {
-        self.rebuild_layer_requirement_facts();
-    }
-
-    pub(crate) fn mark_layer_requirement_available(&mut self, key: DatasetResourceKey) {
-        if self.synchronize_layer_requirement_facts() || !self.request_requires(key) {
-            return;
-        }
-        if let Some(facts) = self.layer_requirement_facts.get_mut(&key.layer()) {
-            facts.available_requirements = facts.available_requirements.saturating_add(1);
-        }
-    }
-
-    pub(crate) fn mark_layer_requirement_unavailable(&mut self, key: DatasetResourceKey) {
-        if self.synchronize_layer_requirement_facts() || !self.request_requires(key) {
-            return;
-        }
-        if let Some(facts) = self.layer_requirement_facts.get_mut(&key.layer()) {
-            facts.available_requirements = facts.available_requirements.saturating_sub(1);
-        }
-    }
-
-    fn request_requires(&self, key: DatasetResourceKey) -> bool {
-        self.request
-            .as_ref()
-            .is_some_and(|request| request.requirements.is_required_resource(key))
-    }
-
-    /// Rebuilds coverage when the immutable resource body or its O(1)
-    /// prefetch-promotion semantics changed. The satisfied set is already the
-    /// target's exact residency observation, so totals and availability move
-    /// together instead of incrementally relabeling dormant guard keys.
-    fn synchronize_layer_requirement_facts(&mut self) -> bool {
-        let current = self.request.as_ref().map(|request| &request.requirements);
-        let semantics_match = match (self.layer_requirement_facts_requirements.as_ref(), current) {
-            (Some(recorded), Some(current)) => {
-                recorded.shares_resources_with(current)
-                    && recorded.prefetch_promoted() == current.prefetch_promoted()
-            }
-            (None, None) => true,
-            _ => false,
-        };
-        if semantics_match {
-            return false;
-        }
-        self.rebuild_layer_requirement_facts();
-        true
-    }
-
-    fn rebuild_layer_requirement_facts(&mut self) {
-        let requirements = self
-            .request
-            .as_ref()
-            .map(|request| request.requirements.clone());
-        self.layer_requirement_facts =
-            requirements.as_ref().map_or_else(BTreeMap::new, |current| {
-                product_layer_requirement_facts(current, &self.satisfied_requirement_keys)
-            });
-        self.layer_requirement_facts_requirements = requirements;
-    }
-
-    /// Opens one finite membership pass after an event that can make another
-    /// retained update useful. Ordinary UI polling never reopens the pass.
-    pub(crate) fn dirty_progressive_lease_probe(&self) {
-        let requirement_count = self.lease_priority_keys.len();
-        let next_requirement = if requirement_count == 0 {
-            0
-        } else {
-            self.next_unsatisfied_requirement % requirement_count
-        };
-        self.progressive_lease_probe
-            .set(ProgressiveLeaseProbeState {
-                next_requirement,
-                requirements_remaining: requirement_count,
-                render_requested: false,
-            });
-    }
-
-    pub(crate) fn progressive_lease_probe_state(&self) -> ProgressiveLeaseProbeState {
-        self.progressive_lease_probe.get()
-    }
-
-    pub(crate) fn set_progressive_lease_probe_state(&self, state: ProgressiveLeaseProbeState) {
-        self.progressive_lease_probe.set(state);
-    }
-
-    pub(crate) fn progressive_render_requested(&self) -> bool {
-        self.progressive_lease_probe.get().render_requested
-    }
-
-    pub(crate) fn clear_progressive_render_request(&mut self) {
-        self.synchronize_layer_requirement_facts();
-        let mut state = self.progressive_lease_probe.get();
-        state.render_requested = false;
-        self.progressive_lease_probe.set(state);
-    }
-}
-
-fn product_layer_requirement_facts(
-    requirements: &RenderRequirements,
-    satisfied: &HashSet<DatasetResourceKey>,
-) -> BTreeMap<LogicalLayerKey, ProductLayerRequirementFacts> {
-    let mut facts_by_layer = BTreeMap::<LogicalLayerKey, ProductLayerRequirementFacts>::new();
-    for requirement in requirements
-        .resources()
-        .filter(|requirement| requirement.role() != RenderRequirementRole::Prefetch)
-    {
-        let key = requirement.key();
-        let facts = facts_by_layer.entry(key.layer()).or_default();
-        facts.displayed_scale_level = Some(key.scale().get());
-        facts.total_requirements = facts.total_requirements.saturating_add(1);
-        if satisfied.contains(&key) {
-            facts.available_requirements = facts.available_requirements.saturating_add(1);
-        }
-    }
-    facts_by_layer
+#[derive(Debug, Clone)]
+pub(crate) struct CompletedCoordinatedValidationCapture {
+    pub(crate) frame: PresentedFrame,
+    pub(crate) ticket: CoordinatedValidationCaptureTicket,
+    pub(crate) capture: ValidationCapture,
 }
 
 pub(crate) struct ProductGpuRenderRuntime {
     pub(crate) renderer: WgpuRenderRuntime,
-    pub(crate) targets: BTreeMap<PanelId, ProductPresentationTarget>,
-    pub(crate) staging_3d: Option<ProductPresentationTarget>,
-    next_frame_identity: u64,
     pub(crate) current_partial_frames_presented: u64,
     pub(crate) partial_to_settled_transitions: u64,
     pub(crate) stale_frames_rejected: u64,
+    pub(crate) last_coordinated_cpu_timing: Option<CpuFrameTiming>,
+    pub(crate) last_coordinated_recorded_targets: Box<[PresentationTarget]>,
+    pub(crate) last_coordinated_color_submissions: u32,
+    pub(crate) total_coordinated_color_submissions: u64,
+    pub(crate) last_coordinated_residency_submissions: u32,
+    pub(crate) pending_gpu_timings: VecDeque<GpuTimingTicket>,
+    pub(crate) pending_validation_captures: VecDeque<PendingCoordinatedValidationCapture>,
+    pub(crate) completed_validation_captures: [Option<CompletedCoordinatedValidationCapture>; 4],
     presented_frame_intervals: PresentedFrameIntervalDiagnostics,
 }
 
@@ -443,12 +154,17 @@ impl ProductGpuRenderRuntime {
         let frame_timing_enabled = renderer.diagnostics().gpu_timing_enabled();
         Self {
             renderer,
-            targets: BTreeMap::new(),
-            staging_3d: None,
-            next_frame_identity: 1,
             current_partial_frames_presented: 0,
             partial_to_settled_transitions: 0,
             stale_frames_rejected: 0,
+            last_coordinated_cpu_timing: None,
+            last_coordinated_recorded_targets: Box::new([]),
+            last_coordinated_color_submissions: 0,
+            total_coordinated_color_submissions: 0,
+            last_coordinated_residency_submissions: 0,
+            pending_gpu_timings: VecDeque::new(),
+            pending_validation_captures: VecDeque::new(),
+            completed_validation_captures: std::array::from_fn(|_| None),
             presented_frame_intervals: PresentedFrameIntervalDiagnostics::new(frame_timing_enabled),
         }
     }
@@ -458,28 +174,11 @@ impl ProductGpuRenderRuntime {
         panel: PanelId,
         frame: FrameIdentity,
         cpu_timing: Option<CpuFrameTiming>,
-        gpu_execution: Option<ProductGpuExecutionIdentity>,
-        gpu_timing: Option<ProductGpuExecutionTiming>,
     ) {
         if self.presented_frame_intervals.enabled {
-            self.presented_frame_intervals.observe(
-                panel,
-                frame,
-                cpu_timing,
-                gpu_execution,
-                gpu_timing,
-                Instant::now(),
-            );
+            self.presented_frame_intervals
+                .observe(panel, frame, cpu_timing, Instant::now());
         }
-    }
-
-    pub(crate) fn complete_presented_frame_gpu_timing(
-        &mut self,
-        ticket: GpuTimingTicket,
-        timing: GpuFrameTiming,
-    ) -> bool {
-        self.presented_frame_intervals
-            .complete_gpu_timing(ticket, timing)
     }
 
     pub(crate) const fn presented_frame_interval_timing_enabled(&self) -> bool {
@@ -500,46 +199,63 @@ impl ProductGpuRenderRuntime {
         self.presented_frame_intervals.dropped_samples
     }
 
-    pub(crate) fn allocate_frame_identity(&mut self) -> FrameIdentity {
-        let frame = FrameIdentity::new(self.next_frame_identity);
-        self.next_frame_identity = self.next_frame_identity.saturating_add(1);
-        frame
+    pub(crate) fn clear_validation_capture(&mut self, target: PresentationTarget) {
+        self.pending_validation_captures
+            .retain(|pending| pending.ticket.target() != target);
+        self.completed_validation_captures[target.index()] = None;
     }
 
-    /// Keeps the native device and registered targets while removing every
-    /// source-scoped renderer and presentation fact before a replacement
-    /// dataset can submit work.
+    pub(crate) fn queue_validation_capture(
+        &mut self,
+        frame: PresentedFrame,
+        ticket: CoordinatedValidationCaptureTicket,
+    ) {
+        self.clear_validation_capture(ticket.target());
+        self.pending_validation_captures
+            .push_back(PendingCoordinatedValidationCapture { frame, ticket });
+    }
+
+    pub(crate) fn completed_validation_capture(
+        &self,
+        target: PresentationTarget,
+    ) -> Option<&CompletedCoordinatedValidationCapture> {
+        self.completed_validation_captures[target.index()].as_ref()
+    }
+
+    /// Keeps the native device and fixed-target allocations while removing
+    /// every source-scoped renderer and readback fact.
     pub(crate) fn retire_dataset_generation(&mut self) {
         self.renderer.retire_dataset_generation();
-        for target in self.targets.values_mut().chain(self.staging_3d.iter_mut()) {
-            target.reset();
-        }
+        self.pending_validation_captures.clear();
+        self.completed_validation_captures = std::array::from_fn(|_| None);
+        self.last_coordinated_cpu_timing = None;
+        self.last_coordinated_recorded_targets = Box::new([]);
+        self.last_coordinated_color_submissions = 0;
+        self.total_coordinated_color_submissions = 0;
+        self.last_coordinated_residency_submissions = 0;
         self.presented_frame_intervals.retire_dataset_generation();
     }
 
-    /// Dirties only targets whose canonical requirement body contains one of
-    /// the exact resources that became newly actionable.
-    pub(crate) fn dirty_progressive_lease_probes_for_keys(&self, keys: &[DatasetResourceKey]) {
-        if keys.is_empty() {
-            return;
-        }
-        for target in self.targets.values().chain(self.staging_3d.iter()) {
-            if target.request.is_some()
-                && keys
-                    .iter()
-                    .any(|key| target.requirement_keys.binary_search(key).is_ok())
-            {
-                target.dirty_progressive_lease_probe();
-            }
-        }
+    pub(crate) fn activate_dataset_generation(
+        &mut self,
+        catalog: &DatasetCatalog,
+    ) -> Result<(), WgpuRenderRuntimeError> {
+        self.renderer.activate_dataset_generation(catalog)
     }
 }
 
 pub(crate) struct NativePresentationBridge {
     texture_renderer: Option<Arc<egui::mutex::RwLock<eframe::egui_wgpu::Renderer>>>,
     device: Option<eframe::wgpu::Device>,
-    textures: BTreeMap<PresentationToken, egui::TextureId>,
+    textures: BTreeMap<PresentationTarget, BoundTargetTexture>,
     pub(crate) product_gpu: Option<ProductGpuRenderRuntime>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundTargetTexture {
+    device_generation: u64,
+    texture_revision: u64,
+    texture_id: egui::TextureId,
 }
 
 impl NativePresentationBridge {
@@ -566,14 +282,53 @@ impl NativePresentationBridge {
         }
     }
 
-    pub(crate) fn texture_id(&self, token: PresentationToken) -> Option<egui::TextureId> {
-        self.textures.get(&token).copied()
+    #[cfg(test)]
+    pub(crate) fn with_headless_product_renderer(product_renderer: WgpuRenderRuntime) -> Self {
+        Self {
+            texture_renderer: None,
+            device: None,
+            textures: BTreeMap::new(),
+            product_gpu: Some(ProductGpuRenderRuntime::new(product_renderer)),
+        }
     }
 
-    pub(crate) fn dirty_progressive_lease_probes_for_keys(&self, keys: &[DatasetResourceKey]) {
-        if let Some(product) = self.product_gpu.as_ref() {
-            product.dirty_progressive_lease_probes_for_keys(keys);
-        }
+    pub(crate) fn texture_id(&self, target: PresentationTarget) -> Option<egui::TextureId> {
+        self.textures.get(&target).map(|binding| binding.texture_id)
+    }
+
+    pub(crate) fn texture_binding_identity(
+        &self,
+        target: PresentationTarget,
+    ) -> Option<(u64, u64)> {
+        self.textures
+            .get(&target)
+            .map(|binding| (binding.device_generation, binding.texture_revision))
+    }
+
+    /// Projects the renderer-owned fixed-pipeline state without retaining a
+    /// second readiness flag in the composition layer.
+    pub(crate) fn product_pipeline_readiness(
+        &self,
+    ) -> Option<Result<PipelineReadiness, WgpuRenderRuntimeError>> {
+        self.product_gpu
+            .as_ref()
+            .map(|product| product.renderer.pipeline_readiness())
+    }
+
+    pub(crate) fn initial_render_pipeline_is_ready(&self) -> Result<bool, WgpuRenderRuntimeError> {
+        self.product_gpu.as_ref().map_or(Ok(false), |product| {
+            product
+                .renderer
+                .pipeline_capability_is_ready(PipelineCapability::InitialRender)
+        })
+    }
+
+    pub(crate) fn pick_pipeline_is_ready(&self) -> Result<bool, WgpuRenderRuntimeError> {
+        self.product_gpu.as_ref().map_or(Ok(false), |product| {
+            product
+                .renderer
+                .pipeline_capability_is_ready(PipelineCapability::Pick)
+        })
     }
 
     pub(crate) fn paint(
@@ -581,9 +336,17 @@ impl NativePresentationBridge {
         ui: &mut egui::Ui,
         paint: EguiPresentationPaint,
     ) -> anyhow::Result<()> {
+        let target = paint.request().target();
         let texture_id = self
-            .texture_id(paint.request().token())
-            .ok_or_else(|| anyhow::anyhow!("presentation token has no native texture"))?;
+            .texture_id(target)
+            .ok_or_else(|| anyhow::anyhow!("{target:?} has no native texture binding"))?;
+        if let Some((_device_generation, texture_revision)) = self.texture_binding_identity(target)
+        {
+            crate::real_interaction_trace::record_egui_texture_paint_queued(
+                target,
+                texture_revision,
+            );
+        }
         egui::Image::from_texture((texture_id, paint.rect().size()))
             .fit_to_exact_size(paint.rect().size())
             .paint_at(ui, paint.rect());
@@ -592,38 +355,83 @@ impl NativePresentationBridge {
 
     pub(crate) fn bind_texture(
         &mut self,
-        token: PresentationToken,
+        target: PresentationTarget,
+        device_generation: RendererDeviceGeneration,
+        texture_revision: TargetTextureRevision,
         view: &eframe::wgpu::TextureView,
-        extent_changed: bool,
-    ) -> anyhow::Result<()> {
-        let existing = self.texture_id(token);
+    ) {
+        let existing = self.textures.get(&target).copied();
+        if existing.is_some_and(|binding| {
+            binding.device_generation == device_generation.get()
+                && binding.texture_revision == texture_revision.get()
+        }) {
+            return;
+        }
         let Some(texture_renderer) = self.texture_renderer.as_ref() else {
             #[cfg(test)]
-            if existing.is_some() {
-                return Ok(());
+            if self.product_gpu.is_some() {
+                // App-level renderer tests exercise the real offscreen WGPU
+                // target without constructing an unrelated egui paint pass.
+                self.textures.insert(
+                    target,
+                    BoundTargetTexture {
+                        device_generation: device_generation.get(),
+                        texture_revision: texture_revision.get(),
+                        texture_id: egui::TextureId::User(
+                            u64::try_from(target.index() + 1)
+                                .expect("the fixed target index fits a texture id"),
+                        ),
+                    },
+                );
+                return;
             }
-            anyhow::bail!("wgpu texture renderer is unavailable");
+            panic!("an installed product renderer has no egui or headless texture binding");
         };
         let device = self
             .device
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("wgpu device is unavailable"))?;
+            .expect("the egui texture renderer and WGPU device are installed together");
         let mut texture_renderer = texture_renderer.write();
-        let texture_id = if let Some(texture_id) = existing {
-            if extent_changed {
-                texture_renderer.update_egui_texture_from_wgpu_texture(
-                    device,
-                    view,
-                    display_texture_filter(),
-                    texture_id,
-                );
-            }
-            texture_id
+        let texture_id = if let Some(existing) = existing {
+            texture_renderer.update_egui_texture_from_wgpu_texture(
+                device,
+                view,
+                display_texture_filter(),
+                existing.texture_id,
+            );
+            existing.texture_id
         } else {
             texture_renderer.register_native_texture(device, view, display_texture_filter())
         };
-        self.textures.insert(token, texture_id);
-        Ok(())
+        self.textures.insert(
+            target,
+            BoundTargetTexture {
+                device_generation: device_generation.get(),
+                texture_revision: texture_revision.get(),
+                texture_id,
+            },
+        );
+    }
+
+    /// Applies the complete renderer-owned target set to the egui binding
+    /// layer. Omitted targets are retired here as well as in the renderer so
+    /// an old native view cannot keep a deactivated allocation alive.
+    pub(crate) fn retain_texture_bindings(&mut self, retained: &[PresentationTarget]) {
+        let omitted = self
+            .textures
+            .keys()
+            .copied()
+            .filter(|target| !retained.contains(target))
+            .collect::<Vec<_>>();
+        for target in omitted {
+            let binding = self
+                .textures
+                .remove(&target)
+                .expect("the omitted target came from the texture map");
+            if let Some(texture_renderer) = self.texture_renderer.as_ref() {
+                texture_renderer.write().free_texture(&binding.texture_id);
+            }
+        }
     }
 }
 
@@ -636,182 +444,60 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use mirante4d_dataset::{DatasetResourceIdentity, DatasetSourceId, ResourceRegion};
-    use mirante4d_domain::{
-        CameraView, DisplayWindow, IsoLightState, LayerTransfer, Opacity, Projection, RenderState,
-        RgbColor, SamplingPolicy, ScaleLevel, Shape3D, TimeIndex, TransferCurve, UnitQuaternion,
-        WorldPoint3,
-    };
-    use mirante4d_render_api::{
-        LayerRenderIntent, PreparedRenderRequirements, PreparedResourceBody, PresentationViewport,
-        RenderIntent, RenderViewIntent,
-    };
-
-    fn guard_resource(x: u64) -> DatasetResourceKey {
-        DatasetResourceKey::new(
-            DatasetResourceIdentity::Unverified(DatasetSourceId::new(77)),
-            LogicalLayerKey::new(4),
-            TimeIndex::new(0),
-            ScaleLevel::BASE,
-            ResourceRegion::new([0, 0, x], Shape3D::new(1, 1, 1).unwrap()).unwrap(),
-        )
-    }
-
-    fn guard_requirements() -> (PreparedRenderRequirements, [DatasetResourceKey; 3]) {
-        let keys = [guard_resource(0), guard_resource(1), guard_resource(2)];
-        let canonical: Arc<[DatasetResourceKey]> = keys.to_vec().into();
-        let ranked: Arc<[DatasetResourceKey]> = keys.to_vec().into();
-        let body = PreparedResourceBody::new(canonical, ranked, None).unwrap();
-        let requirements = PreparedRenderRequirements::new_with_required_prefix(
-            keys[0].identity(),
-            keys[0].timepoint(),
-            vec![keys[0].layer()],
-            body,
-            1,
-            1,
-        )
-        .unwrap();
-        (requirements, keys)
-    }
-
-    fn guard_request(requirements: &PreparedRenderRequirements) -> Arc<ProductRenderRequest> {
-        let intent = RenderIntent::new(
-            FrameIdentity::new(1),
-            requirements.resource_identity(),
-            requirements.timepoint(),
-            RenderViewIntent::volume(
-                CameraView::new(
-                    Projection::Orthographic,
-                    WorldPoint3::origin(),
-                    UnitQuaternion::identity(),
-                    1.0,
-                    1.0,
-                    1.0,
-                )
-                .unwrap(),
-                IsoLightState::attached_camera(),
-            ),
-            PresentationViewport::new(16.0, 16.0).unwrap(),
-            RenderExtent::new(16, 16).unwrap(),
-            vec![LayerRenderIntent::new(
-                requirements.layers()[0],
-                LayerTransfer::new(
-                    DisplayWindow::new(0.0, 1.0).unwrap(),
-                    RgbColor::new([1.0; 3]).unwrap(),
-                    Opacity::new(1.0).unwrap(),
-                    TransferCurve::linear(),
-                    false,
-                ),
-                RenderState::mip(SamplingPolicy::VoxelExact),
-            )],
-        )
-        .unwrap();
-        Arc::new(ProductRenderRequest {
-            requirements: requirements.bind(&intent).unwrap(),
-            intent,
-        })
-    }
-
-    fn guard_target(
-        requirements: &PreparedRenderRequirements,
-        satisfied: impl IntoIterator<Item = DatasetResourceKey>,
-    ) -> ProductPresentationTarget {
-        let mut target = ProductPresentationTarget::new(
-            PresentationToken::new(1).unwrap(),
-            RenderExtent::new(16, 16).unwrap(),
-        );
-        target.requirement_keys = Arc::clone(requirements.body().canonical());
-        target.lease_priority_keys = Arc::clone(requirements.body().ranked());
-        target.satisfied_requirement_keys.extend(satisfied);
-        target.request = Some(guard_request(requirements));
-        target.reset_layer_requirement_facts();
-        target
-    }
-
     #[test]
     fn display_texture_handoff_uses_linear_filtering() {
         assert_eq!(display_texture_filter(), eframe::wgpu::FilterMode::Linear);
     }
 
     #[test]
-    fn dormant_prefetch_is_excluded_from_layer_coverage_facts() {
-        let (requirements, keys) = guard_requirements();
-        let mut target = guard_target(&requirements, keys);
-        let facts = target.layer_requirement_facts[&keys[0].layer()];
-        assert_eq!(facts.total_requirements, 1);
-        assert_eq!(facts.available_requirements, 1);
-
-        target.satisfied_requirement_keys.remove(&keys[1]);
-        target.mark_layer_requirement_unavailable(keys[1]);
-        target.satisfied_requirement_keys.insert(keys[1]);
-        target.mark_layer_requirement_available(keys[1]);
-        assert_eq!(
-            target.layer_requirement_facts[&keys[0].layer()],
-            facts,
-            "dormant guard residency must not change current-frame coverage"
-        );
-    }
-
-    #[test]
-    fn prefetch_promotion_rebuilds_totals_and_availability_together() {
-        let (requirements, keys) = guard_requirements();
-        let mut target = guard_target(&requirements, [keys[0], keys[1]]);
-        assert_eq!(
-            target.layer_requirement_facts[&keys[0].layer()],
-            ProductLayerRequirementFacts {
-                displayed_scale_level: Some(0),
-                available_requirements: 1,
-                total_requirements: 1,
-            }
-        );
-
-        let promoted = requirements.promote_prefetch();
-        target.request = Some(guard_request(&promoted));
-        target.clear_progressive_render_request();
-        assert_eq!(
-            target.layer_requirement_facts[&keys[0].layer()],
-            ProductLayerRequirementFacts {
-                displayed_scale_level: Some(0),
-                available_requirements: 2,
-                total_requirements: 3,
-            },
-            "promotion must rebuild from the promoted semantics and exact satisfied set"
-        );
-
-        target.satisfied_requirement_keys.insert(keys[2]);
-        target.mark_layer_requirement_available(keys[2]);
-        assert_eq!(
-            target.layer_requirement_facts[&keys[0].layer()].available_requirements,
-            3
-        );
-    }
-
-    #[test]
     fn unavailable_bridge_has_no_native_texture_mapping() {
         let bridge = NativePresentationBridge::unavailable();
-        let token = PresentationToken::new(1).unwrap();
 
-        assert_eq!(bridge.texture_id(token), None);
+        assert_eq!(bridge.texture_id(PresentationTarget::ThreeD), None);
+    }
+
+    #[test]
+    fn complete_layout_omission_retires_the_binding_identity() {
+        let mut bridge = NativePresentationBridge::unavailable();
+        bridge.textures.insert(
+            PresentationTarget::ThreeD,
+            BoundTargetTexture {
+                device_generation: 4,
+                texture_revision: 8,
+                texture_id: egui::TextureId::User(1),
+            },
+        );
+        bridge.textures.insert(
+            PresentationTarget::Xy,
+            BoundTargetTexture {
+                device_generation: 4,
+                texture_revision: 9,
+                texture_id: egui::TextureId::User(2),
+            },
+        );
+
+        bridge.retain_texture_bindings(&[PresentationTarget::ThreeD]);
+
+        assert_eq!(
+            bridge.texture_binding_identity(PresentationTarget::ThreeD),
+            Some((4, 8))
+        );
+        assert_eq!(
+            bridge.texture_binding_identity(PresentationTarget::Xy),
+            None
+        );
+        assert_eq!(bridge.texture_id(PresentationTarget::Xy), None);
     }
 
     #[test]
     fn presented_frame_intervals_are_opt_in_and_keep_the_newest_bounded_samples() {
         let origin = Instant::now();
         let mut disabled = PresentedFrameIntervalDiagnostics::new(false);
-        disabled.observe(
-            PanelId::ThreeD,
-            FrameIdentity::new(1),
-            None,
-            None,
-            None,
-            origin,
-        );
+        disabled.observe(PanelId::ThreeD, FrameIdentity::new(1), None, origin);
         disabled.observe(
             PanelId::ThreeD,
             FrameIdentity::new(2),
-            Some(CpuFrameTiming::new(4, None, None, 2)),
-            None,
-            None,
+            Some(CpuFrameTiming::new(4, 2)),
             origin + Duration::from_nanos(7),
         );
         assert!(disabled.samples.is_empty());
@@ -821,9 +507,7 @@ mod tests {
         enabled.observe(
             PanelId::ThreeD,
             FrameIdentity::new(1),
-            Some(CpuFrameTiming::new(11, None, None, 3)),
-            None,
-            None,
+            Some(CpuFrameTiming::new(11, 3)),
             origin,
         );
         assert_eq!(enabled.samples.front().unwrap().interval_ns, None);
@@ -840,9 +524,7 @@ mod tests {
             enabled.observe(
                 PanelId::ThreeD,
                 FrameIdentity::new(index as u64 + 1),
-                Some(CpuFrameTiming::new(index as u64, None, None, 1)),
-                None,
-                None,
+                Some(CpuFrameTiming::new(index as u64, 1)),
                 origin + Duration::from_nanos(index as u64),
             );
         }
@@ -860,72 +542,13 @@ mod tests {
     }
 
     #[test]
-    fn superseded_publication_receives_exact_gpu_timing_without_becoming_current() {
-        let origin = Instant::now();
-        let frame = FrameIdentity::new(9);
-        let presentation = PresentationToken::new(3).unwrap();
-        let older = ProductGpuExecutionIdentity {
-            execution_id: 41,
-            target: presentation,
-            renderer_frame: frame,
-            display_generation: 3,
-            pass_kind: RenderPassKind::Volume,
-        };
-        let newer = ProductGpuExecutionIdentity {
-            execution_id: 42,
-            target: presentation,
-            renderer_frame: frame,
-            display_generation: 4,
-            pass_kind: RenderPassKind::Volume,
-        };
-        let mut diagnostics = PresentedFrameIntervalDiagnostics::new(true);
-        diagnostics.observe(PanelId::ThreeD, frame, None, Some(older), None, origin);
-        diagnostics.observe(
-            PanelId::ThreeD,
-            frame,
-            None,
-            Some(newer),
-            None,
-            origin + Duration::from_nanos(1),
-        );
-
-        let older_timing = ProductGpuExecutionTiming {
-            batch_gpu_envelope_ns: Some(17),
-            payload_copy_ns: None,
-            render_pass_ns: Some(17),
-        };
-        let newer_timing = ProductGpuExecutionTiming {
-            batch_gpu_envelope_ns: Some(22),
-            payload_copy_ns: Some(3),
-            render_pass_ns: Some(19),
-        };
-        assert!(!diagnostics.complete_gpu_timing_for_test(older, older_timing));
-        // The historical publication receives its exact result, but false is
-        // the guard used by the caller to keep stale timing out of current-
-        // frame metrics.
-        assert_eq!(diagnostics.samples[0].gpu_timing, Some(older_timing));
-        assert_eq!(diagnostics.samples[1].gpu_timing, None);
-        assert!(diagnostics.complete_gpu_timing_for_test(newer, newer_timing));
-        assert_eq!(diagnostics.samples[1].gpu_timing, Some(newer_timing));
-    }
-
-    #[test]
     fn presented_frame_intervals_use_independent_panel_clocks() {
         let origin = Instant::now();
         let mut diagnostics = PresentedFrameIntervalDiagnostics::new(true);
-        diagnostics.observe(
-            PanelId::ThreeD,
-            FrameIdentity::new(1),
-            None,
-            None,
-            None,
-            origin,
-        );
+        diagnostics.observe(PanelId::ThreeD, FrameIdentity::new(1), None, origin);
         diagnostics.observe(
             PanelId::Xy,
             FrameIdentity::new(2),
-            None,
-            None,
             None,
             origin + Duration::from_nanos(5),
         );
@@ -933,15 +556,11 @@ mod tests {
             PanelId::ThreeD,
             FrameIdentity::new(3),
             None,
-            None,
-            None,
             origin + Duration::from_nanos(11),
         );
         diagnostics.observe(
             PanelId::Xy,
             FrameIdentity::new(4),
-            None,
-            None,
             None,
             origin + Duration::from_nanos(18),
         );
@@ -956,19 +575,10 @@ mod tests {
     fn dataset_retirement_breaks_interval_and_timing_authority_across_sources() {
         let origin = Instant::now();
         let mut diagnostics = PresentedFrameIntervalDiagnostics::new(true);
-        diagnostics.observe(
-            PanelId::ThreeD,
-            FrameIdentity::new(1),
-            None,
-            None,
-            None,
-            origin,
-        );
+        diagnostics.observe(PanelId::ThreeD, FrameIdentity::new(1), None, origin);
         diagnostics.observe(
             PanelId::ThreeD,
             FrameIdentity::new(2),
-            None,
-            None,
             None,
             origin + Duration::from_nanos(7),
         );
@@ -981,8 +591,6 @@ mod tests {
         diagnostics.observe(
             PanelId::ThreeD,
             FrameIdentity::new(3),
-            None,
-            None,
             None,
             origin + Duration::from_nanos(100),
         );

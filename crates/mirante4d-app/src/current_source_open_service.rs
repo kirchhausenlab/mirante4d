@@ -506,6 +506,10 @@ fn map_verified_open_failure(error: &UnifiedVerifiedSourceOpenError) -> Operatio
         UnifiedVerifiedSourceOpenError::MissingLocalSource => {
             OperationFailureCode::DatasetReadFailed
         }
+        UnifiedVerifiedSourceOpenError::DemandPlanner(error) => {
+            tracing::error!(%error, "current-source data-plane worker could not start");
+            OperationFailureCode::DatasetReadFailed
+        }
         UnifiedVerifiedSourceOpenError::Adapter(
             LocalDatasetSourceOpenError::MetadataAccountingOverflow
             | LocalDatasetSourceOpenError::MetadataAdmission(_)

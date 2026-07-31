@@ -23,16 +23,6 @@ pub(crate) struct ProductRenderRequest {
     pub(crate) requirements: RenderRequirements,
 }
 
-impl ProductRenderRequest {
-    pub(crate) fn rebind(&self, intent: RenderIntent) -> anyhow::Result<Self> {
-        let requirements = self.requirements.rebind(&intent)?;
-        Ok(Self {
-            intent,
-            requirements,
-        })
-    }
-}
-
 pub(crate) fn volume_intent(
     snapshot: &ApplicationSnapshot,
     frame: FrameIdentity,
@@ -56,13 +46,13 @@ pub(crate) fn cross_section_intent(
     snapshot: &ApplicationSnapshot,
     frame: FrameIdentity,
     panel: PanelId,
+    source: CrossSectionView,
     presentation: PresentationViewport,
     extent: RenderExtent,
 ) -> anyhow::Result<Option<RenderIntent>> {
     let Some(relative) = panel_relative_orientation(panel) else {
         anyhow::bail!("the 3D panel is not a cross-section target");
     };
-    let source = *application_view(snapshot).cross_section();
     let orientation = DQuat::from_array(source.orientation().xyzw()) * relative;
     let [x, y, z, w] = orientation.to_array();
     let view = CrossSectionView::new(

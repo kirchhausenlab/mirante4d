@@ -2092,6 +2092,7 @@ name = "mirante4d-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ash",
  "eframe",
  "egui_kittest",
  "glam",
@@ -2106,10 +2107,12 @@ dependencies = [
  "mirante4d-project-model",
  "mirante4d-project-store",
  "mirante4d-render-api",
+ "mirante4d-render-reference",
  "mirante4d-render-wgpu",
  "mirante4d-settings",
  "mirante4d-storage",
  "mirante4d-ui-egui",
+ "pollster",
  "rfd",
  "rustix 1.1.4",
  "serde",
@@ -2120,6 +2123,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wgpu",
  "winit",
 ]
 

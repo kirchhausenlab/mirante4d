@@ -1,12 +1,11 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::zarr_metadata::encode_sorted_wire;
 use crate::{
     F64Bits, MAX_ZARR_METADATA_BYTES, ProfileImage, ScienceTemporalCalibration, ZarrMetadataError,
 };
+use crate::{control::LEVEL_COUNT_MAX, zarr_metadata::encode_sorted_wire};
 
 const OBJECT: &str = "OME image-group metadata";
-const LEVEL_COUNT_MAX: usize = 7;
 const ZERO_BITS: u64 = 0.0_f64.to_bits();
 const ONE_BITS: u64 = 1.0_f64.to_bits();
 
@@ -85,14 +84,14 @@ impl OmeImageGroupMetadata {
         let multiscale = &wire.attributes.ome.multiscales[0];
         let (regular_time, diagonal_spatial) = parse_axes(&multiscale.axes)?;
         if multiscale.datasets.is_empty() || multiscale.datasets.len() > LEVEL_COUNT_MAX {
-            return invalid("OME datasets must contain one through seven levels");
+            return invalid("OME datasets must contain one through 64 levels");
         }
 
         let mut time_scale = None;
         let mut levels = Vec::with_capacity(multiscale.datasets.len());
         for (ordinal, dataset) in multiscale.datasets.iter().enumerate() {
             if dataset.path != format!("s{ordinal:02}") {
-                return invalid("OME dataset paths must be contiguous s00 through s06");
+                return invalid("OME dataset paths must be contiguous s00 through s63");
             }
             let (scale, translation, translation_present) =
                 parse_transform_sequence(&dataset.coordinate_transformations)?;
@@ -185,7 +184,7 @@ fn validate_parts(
     levels: &[OmeLevelTransform],
 ) -> Result<(), ZarrMetadataError> {
     if levels.is_empty() || levels.len() > LEVEL_COUNT_MAX {
-        return invalid("OME datasets must contain one through seven levels");
+        return invalid("OME datasets must contain one through 64 levels");
     }
     if regular_time_step_seconds.is_some_and(|step| step.value() <= 0.0) {
         return invalid("regular OME time scale must be positive and finite");
@@ -585,6 +584,27 @@ mod tests {
                 ],
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn ome_image_group_round_trips_every_representable_geometry_chain() {
+        let levels = (0..LEVEL_COUNT_MAX)
+            .map(|_| OmeLevelTransform::UnitlessIdentity)
+            .collect::<Vec<_>>();
+        let metadata = OmeImageGroupMetadata::new(
+            &image(LEVEL_COUNT_MAX as u32),
+            &ScienceTemporalCalibration::unknown(),
+            levels,
+        )
+        .unwrap();
+        let bytes = metadata.deterministic_bytes().unwrap();
+        let parsed = OmeImageGroupMetadata::parse(&bytes).unwrap();
+        assert_eq!(parsed, metadata);
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .contains("\"path\":\"s63\"")
         );
     }
 }

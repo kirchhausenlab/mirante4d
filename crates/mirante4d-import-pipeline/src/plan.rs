@@ -613,16 +613,16 @@ mod tests {
         let first = ImportPlan::new(&options).unwrap();
         let second = ImportPlan::new(&options).unwrap();
         assert_eq!(first.plan_digest, second.plan_digest);
-        assert_eq!(first.shapes.len(), 2);
+        assert_eq!(first.shapes.len(), 4);
         assert!(first.work_units > 0);
     }
 
     #[test]
-    fn exact_scale_profiles_choose_their_declared_count() {
+    fn every_profile_uses_the_same_geometry_derived_scale_count() {
         let mut options = options(Shape4D::new(1, 2, 2, 2).unwrap());
         options.profile = ProfileKind::Ds4;
         let plan = ImportPlan::new(&options).unwrap();
-        assert_eq!(plan.shapes.len(), 4);
+        assert_eq!(plan.shapes, vec![Shape4D::new(1, 2, 2, 2).unwrap()]);
     }
 
     #[test]

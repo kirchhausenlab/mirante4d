@@ -146,6 +146,60 @@
       "listed_in": "docs/README.md"
     },
     {
+      "path": "docs/plans/active/VIEWER_RESIDENT_3D_NAVIGATION_LADDER.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/VIEWER_GPU_MEMORY_AND_ASYNC_REFINEMENT.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/VIEWER_NATIVE_RESOLUTION_NAVIGATION.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/VIEWER_BOUNDED_3D_PRESENTATION.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/VIEWER_ADAPTIVE_LOD_AND_GLOBAL_CAPACITY.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/VIEWER_GPU_PLACEABILITY_AND_RECOVERY.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/VIEWER_LINKED_2D_LOD_TRUTH_AND_SETTLEMENT.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/VIEWER_PROGRESSIVE_MULTISCALE_PRESENTATION.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/VIEWER_RENDERING_PIPELINE_OVERHAUL.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
       "path": "docs/plans/deferred/OPEN_DATA_FOLLOW_ON.md",
       "truth_scope": "deferred",
       "authorities": [],

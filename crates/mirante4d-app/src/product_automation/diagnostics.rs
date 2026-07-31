@@ -184,37 +184,68 @@ fn category_bytes_json(diagnostics: DatasetRuntimeDiagnostics, capacity: bool) -
     })
 }
 
-pub(crate) fn gpu_adapter_diagnostics_json(adapter: &WgpuRenderRuntimeDiagnostics) -> Value {
+pub(crate) fn gpu_adapter_diagnostics_json(
+    adapter: &WgpuRenderRuntimeDiagnostics,
+    memory: &crate::gpu_memory::SelectedAdapterMemoryFacts,
+) -> Value {
     let mut requested_features = Vec::new();
     if adapter.gpu_timestamps_supported() {
         requested_features.push("TIMESTAMP_QUERY");
     }
-    if adapter.gpu_payload_copy_timestamps_supported() {
+    if adapter.gpu_encoder_timestamps_supported() {
         requested_features.push("TIMESTAMP_QUERY_INSIDE_ENCODERS");
     }
     let timing = json!({
         "timestamps_supported": adapter.gpu_timestamps_supported(),
         "enabled": adapter.gpu_timing_enabled(),
-        "payload_copy_timestamps_supported": adapter.gpu_payload_copy_timestamps_supported(),
+        "encoder_timestamps_supported": adapter.gpu_encoder_timestamps_supported(),
         "completed": adapter.completed_gpu_timings(),
         "failures": adapter.gpu_timing_failures(),
-        "gpu_timing_prelude_submissions": adapter.gpu_timing_prelude_submissions(),
         "last_batch_gpu_envelope_ns": adapter.last_gpu_batch_envelope_ns(),
-        "last_payload_copy_ns": adapter.last_gpu_payload_copy_ns(),
         "last_render_pass_ns": adapter.last_gpu_render_pass_ns(),
         "cpu": {
-            "measurement_scope": "retained_cohort_preflight_validation_residency_control_and_command_encoding_excluding_queue_submit",
+            "measurement_scope": "coordinated_color_control_preparation_and_command_encoding_excluding_queue_submit",
             "completed": adapter.completed_cpu_timings(),
             "last_frame": adapter.last_cpu_timing_frame(),
             "last_planning_ns": adapter.last_cpu_planning_ns(),
-            "last_control_publication_ns": adapter.last_cpu_control_publication_ns(),
-            "last_payload_staging_ns": adapter.last_cpu_payload_staging_ns(),
             "last_queue_submit_ns": adapter.last_cpu_queue_submit_ns(),
             "total_planning_ns": adapter.total_cpu_planning_ns(),
-            "total_control_publication_ns": adapter.total_cpu_control_publication_ns(),
-            "total_payload_staging_ns": adapter.total_cpu_payload_staging_ns(),
             "total_queue_submit_ns": adapter.total_cpu_queue_submit_ns(),
         },
+    });
+    let hidden_refinement = json!({
+        "jobs_started": adapter.hidden_refinement_jobs_started(),
+        "jobs_completed": adapter.hidden_refinement_jobs_completed(),
+        "jobs_cancelled": adapter.hidden_refinement_jobs_cancelled(),
+        "jobs_failed": adapter.hidden_refinement_jobs_failed(),
+        "batches": adapter.hidden_refinement_batches(),
+        "rows": adapter.hidden_refinement_rows(),
+        "elapsed_ns": adapter.hidden_refinement_elapsed_ns(),
+        "last_batch_rows": adapter.hidden_refinement_last_batch_rows(),
+        "target_batch_ns": 3_000_000_u64,
+        "scheduling_clock": "renderer_worker_gpu_submission_completion",
+    });
+    let selected_memory = json!({
+        "selected_adapter_name": memory.adapter_name(),
+        "selected_adapter_backend": format!("{:?}", memory.backend()),
+        "selected_adapter_device_type": format!("{:?}", memory.device_type()),
+        "model": memory.memory_model().to_string(),
+        "source": memory.source().to_string(),
+        "device_local_bytes": memory.device_local_bytes(),
+        "driver_budget_bytes": memory.driver_budget_bytes(),
+        "driver_usage_bytes": memory.driver_usage_bytes(),
+        "recommendation_capacity_bytes": memory.recommended_capacity_bytes(),
+        "failure": memory.failure().map(ToString::to_string),
+    });
+    let payload_commitment = json!({
+        "logical_capacity_bytes": adapter.payload_capacity_bytes(),
+        "physical_buffer_bytes": adapter.payload_arena_allocated_bytes(),
+        "committed_capacity_bytes": adapter.payload_committed_capacity_bytes(),
+        "uncommitted_capacity_bytes": adapter.payload_uncommitted_capacity_bytes(),
+        "segment_logical_capacity_bytes": adapter.payload_segment_capacity_bytes(),
+        "segment_committed_capacity_bytes": adapter.payload_segment_committed_capacity_bytes(),
+        "growths": adapter.payload_growths(),
+        "growth_copy_bytes": adapter.payload_growth_copy_bytes(),
     });
     json!({
         "name": adapter.adapter_name(),
@@ -235,18 +266,28 @@ pub(crate) fn gpu_adapter_diagnostics_json(adapter: &WgpuRenderRuntimeDiagnostic
             "memory_hint": "MemoryUsage",
             "source": "enabled_device_features_and_fixed_renderer_device_descriptor",
         },
+        "memory": selected_memory,
         "limits": {
             "max_buffer_size": adapter.max_buffer_size_bytes(),
             "max_storage_buffer_binding_size": adapter.max_storage_buffer_binding_size_bytes(),
             "max_storage_buffers_per_shader_stage": adapter.max_storage_buffers_per_shader_stage(),
         },
         "gpu_budget_bytes": adapter.gpu_budget_bytes(),
-        "payload_capacity_bytes": adapter.payload_capacity_bytes(),
         "transfer_capacity_bytes": adapter.transfer_capacity_bytes(),
         "other_capacity_bytes": adapter.other_capacity_bytes(),
-        "payload_arena_allocated_bytes": adapter.payload_arena_allocated_bytes(),
+        "payload_commitment": payload_commitment,
         "resident_payload_bytes": adapter.resident_payload_bytes(),
         "peak_resident_payload_bytes": adapter.peak_resident_payload_bytes(),
+        "payload_placeability": {
+            "aggregate_free_bytes": adapter.payload_free_bytes(),
+            "largest_contiguous_bytes": adapter.payload_largest_contiguous_bytes(),
+            "segment_free_bytes": adapter.payload_segment_free_bytes(),
+            "segment_largest_contiguous_bytes": adapter.payload_segment_largest_contiguous_bytes(),
+            "failures": adapter.payload_placeability_failures(),
+            "compactions": adapter.payload_compactions(),
+            "compaction_resources_moved": adapter.payload_compaction_resources_moved(),
+            "compaction_bytes_moved": adapter.payload_compaction_bytes_moved(),
+        },
         "resident_metadata": {
             "records": adapter.empty_resident_metadata_records(),
             "capacity_records": adapter.empty_resident_metadata_capacity_records(),
@@ -258,12 +299,24 @@ pub(crate) fn gpu_adapter_diagnostics_json(adapter: &WgpuRenderRuntimeDiagnostic
         "queue_submissions": adapter.queue_submissions(),
         "current_in_flight_submissions": adapter.current_in_flight_submissions(),
         "peak_in_flight_submissions": adapter.peak_in_flight_submissions(),
+        "peak_in_flight_color_cutoffs": adapter.peak_in_flight_color_cutoffs(),
         "backpressure_deferrals": adapter.backpressure_deferrals(),
+        "hidden_refinement": hidden_refinement,
         "residency": {
             "hits": adapter.residency_hits(),
             "misses": adapter.residency_misses(),
             "evictions": adapter.residency_evictions(),
             "epoch_reuploads": adapter.residency_epoch_reuploads(),
+            "allocator_plans": adapter.allocator_plans(),
+            "coverage_membership_checks": adapter.cold_coverage_membership_checks(),
+            "coverage_resident_matches": adapter.cold_coverage_resident_matches(),
+            "directory": {
+                "publications": adapter.directory_publications(),
+                "mutations": adapter.directory_mutations(),
+                "rebuilds": adapter.directory_rebuilds(),
+                "slot_writes": adapter.directory_slot_writes(),
+            },
+            "page_record_writes": adapter.page_record_writes(),
         },
         "uploads": {
             "resources": adapter.uploaded_resources(),
@@ -274,21 +327,15 @@ pub(crate) fn gpu_adapter_diagnostics_json(adapter: &WgpuRenderRuntimeDiagnostic
             },
             "render_thread_payload_fact_scan_bytes": adapter.render_thread_payload_fact_scan_bytes(),
         },
-        "control": {
-            "static_rebuilds": adapter.control_static_rebuilds(),
-            "static_rebuild_bytes": adapter.control_static_rebuild_bytes(),
-            "dynamic_updates": adapter.control_dynamic_updates(),
-            "dynamic_upload_bytes": adapter.control_dynamic_upload_bytes(),
-            "publication_writes": adapter.control_publication_writes(),
-            "peak_publication_writes_per_frame": adapter.peak_control_publication_writes_per_frame(),
-            "dense_fallbacks": adapter.control_dense_fallbacks(),
+        "target_control": {
+            "updates": adapter.target_control_updates(),
+            "upload_bytes": adapter.target_control_upload_bytes(),
             "buffer_allocations": adapter.control_buffer_allocations(),
+            "buffer_allocation_bytes": adapter.control_buffer_allocation_bytes(),
+        },
+        "gpu_objects": {
             "bind_group_creations": adapter.bind_group_creations(),
-            "pipeline_creations": adapter.pipeline_creations(),
-            "residency_directory_updates": adapter.control_body_delta_updates(),
-            "page_layout_constructions": adapter.page_layout_constructions(),
-            "page_table_updates": adapter.control_body_delta_page_entries(),
-            "allocator_plans": adapter.allocator_plans(),
+            "usable_pipeline_handles": adapter.usable_pipeline_handles(),
         },
         "staging": {
             "explicit_allocations": adapter.explicit_staging_allocations(),

@@ -44,6 +44,23 @@ OME-TIFF sources. Import never changes source data. It writes to an owned
 stage, validates the result, and publishes only to a previously absent
 destination.
 
+Imported spatial pyramids follow one deterministic geometry contract. Time is
+never reduced. Starting at S0, each spatial dimension is ceil-divided by two
+until the coarsest shape satisfies both:
+
+```text
+max(z, y, x) <= 64
+z * y * x <= 262,144 voxels per layer and timepoint
+```
+
+A small source that already satisfies both conditions remains single-scale.
+A larger or long-thin source receives however many distinct factor-two levels
+its geometry requires. The closed two-digit profile admits up to 64 levels;
+the largest possible `u64` dimension reaches the terminal contract in 59, so
+this bound covers every representable `Shape4D` rather than imposing a
+product LOD count. The terminal geometry—not an ordinal such as S6—is the
+viewer navigation-floor contract.
+
 For a reviewed `uint8` sentinel, source equality is evaluated only at LOD 0.
 Final base validity is the in-bounds Chebyshev-radius-one erosion of source
 validity (zero Z radius for 2D). Each later LOD stores the half-up mean of valid

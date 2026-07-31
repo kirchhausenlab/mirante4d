@@ -3,10 +3,12 @@
 //! Exact candidate testing and contribution sorting can touch the complete
 //! 131,072-brick planning envelope. This owner keeps that work off the UI
 //! thread. It has one running job, one replaceable pending job, and one
-//! replaceable result; source/view currentness is represented by a monotonic
-//! generation and checked before a result is exposed.
+//! replaceable result; source/view currentness is represented by the opaque
+//! revision allocated by the render-intent mailbox and checked before a
+//! result is exposed.
 
 use std::{
+    collections::BTreeMap,
     fmt, io,
     sync::{
         Arc, Condvar, Mutex,
@@ -16,26 +18,30 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mirante4d_dataset::{CpuByteLease, CpuByteLedger, DatasetCatalog, DatasetResourceKey};
-use mirante4d_domain::{LogicalLayerKey, TimeIndex};
+use mirante4d_application::RenderIntentRevision;
+use mirante4d_dataset::{BrickKey, CpuByteLease, CpuByteLedger, DatasetCatalog};
+use mirante4d_domain::{LogicalLayerKey, ScaleLevel, TimeIndex};
 use mirante4d_project_model::ViewState;
 use mirante4d_render_api::{
     PreparedRenderRequirements, PreparedResourceBody, PresentationViewport, RenderExtent,
-};
-use mirante4d_render_wgpu::{
-    MAX_INCREMENTAL_STATIC_KEY_CHANGES, PreparedStaticPresentationLayout,
-    preflight_static_presentation_layout_update, prepare_static_presentation_layout_update,
+    RenderLayerScaleChain,
 };
 
-#[cfg(test)]
-use crate::dataset_demand_plan::plan_progressive_current_3d_cancellable;
 use crate::dataset_demand_plan::{
-    DatasetDemandPlanLimits, PreparedAllocationReservations, PreparedDatasetDemandPlan,
-    PreparedDemandRequirements, PreparedProgressiveDatasetDemandPlan,
-    bounded_requirement_delta_scratch_bytes, key_array_bytes, plan_cross_section_panel_cancellable,
-    plan_guarded_progressive_current_3d_cancellable,
+    DatasetDemandPlan, DatasetDemandPlanCapacityError, DatasetDemandPlanLimits,
+    NavigationLadderBaseline, PreparedAllocationReservations, PreparedDatasetDemandPlan,
+    PreparedDemandRequirements, PreparedProgressiveDatasetDemandPlan, key_array_bytes,
+    plan_adaptive_cross_section_panel_with_obligations_cancellable,
+    plan_cross_section_navigation_floor_cancellable,
+    plan_guarded_progressive_current_3d_with_obligations_cancellable,
+    plane_guard_attempt_should_retry_exact,
+};
+#[cfg(test)]
+use crate::dataset_demand_plan::{
+    plan_cross_section_panel_attempt, plan_progressive_current_3d_cancellable,
 };
 use crate::retained_leases::RetainedRequirementHandle;
+use crate::semantic_demand::SemanticPlaneReuseEnvelope;
 use crate::viewer_layout::PanelId;
 
 const WORKER_NAME: &str = "mirante4d-camera-demand";
@@ -44,22 +50,16 @@ const WORKER_NAME: &str = "mirante4d-camera-demand";
 /// one latest request rather than repeatedly traversing stale candidates.
 const REPLACEMENT_QUIET_PERIOD: Duration = Duration::from_millis(4);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct CameraDemandGeneration(u64);
-
-impl CameraDemandGeneration {
-    pub(crate) const fn get(self) -> u64 {
-        self.0
-    }
-}
-
 pub(crate) struct CameraDemandRequest {
+    revision: RenderIntentRevision,
     catalog: Arc<DatasetCatalog>,
     cpu_ledger: Arc<dyn CpuByteLedger>,
     view: ViewState,
+    global_limits: DatasetDemandPlanLimits,
     current_3d: Option<Current3dDemandRequest>,
     cross_sections: Box<[CrossSectionDemandRequest]>,
     previous_renderer_requirement_union: RetainedRequirementHandle,
+    preserve_previous_renderer_requirement_union: bool,
     unchanged_renderer_requirement_bodies: Box<[PreparedResourceBody]>,
     post_refinement_promotion_unchanged_bodies: Option<Box<[PreparedResourceBody]>>,
 }
@@ -71,6 +71,7 @@ pub(crate) struct Current3dDemandRequest {
     playback_active: bool,
     next_playback_timepoint: Option<TimeIndex>,
     preserve_complete_presentation: bool,
+    navigation_ladder_baseline: Option<NavigationLadderBaseline>,
     baselines: Current3dDemandBaselines,
 }
 
@@ -106,7 +107,6 @@ impl Current3dDemandBaselines {
 pub(crate) struct ScopeDemandBaseline {
     body: PreparedResourceBody,
     admitted_prefix_len: usize,
-    static_layout: Option<PreparedStaticPresentationLayout>,
 }
 
 impl ScopeDemandBaseline {
@@ -115,19 +115,10 @@ impl ScopeDemandBaseline {
         Self {
             body,
             admitted_prefix_len,
-            static_layout: None,
         }
     }
 
-    pub(crate) fn with_static_layout(
-        mut self,
-        static_layout: Option<PreparedStaticPresentationLayout>,
-    ) -> Self {
-        self.static_layout = static_layout;
-        self
-    }
-
-    fn admitted_prefix(&self) -> &[DatasetResourceKey] {
+    fn admitted_prefix(&self) -> &[BrickKey] {
         &self.body.ranked()[..self.admitted_prefix_len.min(self.body.ranked().len())]
     }
 
@@ -145,20 +136,37 @@ impl Current3dDemandRequest {
         presentation: PresentationViewport,
         viewport: RenderExtent,
         limits: DatasetDemandPlanLimits,
-        playback_active: bool,
-        next_playback_timepoint: Option<TimeIndex>,
-        preserve_complete_presentation: bool,
         baselines: Current3dDemandBaselines,
     ) -> Self {
         Self {
             presentation,
             viewport,
             limits,
-            playback_active,
-            next_playback_timepoint,
-            preserve_complete_presentation,
+            playback_active: false,
+            next_playback_timepoint: None,
+            preserve_complete_presentation: false,
+            navigation_ladder_baseline: None,
             baselines,
         }
+    }
+
+    pub(crate) fn with_playback(mut self, active: bool, next_timepoint: Option<TimeIndex>) -> Self {
+        self.playback_active = active;
+        self.next_playback_timepoint = next_timepoint;
+        self
+    }
+
+    pub(crate) fn with_complete_presentation_preserved(mut self, preserve: bool) -> Self {
+        self.preserve_complete_presentation = preserve;
+        self
+    }
+
+    pub(crate) fn with_navigation_ladder_baseline(
+        mut self,
+        baseline: Option<NavigationLadderBaseline>,
+    ) -> Self {
+        self.navigation_ladder_baseline = baseline;
+        self
     }
 }
 
@@ -194,9 +202,11 @@ impl CameraDemandRequest {
         reason = "the worker request keeps each independently replaceable demand/union cohort explicit"
     )]
     pub(crate) fn new(
+        revision: RenderIntentRevision,
         catalog: Arc<DatasetCatalog>,
         cpu_ledger: Arc<dyn CpuByteLedger>,
         view: ViewState,
+        global_limits: DatasetDemandPlanLimits,
         current_3d: Option<Current3dDemandRequest>,
         cross_sections: Vec<CrossSectionDemandRequest>,
         previous_renderer_requirement_union: RetainedRequirementHandle,
@@ -204,17 +214,32 @@ impl CameraDemandRequest {
         post_refinement_promotion_unchanged_bodies: Option<Vec<PreparedResourceBody>>,
     ) -> Self {
         Self {
+            revision,
             catalog,
             cpu_ledger,
             view,
+            global_limits,
             current_3d,
             cross_sections: cross_sections.into_boxed_slice(),
             previous_renderer_requirement_union,
+            preserve_previous_renderer_requirement_union: false,
             unchanged_renderer_requirement_bodies: unchanged_renderer_requirement_bodies
                 .into_boxed_slice(),
             post_refinement_promotion_unchanged_bodies: post_refinement_promotion_unchanged_bodies
                 .map(Vec::into_boxed_slice),
         }
+    }
+
+    pub(crate) const fn revision(&self) -> RenderIntentRevision {
+        self.revision
+    }
+
+    pub(crate) fn with_previous_renderer_requirement_union_preserved(
+        mut self,
+        preserve: bool,
+    ) -> Self {
+        self.preserve_previous_renderer_requirement_union = preserve;
+        self
     }
 }
 
@@ -223,7 +248,7 @@ impl CameraDemandRequest {
 /// escaping its accounting lifetime.
 #[derive(Clone)]
 pub(crate) struct PreparedRequirementUnion {
-    pub(crate) requirements: Arc<[DatasetResourceKey]>,
+    pub(crate) requirements: Arc<[BrickKey]>,
     pub(crate) charge: Arc<dyn CpuByteLease>,
 }
 
@@ -244,7 +269,7 @@ impl fmt::Debug for PreparedRequirementUnion {
 pub(crate) struct PreparedRendererRequirementUpdate {
     pub(crate) previous: RetainedRequirementHandle,
     pub(crate) next: PreparedRequirementUnion,
-    pub(crate) removals: Arc<[DatasetResourceKey]>,
+    pub(crate) removals: Arc<[BrickKey]>,
     /// Transient ownership for the removal array; it is released immediately
     /// after the UI's O(delta) commit.
     pub(crate) removal_charge: Arc<dyn CpuByteLease>,
@@ -277,7 +302,21 @@ impl fmt::Debug for PreparedRendererRequirementUpdate {
 pub(crate) struct PreparedScopeDemand {
     pub(crate) requirements: PreparedDemandRequirements,
     pub(crate) render_requirements: Option<PreparedRenderRequirements>,
-    pub(crate) static_layout: Option<PreparedStaticPresentationLayout>,
+    pub(crate) render_payload_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedNavigationCandidateDemand {
+    pub(crate) render_requirements: PreparedRenderRequirements,
+    pub(crate) selection_body: PreparedResourceBody,
+    pub(crate) layer_scales: BTreeMap<LogicalLayerKey, ScaleLevel>,
+    pub(crate) planned_payload_bytes: u64,
+    pub(crate) resource_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedNavigationLadderDemand {
+    pub(crate) candidates: Vec<PreparedNavigationCandidateDemand>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,20 +325,27 @@ pub(crate) struct PreparedCurrent3dDemand {
     pub(crate) current: PreparedScopeDemand,
     pub(crate) refinement: PreparedScopeDemand,
     pub(crate) playback: PreparedScopeDemand,
+    pub(crate) navigation_ladder: PreparedNavigationLadderDemand,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedCrossSectionDemand {
     pub(crate) panel: PanelId,
     pub(crate) plan: PreparedDatasetDemandPlan,
-    pub(crate) render_requirements: PreparedRenderRequirements,
-    pub(crate) static_layout: PreparedStaticPresentationLayout,
+    pub(crate) render_requirements: Option<PreparedRenderRequirements>,
+    pub(crate) render_payload_bytes: Option<u64>,
+    pub(crate) reuse_envelope: Option<SemanticPlaneReuseEnvelope>,
 }
 
 pub(crate) struct PreparedVisibleDemand {
     pub(crate) current_3d: Option<PreparedCurrent3dDemand>,
     pub(crate) cross_sections: Box<[PreparedCrossSectionDemand]>,
     pub(crate) renderer_requirement_update: PreparedRendererRequirementUpdate,
+    /// Exact GPU payload bytes represented by
+    /// `renderer_requirement_update.next`. This is prepared on the worker
+    /// beside the canonical union so the UI can tighten adaptive selection
+    /// after a physical-placement refusal without rescanning the catalog.
+    pub(crate) renderer_requirement_payload_bytes: u64,
     pub(crate) post_refinement_promotion_update: Option<PreparedRendererRequirementUpdate>,
     pub(crate) candidates_visited: usize,
 }
@@ -313,6 +359,10 @@ impl fmt::Debug for PreparedVisibleDemand {
             .field(
                 "renderer_requirement_union_len",
                 &self.renderer_requirement_update.next.requirements.len(),
+            )
+            .field(
+                "renderer_requirement_payload_bytes",
+                &self.renderer_requirement_payload_bytes,
             )
             .field(
                 "post_refinement_promotion_union_len",
@@ -332,7 +382,7 @@ impl fmt::Debug for PreparedVisibleDemand {
 
 #[derive(Debug)]
 pub(crate) struct CameraDemandResult {
-    pub(crate) generation: CameraDemandGeneration,
+    pub(crate) revision: RenderIntentRevision,
     pub(crate) outcome: anyhow::Result<PreparedVisibleDemand>,
     pub(crate) planning_duration: Duration,
 }
@@ -345,7 +395,6 @@ pub(crate) struct CameraDemandDiagnostics {
     pub(crate) stale_results_suppressed: u64,
     pub(crate) completed: u64,
     pub(crate) completed_candidates_visited: u64,
-    pub(crate) renderer_static_preparations: u64,
     pub(crate) contained_reuses: u64,
     pub(crate) candidates_reused: u64,
     pub(crate) completed_guarded_rebuilds: u64,
@@ -364,7 +413,6 @@ pub(crate) struct CameraDemandDiagnostics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CameraDemandPlannerError {
     WorkerSpawnFailed(io::ErrorKind),
-    GenerationExhausted,
 }
 
 impl fmt::Display for CameraDemandPlannerError {
@@ -373,9 +421,6 @@ impl fmt::Display for CameraDemandPlannerError {
             Self::WorkerSpawnFailed(kind) => {
                 write!(formatter, "failed to spawn camera-demand worker: {kind:?}")
             }
-            Self::GenerationExhausted => {
-                formatter.write_str("camera-demand generation space is exhausted")
-            }
         }
     }
 }
@@ -383,7 +428,6 @@ impl fmt::Display for CameraDemandPlannerError {
 impl std::error::Error for CameraDemandPlannerError {}
 
 struct QueuedRequest {
-    generation: CameraDemandGeneration,
     submitted_at: Instant,
     request: CameraDemandRequest,
 }
@@ -393,6 +437,7 @@ struct WorkerState {
     shutdown: bool,
     pending: Option<QueuedRequest>,
     result: Option<CameraDemandResult>,
+    running_revision: Option<RenderIntentRevision>,
 }
 
 #[derive(Default)]
@@ -403,7 +448,6 @@ struct Counters {
     stale_results_suppressed: AtomicU64,
     completed: AtomicU64,
     completed_candidates_visited: AtomicU64,
-    renderer_static_preparations: AtomicU64,
     contained_reuses: AtomicU64,
     candidates_reused: AtomicU64,
     completed_guarded_rebuilds: AtomicU64,
@@ -420,8 +464,8 @@ struct Shared {
     state: Mutex<WorkerState>,
     wake: Condvar,
     shutdown: AtomicBool,
-    latest_generation: AtomicU64,
-    running_generation: AtomicU64,
+    latest_revision: AtomicU64,
+    running_invalidated: AtomicBool,
     counters: Counters,
     #[cfg(test)]
     before_result_publication: Mutex<Option<TestPublicationBarrier>>,
@@ -436,7 +480,6 @@ struct TestPublicationBarrier {
 pub(crate) struct CameraDemandPlanner {
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
-    next_generation: u64,
 }
 
 impl CameraDemandPlanner {
@@ -445,8 +488,8 @@ impl CameraDemandPlanner {
             state: Mutex::new(WorkerState::default()),
             wake: Condvar::new(),
             shutdown: AtomicBool::new(false),
-            latest_generation: AtomicU64::new(0),
-            running_generation: AtomicU64::new(0),
+            latest_revision: AtomicU64::new(RenderIntentRevision::initial().get()),
+            running_invalidated: AtomicBool::new(false),
             counters: Counters::default(),
             #[cfg(test)]
             before_result_publication: Mutex::new(None),
@@ -459,34 +502,37 @@ impl CameraDemandPlanner {
         Ok(Self {
             shared,
             worker: Some(worker),
-            next_generation: 1,
         })
     }
 
     /// Replaces any not-yet-started request and cancels a running older
-    /// generation. The caller performs only one bounded slot replacement.
-    pub(crate) fn submit(
-        &mut self,
-        request: CameraDemandRequest,
-    ) -> Result<CameraDemandGeneration, CameraDemandPlannerError> {
-        let generation = CameraDemandGeneration(self.next_generation);
-        self.next_generation = self
-            .next_generation
-            .checked_add(1)
-            .ok_or(CameraDemandPlannerError::GenerationExhausted)?;
-        self.shared
-            .latest_generation
-            .store(generation.get(), Ordering::Release);
+    /// revision. The caller performs only one bounded slot replacement.
+    pub(crate) fn submit(&mut self, request: CameraDemandRequest) -> bool {
+        let revision = request.revision;
+        if self
+            .shared
+            .latest_revision
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (revision.get() >= current).then_some(revision.get())
+            })
+            .is_err()
+        {
+            return false;
+        }
         self.shared
             .counters
             .submitted
             .fetch_add(1, Ordering::Relaxed);
 
         let mut state = lock_state(&self.shared);
+        if state.running_revision.is_some() {
+            self.shared
+                .running_invalidated
+                .store(true, Ordering::Release);
+        }
         if state
             .pending
             .replace(QueuedRequest {
-                generation,
                 submitted_at: Instant::now(),
                 request,
             })
@@ -505,15 +551,15 @@ impl CameraDemandPlanner {
         }
         drop(state);
         self.shared.wake.notify_one();
-        Ok(generation)
+        true
     }
 
     /// Takes the sole result only when it still belongs to the latest request.
     pub(crate) fn take_result(&mut self) -> Option<CameraDemandResult> {
-        let latest = self.shared.latest_generation.load(Ordering::Acquire);
+        let latest = self.shared.latest_revision.load(Ordering::Acquire);
         let mut state = lock_state(&self.shared);
         let result = state.result.take()?;
-        if result.generation.get() == latest {
+        if result.revision.get() == latest {
             Some(result)
         } else {
             self.shared
@@ -525,37 +571,41 @@ impl CameraDemandPlanner {
     }
 
     pub(crate) fn has_outstanding_request(&self) -> bool {
-        let latest = self.shared.latest_generation.load(Ordering::Acquire);
-        if latest == 0 {
-            return false;
-        }
+        let latest = self.shared.latest_revision.load(Ordering::Acquire);
         let state = lock_state(&self.shared);
         state
             .pending
             .as_ref()
-            .is_some_and(|pending| pending.generation.get() == latest)
+            .is_some_and(|pending| pending.request.revision.get() == latest)
             || state
                 .result
                 .as_ref()
-                .is_some_and(|result| result.generation.get() == latest)
-            || self.shared.running_generation.load(Ordering::Acquire) == latest
+                .is_some_and(|result| result.revision.get() == latest)
+            || state
+                .running_revision
+                .is_some_and(|revision| revision.get() == latest)
     }
 
     /// Invalidates pending/running work during source replacement without
-    /// manufacturing a request for the retired source.
-    pub(crate) fn invalidate(&mut self) -> Result<(), CameraDemandPlannerError> {
-        let generation = self.next_generation;
-        self.next_generation = self
-            .next_generation
-            .checked_add(1)
-            .ok_or(CameraDemandPlannerError::GenerationExhausted)?;
-        self.shared
-            .latest_generation
-            .store(generation, Ordering::Release);
+    /// manufacturing a revision. The revision is copied from the sole
+    /// render-intent mailbox authority.
+    pub(crate) fn invalidate(&mut self, revision: RenderIntentRevision) {
+        let previous = self
+            .shared
+            .latest_revision
+            .fetch_max(revision.get(), Ordering::AcqRel);
+        debug_assert!(
+            revision.get() >= previous,
+            "camera-demand invalidation must observe the latest mailbox revision"
+        );
         let mut state = lock_state(&self.shared);
+        if state.running_revision.is_some() {
+            self.shared
+                .running_invalidated
+                .store(true, Ordering::Release);
+        }
         state.pending = None;
         state.result = None;
-        Ok(())
     }
 
     pub(crate) fn diagnostics(&self) -> CameraDemandDiagnostics {
@@ -581,11 +631,6 @@ impl CameraDemandPlanner {
                 .shared
                 .counters
                 .completed_candidates_visited
-                .load(Ordering::Relaxed),
-            renderer_static_preparations: self
-                .shared
-                .counters
-                .renderer_static_preparations
                 .load(Ordering::Relaxed),
             contained_reuses: self
                 .shared
@@ -655,17 +700,36 @@ impl CameraDemandPlanner {
             Ordering::Relaxed,
         );
     }
+
+    #[cfg(test)]
+    pub(crate) fn block_next_result_publication(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self
+            .shared
+            .before_result_publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(TestPublicationBarrier {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, release_tx)
+    }
 }
 
 impl Drop for CameraDemandPlanner {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::Release);
-        self.shared.latest_generation.fetch_add(1, Ordering::AcqRel);
         {
             let mut state = lock_state(&self.shared);
             state.shutdown = true;
             state.pending = None;
             state.result = None;
+            self.shared
+                .running_invalidated
+                .store(true, Ordering::Release);
         }
         self.shared.wake.notify_one();
         if let Some(worker) = self.worker.take() {
@@ -702,37 +766,29 @@ fn run_worker(shared: Arc<Shared>) {
                         continue;
                     }
                 }
-                break state
+                let queued = state
                     .pending
                     .take()
                     .expect("a checked pending request remains present");
+                state.running_revision = Some(queued.request.revision);
+                shared.running_invalidated.store(false, Ordering::Release);
+                break queued;
             }
         };
 
-        let generation = queued.generation;
-        shared
-            .running_generation
-            .store(generation.get(), Ordering::Release);
+        let revision = queued.request.revision;
         let started = Instant::now();
         let planning = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            plan_visible_demand(
-                queued.request,
-                || {
-                    shared.shutdown.load(Ordering::Acquire)
-                        || shared.latest_generation.load(Ordering::Acquire) != generation.get()
-                },
-                || {
-                    shared
-                        .counters
-                        .renderer_static_preparations
-                        .fetch_add(1, Ordering::Relaxed);
-                },
-            )
+            plan_visible_demand(queued.request, || {
+                shared.shutdown.load(Ordering::Acquire)
+                    || shared.running_invalidated.load(Ordering::Acquire)
+                    || shared.latest_revision.load(Ordering::Acquire) != revision.get()
+            })
         }));
         let outcome = match planning {
             Ok(Ok(Some(planning))) => Ok(planning),
             Ok(Ok(None)) => {
-                shared.running_generation.store(0, Ordering::Release);
+                clear_running_revision(&shared, revision);
                 shared
                     .counters
                     .cancelled_running
@@ -748,11 +804,13 @@ fn run_worker(shared: Arc<Shared>) {
             Err(_) => Err(anyhow::anyhow!("camera-demand worker panicked")),
         };
         if shared.shutdown.load(Ordering::Acquire) {
-            shared.running_generation.store(0, Ordering::Release);
+            clear_running_revision(&shared, revision);
             return;
         }
-        if shared.latest_generation.load(Ordering::Acquire) != generation.get() {
-            shared.running_generation.store(0, Ordering::Release);
+        if shared.running_invalidated.load(Ordering::Acquire)
+            || shared.latest_revision.load(Ordering::Acquire) != revision.get()
+        {
+            clear_running_revision(&shared, revision);
             shared
                 .counters
                 .stale_results_suppressed
@@ -779,7 +837,7 @@ fn run_worker(shared: Arc<Shared>) {
         });
         let planning_duration = started.elapsed();
         let result = CameraDemandResult {
-            generation,
+            revision,
             outcome,
             planning_duration,
         };
@@ -794,8 +852,13 @@ fn run_worker(shared: Arc<Shared>) {
             let _ = barrier.release.recv();
         }
         let mut state = lock_state(&shared);
-        if state.shutdown || shared.latest_generation.load(Ordering::Acquire) != generation.get() {
-            shared.running_generation.store(0, Ordering::Release);
+        if state.shutdown
+            || shared.running_invalidated.load(Ordering::Acquire)
+            || shared.latest_revision.load(Ordering::Acquire) != revision.get()
+        {
+            if state.running_revision == Some(revision) {
+                state.running_revision = None;
+            }
             shared
                 .counters
                 .stale_results_suppressed
@@ -805,11 +868,13 @@ fn run_worker(shared: Arc<Shared>) {
             continue;
         }
         state.result = Some(result);
-        // Keep the generation visibly running until the result is installed
+        // Keep the revision visibly running until the result is installed
         // under the same lock observed by `has_outstanding_request`. Readers
         // therefore see either running work or a publishable result, never an
         // idle gap that can consume the final repaint wakeup.
-        shared.running_generation.store(0, Ordering::Release);
+        if state.running_revision == Some(revision) {
+            state.running_revision = None;
+        }
         shared.counters.completed.fetch_add(1, Ordering::Relaxed);
         shared
             .counters
@@ -846,28 +911,114 @@ fn run_worker(shared: Arc<Shared>) {
 fn plan_visible_demand(
     request: CameraDemandRequest,
     mut cancelled: impl FnMut() -> bool,
-    mut record_static_preparation: impl FnMut(),
 ) -> anyhow::Result<Option<PreparedVisibleDemand>> {
     let CameraDemandRequest {
+        revision: _,
         catalog,
         cpu_ledger,
         view,
+        global_limits,
         current_3d,
         cross_sections,
         previous_renderer_requirement_union,
+        preserve_previous_renderer_requirement_union,
         unchanged_renderer_requirement_bodies,
         post_refinement_promotion_unchanged_bodies,
     } = request;
     let mut candidates_visited = 0_usize;
+    let linked_navigation_floor = if cross_sections.is_empty() {
+        None
+    } else {
+        let Some(floor) = plan_cross_section_navigation_floor_cancellable(
+            catalog.as_ref(),
+            &view,
+            global_limits,
+            Some(cpu_ledger.as_ref()),
+            &mut cancelled,
+        )?
+        else {
+            return Ok(None);
+        };
+        candidates_visited = candidates_visited.saturating_add(floor.candidates_visited);
+        Some(floor)
+    };
+    let linked_navigation_floor_body = linked_navigation_floor.as_ref().map(|floor| {
+        let mut canonical = floor.plan.resources.clone();
+        canonical.sort_unstable();
+        canonical.dedup();
+        Arc::<[BrickKey]>::from(canonical)
+    });
+    let mut transition_obligation_bodies = unchanged_renderer_requirement_bodies
+        .iter()
+        .map(|body| Arc::clone(body.canonical()))
+        .collect::<Vec<_>>();
+    let preserved_previous_renderer_requirement_union =
+        preserve_previous_renderer_requirement_union
+            .then(|| Arc::clone(&previous_renderer_requirement_union.requirements));
+    transition_obligation_bodies.extend(
+        preserved_previous_renderer_requirement_union
+            .iter()
+            .cloned(),
+    );
+    if let Some(input) = current_3d.as_ref() {
+        // The complete current front remains visible through replacement.
+        // Refinement and playback scopes are latest-only work owned by this
+        // same transaction; their predecessor bodies are cancelled/replaced
+        // atomically and therefore are not permanent aggregate obligations.
+        // Any genuinely in-flight GPU pins remain renderer-owned and are
+        // checked by its transactional residency preflight.
+        transition_obligation_bodies.push(Arc::clone(input.baselines.current.body.canonical()));
+    }
+    transition_obligation_bodies.extend(
+        cross_sections
+            .iter()
+            .map(|input| Arc::clone(input.baseline.body.canonical())),
+    );
+    transition_obligation_bodies.extend(linked_navigation_floor_body.iter().cloned());
+    let mut transition_obligation_reservations =
+        PreparedAllocationReservations::new(cpu_ledger.as_ref());
+    let Some(transition_obligations) = merge_requirement_union(
+        &transition_obligation_bodies,
+        &mut transition_obligation_reservations,
+        &mut cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    let _transition_obligation_charge = transition_obligation_reservations.finish();
+    let transition_payload_bytes =
+        requirement_payload_bytes(catalog.as_ref(), &transition_obligations)?;
+    if transition_obligations.len() > global_limits.max_resources
+        || transition_payload_bytes > global_limits.max_gpu_payload_bytes
+    {
+        return Err(DatasetDemandPlanCapacityError::for_global_usage(
+            global_limits,
+            "visible transition",
+            None,
+            transition_obligations.len(),
+            transition_payload_bytes,
+        )
+        .into());
+    }
+    let transition_current_front_body = current_3d
+        .as_ref()
+        .map(|input| Arc::clone(input.baselines.current.body.canonical()));
+    let transition_cross_front_bodies = cross_sections
+        .iter()
+        .map(|input| Arc::clone(input.baseline.body.canonical()))
+        .collect::<Vec<_>>();
     let current_3d = if let Some(input) = current_3d {
         let mut reservations = PreparedAllocationReservations::new(cpu_ledger.as_ref());
-        let planning = plan_guarded_progressive_current_3d_cancellable(
+        let planning = plan_guarded_progressive_current_3d_with_obligations_cancellable(
             catalog.as_ref(),
             &view,
             input.presentation,
             input.viewport,
             input.limits,
             input.playback_active,
+            input.next_playback_timepoint,
+            transition_obligations.as_ref(),
+            input.navigation_ladder_baseline.as_ref(),
             Some(cpu_ledger.as_ref()),
             &mut cancelled,
         )?;
@@ -917,14 +1068,23 @@ fn plan_visible_demand(
         let playback_requirements = if input.playback_active
             && let Some(timepoint) = input.next_playback_timepoint
         {
-            let required_prefix_len = plan.target.requirements.required_prefix_len();
-            let temporary_charge = reservations
-                .reserve_temporary(key_array_bytes(plan.target.requirements.ranked().len())?)?;
+            let playback_resource_count = plan
+                .target
+                .playback_resource_count
+                .min(plan.target.requirements.ranked().len());
+            let required_prefix_len = plan
+                .target
+                .requirements
+                .required_prefix_len()
+                .min(playback_resource_count);
+            let temporary_charge =
+                reservations.reserve_temporary(key_array_bytes(playback_resource_count)?)?;
             let ranked = plan
                 .target
                 .requirements
                 .ranked()
                 .iter()
+                .take(playback_resource_count)
                 .copied()
                 .map(|key| rebind_timepoint(key, timepoint))
                 .collect::<Vec<_>>();
@@ -944,24 +1104,74 @@ fn plan_visible_demand(
         if cancelled() {
             return Ok(None);
         }
-        let current_artifacts = prepare_presentation_artifacts(
+        let navigation_residency_requirements = plan
+            .coarse
+            .as_ref()
+            .map(|coarse| coarse.requirements.clone())
+            .unwrap_or_else(|| plan.target.requirements.clone());
+        let navigation_candidates = std::mem::take(&mut plan.navigation_candidates);
+        let mut prepared_navigation_candidates = Vec::with_capacity(navigation_candidates.len());
+        for candidate in navigation_candidates {
+            let render_requirements = prepare_navigation_render_requirements(
+                catalog.as_ref(),
+                &view,
+                &candidate.layer_scales,
+                &candidate.requirements,
+                &navigation_residency_requirements,
+                &mut reservations,
+            )?
+            .ok_or_else(|| anyhow::anyhow!("a full-volume navigation candidate is empty"))?;
+            prepared_navigation_candidates.push(PreparedNavigationCandidateDemand {
+                render_requirements,
+                selection_body: candidate.requirements.body().clone(),
+                layer_scales: candidate.layer_scales,
+                planned_payload_bytes: candidate.payload_bytes,
+                resource_count: candidate.primary_resource_count,
+            });
+        }
+        if prepared_navigation_candidates.is_empty() {
+            anyhow::bail!("the full-volume navigation ladder is empty");
+        }
+        let navigation_ladder = PreparedNavigationLadderDemand {
+            candidates: prepared_navigation_candidates,
+        };
+        if cancelled() {
+            return Ok(None);
+        }
+        let current_layer_scales = plan
+            .coarse
+            .as_ref()
+            .map(|coarse| &coarse.layer_scales)
+            .unwrap_or(&plan.target.layer_scales);
+        let current_source_prefix_len = plan
+            .coarse
+            .as_ref()
+            .map(|coarse| coarse.playback_resource_count)
+            .unwrap_or(plan.target.playback_resource_count);
+        let current_render_requirements = prepare_primary_render_requirements(
             catalog.as_ref(),
             &view,
+            current_layer_scales,
             &current_requirements,
-            Some(&input.baselines.current),
+            current_source_prefix_len,
             &mut reservations,
-            &mut record_static_preparation,
         )?;
         if cancelled() {
             return Ok(None);
         }
-        let refinement_artifacts = prepare_presentation_artifacts(
+        let refinement_render_requirements = prepare_primary_render_requirements(
             catalog.as_ref(),
             &view,
+            &plan.target.layer_scales,
             &refinement_requirements,
-            Some(&input.baselines.refinement),
+            plan.target.playback_resource_count,
             &mut reservations,
-            &mut record_static_preparation,
+        )?;
+        let current_render_payload_bytes =
+            prepared_render_payload_bytes(catalog.as_ref(), current_render_requirements.as_ref())?;
+        let refinement_render_payload_bytes = prepared_render_payload_bytes(
+            catalog.as_ref(),
+            refinement_render_requirements.as_ref(),
         )?;
         if cancelled() {
             return Ok(None);
@@ -969,23 +1179,20 @@ fn plan_visible_demand(
         let prepared = PreparedCurrent3dDemand {
             current: PreparedScopeDemand {
                 requirements: current_requirements,
-                render_requirements: current_artifacts
-                    .as_ref()
-                    .map(|(requirements, _)| requirements.clone()),
-                static_layout: current_artifacts.map(|(_, layout)| layout),
+                render_requirements: current_render_requirements,
+                render_payload_bytes: current_render_payload_bytes,
             },
             refinement: PreparedScopeDemand {
                 requirements: refinement_requirements,
-                render_requirements: refinement_artifacts
-                    .as_ref()
-                    .map(|(requirements, _)| requirements.clone()),
-                static_layout: refinement_artifacts.map(|(_, layout)| layout),
+                render_requirements: refinement_render_requirements,
+                render_payload_bytes: refinement_render_payload_bytes,
             },
             playback: PreparedScopeDemand {
                 requirements: playback_requirements,
                 render_requirements: None,
-                static_layout: None,
+                render_payload_bytes: None,
             },
+            navigation_ladder,
             plan,
         };
         let cohort_charge = reservations.finish();
@@ -996,79 +1203,92 @@ fn plan_visible_demand(
         ] {
             body.attach_charge(Arc::clone(&cohort_charge))?;
         }
+        for candidate in &prepared.navigation_ladder.candidates {
+            candidate
+                .render_requirements
+                .body()
+                .attach_charge(Arc::clone(&cohort_charge))?;
+            candidate
+                .selection_body
+                .attach_charge(Arc::clone(&cohort_charge))?;
+        }
+        for render_requirements in [
+            prepared.current.render_requirements.as_ref(),
+            prepared.refinement.render_requirements.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            render_requirements
+                .body()
+                .attach_charge(Arc::clone(&cohort_charge))?;
+        }
         Some(prepared)
     } else {
         None
     };
 
+    let mut selection_obligation_bodies = vec![Arc::clone(&transition_obligations)];
+    if let Some(current) = current_3d.as_ref() {
+        selection_obligation_bodies.extend([
+            Arc::clone(current.current.requirements.canonical()),
+            Arc::clone(current.refinement.requirements.canonical()),
+            Arc::clone(current.playback.requirements.canonical()),
+        ]);
+    }
+    let mut selection_obligation_reservations =
+        PreparedAllocationReservations::new(cpu_ledger.as_ref());
+    let Some(mut selection_obligations) = merge_requirement_union(
+        &selection_obligation_bodies,
+        &mut selection_obligation_reservations,
+        &mut cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut _selection_obligation_charge = selection_obligation_reservations.finish();
+
     let mut prepared_cross_sections = Vec::with_capacity(cross_sections.len());
     for input in cross_sections {
-        let mut reservations = PreparedAllocationReservations::new(cpu_ledger.as_ref());
         if cancelled() {
             return Ok(None);
         }
-        let planning = plan_cross_section_panel_cancellable(
+        let prepared = prepare_adaptive_cross_section_panel(
             catalog.as_ref(),
             &view,
-            input.panel,
-            input.presentation,
-            input.viewport,
-            input.limits,
-            Some(cpu_ledger.as_ref()),
+            &input,
+            &linked_navigation_floor
+                .as_ref()
+                .expect("a requested cross-section owns one navigation floor")
+                .plan,
+            &selection_obligations,
+            cpu_ledger.as_ref(),
             &mut cancelled,
         )?;
-        let Some(planning) = planning else {
+        let Some((prepared, work)) = prepared else {
             return Ok(None);
         };
-        let (plan, work) = planning.prepare_accounted(&mut reservations)?;
         candidates_visited = candidates_visited.saturating_add(work);
-        let PreparedDatasetDemandPlan {
-            scale,
-            layer_scales,
-            requirements,
-            payload_bytes,
-            playback_downshifted,
-            covers_full_volume,
-            primary_resource_count,
-        } = plan;
-        let requirements = requirements.into_preserving_admitted_prefix_accounted(
-            input.baseline.admitted_prefix(),
-            &reservations,
-        )?;
-        let plan = PreparedDatasetDemandPlan {
-            scale,
-            layer_scales,
-            requirements,
-            payload_bytes,
-            playback_downshifted,
-            covers_full_volume,
-            primary_resource_count,
-        };
-        let (render_requirements, static_layout) = prepare_presentation_artifacts(
-            catalog.as_ref(),
-            &view,
-            &plan.requirements,
-            Some(&input.baseline),
-            &mut reservations,
-            &mut record_static_preparation,
-        )?
-        .ok_or_else(|| anyhow::anyhow!("a planned cross section has no resources"))?;
-        if cancelled() {
-            return Ok(None);
-        }
-        let prepared = PreparedCrossSectionDemand {
-            panel: input.panel,
-            plan,
-            render_requirements,
-            static_layout,
-        };
-        let panel_charge = reservations.finish();
-        prepared
-            .plan
-            .requirements
-            .body()
-            .attach_charge(panel_charge)?;
         prepared_cross_sections.push(prepared);
+        selection_obligation_bodies.push(Arc::clone(
+            prepared_cross_sections
+                .last()
+                .expect("the prepared panel was just appended")
+                .plan
+                .requirements
+                .canonical(),
+        ));
+        let mut reservations = PreparedAllocationReservations::new(cpu_ledger.as_ref());
+        let Some(next_obligations) = merge_requirement_union(
+            &selection_obligation_bodies,
+            &mut reservations,
+            &mut cancelled,
+        )?
+        else {
+            return Ok(None);
+        };
+        selection_obligations = next_obligations;
+        _selection_obligation_charge = reservations.finish();
     }
     if cancelled() {
         return Ok(None);
@@ -1114,11 +1334,20 @@ fn plan_visible_demand(
         .iter()
         .map(|body| Arc::clone(body.canonical()))
         .collect::<Vec<_>>();
+    union_bodies.extend(
+        preserved_previous_renderer_requirement_union
+            .iter()
+            .cloned(),
+    );
     if let Some(current) = current_3d.as_ref() {
         union_bodies.push(Arc::clone(current.current.requirements.canonical()));
         union_bodies.push(Arc::clone(current.refinement.requirements.canonical()));
         union_bodies.push(Arc::clone(current.playback.requirements.canonical()));
     }
+    if let Some(current_front) = transition_current_front_body {
+        union_bodies.push(current_front);
+    }
+    union_bodies.extend(transition_cross_front_bodies);
     union_bodies.extend(cross_bodies);
     let mut union_reservations = PreparedAllocationReservations::new(cpu_ledger.as_ref());
     let Some(renderer_requirement_union) =
@@ -1126,6 +1355,20 @@ fn plan_visible_demand(
     else {
         return Ok(None);
     };
+    let renderer_union_payload_bytes =
+        requirement_payload_bytes(catalog.as_ref(), &renderer_requirement_union)?;
+    if renderer_requirement_union.len() > global_limits.max_resources
+        || renderer_union_payload_bytes > global_limits.max_gpu_payload_bytes
+    {
+        return Err(DatasetDemandPlanCapacityError::for_global_usage(
+            global_limits,
+            "visible aggregate",
+            None,
+            renderer_requirement_union.len(),
+            renderer_union_payload_bytes,
+        )
+        .into());
+    }
     let renderer_union_charge = union_reservations.finish();
     let mut removal_reservations = PreparedAllocationReservations::new(cpu_ledger.as_ref());
     let Some(removals) = prepare_requirement_removals(
@@ -1178,27 +1421,274 @@ fn plan_visible_demand(
             removals,
             removal_charge,
         },
+        renderer_requirement_payload_bytes: renderer_union_payload_bytes,
         post_refinement_promotion_update,
         candidates_visited,
     }))
 }
 
-fn prepare_presentation_artifacts(
+fn requirement_payload_bytes(
+    catalog: &DatasetCatalog,
+    requirements: &[BrickKey],
+) -> anyhow::Result<u64> {
+    requirements.iter().try_fold(0_u64, |total, key| {
+        let descriptor = catalog.resource_payload_descriptor(*key)?;
+        let bytes = mirante4d_render_wgpu::payload_allocation_bytes(descriptor)?;
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow::anyhow!("global GPU payload accounting overflow"))
+    })
+}
+
+fn prepare_adaptive_cross_section_panel(
     catalog: &DatasetCatalog,
     view: &ViewState,
-    requirements: &PreparedDemandRequirements,
-    baseline: Option<&ScopeDemandBaseline>,
+    input: &CrossSectionDemandRequest,
+    navigation_floor: &DatasetDemandPlan,
+    obligated_resources: &[BrickKey],
+    cpu_ledger: &dyn CpuByteLedger,
+    cancelled: &mut impl FnMut() -> bool,
+) -> anyhow::Result<Option<(PreparedCrossSectionDemand, usize)>> {
+    let planning = plan_adaptive_cross_section_panel_with_obligations_cancellable(
+        catalog,
+        view,
+        input.panel,
+        input.presentation,
+        input.viewport,
+        input.limits,
+        Some(cpu_ledger),
+        None,
+        obligated_resources,
+        true,
+        cancelled,
+    )?;
+    let Some(planning) = planning else {
+        return Ok(None);
+    };
+    let guarded = planning.plane_reuse_envelope.is_some();
+    match prepare_cross_section_planning(
+        catalog,
+        view,
+        input,
+        navigation_floor,
+        planning,
+        cpu_ledger,
+        cancelled,
+    ) {
+        Ok(prepared) => Ok(prepared),
+        Err(error) if guarded && plane_guard_attempt_should_retry_exact(&error) => {
+            let planning = plan_adaptive_cross_section_panel_with_obligations_cancellable(
+                catalog,
+                view,
+                input.panel,
+                input.presentation,
+                input.viewport,
+                input.limits,
+                Some(cpu_ledger),
+                None,
+                obligated_resources,
+                false,
+                cancelled,
+            )?;
+            let Some(planning) = planning else {
+                return Ok(None);
+            };
+            prepare_cross_section_planning(
+                catalog,
+                view,
+                input,
+                navigation_floor,
+                planning,
+                cpu_ledger,
+                cancelled,
+            )
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn prepare_cross_section_planning(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    input: &CrossSectionDemandRequest,
+    navigation_floor: &DatasetDemandPlan,
+    planning: crate::dataset_demand_plan::DatasetDemandPlanning,
+    cpu_ledger: &dyn CpuByteLedger,
+    cancelled: &mut impl FnMut() -> bool,
+) -> anyhow::Result<Option<(PreparedCrossSectionDemand, usize)>> {
+    let mut reservations = PreparedAllocationReservations::new(cpu_ledger);
+    let (plan, work, reuse_envelope) = planning.prepare_accounted(&mut reservations)?;
+    let PreparedDatasetDemandPlan {
+        scale,
+        layer_scales,
+        requirements,
+        payload_bytes,
+        playback_downshifted,
+        covers_full_volume,
+        primary_resource_count,
+        playback_resource_count,
+    } = plan;
+    let requirements = requirements.into_preserving_admitted_prefix_accounted(
+        input.baseline.admitted_prefix(),
+        &reservations,
+    )?;
+    let mut plan = PreparedDatasetDemandPlan {
+        scale,
+        layer_scales,
+        requirements,
+        payload_bytes,
+        playback_downshifted,
+        covers_full_volume,
+        primary_resource_count,
+        playback_resource_count,
+    };
+    // A plane with no selected target data is a terminal transparent result.
+    // It needs neither fallback samples nor a synthetic nonempty render body;
+    // preserving that explicit empty path also avoids calling coarse data
+    // scientific coverage outside the dataset.
+    if plan.primary_resource_count != 0 {
+        merge_linked_navigation_floor(catalog, navigation_floor, &mut plan, &mut reservations)?;
+    }
+    let render_requirements = prepare_render_requirements(
+        catalog,
+        view,
+        &plan.layer_scales,
+        &plan.requirements,
+        true,
+        &mut reservations,
+    )?;
+    let render_payload_bytes =
+        prepared_render_payload_bytes(catalog, render_requirements.as_ref())?;
+    if cancelled() {
+        return Ok(None);
+    }
+    let prepared = PreparedCrossSectionDemand {
+        panel: input.panel,
+        plan,
+        render_requirements,
+        render_payload_bytes,
+        reuse_envelope,
+    };
+    let panel_charge = reservations.finish();
+    prepared
+        .plan
+        .requirements
+        .body()
+        .attach_charge(panel_charge)?;
+    Ok(Some((prepared, work)))
+}
+
+fn merge_linked_navigation_floor(
+    catalog: &DatasetCatalog,
+    navigation_floor: &DatasetDemandPlan,
+    target: &mut PreparedDatasetDemandPlan,
     reservations: &mut PreparedAllocationReservations<'_>,
-    record_static_preparation: &mut impl FnMut(),
-) -> anyhow::Result<Option<(PreparedRenderRequirements, PreparedStaticPresentationLayout)>> {
+) -> anyhow::Result<()> {
+    if navigation_floor.resources.is_empty() {
+        anyhow::bail!("the linked navigation floor is empty");
+    }
+    let temporary_count = navigation_floor
+        .resources
+        .len()
+        .checked_add(target.requirements.ranked().len())
+        .ok_or_else(|| anyhow::anyhow!("linked navigation requirement count overflow"))?;
+    let temporary_charge = reservations.reserve_temporary(key_array_bytes(temporary_count)?)?;
+    let mut floor_membership = navigation_floor.resources.clone();
+    floor_membership.sort_unstable();
+    floor_membership.dedup();
+    if floor_membership.len() != navigation_floor.resources.len() {
+        anyhow::bail!("the linked navigation floor contains duplicate resources");
+    }
+
+    let target_required = target.requirements.required_prefix_len();
+    let mut ranked = Vec::with_capacity(temporary_count);
+    ranked.extend(navigation_floor.resources.iter().copied());
+    let mut target_required_unique = 0_usize;
+    for key in target.requirements.ranked()[..target_required]
+        .iter()
+        .copied()
+    {
+        if floor_membership.binary_search(&key).is_err() {
+            ranked.push(key);
+            target_required_unique = target_required_unique.saturating_add(1);
+        }
+    }
+    for key in target.requirements.ranked()[target_required..]
+        .iter()
+        .copied()
+    {
+        if floor_membership.binary_search(&key).is_err() {
+            ranked.push(key);
+        }
+    }
+    let first_useful_prefix_len = navigation_floor.resources.len();
+    let required_prefix_len = first_useful_prefix_len
+        .checked_add(target_required_unique)
+        .ok_or_else(|| anyhow::anyhow!("linked required-prefix count overflow"))?;
+    let target_requirements = std::mem::replace(
+        &mut target.requirements,
+        PreparedDemandRequirements::empty(),
+    );
+    let merged = target_requirements.into_merged_ranked_with_prefixes_accounted(
+        ranked,
+        first_useful_prefix_len,
+        required_prefix_len,
+        reservations,
+    )?;
+    let payload_bytes = requirement_payload_bytes(catalog, merged.canonical())?;
+    target.requirements = merged;
+    target.payload_bytes = payload_bytes;
+    target.primary_resource_count = required_prefix_len;
+    drop(temporary_charge);
+    Ok(())
+}
+
+fn prepare_render_requirements(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    layer_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
+    requirements: &PreparedDemandRequirements,
+    progressive_plane: bool,
+    reservations: &mut PreparedAllocationReservations<'_>,
+) -> anyhow::Result<Option<PreparedRenderRequirements>> {
     let Some(first) = requirements.canonical().first().copied() else {
         return Ok(None);
     };
     let layer_count = view.layers().iter().filter(|layer| layer.visible()).count();
-    reservations.reserve_result(PreparedRenderRequirements::preflight_host_allocation_bytes(
-        layer_count,
-        requirements.canonical().len(),
-    )?)?;
+    let mut scale_chains = Vec::with_capacity(layer_count);
+    for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
+        let layer = view_layer.layer_key();
+        let target = layer_scales.get(&layer).copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "visible layer {} has no prepared render target scale",
+                layer.ordinal()
+            )
+        })?;
+        let catalog_layer = catalog.layer(layer).ok_or_else(|| {
+            anyhow::anyhow!(
+                "visible layer {} disappeared from the catalog",
+                layer.ordinal()
+            )
+        })?;
+        let scales = if progressive_plane {
+            catalog_layer
+                .scales()
+                .map(|scale| scale.level())
+                .filter(|scale| *scale >= target)
+                .collect::<Vec<_>>()
+        } else {
+            vec![target]
+        };
+        scale_chains.push(RenderLayerScaleChain::new(layer, scales)?);
+    }
+    let scale_count = scale_chains.iter().map(|chain| chain.scales().len()).sum();
+    reservations.reserve_result(
+        PreparedRenderRequirements::preflight_host_allocation_bytes_with_scale_count(
+            layer_count,
+            scale_count,
+            requirements.canonical().len(),
+        )?,
+    )?;
     let layer_bytes = layer_count
         .checked_mul(std::mem::size_of::<LogicalLayerKey>())
         .and_then(|bytes| u64::try_from(bytes).ok())
@@ -1210,71 +1700,218 @@ fn prepare_presentation_artifacts(
         .filter(|layer| layer.visible())
         .map(|layer| layer.layer_key())
         .collect::<Vec<LogicalLayerKey>>();
-    let render_requirements = PreparedRenderRequirements::new_with_required_prefix(
-        catalog.resource_identity(),
-        first.timepoint(),
-        layers,
-        requirements.body().clone(),
-        1,
-        requirements.required_prefix_len(),
-    )?;
-    drop(layer_scratch);
-    let previous_layout = baseline.and_then(|baseline| baseline.static_layout.as_ref());
-    let delta_scratch = if previous_layout.is_some() {
-        Some(
-            reservations.reserve_temporary(bounded_requirement_delta_scratch_bytes(
-                MAX_INCREMENTAL_STATIC_KEY_CHANGES,
-            )?)?,
-        )
+    let first_useful_prefix_len = if progressive_plane {
+        requirements.first_useful_prefix_len()
     } else {
-        None
+        requirements.required_prefix_len()
     };
-    let delta = previous_layout.and_then(|_| {
-        requirements.bounded_delta_from(
-            baseline
-                .expect("a previous layout belongs to a baseline")
-                .body
-                .canonical(),
-            MAX_INCREMENTAL_STATIC_KEY_CHANGES,
-        )
-    });
-    // A material replacement deliberately drops the predecessor: the one
-    // full builder then owns both preflight and construction.
-    let incremental_previous = delta.as_ref().and(previous_layout);
-    let additions = delta
-        .as_ref()
-        .map_or(&[][..], |delta| delta.additions().as_ref());
-    let removals = delta
-        .as_ref()
-        .map_or(&[][..], |delta| delta.removals().as_ref());
-    let preflight = preflight_static_presentation_layout_update(
-        catalog,
-        &render_requirements,
-        incremental_previous,
-        additions,
-        removals,
+    let render_requirements =
+        PreparedRenderRequirements::new_with_required_prefix_and_scale_chains(
+            catalog.resource_identity(),
+            first.timepoint(),
+            layers,
+            scale_chains,
+            requirements.body().clone(),
+            first_useful_prefix_len,
+            requirements.required_prefix_len(),
+        )?;
+    drop(layer_scratch);
+    Ok(Some(render_requirements))
+}
+
+fn prepare_navigation_render_requirements(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    layer_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
+    selection_requirements: &PreparedDemandRequirements,
+    residency_requirements: &PreparedDemandRequirements,
+    reservations: &mut PreparedAllocationReservations<'_>,
+) -> anyhow::Result<Option<PreparedRenderRequirements>> {
+    let Some(first) = residency_requirements.canonical().first().copied() else {
+        return Ok(None);
+    };
+    if selection_requirements.canonical().is_empty() {
+        return Ok(None);
+    }
+    if selection_requirements.canonical().iter().any(|key| {
+        residency_requirements
+            .canonical()
+            .binary_search(key)
+            .is_err()
+    }) {
+        anyhow::bail!(
+            "a full-volume navigation candidate is not contained by its aggregate residency body"
+        );
+    }
+
+    let layer_count = view.layers().iter().filter(|layer| layer.visible()).count();
+    let mut scale_chains = Vec::with_capacity(layer_count);
+    for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
+        let layer = view_layer.layer_key();
+        let target = layer_scales.get(&layer).copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "visible layer {} has no navigation target scale",
+                layer.ordinal()
+            )
+        })?;
+        let _catalog_layer = catalog.layer(layer).ok_or_else(|| {
+            anyhow::anyhow!(
+                "visible layer {} disappeared from the catalog",
+                layer.ordinal()
+            )
+        })?;
+        // A volume frame remains one truthful uniform scale. Other complete
+        // ladder rungs belong only to this wrapper's dormant residency suffix
+        // and therefore must never enter the active render chain.
+        scale_chains.push(RenderLayerScaleChain::new(layer, vec![target])?);
+    }
+
+    // Rank this candidate's exact coherent rung first, followed by every
+    // other aggregate ladder resource in the planner's terminal-to-fine
+    // order. The canonical residency set remains common to all wrappers,
+    // while only this first prefix contributes to coverage and pixels.
+    let aggregate_len = residency_requirements.canonical().len();
+    reservations.reserve_result(PreparedResourceBody::preflight_host_allocation_bytes(
+        aggregate_len,
+        aggregate_len,
+    )?)?;
+    let ranked_scratch = reservations.reserve_temporary(key_array_bytes(aggregate_len)?)?;
+    let mut ranked = Vec::with_capacity(aggregate_len);
+    ranked.extend(selection_requirements.ranked().iter().copied());
+    ranked.extend(
+        residency_requirements
+            .ranked()
+            .iter()
+            .copied()
+            .filter(|key| {
+                selection_requirements
+                    .canonical()
+                    .binary_search(key)
+                    .is_err()
+            }),
+    );
+    if ranked.len() != aggregate_len {
+        anyhow::bail!("navigation residency wrapper lost or duplicated aggregate resources");
+    }
+    let residency_body = PreparedResourceBody::new(
+        Arc::clone(residency_requirements.canonical()),
+        ranked.into(),
+        None,
     )?;
-    reservations.reserve_result(preflight.renderer_host_allocation_bytes())?;
-    let construction_scratch =
-        reservations.reserve_temporary(preflight.construction_scratch_allocation_bytes())?;
-    let static_layout = prepare_static_presentation_layout_update(
-        catalog,
-        &render_requirements,
-        incremental_previous,
-        additions,
-        removals,
+    drop(ranked_scratch);
+
+    let scale_count = scale_chains.iter().map(|chain| chain.scales().len()).sum();
+    reservations.reserve_result(
+        PreparedRenderRequirements::preflight_host_allocation_bytes_with_scale_count(
+            layer_count,
+            scale_count,
+            residency_body.canonical().len(),
+        )?,
     )?;
-    record_static_preparation();
-    drop(construction_scratch);
-    drop(delta_scratch);
-    Ok(Some((render_requirements, static_layout)))
+    let layer_bytes = layer_count
+        .checked_mul(std::mem::size_of::<LogicalLayerKey>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| anyhow::anyhow!("prepared navigation-layer byte overflow"))?;
+    let layer_scratch = reservations.reserve_temporary(layer_bytes)?;
+    let layers = view
+        .layers()
+        .iter()
+        .filter(|layer| layer.visible())
+        .map(|layer| layer.layer_key())
+        .collect::<Vec<_>>();
+    let render_requirements =
+        PreparedRenderRequirements::new_with_dormant_residency_suffix_and_scale_chains(
+            catalog.resource_identity(),
+            first.timepoint(),
+            layers,
+            scale_chains,
+            residency_body,
+            selection_requirements.ranked().len(),
+            selection_requirements.ranked().len(),
+        )?;
+    drop(layer_scratch);
+    Ok(Some(render_requirements))
+}
+
+fn prepare_primary_render_requirements(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    layer_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
+    requirements: &PreparedDemandRequirements,
+    source_prefix_len: usize,
+    reservations: &mut PreparedAllocationReservations<'_>,
+) -> anyhow::Result<Option<PreparedRenderRequirements>> {
+    let required_prefix_len = requirements.required_prefix_len();
+    if required_prefix_len == 0 {
+        return Ok(None);
+    }
+    let source_prefix_len = source_prefix_len.min(requirements.ranked().len());
+    if source_prefix_len < required_prefix_len {
+        anyhow::bail!(
+            "selected-scale render source prefix {source_prefix_len} is shorter than its required prefix {required_prefix_len}"
+        );
+    }
+    if required_prefix_len == requirements.ranked().len()
+        && source_prefix_len == requirements.ranked().len()
+    {
+        return prepare_render_requirements(
+            catalog,
+            view,
+            layer_scales,
+            requirements,
+            false,
+            reservations,
+        );
+    }
+    let temporary_charge = reservations.reserve_temporary(key_array_bytes(source_prefix_len)?)?;
+    let target = requirements
+        .ranked()
+        .iter()
+        .take(source_prefix_len)
+        .copied()
+        .filter(|key| layer_scales.get(&key.layer()) == Some(&key.scale()))
+        .collect::<Vec<_>>();
+    if target.len() < required_prefix_len {
+        anyhow::bail!(
+            "selected-scale render body lost required resources while excluding its independent navigation ladder"
+        );
+    }
+    let target = PreparedDemandRequirements::from_ranked_accounted(
+        target,
+        required_prefix_len,
+        reservations,
+    )?;
+    drop(temporary_charge);
+    prepare_render_requirements(catalog, view, layer_scales, &target, false, reservations)
+}
+
+fn prepared_render_payload_bytes(
+    catalog: &DatasetCatalog,
+    requirements: Option<&PreparedRenderRequirements>,
+) -> anyhow::Result<Option<u64>> {
+    requirements
+        .map(|requirements| {
+            requirements
+                .body()
+                .canonical()
+                .iter()
+                .try_fold(0_u64, |total, key| {
+                    let descriptor = catalog.resource_payload_descriptor(*key)?;
+                    total
+                        .checked_add(mirante4d_render_wgpu::payload_allocation_bytes(descriptor)?)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("prepared render payload accounting overflow")
+                        })
+                })
+        })
+        .transpose()
 }
 
 pub(crate) fn merge_requirement_union(
-    bodies: &[Arc<[DatasetResourceKey]>],
+    bodies: &[Arc<[BrickKey]>],
     reservations: &mut PreparedAllocationReservations<'_>,
     cancelled: &mut impl FnMut() -> bool,
-) -> anyhow::Result<Option<Arc<[DatasetResourceKey]>>> {
+) -> anyhow::Result<Option<Arc<[BrickKey]>>> {
     let cursor_bytes = bodies
         .len()
         .checked_mul(std::mem::size_of::<usize>())
@@ -1312,10 +1949,7 @@ pub(crate) fn merge_requirement_union(
     Ok(Some(union))
 }
 
-fn next_union_key(
-    bodies: &[Arc<[DatasetResourceKey]>],
-    cursors: &mut [usize],
-) -> Option<DatasetResourceKey> {
+fn next_union_key(bodies: &[Arc<[BrickKey]>], cursors: &mut [usize]) -> Option<BrickKey> {
     let next = bodies
         .iter()
         .zip(cursors.iter())
@@ -1330,11 +1964,11 @@ fn next_union_key(
 }
 
 pub(crate) fn prepare_requirement_removals(
-    previous: &[DatasetResourceKey],
-    next: &[DatasetResourceKey],
+    previous: &[BrickKey],
+    next: &[BrickKey],
     reservations: &mut PreparedAllocationReservations<'_>,
     cancelled: &mut impl FnMut() -> bool,
-) -> anyhow::Result<Option<Arc<[DatasetResourceKey]>>> {
+) -> anyhow::Result<Option<Arc<[BrickKey]>>> {
     let mut previous_index = 0_usize;
     let mut next_index = 0_usize;
     let mut removal_len = 0_usize;
@@ -1389,8 +2023,8 @@ pub(crate) fn prepare_requirement_removals(
     Ok(Some(removals))
 }
 
-fn rebind_timepoint(key: DatasetResourceKey, timepoint: TimeIndex) -> DatasetResourceKey {
-    DatasetResourceKey::new(
+fn rebind_timepoint(key: BrickKey, timepoint: TimeIndex) -> BrickKey {
+    BrickKey::new(
         key.identity(),
         key.layer(),
         timepoint,
@@ -1417,6 +2051,13 @@ fn lock_state(shared: &Shared) -> std::sync::MutexGuard<'_, WorkerState> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn clear_running_revision(shared: &Shared, revision: RenderIntentRevision) {
+    let mut state = lock_state(shared);
+    if state.running_revision == Some(revision) {
+        state.running_revision = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1425,6 +2066,7 @@ mod tests {
     };
 
     use glam::{DMat4, DQuat, DVec3};
+    use mirante4d_application::{RenderIntentFamily, RenderIntentMailbox};
     use mirante4d_dataset::{
         CpuByteLease, CpuLedgerCategory, CpuLedgerError, DatasetLayer, DatasetResourceIdentity,
         DatasetSourceId, ResourceRegion, ResourceValidity, ScientificIdentityStatus,
@@ -1470,6 +2112,90 @@ mod tests {
 
     fn test_cpu_ledger() -> Arc<dyn CpuByteLedger> {
         Arc::new(TestCpuLedger)
+    }
+
+    struct QueueCapLedger {
+        live_result_bytes: Arc<AtomicU64>,
+        capacity_bytes: u64,
+        rejected_result_reservations: Arc<AtomicU64>,
+    }
+
+    struct QueueCapLease {
+        category: CpuLedgerCategory,
+        bytes: u64,
+        live_result_bytes: Option<Arc<AtomicU64>>,
+    }
+
+    impl CpuByteLease for QueueCapLease {
+        fn category(&self) -> CpuLedgerCategory {
+            self.category
+        }
+
+        fn reserved_bytes(&self) -> u64 {
+            self.bytes
+        }
+    }
+
+    impl Drop for QueueCapLease {
+        fn drop(&mut self) {
+            if let Some(live) = &self.live_result_bytes {
+                live.fetch_sub(self.bytes, Ordering::AcqRel);
+            }
+        }
+    }
+
+    impl CpuByteLedger for QueueCapLedger {
+        fn try_acquire(
+            &self,
+            category: CpuLedgerCategory,
+            bytes: u64,
+        ) -> Result<Box<dyn CpuByteLease>, CpuLedgerError> {
+            if bytes == 0 {
+                return Err(CpuLedgerError::ZeroByteReservation);
+            }
+            if category != CpuLedgerCategory::QueuesAndResults {
+                return Ok(Box::new(QueueCapLease {
+                    category,
+                    bytes,
+                    live_result_bytes: None,
+                }));
+            }
+            let mut live = self.live_result_bytes.load(Ordering::Acquire);
+            loop {
+                let Some(next) = live.checked_add(bytes) else {
+                    self.rejected_result_reservations
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(CpuLedgerError::CapacityExceeded {
+                        category,
+                        requested_bytes: bytes,
+                        available_bytes: self.capacity_bytes.saturating_sub(live),
+                    });
+                };
+                if next > self.capacity_bytes {
+                    self.rejected_result_reservations
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(CpuLedgerError::CapacityExceeded {
+                        category,
+                        requested_bytes: bytes,
+                        available_bytes: self.capacity_bytes.saturating_sub(live),
+                    });
+                }
+                match self.live_result_bytes.compare_exchange_weak(
+                    live,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => live = current,
+                }
+            }
+            Ok(Box::new(QueueCapLease {
+                category,
+                bytes,
+                live_result_bytes: Some(Arc::clone(&self.live_result_bytes)),
+            }))
+        }
     }
 
     struct TrackingCpuLedger {
@@ -1543,9 +2269,7 @@ mod tests {
         }
     }
 
-    fn unaccounted_requirement_handle(
-        requirements: Arc<[DatasetResourceKey]>,
-    ) -> RetainedRequirementHandle {
+    fn unaccounted_requirement_handle(requirements: Arc<[BrickKey]>) -> RetainedRequirementHandle {
         RetainedRequirementHandle {
             requirements,
             charge: None,
@@ -1553,18 +2277,22 @@ mod tests {
     }
 
     #[test]
-    fn latest_slot_exposes_only_the_current_generation_and_never_visits_candidates_on_caller() {
+    fn latest_slot_exposes_only_the_current_revision_and_never_visits_candidates_on_caller() {
         let (catalog, view) = fixture(Shape3D::new(128, 128, 128).unwrap());
         let mut planner = CameraDemandPlanner::new().unwrap();
-        let first = planner.submit(request(Arc::clone(&catalog), view.clone(), 4_096));
-        let first = first.unwrap();
-        let latest = planner
-            .submit(request(Arc::clone(&catalog), view, 4_096))
+        let mut mailbox = RenderIntentMailbox::new();
+        let first = mailbox
+            .observe_durable_intent(RenderIntentFamily::Both)
             .unwrap();
+        assert!(planner.submit(request(first, Arc::clone(&catalog), view.clone(), 4_096,)));
+        let latest = mailbox
+            .observe_durable_intent(RenderIntentFamily::Both)
+            .unwrap();
+        assert!(planner.submit(request(latest, Arc::clone(&catalog), view, 4_096,)));
         assert!(latest > first);
 
         let result = wait_for_result(&mut planner, Duration::from_secs(5));
-        assert_eq!(result.generation, latest);
+        assert_eq!(result.revision, latest);
         let planning = result.outcome.unwrap();
         assert!(
             !planning
@@ -1582,7 +2310,6 @@ mod tests {
         let diagnostics = planner.diagnostics();
         assert_eq!(diagnostics.submitted, 2);
         assert_eq!(diagnostics.completed, 1);
-        assert_eq!(diagnostics.renderer_static_preparations, 1);
         assert_eq!(diagnostics.ui_thread_candidates_visited, 0);
         assert_eq!(diagnostics.maximum_pending_requests, 1);
         assert!(diagnostics.pending_replacements + diagnostics.cancelled_running >= 1);
@@ -1599,7 +2326,6 @@ mod tests {
         assert_eq!(diagnostics.contained_reuses, 2);
         assert_eq!(diagnostics.candidates_reused, 100_642);
         assert_eq!(diagnostics.completed_candidates_visited, 0);
-        assert_eq!(diagnostics.renderer_static_preparations, 0);
         assert_eq!(diagnostics.ui_thread_candidates_visited, 0);
     }
 
@@ -1607,17 +2333,13 @@ mod tests {
     fn completed_plan_remains_outstanding_until_result_publication() {
         let (catalog, view) = fixture(Shape3D::new(64, 64, 64).unwrap());
         let mut planner = CameraDemandPlanner::new().unwrap();
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        *planner
-            .shared
-            .before_result_publication
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(TestPublicationBarrier {
-            entered: entered_tx,
-            release: release_rx,
-        });
-        planner.submit(request(catalog, view, 4_096)).unwrap();
+        let (entered_rx, release_tx) = planner.block_next_result_publication();
+        assert!(planner.submit(request(
+            RenderIntentRevision::initial(),
+            catalog,
+            view,
+            4_096,
+        )));
 
         entered_rx
             .recv_timeout(Duration::from_secs(5))
@@ -1638,8 +2360,9 @@ mod tests {
     fn invalidation_cancels_retired_source_work_without_exposing_a_result() {
         let (catalog, view) = fixture(Shape3D::new(128, 128, 128).unwrap());
         let mut planner = CameraDemandPlanner::new().unwrap();
-        planner.submit(request(catalog, view, 4_096)).unwrap();
-        planner.invalidate().unwrap();
+        let revision = RenderIntentRevision::initial();
+        assert!(planner.submit(request(revision, catalog, view, 4_096)));
+        planner.invalidate(revision);
 
         let deadline = Instant::now() + Duration::from_millis(100);
         while Instant::now() < deadline && planner.has_outstanding_request() {
@@ -1653,9 +2376,11 @@ mod tests {
     fn cross_section_planning_and_render_validation_share_one_worker_built_body() {
         let (catalog, view) = fixture(Shape3D::new(128, 128, 128).unwrap());
         let request = CameraDemandRequest::new(
+            RenderIntentRevision::initial(),
             Arc::clone(&catalog),
             test_cpu_ledger(),
             view,
+            DatasetDemandPlanLimits::new(4_096, 65_536, u64::MAX),
             None,
             vec![CrossSectionDemandRequest::new(
                 PanelId::Xy,
@@ -1669,7 +2394,7 @@ mod tests {
             None,
         );
         let mut planner = CameraDemandPlanner::new().unwrap();
-        planner.submit(request).unwrap();
+        assert!(planner.submit(request));
 
         let result = wait_for_result(&mut planner, Duration::from_secs(5));
         let planning = result.outcome.unwrap();
@@ -1681,6 +2406,8 @@ mod tests {
         assert!(
             cross
                 .render_requirements
+                .as_ref()
+                .expect("a non-empty plane owns render requirements")
                 .body()
                 .shares_storage_with(cross.plan.requirements.body())
         );
@@ -1695,10 +2422,111 @@ mod tests {
     }
 
     #[test]
+    fn coarsest_floor_deduplicates_same_scale_guard_without_false_retry() {
+        let (catalog, view) = fixture(Shape3D::new(512, 512, 512).unwrap());
+        let input = CrossSectionDemandRequest::new(
+            PanelId::Xy,
+            PresentationViewport::new(64.0, 64.0).unwrap(),
+            RenderExtent::new(64, 64).unwrap(),
+            DatasetDemandPlanLimits::new(4_096, 4_096, u64::MAX),
+            ScopeDemandBaseline::empty(),
+        );
+        let exact = plan_cross_section_panel_attempt(
+            catalog.as_ref(),
+            &view,
+            input.panel,
+            input.presentation,
+            input.viewport,
+            input.limits,
+            Some(&TestCpuLedger),
+            None,
+            false,
+            &mut || false,
+        )
+        .unwrap()
+        .unwrap();
+        let guarded = plan_cross_section_panel_attempt(
+            catalog.as_ref(),
+            &view,
+            input.panel,
+            input.presentation,
+            input.viewport,
+            input.limits,
+            Some(&TestCpuLedger),
+            None,
+            true,
+            &mut || false,
+        )
+        .unwrap()
+        .unwrap();
+        let exact_count = exact.plan.resources.len();
+        let guarded_count = guarded.plan.resources.len();
+        assert!(
+            guarded_count > exact_count,
+            "the fixture must successfully plan a real guard before preparation fails"
+        );
+        let floor = plan_cross_section_navigation_floor_cancellable(
+            catalog.as_ref(),
+            &view,
+            input.limits,
+            Some(&TestCpuLedger),
+            &mut || false,
+        )
+        .unwrap()
+        .unwrap();
+        let floor_count = floor.plan.resources.len();
+        let final_body_bytes =
+            PreparedResourceBody::preflight_host_allocation_bytes(floor_count, floor_count)
+                .unwrap();
+        let final_render_bytes =
+            PreparedRenderRequirements::preflight_host_allocation_bytes_with_scale_count(
+                1,
+                1,
+                floor_count,
+            )
+            .unwrap();
+        let final_result_bytes = final_body_bytes.checked_add(final_render_bytes).unwrap();
+
+        let live_result_bytes = Arc::new(AtomicU64::new(0));
+        let rejected_result_reservations = Arc::new(AtomicU64::new(0));
+        let ledger = QueueCapLedger {
+            live_result_bytes: Arc::clone(&live_result_bytes),
+            capacity_bytes: final_result_bytes,
+            rejected_result_reservations: Arc::clone(&rejected_result_reservations),
+        };
+        let (prepared, _work) = prepare_adaptive_cross_section_panel(
+            catalog.as_ref(),
+            &view,
+            &input,
+            &floor.plan,
+            &[],
+            &ledger,
+            &mut || false,
+        )
+        .unwrap()
+        .expect("the floor-deduplicated guarded body fits its exact retained-result budget");
+
+        assert_eq!(rejected_result_reservations.load(Ordering::Acquire), 0);
+        assert_eq!(prepared.plan.requirements.ranked().len(), floor_count);
+        assert_eq!(prepared.plan.primary_resource_count, floor_count);
+        assert_eq!(prepared.plan.scale, guarded.plan.scale);
+        assert!(
+            prepared.reuse_envelope.is_some(),
+            "a same-scale guard contained by the mandatory floor remains a valid zero-cost reuse proof"
+        );
+        drop(prepared);
+        assert_eq!(
+            live_result_bytes.load(Ordering::Acquire),
+            0,
+            "the successful exact body owns and releases precisely its fresh reservations"
+        );
+    }
+
+    #[test]
     fn full_envelope_union_delta_is_prepared_on_worker_with_two_removals() {
         let identity = DatasetResourceIdentity::Unverified(DatasetSourceId::new(77));
         let key = |x| {
-            DatasetResourceKey::new(
+            BrickKey::new(
                 identity,
                 LogicalLayerKey::new(0),
                 TimeIndex::new(0),
@@ -1725,7 +2553,7 @@ mod tests {
         assert_eq!(removals.as_ref(), expected.as_slice());
         assert_eq!(
             charge.reserved_bytes(),
-            u64::try_from(expected.len() * std::mem::size_of::<DatasetResourceKey>()).unwrap()
+            u64::try_from(expected.len() * std::mem::size_of::<BrickKey>()).unwrap()
         );
     }
 
@@ -1739,16 +2567,19 @@ mod tests {
         });
         let (catalog, view) = fixture(Shape3D::new(128, 128, 128).unwrap());
         let mut planner = CameraDemandPlanner::new().unwrap();
-        planner
-            .submit(volume_request_with_ledger(
-                Arc::clone(&catalog),
-                Arc::clone(&ledger),
-                view.clone(),
-                PresentationViewport::new(64.0, 64.0).unwrap(),
-                RenderExtent::new(64, 64).unwrap(),
-                DatasetDemandPlanLimits::new(4_096, 65_536, u64::MAX),
-            ))
+        let mut mailbox = RenderIntentMailbox::new();
+        let first_revision = mailbox
+            .observe_durable_intent(RenderIntentFamily::Both)
             .unwrap();
+        assert!(planner.submit(volume_request_with_ledger(
+            first_revision,
+            Arc::clone(&catalog),
+            Arc::clone(&ledger),
+            view.clone(),
+            PresentationViewport::new(64.0, 64.0).unwrap(),
+            RenderExtent::new(64, 64).unwrap(),
+            DatasetDemandPlanLimits::new(4_096, 65_536, u64::MAX),
+        )));
         let first = wait_for_result(&mut planner, Duration::from_secs(5))
             .outcome
             .unwrap();
@@ -1764,24 +2595,27 @@ mod tests {
         let old_scope_bytes = live_bytes.load(Ordering::Acquire);
         assert!(old_scope_bytes > 0, "the installed body retains its charge");
 
-        planner
-            .submit(CameraDemandRequest::new(
-                Arc::clone(&catalog),
-                Arc::clone(&ledger),
-                view,
-                None,
-                vec![CrossSectionDemandRequest::new(
-                    PanelId::Xy,
-                    PresentationViewport::new(64.0, 64.0).unwrap(),
-                    RenderExtent::new(64, 64).unwrap(),
-                    DatasetDemandPlanLimits::new(4_096, 65_536, u64::MAX),
-                    ScopeDemandBaseline::empty(),
-                )],
-                unaccounted_requirement_handle(Arc::from([])),
-                vec![installed_volume_body.clone()],
-                None,
-            ))
+        let replacement_revision = mailbox
+            .observe_durable_intent(RenderIntentFamily::Both)
             .unwrap();
+        assert!(planner.submit(CameraDemandRequest::new(
+            replacement_revision,
+            Arc::clone(&catalog),
+            Arc::clone(&ledger),
+            view,
+            DatasetDemandPlanLimits::new(4_096, 65_536, u64::MAX),
+            None,
+            vec![CrossSectionDemandRequest::new(
+                PanelId::Xy,
+                PresentationViewport::new(64.0, 64.0).unwrap(),
+                RenderExtent::new(64, 64).unwrap(),
+                DatasetDemandPlanLimits::new(4_096, 65_536, u64::MAX),
+                ScopeDemandBaseline::empty(),
+            )],
+            unaccounted_requirement_handle(Arc::from([])),
+            vec![installed_volume_body.clone()],
+            None,
+        )));
         let replacement = wait_for_result(&mut planner, Duration::from_secs(5))
             .outcome
             .unwrap();
@@ -1810,15 +2644,15 @@ mod tests {
             capacity_bytes,
         });
         let (catalog, view) = fixture(Shape3D::new(128, 128, 128).unwrap());
-        let old_requirement = DatasetResourceKey::new(
+        let old_requirement = BrickKey::new(
             catalog.resource_identity(),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             mirante4d_domain::ScaleLevel::BASE,
             ResourceRegion::new([9_999, 0, 0], Shape3D::new(1, 1, 1).unwrap()).unwrap(),
         );
-        let old_requirements: Arc<[DatasetResourceKey]> = Arc::from([old_requirement]);
-        let old_bytes = u64::try_from(std::mem::size_of::<DatasetResourceKey>()).unwrap();
+        let old_requirements: Arc<[BrickKey]> = Arc::from([old_requirement]);
+        let old_bytes = u64::try_from(std::mem::size_of::<BrickKey>()).unwrap();
         let old_charge: Arc<dyn CpuByteLease> = Arc::from(
             ledger
                 .try_acquire(CpuLedgerCategory::QueuesAndResults, old_bytes)
@@ -1831,9 +2665,11 @@ mod tests {
             charge: Some(Arc::clone(&old_charge)),
         };
         let request = CameraDemandRequest::new(
+            RenderIntentRevision::initial(),
             Arc::clone(&catalog),
             Arc::clone(&ledger),
             view,
+            DatasetDemandPlanLimits::new(4_096, 65_536, u64::MAX),
             None,
             vec![CrossSectionDemandRequest::new(
                 PanelId::Xy,
@@ -1847,7 +2683,7 @@ mod tests {
             None,
         );
         let mut planner = CameraDemandPlanner::new().unwrap();
-        planner.submit(request).unwrap();
+        assert!(planner.submit(request));
         drop(installed_owner);
         drop(old_requirements);
         drop(old_charge);
@@ -1888,7 +2724,7 @@ mod tests {
     }
 
     #[test]
-    fn tiny_cross_panel_does_not_pin_large_current_or_create_false_capacity() {
+    fn linked_floor_charge_does_not_pin_replaced_current_or_create_false_capacity() {
         let live_bytes = Arc::new(AtomicU64::new(0));
         let capacity_bytes = Arc::new(AtomicU64::new(u64::MAX));
         let ledger: Arc<dyn CpuByteLedger> = Arc::new(TrackingCpuLedger {
@@ -1897,16 +2733,15 @@ mod tests {
         });
         let (catalog, view) = fixture(Shape3D::new(512, 512, 512).unwrap());
         let request = CameraDemandRequest::new(
+            RenderIntentRevision::initial(),
             catalog,
             Arc::clone(&ledger),
             view,
+            DatasetDemandPlanLimits::new(4_096, 65_536, u64::MAX),
             Some(Current3dDemandRequest::new(
                 PresentationViewport::new(320.0, 320.0).unwrap(),
                 RenderExtent::new(320, 320).unwrap(),
                 DatasetDemandPlanLimits::new(4_096, 65_536, u64::MAX),
-                false,
-                None,
-                false,
                 Current3dDemandBaselines::empty(),
             )),
             vec![CrossSectionDemandRequest::new(
@@ -1920,9 +2755,7 @@ mod tests {
             Vec::new(),
             None,
         );
-        let prepared = plan_visible_demand(request, || false, || {})
-            .unwrap()
-            .unwrap();
+        let prepared = plan_visible_demand(request, || false).unwrap().unwrap();
         let current_charge = prepared
             .current_3d
             .as_ref()
@@ -1934,13 +2767,14 @@ mod tests {
             .unwrap();
         let cross_body = prepared.cross_sections[0].plan.requirements.body().clone();
         let cross_charge = cross_body.charged_bytes().unwrap();
-        assert!(current_charge > cross_charge);
+        assert!(current_charge != 0);
+        assert!(cross_charge != 0);
 
         drop(prepared);
         assert_eq!(
             live_bytes.load(Ordering::Acquire),
             cross_charge,
-            "the surviving tiny panel must own only its panel cohort"
+            "the surviving linked panel must own only its independently charged cohort"
         );
         capacity_bytes.store(
             cross_charge.checked_add(current_charge).unwrap(),
@@ -1956,6 +2790,74 @@ mod tests {
     }
 
     #[test]
+    fn asymmetric_four_target_union_borrows_the_renderer_global_capacity() {
+        let (catalog, single_view) = fixture(Shape3D::new(2_048, 2_048, 2_048).unwrap());
+        let view = ViewState::new(
+            single_view.layers().to_vec(),
+            single_view.active_layer(),
+            single_view.timepoint(),
+            *single_view.camera(),
+            ViewerLayout::FourPanel,
+            *single_view.cross_section(),
+            *single_view.iso_light(),
+        )
+        .unwrap();
+        let limits = DatasetDemandPlanLimits::new(131_072, 65_536, u64::MAX);
+        let presentation = PresentationViewport::new(320.0, 320.0).unwrap();
+        let viewport = RenderExtent::new(320, 320).unwrap();
+        let cross_sections = [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+            .into_iter()
+            .map(|panel| {
+                CrossSectionDemandRequest::new(
+                    panel,
+                    presentation,
+                    viewport,
+                    limits,
+                    ScopeDemandBaseline::empty(),
+                )
+            })
+            .collect();
+        let request = CameraDemandRequest::new(
+            RenderIntentRevision::initial(),
+            Arc::clone(&catalog),
+            test_cpu_ledger(),
+            view,
+            limits,
+            Some(Current3dDemandRequest::new(
+                presentation,
+                viewport,
+                limits,
+                Current3dDemandBaselines::empty(),
+            )),
+            cross_sections,
+            unaccounted_requirement_handle(Arc::from([])),
+            Vec::new(),
+            None,
+        );
+
+        let prepared = plan_visible_demand(request, || false).unwrap().unwrap();
+        let current_count = prepared
+            .current_3d
+            .as_ref()
+            .expect("the four-target request includes 3D")
+            .plan
+            .target
+            .requirements
+            .canonical()
+            .len();
+        let old_equal_share = limits.max_resources / 4;
+        assert!(
+            current_count > old_equal_share,
+            "the active 3D target must need more than the deleted one-quarter quota"
+        );
+        assert_eq!(prepared.cross_sections.len(), 3);
+        assert!(
+            prepared.renderer_requirement_update.next.requirements.len() <= limits.max_resources,
+            "the exact deduplicated four-target union must fit the one global renderer limit"
+        );
+    }
+
+    #[test]
     fn alternating_current_and_cross_replacements_release_only_replaced_cohorts() {
         let live_bytes = Arc::new(AtomicU64::new(0));
         let capacity_bytes = Arc::new(AtomicU64::new(u64::MAX));
@@ -1967,16 +2869,15 @@ mod tests {
         let limits = DatasetDemandPlanLimits::new(4_096, 65_536, u64::MAX);
         let first = plan_visible_demand(
             CameraDemandRequest::new(
+                RenderIntentRevision::initial(),
                 Arc::clone(&catalog),
                 Arc::clone(&ledger),
                 view.clone(),
+                limits,
                 Some(Current3dDemandRequest::new(
                     PresentationViewport::new(128.0, 128.0).unwrap(),
                     RenderExtent::new(128, 128).unwrap(),
                     limits,
-                    false,
-                    None,
-                    false,
                     Current3dDemandBaselines::empty(),
                 )),
                 vec![CrossSectionDemandRequest::new(
@@ -1991,7 +2892,6 @@ mod tests {
                 None,
             ),
             || false,
-            || {},
         )
         .unwrap()
         .unwrap();
@@ -2013,16 +2913,15 @@ mod tests {
 
         let second = plan_visible_demand(
             CameraDemandRequest::new(
+                RenderIntentRevision::initial(),
                 Arc::clone(&catalog),
                 Arc::clone(&ledger),
                 view.clone(),
+                limits,
                 Some(Current3dDemandRequest::new(
                     PresentationViewport::new(96.0, 96.0).unwrap(),
                     RenderExtent::new(96, 96).unwrap(),
                     limits,
-                    false,
-                    None,
-                    false,
                     Current3dDemandBaselines::new(
                         ScopeDemandBaseline::new(first_current.clone(), 0),
                         ScopeDemandBaseline::new(first_refinement.clone(), 0),
@@ -2038,7 +2937,6 @@ mod tests {
                 None,
             ),
             || false,
-            || {},
         )
         .unwrap()
         .unwrap();
@@ -2064,9 +2962,11 @@ mod tests {
 
         let third = plan_visible_demand(
             CameraDemandRequest::new(
+                RenderIntentRevision::initial(),
                 catalog,
                 Arc::clone(&ledger),
                 view,
+                limits,
                 None,
                 vec![CrossSectionDemandRequest::new(
                     PanelId::Xy,
@@ -2087,7 +2987,6 @@ mod tests {
                 None,
             ),
             || false,
-            || {},
         )
         .unwrap()
         .unwrap();
@@ -2136,6 +3035,7 @@ mod tests {
         let mut enqueue_samples = Vec::with_capacity(5);
         let mut worker_samples = Vec::with_capacity(5);
         let mut accepted = None;
+        let mut mailbox = RenderIntentMailbox::new();
         for _ in 0..5 {
             let synchronous_started = Instant::now();
             let synchronous = plan_progressive_current_3d_cancellable(
@@ -2154,20 +3054,22 @@ mod tests {
             assert!(synchronous.candidates_visited >= 100_000);
 
             let enqueue_started = Instant::now();
-            let generation = planner
-                .submit(volume_request(
-                    Arc::clone(&catalog),
-                    view.clone(),
-                    presentation,
-                    viewport,
-                    limits,
-                ))
+            let revision = mailbox
+                .observe_durable_intent(RenderIntentFamily::Both)
                 .unwrap();
+            assert!(planner.submit(volume_request(
+                revision,
+                Arc::clone(&catalog),
+                view.clone(),
+                presentation,
+                viewport,
+                limits,
+            )));
             enqueue_samples.push(enqueue_started.elapsed());
             let result = wait_for_result(&mut planner, Duration::from_secs(30));
             worker_samples.push(result.planning_duration);
             let planning = result.outcome.unwrap();
-            assert_eq!(result.generation, generation);
+            assert_eq!(result.revision, revision);
             assert_eq!(
                 planning
                     .current_3d
@@ -2233,11 +3135,13 @@ mod tests {
     }
 
     fn request(
+        revision: RenderIntentRevision,
         catalog: Arc<DatasetCatalog>,
         view: ViewState,
         max_candidates: usize,
     ) -> CameraDemandRequest {
         volume_request(
+            revision,
             catalog,
             view,
             PresentationViewport::new(64.0, 64.0).unwrap(),
@@ -2247,6 +3151,7 @@ mod tests {
     }
 
     fn volume_request(
+        revision: RenderIntentRevision,
         catalog: Arc<DatasetCatalog>,
         view: ViewState,
         presentation: PresentationViewport,
@@ -2254,6 +3159,7 @@ mod tests {
         limits: DatasetDemandPlanLimits,
     ) -> CameraDemandRequest {
         volume_request_with_ledger(
+            revision,
             catalog,
             test_cpu_ledger(),
             view,
@@ -2264,6 +3170,7 @@ mod tests {
     }
 
     fn volume_request_with_ledger(
+        revision: RenderIntentRevision,
         catalog: Arc<DatasetCatalog>,
         cpu_ledger: Arc<dyn CpuByteLedger>,
         view: ViewState,
@@ -2272,16 +3179,15 @@ mod tests {
         limits: DatasetDemandPlanLimits,
     ) -> CameraDemandRequest {
         CameraDemandRequest::new(
+            revision,
             catalog,
             cpu_ledger,
             view,
+            limits,
             Some(Current3dDemandRequest::new(
                 presentation,
                 viewport,
                 limits,
-                false,
-                None,
-                false,
                 Current3dDemandBaselines::empty(),
             )),
             Vec::new(),

@@ -76,22 +76,57 @@ For viewer/rendering work, the focused release diagnostics and normal-product
 scenarios are:
 
 ```bash
+cargo test -p mirante4d-app \
+  selected_vulkan_adapter_reports_typed_device_local_memory \
+  -- --ignored --nocapture --test-threads=1
+cargo test -p mirante4d-render-wgpu \
+  segmented_payload_upload_and_sampling_cross_the_first_binding \
+  -- --ignored --nocapture --test-threads=1
+cargo test -p mirante4d-render-wgpu \
+  coordinated_atomic_volume_strips_stay_hidden_and_match_the_direct_frame \
+  -- --ignored --nocapture --test-threads=1
 cargo test --release -p mirante4d-render-wgpu \
-  resident_volume_gpu_timing -- --ignored --nocapture
+  resident_coordinated_volume_gpu_timing -- --ignored --nocapture
 cargo test --release -p mirante4d-render-wgpu \
-  payload_buffer_vs_texture_gpu_timing -- --ignored --nocapture
+  native_1080p_terminal_navigation_gpu_timing \
+  -- --ignored --nocapture --test-threads=1
 MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
   cargo xtask product-validate target_fixture_render_modes
 MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
   cargo xtask product-validate \
-    target_fixture_resident_navigation_no_readback
+    /absolute/path/to/dataset.m4d representative_native_navigation
+cargo xtask viewer-oblique-continuity \
+  --workflow linked-lod-diagnostic \
+  --dataset /absolute/path/to/dataset.m4d \
+  --duration-secs 30 --runs 1 \
+  --allow-host-stress
+cargo xtask viewer-oblique-continuity \
+  --workflow zoom \
+  --dataset /absolute/path/to/dataset.m4d \
+  --duration-secs 30 --runs 3 --skip-build
+cargo xtask viewer-oblique-continuity \
+  --workflow combined \
+  --dataset /absolute/path/to/dataset.m4d \
+  --duration-secs 300 --runs 1 --skip-build
 ```
 
-The two ignored tests are component diagnostics. The product commands use the
-normal release application; the resident-navigation scenario avoids
-validation capture/readback. None is a final performance qualification without
-the owner-bound workload, fidelity floor, metrics, samples, and absolute
-thresholds required by [Testing](TESTING.md).
+The ignored timing tests are component diagnostics of resident sparse and
+single-resource terminal rendering. The terminal fixture measures
+voxel-exact and smooth-linear MIP/DVR/ISO at 1920×1080. The render-modes
+command uses the normal release application for independent pixel and mode
+facts. The former representative three-session and command-driven
+resident-navigation cadence scenarios were deleted because they did not
+establish visible continuity.
+
+`linked-lod-diagnostic` drives real bounded Shift-drag at exact S3, S1, and S0
+and records causal boundaries, but it does not observe monitor visibility or
+apply a performance threshold. Its first S0 attempt froze the desktop, so it
+is quarantined by default. Do not run it unattended; the shown
+`--allow-host-stress` flag is an explicit acknowledgement for a later
+owner-approved controlled run, not a safety guarantee. `zoom` requires both a
+feasible finer 3D display and an aggregate-capacity adaptive boundary under
+real wheel input; `combined` adds real resize and orbit round trips. Omit
+`--skip-build` for the first relevant workflow after changing product source.
 
 The project-store power-cut check is reserved for changes to its qualified
 durability boundary. Do not rerun it for unrelated work:

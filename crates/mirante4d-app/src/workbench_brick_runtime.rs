@@ -7,54 +7,110 @@ use std::{
 };
 
 use eframe::egui;
-use mirante4d_application::ApplicationCommand;
-use mirante4d_dataset::{CpuLedgerCategory, CpuLedgerError};
+use mirante4d_application::{
+    ApplicationCommand, PresentationSlot, RenderIntentBase, RenderIntentRevision,
+    RenderIntentTarget,
+};
+use mirante4d_dataset::{BrickKey, CpuLedgerCategory, CpuLedgerError};
 use mirante4d_dataset_runtime::{RuntimeFault, RuntimeFaultCode};
-use mirante4d_domain::{CameraView, TimeIndex, ViewerLayout};
+use mirante4d_domain::{CameraView, LogicalLayerKey, ScaleLevel, TimeIndex, ViewerLayout};
 use mirante4d_render_api::{MAX_RENDER_REQUIREMENTS, PreparedRenderRequirements};
-use mirante4d_render_wgpu::PreparedStaticPresentationLayout;
 
 use crate::{
-    BACKGROUND_WORK_REPAINT_INTERVAL, DeterministicFailureLatch, FrameCompleteness,
-    FrameFailureKind, LodDecisionReason, MiranteWorkbenchApp, RenderBackend, application_view,
+    BACKGROUND_WORK_REPAINT_INTERVAL, DeterministicFailureLatch, DisplayedFrameFreshness,
+    FrameCompleteness, FrameFailureKind, LodDecisionReason, MiranteWorkbenchApp, RenderBackend,
+    application_view,
     camera_demand_cache::{
         CameraDemandRequest, CrossSectionDemandRequest, Current3dDemandBaselines,
-        Current3dDemandRequest, PreparedRendererRequirementUpdate, PreparedVisibleDemand,
-        ScopeDemandBaseline,
+        Current3dDemandRequest, PreparedCurrent3dDemand, PreparedRendererRequirementUpdate,
+        PreparedVisibleDemand, ScopeDemandBaseline,
     },
     dataset_demand_plan::{
-        DatasetDemandPlanCapacityError, DatasetDemandPlanLimits, current_3d_projected_layer_scales,
-        sampling_footprint_class,
+        DatasetDemandPlanCapacityError, DatasetDemandPlanLimits, NavigationCandidateBaseline,
+        NavigationLadderBaseline, cross_section_projected_layer_scales,
+        current_3d_projected_layer_scales, sampling_footprint_class,
     },
     dataset_requests::{
-        DatasetDemandState, SCOPE_ANALYSIS, SCOPE_CROSS_SECTION_XY, SCOPE_CROSS_SECTION_XZ,
-        SCOPE_CROSS_SECTION_YZ, SCOPE_CURRENT_3D, SCOPE_CURRENT_3D_REFINEMENT, SCOPE_PLAYBACK,
-        ScopeReconciliationTargets,
+        DatasetDemandState, RendererEvictionDisposition, SCOPE_ANALYSIS, SCOPE_CROSS_SECTION_XY,
+        SCOPE_CROSS_SECTION_XZ, SCOPE_CROSS_SECTION_YZ, SCOPE_CURRENT_3D,
+        SCOPE_CURRENT_3D_REFINEMENT, SCOPE_PLAYBACK, ScopeReconciliationTargets,
     },
     display_refresh::render_backend_for_mode,
     native_presentation::NativePresentationBridge,
     product_render_intent::PRODUCT_RENDER_RESOURCE_LIMIT,
+    retained_leases::RetainedRequirementHandle,
     viewer_layout::PanelId,
 };
 
+fn dataset_fidelity_completeness(
+    empty: bool,
+    displayed_scale_level: Option<u32>,
+    display_freshness: DisplayedFrameFreshness,
+    presented_completeness: Option<mirante4d_render_api::FrameCompleteness>,
+) -> FrameCompleteness {
+    if empty {
+        FrameCompleteness::Complete
+    } else if displayed_scale_level == Some(0)
+        && matches!(display_freshness, DisplayedFrameFreshness::Current)
+        && matches!(
+            presented_completeness,
+            Some(mirante4d_render_api::FrameCompleteness::Exact)
+        )
+    {
+        // Dataset readiness must not downgrade the stronger renderer-owned
+        // fact already published for the current full S0 presentation.
+        FrameCompleteness::Exact
+    } else {
+        match presented_completeness {
+            Some(mirante4d_render_api::FrameCompleteness::Progressive) => {
+                FrameCompleteness::Incomplete
+            }
+            Some(
+                mirante4d_render_api::FrameCompleteness::Complete
+                | mirante4d_render_api::FrameCompleteness::Exact,
+            ) => FrameCompleteness::Complete,
+            None => FrameCompleteness::Loading,
+        }
+    }
+}
+
 fn pump_interactive_admission_with_renderer(
     dataset: &mut DatasetDemandState,
-    native: &NativePresentationBridge,
+    native: &mut NativePresentationBridge,
 ) -> Result<usize, RuntimeFault> {
-    let Some(product) = native.product_gpu.as_ref() else {
+    let Some(product) = native.product_gpu.as_mut() else {
         return dataset.pump_interactive_admission();
     };
-    let epoch = product.renderer.residency_invalidation_epoch();
-    dataset.reconcile_gpu_residency_invalidation(epoch.get(), |key| {
-        product.renderer.resource_is_resident(key)
-    });
+    dataset.begin_submission_pass();
+    let events = product.renderer.pending_residency_evictions(256);
+    let mut acknowledge_through = None;
+    for event in events.iter().copied() {
+        match dataset.resolve_renderer_eviction(event.key())? {
+            RendererEvictionDisposition::Reoffer(lease) => {
+                product
+                    .renderer
+                    .offer_residency_leases(&[lease])
+                    .map_err(|error| {
+                        tracing::error!(%error, "renderer rejected an exact eviction reoffer lease");
+                        RuntimeFault::new(RuntimeFaultCode::InvariantViolation)
+                    })?;
+                acknowledge_through = Some(event.sequence());
+            }
+            RendererEvictionDisposition::Submitted
+            | RendererEvictionDisposition::NoLongerDemanded => {
+                acknowledge_through = Some(event.sequence());
+            }
+            RendererEvictionDisposition::Deferred => break,
+        }
+    }
+    if let Some(sequence) = acknowledge_through {
+        product.renderer.acknowledge_residency_evictions(sequence);
+    }
     dataset
         .retire_released_cpu_authority_payloads(|key| product.renderer.resource_is_resident(key));
-    let submitted = dataset.pump_interactive_admission_with_gpu_residency(|key| {
+    dataset.pump_interactive_admission_after_begin_with_gpu_residency(|key| {
         product.renderer.resource_is_resident(key)
-    })?;
-    debug_assert_eq!(product.renderer.residency_invalidation_epoch(), epoch);
-    Ok(submitted)
+    })
 }
 
 fn scope_complete_with_renderer(
@@ -65,16 +121,11 @@ fn scope_complete_with_renderer(
     let Some(product) = native.product_gpu.as_ref() else {
         return dataset.scope_complete(scope);
     };
-    let epoch = product.renderer.residency_invalidation_epoch();
-    let complete = dataset.scope_complete_with_gpu_residency_at_invalidation_epoch(
-        scope,
-        epoch.get(),
-        |key| product.renderer.resource_is_resident(key),
-    );
-    complete && product.renderer.residency_invalidation_epoch() == epoch
+    dataset
+        .scope_complete_with_gpu_residency(scope, |key| product.renderer.resource_is_resident(key))
 }
 
-fn scope_resources_complete_with_renderer(
+pub(crate) fn scope_resources_complete_with_renderer(
     dataset: &DatasetDemandState,
     native: &NativePresentationBridge,
     scope: u64,
@@ -82,71 +133,194 @@ fn scope_resources_complete_with_renderer(
     let Some(product) = native.product_gpu.as_ref() else {
         return dataset.scope_resources_complete(scope);
     };
-    let epoch = product.renderer.residency_invalidation_epoch();
-    let complete = dataset.scope_resources_complete_with_gpu_residency_at_invalidation_epoch(
-        scope,
-        epoch.get(),
-        |key| product.renderer.resource_is_resident(key),
-    );
-    complete && product.renderer.residency_invalidation_epoch() == epoch
+    dataset.scope_resources_complete_with_gpu_residency(scope, |key| {
+        product.renderer.resource_is_resident(key)
+    })
+}
+
+pub(crate) fn scope_all_resources_complete_with_renderer(
+    dataset: &DatasetDemandState,
+    native: &NativePresentationBridge,
+    scope: u64,
+) -> bool {
+    let Some(product) = native.product_gpu.as_ref() else {
+        return dataset.scope_all_resources_complete(scope);
+    };
+    dataset.scope_all_resources_complete_with_gpu_residency(scope, |key| {
+        product.renderer.resource_is_resident(key)
+    })
+}
+
+pub(crate) fn first_useful_resources_complete_with_renderer(
+    dataset: &DatasetDemandState,
+    native: &NativePresentationBridge,
+    plan: &PreparedScopeRenderPlan,
+) -> bool {
+    let first_useful = plan.requirements.first_useful_prefix_len();
+    if first_useful == 0 || first_useful > plan.requirements.body().ranked().len() {
+        return false;
+    }
+    let keys = &plan.requirements.body().ranked()[..first_useful];
+    if let Some(product) = native.product_gpu.as_ref() {
+        keys.iter()
+            .copied()
+            .all(|key| product.renderer.resource_is_resident(key))
+    } else {
+        keys.iter()
+            .all(|key| dataset.retained_leases().payload(*key).is_some())
+    }
+}
+
+pub(crate) fn first_useful_resources_uploadable_with_renderer(
+    dataset: &DatasetDemandState,
+    native: &NativePresentationBridge,
+    plan: &PreparedScopeRenderPlan,
+) -> bool {
+    let first_useful = plan.requirements.first_useful_prefix_len();
+    if first_useful == 0 || first_useful > plan.requirements.body().ranked().len() {
+        return false;
+    }
+    let keys = &plan.requirements.body().ranked()[..first_useful];
+    keys.iter().copied().all(|key| {
+        dataset.retained_leases().payload(key).is_some()
+            || native
+                .product_gpu
+                .as_ref()
+                .is_some_and(|product| product.renderer.resource_is_resident(key))
+    })
 }
 
 /// Promotes every installed camera-guard tail covered by the reuse envelope.
-/// A progressive plan can own both a visible coarse scope and a hidden target
+/// A progressive plan can own both a visible coarse scope and a staged exact
 /// scope; preserve-complete planning simply leaves the coarse scope absent.
 /// Dataset and renderer boundaries share immutable bodies and change together.
 fn promote_installed_camera_guards(
     dataset: &mut DatasetDemandState,
     render_plans: &mut std::collections::BTreeMap<u64, PreparedScopeRenderPlan>,
 ) -> bool {
-    let scopes = [SCOPE_CURRENT_3D, SCOPE_CURRENT_3D_REFINEMENT];
-    for scope in scopes {
+    promote_installed_camera_guards_for_scopes(
+        dataset,
+        render_plans,
+        &[SCOPE_CURRENT_3D, SCOPE_CURRENT_3D_REFINEMENT],
+    )
+}
+
+fn promote_installed_camera_guards_for_scopes(
+    dataset: &mut DatasetDemandState,
+    render_plans: &mut std::collections::BTreeMap<u64, PreparedScopeRenderPlan>,
+    scopes: &[u64],
+) -> bool {
+    for &scope in scopes {
+        if !dataset.scope_is_installed(scope) {
+            continue;
+        }
+        let Some(plan) = render_plans.get(&scope) else {
+            return false;
+        };
+        let render_prefetch_count = plan.requirements.prefetch_resource_count();
+        if render_prefetch_count == 0 {
+            // The dataset scope may still own a coarse navigation-floor tail.
+            // That tail has its own render plan and is not a same-scale camera
+            // guard to promote into this target body.
+            continue;
+        }
         let dataset_has_unpromoted_guard =
             dataset.scope_required_prefix_len(scope) < dataset.scope_requirements(scope).len();
-        let render_has_unpromoted_guard = render_plans.get(&scope).is_some_and(|plan| {
-            !plan.requirements.prefetch_promoted()
-                && plan.requirements.prefetch_resource_count() != 0
-        });
+        let render_has_unpromoted_guard = !plan.requirements.prefetch_promoted();
         if dataset_has_unpromoted_guard != render_has_unpromoted_guard {
+            return false;
+        }
+        if render_has_unpromoted_guard && !dataset.can_commit_complete_scope_prefetch_tail(scope) {
             return false;
         }
     }
 
-    for scope in scopes {
-        if dataset.scope_required_prefix_len(scope) >= dataset.scope_requirements(scope).len() {
+    for &scope in scopes {
+        if !dataset.scope_is_installed(scope) {
             continue;
         }
-        let promoted_dataset = dataset.promote_scope_prefetch_tail(scope);
         let plan = render_plans
             .get_mut(&scope)
-            .expect("a camera-guard dataset scope owns matching render requirements");
+            .expect("a preflighted camera scope owns render requirements");
+        if plan.requirements.prefetch_resource_count() == 0 || plan.requirements.prefetch_promoted()
+        {
+            continue;
+        }
+        dataset.commit_complete_scope_prefetch_tail(scope);
         plan.requirements = plan.requirements.promote_prefetch();
-        debug_assert!(promoted_dataset);
     }
     true
 }
 
-fn installed_camera_guard_bodies_are_complete(
+pub(crate) fn installed_camera_guard_bodies_are_complete(
     dataset: &DatasetDemandState,
     native: &NativePresentationBridge,
 ) -> bool {
-    [SCOPE_CURRENT_3D, SCOPE_CURRENT_3D_REFINEMENT]
-        .into_iter()
-        .all(|scope| {
-            let requirements = dataset.scope_requirements(scope);
-            native.product_gpu.as_ref().map_or_else(
-                || {
-                    requirements
-                        .iter()
-                        .all(|key| dataset.retained_leases().payload(*key).is_some())
-                },
-                |product| {
-                    requirements
-                        .iter()
-                        .all(|key| product.renderer.resource_is_resident(*key))
-                },
-            )
-        })
+    installed_camera_guard_scopes_are_complete(
+        dataset,
+        native,
+        &[SCOPE_CURRENT_3D, SCOPE_CURRENT_3D_REFINEMENT],
+    )
+}
+
+fn installed_camera_guard_scopes_are_complete(
+    dataset: &DatasetDemandState,
+    native: &NativePresentationBridge,
+    scopes: &[u64],
+) -> bool {
+    let mut installed = false;
+    for &scope in scopes {
+        if !dataset.scope_is_installed(scope) {
+            continue;
+        }
+        installed = true;
+        if !scope_all_resources_complete_with_renderer(dataset, native, scope) {
+            return false;
+        }
+    }
+    installed
+}
+
+fn commit_preflighted_installed_plane_guard(
+    dataset: &mut DatasetDemandState,
+    render_plans: &mut BTreeMap<u64, PreparedScopeRenderPlan>,
+    scope: u64,
+) {
+    debug_assert!(installed_plane_guard_is_promotable(
+        dataset,
+        render_plans,
+        scope
+    ));
+    let plan = render_plans
+        .get_mut(&scope)
+        .expect("a preflighted plane guard owns render requirements");
+    let dataset_has_unpromoted_guard =
+        dataset.scope_required_prefix_len(scope) < dataset.scope_requirements(scope).len();
+    dataset.commit_complete_scope_prefetch_tail(scope);
+    if dataset_has_unpromoted_guard {
+        plan.requirements = plan.requirements.promote_prefetch();
+    }
+}
+
+fn installed_plane_guard_is_promotable(
+    dataset: &DatasetDemandState,
+    render_plans: &BTreeMap<u64, PreparedScopeRenderPlan>,
+    scope: u64,
+) -> bool {
+    let Some(plan) = render_plans.get(&scope) else {
+        return false;
+    };
+    if plan.plane_reuse_envelope.is_none() {
+        return false;
+    }
+    if !dataset.can_commit_complete_scope_prefetch_tail(scope) {
+        return false;
+    }
+    let dataset_has_unpromoted_guard =
+        dataset.scope_required_prefix_len(scope) < dataset.scope_requirements(scope).len();
+    let render_has_unpromoted_guard =
+        !plan.requirements.prefetch_promoted() && plan.requirements.prefetch_resource_count() != 0;
+    dataset_has_unpromoted_guard == render_has_unpromoted_guard
 }
 
 fn promote_ready_staged_plan_with_renderer(
@@ -196,8 +370,8 @@ fn promote_ready_staged_plan_with_renderer(
         );
         return Ok(true);
     }
-    // Product rendering pre-fills a hidden presentation token and performs
-    // the dataset promotion together with the atomic texture-token swap.
+    // Product rendering streams the renderer-owned private 3D candidate and
+    // performs dataset promotion with its atomic fixed-target revision swap.
     // Promoting here on residency alone would expose the target request before
     // its complete texture exists.
     Ok(false)
@@ -284,6 +458,7 @@ pub(crate) struct VisibleBrickRequestOutcome {
     /// This is distinct from changed resource membership: viewport or camera
     /// changes can need a new frame while reusing the exact same resident set.
     pub(crate) current_plan_installed: bool,
+    pub(crate) cross_section_plan_installed: bool,
     pub(crate) current_changed: bool,
     pub(crate) resident_changed: bool,
     pub(crate) current_frame_ready: bool,
@@ -293,6 +468,13 @@ pub(crate) struct VisibleBrickRequestOutcome {
 pub(crate) struct VisibleDemandPlanCurrentness {
     pub(crate) current_3d: bool,
     pub(crate) cross_sections: bool,
+    cross_section_panels: [bool; 3],
+}
+
+impl VisibleDemandPlanCurrentness {
+    pub(crate) fn cross_section(self, panel: PanelId) -> bool {
+        self.cross_section_panels[cross_section_panel_index(panel)]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -330,6 +512,7 @@ impl Current3dDemandPlanningSignature {
     }
 }
 
+#[cfg(test)]
 fn installed_target_layer_scales<'a>(
     staging_refinement: bool,
     current: Option<&'a BTreeMap<mirante4d_domain::LogicalLayerKey, mirante4d_domain::ScaleLevel>>,
@@ -345,60 +528,246 @@ fn installed_target_layer_scales<'a>(
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct CrossSectionDemandPlanningSignature {
+struct CrossSectionPanelDemandPlanningSignature {
+    cross_section: mirante4d_domain::CrossSectionView,
+    presentation_viewport: Option<mirante4d_render_api::PresentationViewport>,
+    render_extent: Option<mirante4d_render_api::RenderExtent>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CrossSectionDemandPlanningSignature {
     resource_identity: mirante4d_dataset::DatasetResourceIdentity,
     active_layer: mirante4d_domain::LogicalLayerKey,
     timepoint: TimeIndex,
     layout: ViewerLayout,
-    cross_section: mirante4d_domain::CrossSectionView,
     layers: Box<[DemandPlanningLayerSignature]>,
-    presentation_viewports: [Option<mirante4d_render_api::PresentationViewport>; 3],
-    render_extents: [Option<mirante4d_render_api::RenderExtent>; 3],
+    panels: [CrossSectionPanelDemandPlanningSignature; 3],
     playback_active: bool,
     gpu_payload_capacity: u64,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct PendingVisibleDemandPlan {
-    generation: crate::camera_demand_cache::CameraDemandGeneration,
-    current_3d: Option<Current3dDemandPlanningSignature>,
-    cross_sections: Option<CrossSectionDemandPlanningSignature>,
-    union_plan_required: bool,
-    preserve_complete_presentation: bool,
-    unchanged_scope_handles: Vec<(u64, Arc<[mirante4d_dataset::DatasetResourceKey]>)>,
-    cpu_capacity_epoch: u64,
-    runtime_recovery_epoch: u64,
+impl CrossSectionDemandPlanningSignature {
+    fn same_common_demand(&self, other: &Self) -> bool {
+        self.resource_identity == other.resource_identity
+            && self.active_layer == other.active_layer
+            && self.timepoint == other.timepoint
+            && self.layout == other.layout
+            && self.layers == other.layers
+            && self.playback_active == other.playback_active
+            && self.gpu_payload_capacity == other.gpu_payload_capacity
+    }
+
+    fn panel(&self, panel: PanelId) -> &CrossSectionPanelDemandPlanningSignature {
+        &self.panels[cross_section_panel_index(panel)]
+    }
+
+    fn panel_mut(&mut self, panel: PanelId) -> &mut CrossSectionPanelDemandPlanningSignature {
+        &mut self.panels[cross_section_panel_index(panel)]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CrossSectionPlanMask([bool; 3]);
+
+impl CrossSectionPlanMask {
+    const ALL: Self = Self([true; 3]);
+
+    fn contains(self, panel: PanelId) -> bool {
+        self.0[cross_section_panel_index(panel)]
+    }
+
+    fn insert(&mut self, panel: PanelId) {
+        self.0[cross_section_panel_index(panel)] = true;
+    }
+
+    fn any(self) -> bool {
+        self.0.into_iter().any(|required| required)
+    }
 }
 
 #[derive(Debug, Clone)]
+struct PendingCrossSectionDemandPlan {
+    target: CrossSectionDemandPlanningSignature,
+    panels: CrossSectionPlanMask,
+    exact: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingVisibleDemandPlan {
+    revision: RenderIntentRevision,
+    planning: VisibleDemandPlanningSignature,
+    current_3d: Option<Current3dDemandPlanningSignature>,
+    cross_sections: Option<PendingCrossSectionDemandPlan>,
+    union_plan_required: bool,
+    preserve_complete_presentation: bool,
+    unchanged_scope_handles: Vec<(u64, Arc<[mirante4d_dataset::BrickKey]>)>,
+    renderer_requirement_base: RetainedRequirementHandle,
+    cpu_capacity_epoch: u64,
+    dataset_runtime_epoch: u64,
+}
+
+impl PendingVisibleDemandPlan {
+    fn target_group(&self) -> &'static str {
+        match (self.current_3d.is_some(), self.cross_sections.is_some()) {
+            (false, true) => "linked 2D",
+            (true, false) => "3D",
+            (true, true) | (false, false) => "visible aggregate",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PayloadPlacementFacts {
+    requested_bytes: u64,
+    total_free_bytes: u64,
+    largest_contiguous_bytes: u64,
+}
+
+impl PayloadPlacementFacts {
+    fn from_runtime_error(error: mirante4d_render_wgpu::WgpuRenderRuntimeError) -> Option<Self> {
+        match error {
+            mirante4d_render_wgpu::WgpuRenderRuntimeError::PayloadPlacementUnavailable {
+                requested_bytes,
+                total_free_bytes,
+                largest_contiguous_bytes,
+            } => Some(Self {
+                requested_bytes,
+                total_free_bytes,
+                largest_contiguous_bytes,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibleDemandPlaceabilityRetry {
+    target_group: &'static str,
+    failed_union_payload_bytes: u64,
+    placement: PayloadPlacementFacts,
+}
+
+impl std::fmt::Display for VisibleDemandPlaceabilityRetry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} candidate with {} aggregate payload bytes needs one contiguous \
+             {}-byte allocation; {} bytes are free in aggregate but the largest \
+             contiguous range is {} bytes",
+            self.target_group,
+            self.failed_union_payload_bytes,
+            self.placement.requested_bytes,
+            self.placement.total_free_bytes,
+            self.placement.largest_contiguous_bytes,
+        )
+    }
+}
+
+impl std::error::Error for VisibleDemandPlaceabilityRetry {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibleDemandMinimumPlacementError {
+    target_group: &'static str,
+    placement: PayloadPlacementFacts,
+}
+
+impl std::fmt::Display for VisibleDemandMinimumPlacementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} minimum navigation demand remains physically unplaceable after \
+             bounded compaction: one {}-byte payload requires a contiguous range; \
+             {} bytes are free in aggregate and the largest contiguous range is \
+             {} bytes",
+            self.target_group,
+            self.placement.requested_bytes,
+            self.placement.total_free_bytes,
+            self.placement.largest_contiguous_bytes,
+        )
+    }
+}
+
+impl std::error::Error for VisibleDemandMinimumPlacementError {}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VisibleDemandPlaceabilityLimit {
+    planning: VisibleDemandPlanningSignature,
+    max_gpu_payload_bytes: u64,
+    target_group: &'static str,
+    placement: PayloadPlacementFacts,
+}
+
+impl VisibleDemandPlaceabilityLimit {
+    fn tightened(
+        previous: Option<&Self>,
+        planning: VisibleDemandPlanningSignature,
+        retry: VisibleDemandPlaceabilityRetry,
+    ) -> Self {
+        let rejected_body_cap = retry.failed_union_payload_bytes.saturating_sub(1);
+        let max_gpu_payload_bytes = previous
+            .filter(|limit| limit.applies_to(&planning))
+            .map_or(rejected_body_cap, |limit| {
+                limit.max_gpu_payload_bytes.min(rejected_body_cap)
+            });
+        Self {
+            planning,
+            max_gpu_payload_bytes,
+            target_group: retry.target_group,
+            placement: retry.placement,
+        }
+    }
+
+    fn applies_to(&self, planning: &VisibleDemandPlanningSignature) -> bool {
+        self.planning == *planning
+    }
+
+    fn terminal_error(&self) -> VisibleDemandMinimumPlacementError {
+        VisibleDemandMinimumPlacementError {
+            target_group: self.target_group,
+            placement: self.placement,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct VisibleDemandFailureSignature {
+    revision: RenderIntentRevision,
     planning: VisibleDemandPlanningSignature,
     current_plan_required: bool,
-    cross_plan_required: bool,
+    cross_plan_required: CrossSectionPlanMask,
     union_plan_required: bool,
-    unchanged_scope_handles: Vec<(u64, Arc<[mirante4d_dataset::DatasetResourceKey]>)>,
+    unchanged_scope_handles: Vec<(u64, Arc<[mirante4d_dataset::BrickKey]>)>,
+    renderer_requirement_base: RetainedRequirementHandle,
     cpu_capacity_epoch: u64,
-    runtime_recovery_epoch: u64,
+    dataset_runtime_epoch: u64,
 }
 
 impl VisibleDemandFailureSignature {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "all independent retry-latch identity dimensions must remain explicit"
+    )]
     fn new(
+        revision: RenderIntentRevision,
         planning: VisibleDemandPlanningSignature,
         current_plan_required: bool,
-        cross_plan_required: bool,
+        cross_plan_required: CrossSectionPlanMask,
         union_plan_required: bool,
-        unchanged_scope_handles: Vec<(u64, Arc<[mirante4d_dataset::DatasetResourceKey]>)>,
+        unchanged_scope_handles: Vec<(u64, Arc<[mirante4d_dataset::BrickKey]>)>,
+        renderer_requirement_base: RetainedRequirementHandle,
         cpu_capacity_epoch: u64,
-        runtime_recovery_epoch: u64,
+        dataset_runtime_epoch: u64,
     ) -> Self {
         Self {
+            revision,
             planning,
             current_plan_required,
             cross_plan_required,
             union_plan_required,
             unchanged_scope_handles,
+            renderer_requirement_base,
             cpu_capacity_epoch,
-            runtime_recovery_epoch,
+            dataset_runtime_epoch,
         }
     }
 
@@ -408,54 +777,73 @@ impl VisibleDemandFailureSignature {
     )]
     fn matches_current(
         &self,
+        revision: RenderIntentRevision,
         planning: &VisibleDemandPlanningSignature,
         current_plan_required: bool,
-        cross_plan_required: bool,
+        cross_plan_required: CrossSectionPlanMask,
         union_plan_required: bool,
         dataset: &DatasetDemandState,
         cpu_capacity_epoch: u64,
-        runtime_recovery_epoch: u64,
+        dataset_runtime_epoch: u64,
     ) -> bool {
         self.matches_inputs(
+            revision,
             planning,
             current_plan_required,
             cross_plan_required,
             union_plan_required,
             cpu_capacity_epoch,
-            runtime_recovery_epoch,
+            dataset_runtime_epoch,
             scope_handles_are_current(dataset, &self.unchanged_scope_handles),
+            renderer_requirement_base_is_current(dataset, &self.renderer_requirement_base),
         )
     }
 
-    // Keeping the seven independent identity dimensions visible prevents a
+    // Keeping the eight independent identity dimensions visible prevents a
     // partial comparison from silently reopening terminal work.
     #[allow(clippy::too_many_arguments)]
     fn matches_inputs(
         &self,
+        revision: RenderIntentRevision,
         planning: &VisibleDemandPlanningSignature,
         current_plan_required: bool,
-        cross_plan_required: bool,
+        cross_plan_required: CrossSectionPlanMask,
         union_plan_required: bool,
         cpu_capacity_epoch: u64,
-        runtime_recovery_epoch: u64,
+        dataset_runtime_epoch: u64,
         scope_handles_are_current: bool,
+        renderer_requirement_base_is_current: bool,
     ) -> bool {
-        self.planning == *planning
+        self.revision == revision
+            && self.planning == *planning
             && self.current_plan_required == current_plan_required
             && self.cross_plan_required == cross_plan_required
             && self.union_plan_required == union_plan_required
             && self.cpu_capacity_epoch == cpu_capacity_epoch
-            && self.runtime_recovery_epoch == runtime_recovery_epoch
+            && self.dataset_runtime_epoch == dataset_runtime_epoch
             && scope_handles_are_current
+            && renderer_requirement_base_is_current
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedScopeRenderPlan {
     pub(crate) requirements: PreparedRenderRequirements,
-    pub(crate) static_layout: PreparedStaticPresentationLayout,
+    /// Exact semantic body used to decide whether this candidate is selectable.
+    /// A navigation wrapper may carry a larger dormant residency-prefetch body
+    /// in `requirements`.
+    pub(crate) selection_body: mirante4d_render_api::PreparedResourceBody,
+    pub(crate) selection_required_prefix_len: usize,
+    /// Exact installed dataset body which owns this render body's resources.
+    /// The renderer body may be a single-scale prefix of that residency union.
+    pub(crate) scope_requirements: Arc<[BrickKey]>,
+    pub(crate) layer_scales: Arc<BTreeMap<LogicalLayerKey, ScaleLevel>>,
+    /// Payload bytes referenced by this exact render body, excluding any
+    /// independent navigation-tail resources retained by its owning scope.
+    pub(crate) render_payload_bytes: u64,
     pub(crate) planned_payload_bytes: u64,
     pub(crate) primary_resource_count: usize,
+    pub(crate) plane_reuse_envelope: Option<crate::semantic_demand::SemanticPlaneReuseEnvelope>,
 }
 
 /// Concrete per-view caches. Installed dataset scope requirements are the
@@ -467,63 +855,608 @@ pub(crate) struct VisibleDemandPlanningSignature {
     cross_sections: CrossSectionDemandPlanningSignature,
 }
 
+/// A complete installed linked-plane body that may be reprojected for one
+/// active mailbox revision. This is deliberately separate from installed
+/// exact-demand identity: coverage can keep interaction responsive, but it
+/// cannot make a different LOD/body current or settled.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResidentCrossSectionCoverage {
+    revision: RenderIntentRevision,
+    cross_sections: CrossSectionDemandPlanningSignature,
+    exact_guard_reuse: bool,
+    rolling_replan: bool,
+    /// True only while the resident body is a continuity fallback or its
+    /// rolling window is near exhaustion. A worker-installed latest body has
+    /// already satisfied planning even while its target resources continue
+    /// arriving asynchronously.
+    planning_required: bool,
+}
+
+/// Immutable dataset body bound to the durable exact-demand signature for one
+/// linked panel. A transient worker replacement clears this binding; only an
+/// exact worker plan or a fully preflighted durable resident promotion can
+/// establish it again.
+#[derive(Debug, Clone)]
+pub(crate) struct InstalledCrossSectionExactBody {
+    requirements: Arc<[BrickKey]>,
+    layer_scales: Arc<BTreeMap<LogicalLayerKey, ScaleLevel>>,
+}
+
 fn installed_visible_demand_plan_currentness(
     installed: Option<&VisibleDemandPlanningSignature>,
     current: &VisibleDemandPlanningSignature,
+    installed_cross_section_bodies_are_current: [bool; 3],
 ) -> VisibleDemandPlanCurrentness {
     let Some(installed) = installed else {
         return VisibleDemandPlanCurrentness::default();
     };
+    let cross_section_panels = [PanelId::Xy, PanelId::Xz, PanelId::Yz].map(|panel| {
+        installed
+            .cross_sections
+            .same_common_demand(&current.cross_sections)
+            && installed.cross_sections.panel(panel) == current.cross_sections.panel(panel)
+            && installed_cross_section_bodies_are_current[cross_section_panel_index(panel)]
+    });
     VisibleDemandPlanCurrentness {
         current_3d: installed.current_3d == current.current_3d,
-        cross_sections: installed.cross_sections == current.cross_sections,
+        cross_sections: cross_section_panels.into_iter().all(|current| current),
+        cross_section_panels,
     }
 }
 
+fn required_cross_section_plan(
+    installed: Option<&CrossSectionDemandPlanningSignature>,
+    current: &CrossSectionDemandPlanningSignature,
+    installed_bodies_are_current: [bool; 3],
+) -> CrossSectionPlanMask {
+    if current.layout != ViewerLayout::FourPanel {
+        return CrossSectionPlanMask::default();
+    }
+    let Some(installed) = installed else {
+        return CrossSectionPlanMask::ALL;
+    };
+    if !installed.same_common_demand(current) {
+        return CrossSectionPlanMask::ALL;
+    }
+    let mut required = CrossSectionPlanMask::default();
+    for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
+        if installed.panel(panel) != current.panel(panel)
+            || !installed_bodies_are_current[cross_section_panel_index(panel)]
+        {
+            required.insert(panel);
+        }
+    }
+    required
+}
+
 impl MiranteWorkbenchApp {
+    fn installed_cross_section_body_matches_prepared(&self, panel: PanelId) -> bool {
+        let scope = cross_section_scope_id(panel);
+        if !self.dataset.scope_is_installed(scope)
+            || self.dataset.scope_layer_scales(scope).is_none()
+        {
+            return false;
+        }
+        let scope_requirements = self.dataset.scope_requirement_handle(scope);
+        let Some(plan) = self.prepared_scope_render_plans.get(&scope) else {
+            return scope_requirements.is_empty();
+        };
+        !scope_requirements.is_empty()
+            && Arc::ptr_eq(&scope_requirements, &plan.scope_requirements)
+            && self.dataset.scope_layer_scales(scope) == Some(plan.layer_scales.as_ref())
+    }
+
+    fn installed_cross_section_exact_body_candidate(
+        &self,
+        panel: PanelId,
+    ) -> Option<InstalledCrossSectionExactBody> {
+        if !self.installed_cross_section_body_matches_prepared(panel) {
+            return None;
+        }
+        let scope = cross_section_scope_id(panel);
+        let requirements = self.dataset.scope_requirement_handle(scope);
+        let layer_scales = self
+            .prepared_scope_render_plans
+            .get(&scope)
+            .map(|plan| Arc::clone(&plan.layer_scales))
+            .unwrap_or_else(|| {
+                Arc::new(
+                    self.dataset
+                        .scope_layer_scales(scope)
+                        .expect("a matched empty scope retains its selected scales")
+                        .clone(),
+                )
+            });
+        Some(InstalledCrossSectionExactBody {
+            requirements,
+            layer_scales,
+        })
+    }
+
+    fn installed_cross_section_exact_body_is_current(&self, panel: PanelId) -> bool {
+        let scope = cross_section_scope_id(panel);
+        let Some(exact) =
+            self.installed_cross_section_exact_bodies[cross_section_panel_index(panel)].as_ref()
+        else {
+            return false;
+        };
+        if !self.dataset.scope_is_installed(scope)
+            || !Arc::ptr_eq(
+                &self.dataset.scope_requirement_handle(scope),
+                &exact.requirements,
+            )
+            || self.dataset.scope_layer_scales(scope) != Some(exact.layer_scales.as_ref())
+        {
+            return false;
+        }
+        if exact.requirements.is_empty() {
+            return !self.prepared_scope_render_plans.contains_key(&scope);
+        }
+        self.prepared_scope_render_plans
+            .get(&scope)
+            .is_some_and(|plan| {
+                Arc::ptr_eq(&plan.scope_requirements, &exact.requirements)
+                    && plan.layer_scales.as_ref() == exact.layer_scales.as_ref()
+            })
+    }
+
+    fn installed_cross_section_exact_bodies_are_current(&self) -> [bool; 3] {
+        [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+            .map(|panel| self.installed_cross_section_exact_body_is_current(panel))
+    }
+
+    fn resident_cross_section_coverage_matches_current(
+        &self,
+        snapshot: &mirante4d_application::ApplicationSnapshot,
+        current: &VisibleDemandPlanningSignature,
+    ) -> bool {
+        let Some(coverage) = self.resident_cross_section_coverage.as_ref() else {
+            return false;
+        };
+        let base = RenderIntentBase::from_snapshot(snapshot);
+        self.render_intent_mailbox.active_revision(base) == Some(coverage.revision)
+            && matches!(
+                self.render_intent_mailbox.active_target(base),
+                Some(RenderIntentTarget::CrossSection(_))
+            )
+            && coverage.cross_sections == current.cross_sections
+            && [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+                .into_iter()
+                .all(|panel| self.installed_cross_section_body_matches_prepared(panel))
+    }
+
+    fn resident_cross_section_coverage_is_renderable(
+        &self,
+        snapshot: &mirante4d_application::ApplicationSnapshot,
+        current: &VisibleDemandPlanningSignature,
+    ) -> bool {
+        self.resident_cross_section_coverage_matches_current(snapshot, current)
+            && [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+                .into_iter()
+                .all(|panel| {
+                    self.prepared_scope_render_plans
+                        .get(&cross_section_scope_id(panel))
+                        .is_some_and(|plan| {
+                            first_useful_resources_complete_with_renderer(
+                                &self.dataset,
+                                &self.native_presentation,
+                                plan,
+                            )
+                        })
+                })
+    }
+
     pub(crate) fn visible_demand_plan_currentness(&self) -> VisibleDemandPlanCurrentness {
         let snapshot = self.application.snapshot();
-        let current = self.visible_demand_planning_signature(&snapshot);
+        let (view, active_target, _) = self.effective_visible_demand_inputs(&snapshot);
+        let current = self.visible_demand_planning_signature(&snapshot, &view, active_target);
         installed_visible_demand_plan_currentness(
             self.visible_demand_planning_signature.as_ref(),
             &current,
+            self.installed_cross_section_exact_bodies_are_current(),
         )
     }
 
-    /// Prepares the existing immutable demand body for a transient camera.
+    pub(crate) fn resident_cross_section_requires_planning(&self) -> bool {
+        self.resident_cross_section_coverage
+            .as_ref()
+            .is_some_and(|coverage| coverage.planning_required)
+    }
+
+    /// Geometry/body eligibility for issuing a frame. Unlike exact
+    /// currentness, this may accept a complete resident guard while its
+    /// matching mailbox interaction remains active.
+    pub(crate) fn visible_demand_renderability(&self) -> VisibleDemandPlanCurrentness {
+        let snapshot = self.application.snapshot();
+        let (view, active_target, _) = self.effective_visible_demand_inputs(&snapshot);
+        let current = self.visible_demand_planning_signature(&snapshot, &view, active_target);
+        let mut renderability = installed_visible_demand_plan_currentness(
+            self.visible_demand_planning_signature.as_ref(),
+            &current,
+            self.installed_cross_section_exact_bodies_are_current(),
+        );
+        if self.resident_cross_section_coverage_is_renderable(&snapshot, &current) {
+            renderability.cross_section_panels = [true; 3];
+            renderability.cross_sections = true;
+        }
+        renderability
+    }
+
+    /// Starts or replaces production demand for the exact mailbox revision.
+    /// Geometry remains owned by the mailbox; this method merely causes the
+    /// existing data-plane authority to observe and plan its latest snapshot.
+    pub(crate) fn request_transient_visible_demand(
+        &mut self,
+        revision: RenderIntentRevision,
+        target: RenderIntentTarget,
+    ) -> VisibleBrickRequestOutcome {
+        let snapshot = self.application.snapshot();
+        let base = RenderIntentBase::from_snapshot(&snapshot);
+        if self.render_intent_mailbox.active_revision(base) != Some(revision)
+            || self.render_intent_mailbox.active_target(base) != Some(target)
+        {
+            return VisibleBrickRequestOutcome::default();
+        }
+        self.request_visible_bricks()
+    }
+
+    /// Returns whether the installed selected 3D body can cover `camera`
+    /// without changing scale or admitting any new resource.
     ///
-    /// This path never plans or changes application/project state. It accepts
-    /// only full-volume coverage or a camera proven inside the installed guard
-    /// envelope, and it promotes a guard only after its complete body is
-    /// already resident. The caller can therefore rebind the current request
-    /// without exposing an arriving-brick mosaic.
-    pub(crate) fn prepare_resident_camera_preview(&mut self, camera: CameraView) -> bool {
-        let inside_reuse_envelope =
-            self.current_camera_reuse_envelope
+    /// This is deliberately stricter than navigation-floor renderability:
+    /// both the semantic camera envelope and the projected LOD must remain
+    /// valid. This establishes data readiness only; the volume-presentation
+    /// controller separately decides whether the next frame is direct,
+    /// bounded-preview, or an atomic exact-refinement tile.
+    pub(crate) fn resident_camera_target_body_is_complete(&self, camera: CameraView) -> bool {
+        let snapshot = self.application.snapshot();
+        let durable = application_view(&snapshot);
+        let candidate_view = mirante4d_project_model::ViewState::new(
+            durable.layers().to_vec(),
+            durable.active_layer(),
+            durable.timepoint(),
+            camera,
+            durable.layout(),
+            *durable.cross_section(),
+            *durable.iso_light(),
+        )
+        .expect("a validated camera and durable view form a valid transient view");
+        let candidate = self.visible_demand_planning_signature(
+            &snapshot,
+            &candidate_view,
+            Some(RenderIntentTarget::ThreeD),
+        );
+        let Some(installed) = self.visible_demand_planning_signature.as_ref() else {
+            return false;
+        };
+        if !installed
+            .current_3d
+            .same_non_camera_demand(&candidate.current_3d)
+        {
+            return false;
+        }
+        let projected_lod_is_unchanged = current_3d_projected_layer_scales(
+            snapshot.catalog(),
+            &candidate_view,
+            candidate.current_3d.presentation_viewport,
+            candidate.current_3d.render_viewport,
+            candidate.current_3d.playback_active,
+        )
+        .is_ok_and(|ideal| self.dataset.current_ideal_layer_scales() == &ideal);
+        let camera_is_contained = self.dataset.current_covers_full_volume()
+            || self
+                .current_camera_reuse_envelope
                 .as_ref()
                 .is_some_and(|envelope| {
                     mirante4d_render_api::CameraFrame::new(
                         camera,
-                        self.render_coordination.presentation_viewport,
+                        candidate.current_3d.presentation_viewport,
                     )
                     .ok()
-                    .and_then(|camera| {
+                    .and_then(|frame| {
                         envelope
-                            .contains(camera, self.render_coordination.render_viewport)
+                            .contains(frame, candidate.current_3d.render_viewport)
                             .ok()
                     })
                     .unwrap_or(false)
                 });
-        if !self.dataset.current_covers_full_volume() && !inside_reuse_envelope {
-            return false;
-        }
-        if !installed_camera_guard_bodies_are_complete(&self.dataset, &self.native_presentation) {
-            return false;
-        }
-        promote_installed_camera_guards(&mut self.dataset, &mut self.prepared_scope_render_plans)
+        projected_lod_is_unchanged
+            && camera_is_contained
+            && installed_camera_guard_bodies_are_complete(&self.dataset, &self.native_presentation)
     }
 
-    fn effective_gpu_payload_capacity(&self) -> u64 {
+    /// Prepares an already-resident immutable body for a transient camera.
+    ///
+    /// A complete selected body wins the readiness decision. Guard promotion
+    /// only changes the role bitmap of already-resident resources; it performs
+    /// no decode, upload, or allocation. The full-volume floor is used only
+    /// when that body cannot truthfully cover the new camera. Frame-work
+    /// scheduling remains the responsibility of the volume-presentation
+    /// controller.
+    pub(crate) fn prepare_resident_camera_intent(&mut self, camera: CameraView) -> bool {
+        if self.resident_camera_target_body_is_complete(camera)
+            && (self.dataset.current_covers_full_volume()
+                || promote_installed_camera_guards(
+                    &mut self.dataset,
+                    &mut self.prepared_scope_render_plans,
+                ))
+        {
+            return true;
+        }
+        self.navigation_render_plans.first().is_some_and(|plan| {
+            first_useful_resources_complete_with_renderer(
+                &self.dataset,
+                &self.native_presentation,
+                plan,
+            )
+        })
+    }
+
+    /// Rebinds a cross-section mailbox revision to the already-complete
+    /// immutable bodies of all three linked panels. Geometry, common demand,
+    /// the gesture LOD, and every body-derived containment proof are checked
+    /// before the latest-only planner is invalidated.
+    pub(crate) fn prepare_resident_cross_section_intent(
+        &mut self,
+        revision: RenderIntentRevision,
+        panel: PanelId,
+        cross_section: mirante4d_domain::CrossSectionView,
+    ) -> bool {
+        self.resident_cross_section_coverage = None;
+        if panel.cross_section_panel().is_none() {
+            return false;
+        }
+        let snapshot = self.application.snapshot();
+        let base = RenderIntentBase::from_snapshot(&snapshot);
+        if self.render_intent_mailbox.active_revision(base) != Some(revision)
+            || !self
+                .render_intent_mailbox
+                .active_target(base)
+                .is_some_and(|target| {
+                    matches!(
+                        target,
+                        RenderIntentTarget::CrossSection(active)
+                            if PanelId::from_application_panel(active) == panel
+                    )
+                })
+            || self
+                .render_intent_mailbox
+                .effective_cross_section(base, *application_view(&snapshot).cross_section())
+                != cross_section
+        {
+            return false;
+        }
+        let (effective_view, active_target, _) = self.effective_visible_demand_inputs(&snapshot);
+        let current =
+            self.visible_demand_planning_signature(&snapshot, &effective_view, active_target);
+        let Some(installed) = self.visible_demand_planning_signature.as_ref() else {
+            return false;
+        };
+        if !installed
+            .cross_sections
+            .same_common_demand(&current.cross_sections)
+        {
+            return false;
+        }
+        let active_scope = cross_section_scope_id(panel);
+        if !self
+            .dataset
+            .can_observe_visible_intent(revision, Some(active_scope))
+        {
+            return false;
+        }
+        let mut reusable_candidates = 0_usize;
+        let mut exact_guard_reuse = true;
+        let mut rolling_replan = false;
+        for linked_panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
+            let current_panel = current.cross_sections.panel(linked_panel);
+            let (Some(presentation), Some(extent)) = (
+                current_panel.presentation_viewport,
+                current_panel.render_extent,
+            ) else {
+                return false;
+            };
+            let scope = cross_section_scope_id(linked_panel);
+            let Some(plan) = self.prepared_scope_render_plans.get(&scope) else {
+                return false;
+            };
+            if !first_useful_resources_complete_with_renderer(
+                &self.dataset,
+                &self.native_presentation,
+                plan,
+            ) {
+                return false;
+            }
+            let semantic_panel = match linked_panel {
+                PanelId::Xy => crate::semantic_demand::CrossSectionPlane::Xy,
+                PanelId::Xz => crate::semantic_demand::CrossSectionPlane::Xz,
+                PanelId::Yz => crate::semantic_demand::CrossSectionPlane::Yz,
+                PanelId::ThreeD => unreachable!(),
+            };
+            let exact_panel = plan.plane_reuse_envelope.as_ref().is_some_and(|envelope| {
+                envelope
+                    .contains(cross_section, semantic_panel, presentation, extent)
+                    .unwrap_or(false)
+                    && scope_all_resources_complete_with_renderer(
+                        &self.dataset,
+                        &self.native_presentation,
+                        scope,
+                    )
+                    && installed_plane_guard_is_promotable(
+                        &self.dataset,
+                        &self.prepared_scope_render_plans,
+                        scope,
+                    )
+            });
+            exact_guard_reuse &= exact_panel;
+            if exact_panel {
+                let envelope = plan
+                    .plane_reuse_envelope
+                    .as_ref()
+                    .expect("an exact guarded panel owns its envelope");
+                rolling_replan |= envelope
+                    .needs_rolling_replan(cross_section, semantic_panel, presentation, extent)
+                    .unwrap_or(true);
+                reusable_candidates =
+                    reusable_candidates.saturating_add(envelope.reusable_candidates());
+            }
+        }
+        if exact_guard_reuse {
+            if !self
+                .dataset
+                .can_install_visible_intent(revision, active_scope)
+            {
+                return false;
+            }
+            for linked_panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
+                commit_preflighted_installed_plane_guard(
+                    &mut self.dataset,
+                    &mut self.prepared_scope_render_plans,
+                    cross_section_scope_id(linked_panel),
+                );
+            }
+            self.dataset
+                .commit_preflighted_installed_visible_intent(revision, active_scope);
+            self.pending_visible_demand_plan = None;
+            self.visible_demand_failure_latch = None;
+            self.dataset
+                .record_contained_visible_demand_reuse(reusable_candidates);
+            self.resident_plane_guard_reuses = self.resident_plane_guard_reuses.saturating_add(3);
+        }
+        self.resident_cross_section_coverage = Some(ResidentCrossSectionCoverage {
+            revision,
+            cross_sections: current.cross_sections,
+            exact_guard_reuse,
+            rolling_replan,
+            planning_required: !exact_guard_reuse || rolling_replan,
+        });
+        self.render_coordination.invalidate_cross_sections();
+        true
+    }
+
+    /// Rebinds all three linked panels after the one settled durable
+    /// cross-section commit when every panel's installed guard proves the new
+    /// geometry. This avoids turning gesture completion into two passive-panel
+    /// worker rebuilds.
+    pub(crate) fn prepare_resident_durable_cross_sections(&mut self) -> bool {
+        self.resident_cross_section_coverage = None;
+        let snapshot = self.application.snapshot();
+        if application_view(&snapshot).layout() != ViewerLayout::FourPanel {
+            return false;
+        }
+        let base = RenderIntentBase::from_snapshot(&snapshot);
+        if self.render_intent_mailbox.active_target(base).is_some() {
+            return false;
+        }
+        let effective_view = application_view(&snapshot).clone();
+        let current = self.visible_demand_planning_signature(&snapshot, &effective_view, None);
+        let Some(installed) = self.visible_demand_planning_signature.as_ref() else {
+            return false;
+        };
+        if !installed
+            .cross_sections
+            .same_common_demand(&current.cross_sections)
+        {
+            return false;
+        }
+
+        let mut reusable_candidates = 0_usize;
+        for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
+            let signature = current.cross_sections.panel(panel);
+            let (Some(presentation), Some(extent)) =
+                (signature.presentation_viewport, signature.render_extent)
+            else {
+                return false;
+            };
+            let scope = cross_section_scope_id(panel);
+            if !cross_section_projected_layer_scales(
+                snapshot.catalog(),
+                &effective_view,
+                panel,
+                presentation,
+                extent,
+            )
+            .is_ok_and(|selected| self.dataset.scope_layer_scales(scope) == Some(&selected))
+            {
+                return false;
+            }
+            // Renderer residency is the authoritative completeness proof and
+            // advances the cached all-resource cursor used by promotion.
+            // Passive linked panels may not have observed that body since it
+            // was uploaded, so this proof must precede the O(1) promotability
+            // check.
+            if !scope_all_resources_complete_with_renderer(
+                &self.dataset,
+                &self.native_presentation,
+                scope,
+            ) {
+                return false;
+            }
+            if !installed_plane_guard_is_promotable(
+                &self.dataset,
+                &self.prepared_scope_render_plans,
+                scope,
+            ) {
+                return false;
+            }
+            let semantic_panel = match panel {
+                PanelId::Xy => crate::semantic_demand::CrossSectionPlane::Xy,
+                PanelId::Xz => crate::semantic_demand::CrossSectionPlane::Xz,
+                PanelId::Yz => crate::semantic_demand::CrossSectionPlane::Yz,
+                PanelId::ThreeD => unreachable!(),
+            };
+            let envelope = self
+                .prepared_scope_render_plans
+                .get(&scope)
+                .and_then(|plan| plan.plane_reuse_envelope.as_ref())
+                .expect("the checked plane scope retains its envelope");
+            if !envelope
+                .contains(
+                    *effective_view.cross_section(),
+                    semantic_panel,
+                    presentation,
+                    extent,
+                )
+                .unwrap_or(false)
+            {
+                return false;
+            }
+            reusable_candidates =
+                reusable_candidates.saturating_add(envelope.reusable_candidates());
+        }
+
+        let revision = self.render_intent_mailbox.snapshot().linked_2d_revision;
+        if !self.dataset.can_observe_visible_intent(revision, None) {
+            return false;
+        }
+        let exact_bodies = [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+            .map(|panel| self.installed_cross_section_exact_body_candidate(panel));
+        if exact_bodies.iter().any(Option::is_none) {
+            return false;
+        }
+        for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
+            commit_preflighted_installed_plane_guard(
+                &mut self.dataset,
+                &mut self.prepared_scope_render_plans,
+                cross_section_scope_id(panel),
+            );
+        }
+        self.dataset
+            .commit_preflighted_visible_intent(revision, None);
+        self.pending_visible_demand_plan = None;
+        self.visible_demand_failure_latch = None;
+        self.visible_demand_planning_signature
+            .as_mut()
+            .expect("the checked installed signature remains present")
+            .cross_sections = current.cross_sections;
+        self.installed_cross_section_exact_bodies = exact_bodies;
+        self.dataset
+            .record_contained_visible_demand_reuse(reusable_candidates);
+        self.resident_plane_guard_reuses = self.resident_plane_guard_reuses.saturating_add(3);
+        true
+    }
+
+    fn physical_gpu_payload_capacity(&self) -> u64 {
         self.native_presentation
             .product_gpu
             .as_ref()
@@ -539,13 +1472,143 @@ impl MiranteWorkbenchApp {
             })
     }
 
+    fn selected_gpu_payload_capacity(&self, planning: &VisibleDemandPlanningSignature) -> u64 {
+        let physical = self.physical_gpu_payload_capacity();
+        self.visible_demand_placeability_limit
+            .as_ref()
+            .filter(|limit| limit.applies_to(planning))
+            .map_or(physical, |limit| physical.min(limit.max_gpu_payload_bytes))
+    }
+
+    fn activate_visible_demand_placeability_fallback(
+        &mut self,
+        planning: VisibleDemandPlanningSignature,
+        retry: VisibleDemandPlaceabilityRetry,
+    ) {
+        let limit = VisibleDemandPlaceabilityLimit::tightened(
+            self.visible_demand_placeability_limit.as_ref(),
+            planning,
+            retry,
+        );
+        tracing::info!(
+            target_group = retry.target_group,
+            failed_union_payload_bytes = retry.failed_union_payload_bytes,
+            requested_allocation_bytes = retry.placement.requested_bytes,
+            aggregate_free_bytes = retry.placement.total_free_bytes,
+            largest_contiguous_bytes = retry.placement.largest_contiguous_bytes,
+            next_payload_limit_bytes = limit.max_gpu_payload_bytes,
+            "renderer placement refused one visible-demand candidate; retrying generic adaptive selection"
+        );
+        self.visible_demand_placeability_limit = Some(limit);
+        self.visible_demand_failure_latch = None;
+        self.render_coordination.request_refresh();
+    }
+
+    pub(crate) fn recover_from_coordinated_payload_placement(
+        &mut self,
+        target_group: &'static str,
+        error: mirante4d_render_wgpu::WgpuRenderRuntimeError,
+    ) -> bool {
+        let Some(placement) = PayloadPlacementFacts::from_runtime_error(error) else {
+            return false;
+        };
+        let Some(planning) = self.visible_demand_planning_signature.clone() else {
+            return false;
+        };
+        let requirements = self.dataset.renderer_requirement_handle().requirements;
+        let snapshot = self.application.snapshot();
+        let Ok(failed_union_payload_bytes) = requirements.iter().try_fold(0_u64, |total, key| {
+            let descriptor = snapshot.catalog().resource_payload_descriptor(*key)?;
+            let bytes = mirante4d_render_wgpu::payload_allocation_bytes(descriptor)
+                .map_err(anyhow::Error::from)?;
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| anyhow::anyhow!("GPU payload accounting overflow"))
+        }) else {
+            return false;
+        };
+        if failed_union_payload_bytes == 0 {
+            return false;
+        }
+        self.activate_visible_demand_placeability_fallback(
+            planning,
+            VisibleDemandPlaceabilityRetry {
+                target_group,
+                failed_union_payload_bytes,
+                placement,
+            },
+        );
+        // The installed bodies and current complete fronts remain intact, but
+        // their aggregate union has proved physically unusable. Removing only
+        // the semantic-currentness certificate forces the ordinary planner to
+        // replace that union under the stricter bound.
+        self.visible_demand_planning_signature = None;
+        self.resident_cross_section_coverage = None;
+        self.current_camera_reuse_envelope = None;
+        true
+    }
+
+    fn physical_minimum_error_if_limited(
+        &self,
+        planning: &VisibleDemandPlanningSignature,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if error
+            .downcast_ref::<DatasetDemandPlanCapacityError>()
+            .is_some_and(|error| error.is_gpu_payload_capacity())
+            && let Some(limit) = self
+                .visible_demand_placeability_limit
+                .as_ref()
+                .filter(|limit| limit.applies_to(planning))
+        {
+            return anyhow::Error::new(limit.terminal_error());
+        }
+        error
+    }
+
+    fn effective_visible_demand_inputs(
+        &self,
+        snapshot: &mirante4d_application::ApplicationSnapshot,
+    ) -> (
+        mirante4d_project_model::ViewState,
+        Option<RenderIntentTarget>,
+        RenderIntentRevision,
+    ) {
+        let durable = application_view(snapshot);
+        let base = RenderIntentBase::from_snapshot(snapshot);
+        let active_target = self.render_intent_mailbox.active_target(base);
+        let revision = self
+            .render_intent_mailbox
+            .active_revision(base)
+            .unwrap_or_else(|| self.render_intent_mailbox.snapshot().latest_revision);
+        let camera = self
+            .render_intent_mailbox
+            .effective_camera(base, *durable.camera());
+        let cross_section = self
+            .render_intent_mailbox
+            .effective_cross_section(base, *durable.cross_section());
+        let view = mirante4d_project_model::ViewState::new(
+            durable.layers().to_vec(),
+            durable.active_layer(),
+            durable.timepoint(),
+            camera,
+            durable.layout(),
+            cross_section,
+            *durable.iso_light(),
+        )
+        .expect("mailbox geometry and the durable view are already validated");
+        (view, active_target, revision)
+    }
+
     fn visible_demand_planning_signature(
         &self,
         snapshot: &mirante4d_application::ApplicationSnapshot,
+        effective_view: &mirante4d_project_model::ViewState,
+        active_target: Option<RenderIntentTarget>,
     ) -> VisibleDemandPlanningSignature {
-        let view = application_view(snapshot);
+        let durable_view = application_view(snapshot);
         let panels = [PanelId::Xy, PanelId::Xz, PanelId::Yz];
-        let layers = view
+        let layers = effective_view
             .layers()
             .iter()
             .map(|layer| DemandPlanningLayerSignature {
@@ -556,24 +1619,28 @@ impl MiranteWorkbenchApp {
                     .then(|| sampling_footprint_class(*layer.render_state())),
             })
             .collect::<Box<[_]>>();
-        let presentation_viewports = panels.map(|panel| {
-            self.render_coordination
-                .surface(panel.presentation_slot())
-                .presentation_viewport()
+        let linked_interaction_active = active_target
+            .is_some_and(|target| matches!(target, RenderIntentTarget::CrossSection(_)));
+        let panel_signatures = panels.map(|panel| {
+            let surface = self.render_coordination.surface(panel.presentation_slot());
+            CrossSectionPanelDemandPlanningSignature {
+                cross_section: if linked_interaction_active {
+                    *effective_view.cross_section()
+                } else {
+                    *durable_view.cross_section()
+                },
+                presentation_viewport: surface.presentation_viewport(),
+                render_extent: surface.render_viewport(),
+            }
         });
-        let render_extents = panels.map(|panel| {
-            self.render_coordination
-                .surface(panel.presentation_slot())
-                .render_viewport()
-        });
-        let gpu_payload_capacity = self.effective_gpu_payload_capacity();
+        let gpu_payload_capacity = self.physical_gpu_payload_capacity();
         VisibleDemandPlanningSignature {
             current_3d: Current3dDemandPlanningSignature {
                 resource_identity: snapshot.catalog().resource_identity(),
-                active_layer: view.active_layer(),
-                timepoint: view.timepoint(),
-                camera: *view.camera(),
-                layout: view.layout(),
+                active_layer: effective_view.active_layer(),
+                timepoint: effective_view.timepoint(),
+                camera: *effective_view.camera(),
+                layout: effective_view.layout(),
                 layers: layers.clone(),
                 presentation_viewport: self.render_coordination.presentation_viewport,
                 render_viewport: self.render_coordination.render_viewport,
@@ -582,13 +1649,11 @@ impl MiranteWorkbenchApp {
             },
             cross_sections: CrossSectionDemandPlanningSignature {
                 resource_identity: snapshot.catalog().resource_identity(),
-                active_layer: view.active_layer(),
-                timepoint: view.timepoint(),
-                layout: view.layout(),
-                cross_section: *view.cross_section(),
+                active_layer: effective_view.active_layer(),
+                timepoint: effective_view.timepoint(),
+                layout: effective_view.layout(),
                 layers,
-                presentation_viewports,
-                render_extents,
+                panels: panel_signatures,
                 playback_active: snapshot.transient().playback_active(),
                 gpu_payload_capacity,
             },
@@ -608,8 +1673,10 @@ impl MiranteWorkbenchApp {
             }
         };
         let preserve_presentation = self.dataset.deferred_refill_preserves_presentation();
-        match pump_interactive_admission_with_renderer(&mut self.dataset, &self.native_presentation)
-        {
+        match pump_interactive_admission_with_renderer(
+            &mut self.dataset,
+            &mut self.native_presentation,
+        ) {
             Ok(_) => {
                 if let Some(fault) = self.dataset.dispatcher_mut().take_last_fault() {
                     self.dataset
@@ -630,9 +1697,19 @@ impl MiranteWorkbenchApp {
             &self.native_presentation,
             SCOPE_CURRENT_3D,
         );
+        if ready && self.visible_demand_plan_currentness().current_3d {
+            let snapshot = self.application.snapshot();
+            let base = RenderIntentBase::from_snapshot(&snapshot);
+            if self.render_intent_mailbox.active_target(base) == Some(RenderIntentTarget::ThreeD)
+                && let Some(revision) = self.render_intent_mailbox.active_revision(base)
+            {
+                self.render_intent_mailbox.mark_renderable(base, revision);
+            }
+        }
         self.update_dataset_fidelity(ready);
         VisibleBrickRequestOutcome {
             current_plan_installed: false,
+            cross_section_plan_installed: false,
             current_changed: promoted,
             resident_changed: false,
             current_frame_ready: ready,
@@ -641,14 +1718,22 @@ impl MiranteWorkbenchApp {
 
     pub(crate) fn request_visible_bricks(&mut self) -> VisibleBrickRequestOutcome {
         let snapshot = self.application.snapshot();
+        let (effective_view, active_target, intent_revision) =
+            self.effective_visible_demand_inputs(&snapshot);
+        let active_scope = active_target.map(render_intent_scope);
+        if !self
+            .dataset
+            .observe_visible_intent(intent_revision, active_scope)
+        {
+            return VisibleBrickRequestOutcome::default();
+        }
         if self.dataset.source_quarantined()
             || self.dataset.resource_identity() != snapshot.catalog().resource_identity()
         {
-            if (self.pending_visible_demand_plan.is_some()
-                || self.camera_demand_planner.has_outstanding_request())
-                && let Err(error) = self.camera_demand_planner.invalidate()
+            if self.pending_visible_demand_plan.is_some()
+                || self.dataset.visible_demand_plan_outstanding()
             {
-                self.dataset.record_plan_error(error.to_string());
+                self.dataset.invalidate_visible_demand_plan(intent_revision);
             }
             self.pending_visible_demand_plan = None;
             self.render_coordination.frame_fidelity.completeness = FrameCompleteness::Loading;
@@ -657,14 +1742,23 @@ impl MiranteWorkbenchApp {
             return VisibleBrickRequestOutcome::default();
         }
 
-        let planning_signature = self.visible_demand_planning_signature(&snapshot);
+        let planning_signature =
+            self.visible_demand_planning_signature(&snapshot, &effective_view, active_target);
+        if self
+            .visible_demand_placeability_limit
+            .as_ref()
+            .is_some_and(|limit| !limit.applies_to(&planning_signature))
+        {
+            self.visible_demand_placeability_limit = None;
+        }
         let mut accepted = VisibleBrickRequestOutcome::default();
-        if let Some(result) = self.camera_demand_planner.take_result() {
+        if let Some(result) = self.dataset.take_visible_demand_plan_result() {
             self.last_camera_demand_planning_duration = Some(result.planning_duration);
             let pending = self.pending_visible_demand_plan.take();
             let result_is_current = pending
                 .as_ref()
-                .is_some_and(|pending| pending.generation == result.generation)
+                .is_some_and(|pending| pending.revision == result.revision)
+                && result.revision == intent_revision
                 && pending
                     .as_ref()
                     .and_then(|pending| pending.current_3d.as_ref())
@@ -672,9 +1766,13 @@ impl MiranteWorkbenchApp {
                 && pending
                     .as_ref()
                     .and_then(|pending| pending.cross_sections.as_ref())
-                    .is_none_or(|cross| cross == &planning_signature.cross_sections)
+                    .is_none_or(|cross| cross.target == planning_signature.cross_sections)
                 && pending.as_ref().is_some_and(|pending| {
                     unchanged_scope_handles_are_current(&self.dataset, pending)
+                        && renderer_requirement_base_is_current(
+                            &self.dataset,
+                            &pending.renderer_requirement_base,
+                        )
                 });
             if result_is_current {
                 match result.outcome {
@@ -686,21 +1784,36 @@ impl MiranteWorkbenchApp {
                                 accepted = outcome;
                             }
                             Err(error) => {
-                                if visible_demand_failure_is_deterministic(&error) {
-                                    let signature = visible_demand_failure_signature(
-                                        planning_signature.clone(),
-                                        pending,
+                                if let Some(retry) = error
+                                    .downcast_ref::<VisibleDemandPlaceabilityRetry>()
+                                    .copied()
+                                {
+                                    self.activate_visible_demand_placeability_fallback(
+                                        pending.planning.clone(),
+                                        retry,
                                     );
-                                    self.visible_demand_failure_latch =
-                                        Some(DeterministicFailureLatch::new(signature));
+                                } else if visible_demand_failure_is_recovery_backpressure(&error) {
+                                    self.visible_demand_failure_latch = None;
+                                    self.render_coordination.request_refresh();
+                                } else {
+                                    if visible_demand_failure_is_deterministic(&error) {
+                                        let signature = visible_demand_failure_signature(
+                                            planning_signature.clone(),
+                                            pending,
+                                        );
+                                        self.visible_demand_failure_latch =
+                                            Some(DeterministicFailureLatch::new(signature));
+                                    }
+                                    self.record_dataset_plan_error(&error);
+                                    return VisibleBrickRequestOutcome::default();
                                 }
-                                self.record_dataset_plan_error(&error);
-                                return VisibleBrickRequestOutcome::default();
                             }
                         }
                     }
                     Err(error) => {
                         let pending = pending.expect("a current result has pending identity");
+                        let error =
+                            self.physical_minimum_error_if_limited(&planning_signature, error);
                         if visible_demand_failure_is_deterministic(&error) {
                             let signature = visible_demand_failure_signature(
                                 planning_signature.clone(),
@@ -745,20 +1858,15 @@ impl MiranteWorkbenchApp {
                         .current_3d
                         .same_non_camera_demand(&planning_signature.current_3d)
                 });
-        let installed_target_scales = installed_target_layer_scales(
-            self.dataset.staging_current_refinement(),
-            self.dataset.scope_layer_scales(SCOPE_CURRENT_3D),
-            self.dataset.scope_layer_scales(SCOPE_CURRENT_3D_REFINEMENT),
-        );
         let projected_lod_is_unchanged = camera_only_change
             && current_3d_projected_layer_scales(
                 snapshot.catalog(),
-                application_view(&snapshot),
+                &effective_view,
                 planning_signature.current_3d.presentation_viewport,
                 planning_signature.current_3d.render_viewport,
                 planning_signature.current_3d.playback_active,
             )
-            .is_ok_and(|selected| installed_target_scales == Some(&selected));
+            .is_ok_and(|ideal| self.dataset.current_ideal_layer_scales() == &ideal);
         let current_plan_is_reusable = projected_lod_is_unchanged
             && (self.dataset.current_covers_full_volume() || camera_is_inside_reuse_envelope);
         let camera_guard_is_reusable = !current_plan_is_reusable
@@ -775,27 +1883,62 @@ impl MiranteWorkbenchApp {
                 || self.dataset.scope_requirements(SCOPE_CURRENT_3D).len(),
                 |envelope| envelope.reusable_candidates(),
             );
-            self.camera_demand_planner
-                .record_contained_reuse(reusable_candidates);
+            self.dataset
+                .record_contained_visible_demand_reuse(reusable_candidates);
             if let Some(installed) = self.visible_demand_planning_signature.as_mut() {
                 installed.current_3d = planning_signature.current_3d.clone();
             }
         }
-        let cross_plan_required = self
-            .visible_demand_planning_signature
-            .as_ref()
-            .is_none_or(|previous| previous.cross_sections != planning_signature.cross_sections);
+        let resident_cross_sections_match =
+            self.resident_cross_section_coverage_matches_current(&snapshot, &planning_signature);
+        if self.resident_cross_section_coverage.is_some() && !resident_cross_sections_match {
+            self.resident_cross_section_coverage = None;
+        }
+        let installed_cross_section_exact_bodies =
+            self.installed_cross_section_exact_bodies_are_current();
+        let resident_planning_satisfied = resident_cross_sections_match
+            && self
+                .resident_cross_section_coverage
+                .as_ref()
+                .is_some_and(|coverage| !coverage.planning_required);
+        let cross_plan_required = if resident_planning_satisfied {
+            CrossSectionPlanMask::default()
+        } else {
+            required_cross_section_plan(
+                self.visible_demand_planning_signature
+                    .as_ref()
+                    .map(|previous| &previous.cross_sections),
+                &planning_signature.cross_sections,
+                installed_cross_section_exact_bodies,
+            )
+        };
+        let preserve_previous_renderer_requirement_union = [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+            .into_iter()
+            .any(|panel| {
+                cross_plan_required.contains(panel)
+                    && !installed_cross_section_exact_bodies[cross_section_panel_index(panel)]
+            });
+        if let Some(RenderIntentTarget::CrossSection(active_panel)) = active_target {
+            let panel = PanelId::from_application_panel(active_panel);
+            if !cross_plan_required.contains(panel) {
+                let scope = cross_section_scope_id(panel);
+                debug_assert!(
+                    self.dataset
+                        .activate_installed_visible_intent(intent_revision, scope),
+                    "the current mailbox panel must own its active dataset scope"
+                );
+            }
+        }
         let union_plan_required = self.dataset.renderer_requirement_union_needs_preparation();
-        if !current_plan_required && !cross_plan_required && !union_plan_required {
+        if !current_plan_required && !cross_plan_required.any() && !union_plan_required {
             self.visible_demand_failure_latch = None;
             if self.pending_visible_demand_plan.is_some() {
-                if let Err(error) = self.camera_demand_planner.invalidate() {
-                    self.dataset.record_plan_error(error.to_string());
-                }
+                self.dataset.invalidate_visible_demand_plan(intent_revision);
                 self.pending_visible_demand_plan = None;
             }
             let mut pumped = self.pump_unchanged_visible_demand();
             pumped.current_plan_installed |= accepted.current_plan_installed;
+            pumped.cross_section_plan_installed |= accepted.cross_section_plan_installed;
             pumped.current_changed |= accepted.current_changed;
             return pumped;
         }
@@ -807,13 +1950,14 @@ impl MiranteWorkbenchApp {
                 .is_some_and(|latch| {
                     latch.blocks(|failed| {
                         failed.matches_current(
+                            intent_revision,
                             &planning_signature,
                             current_plan_required,
                             cross_plan_required,
                             union_plan_required,
                             &self.dataset,
                             cpu_capacity_epoch,
-                            self.viewer_runtime_recovery_epoch,
+                            self.dataset_runtime_epoch,
                         )
                     })
                 });
@@ -826,18 +1970,30 @@ impl MiranteWorkbenchApp {
             .pending_visible_demand_plan
             .as_ref()
             .is_some_and(|pending| {
-                pending.current_3d.as_ref()
-                    == current_plan_required.then_some(&planning_signature.current_3d)
-                    && pending.cross_sections.as_ref()
-                        == cross_plan_required.then_some(&planning_signature.cross_sections)
+                pending.revision == intent_revision
+                    && pending.current_3d.as_ref()
+                        == current_plan_required.then_some(&planning_signature.current_3d)
+                    && pending_cross_sections_match(
+                        pending.cross_sections.as_ref(),
+                        &planning_signature.cross_sections,
+                        cross_plan_required,
+                    )
                     && unchanged_scope_handles_are_current(&self.dataset, pending)
+                    && renderer_requirement_base_is_current(
+                        &self.dataset,
+                        &pending.renderer_requirement_base,
+                    )
             });
         if !pending_matches {
-            let view = application_view(&snapshot);
+            let view = &effective_view;
             let four_panel = view.layout() == ViewerLayout::FourPanel;
             let playback_active = snapshot.transient().playback_active();
-            let demand_cohorts = 1 + usize::from(playback_active) + if four_panel { 3 } else { 0 };
-            let gpu_payload_capacity = self.effective_gpu_payload_capacity();
+            let gpu_payload_capacity = self.selected_gpu_payload_capacity(&planning_signature);
+            let global_demand_limits = DatasetDemandPlanLimits::new(
+                SEMANTIC_PLAN_CANDIDATES_PER_LAYER,
+                PRODUCT_RENDER_RESOURCE_LIMIT,
+                gpu_payload_capacity,
+            );
             let mut unchanged_scopes = Vec::new();
             if !current_plan_required {
                 unchanged_scopes.extend([
@@ -846,8 +2002,10 @@ impl MiranteWorkbenchApp {
                     SCOPE_PLAYBACK,
                 ]);
             }
-            if !cross_plan_required {
-                unchanged_scopes.extend(cross_section_scopes().map(|(scope, _)| scope));
+            for (scope, panel) in cross_section_scopes() {
+                if !cross_plan_required.contains(panel) {
+                    unchanged_scopes.push(scope);
+                }
             }
             unchanged_scopes.push(SCOPE_ANALYSIS);
             let unchanged_scope_handles = unchanged_scopes
@@ -868,65 +2026,61 @@ impl MiranteWorkbenchApp {
                     self.visible_demand_plan_calls =
                         self.visible_demand_plan_calls.saturating_add(1);
                 }
-                let current_share_numerator = if playback_active { 2 } else { 1 };
+                let navigation_ladder_baseline = installed_navigation_ladder_baseline(
+                    &self.dataset,
+                    &self.navigation_render_plans,
+                );
                 preserve_complete_presentation = self
-                    .native_presentation
-                    .product_gpu
-                    .as_ref()
-                    .and_then(|product| product.targets.get(&PanelId::ThreeD))
-                    .and_then(|target| target.presented.as_ref())
+                    .render_coordination
+                    .surface(PresentationSlot::ThreeD)
+                    .presented_frame()
                     .is_some_and(|frame| {
                         frame.progress().completeness()
                             != mirante4d_render_api::FrameCompleteness::Progressive
+                    })
+                    && navigation_ladder_baseline.is_some()
+                    && self.navigation_render_plans.first().is_some_and(|plan| {
+                        first_useful_resources_complete_with_renderer(
+                            &self.dataset,
+                            &self.native_presentation,
+                            plan,
+                        )
                     });
-                Some(Current3dDemandRequest::new(
-                    self.render_coordination.presentation_viewport,
-                    self.render_coordination.render_viewport,
-                    DatasetDemandPlanLimits::new(
-                        SEMANTIC_PLAN_CANDIDATES_PER_LAYER,
-                        budget_share_usize(
-                            PRODUCT_RENDER_RESOURCE_LIMIT,
-                            current_share_numerator,
-                            demand_cohorts,
+                Some(
+                    Current3dDemandRequest::new(
+                        self.render_coordination.presentation_viewport,
+                        self.render_coordination.render_viewport,
+                        global_demand_limits,
+                        Current3dDemandBaselines::new(
+                            scope_baseline(&self.dataset, SCOPE_CURRENT_3D),
+                            scope_baseline(&self.dataset, SCOPE_CURRENT_3D_REFINEMENT),
+                            scope_baseline(&self.dataset, SCOPE_PLAYBACK),
                         ),
-                        budget_share_u64(
-                            gpu_payload_capacity,
-                            current_share_numerator,
-                            demand_cohorts,
-                        ),
-                    ),
-                    playback_active,
-                    next_playback_timepoint(&snapshot),
-                    preserve_complete_presentation,
-                    Current3dDemandBaselines::new(
-                        scope_baseline(
-                            &self.dataset,
-                            &self.prepared_scope_render_plans,
-                            SCOPE_CURRENT_3D,
-                        ),
-                        scope_baseline(
-                            &self.dataset,
-                            &self.prepared_scope_render_plans,
-                            SCOPE_CURRENT_3D_REFINEMENT,
-                        ),
-                        scope_baseline(
-                            &self.dataset,
-                            &self.prepared_scope_render_plans,
-                            SCOPE_PLAYBACK,
-                        ),
-                    ),
-                ))
+                    )
+                    .with_playback(playback_active, next_playback_timepoint(&snapshot))
+                    .with_complete_presentation_preserved(preserve_complete_presentation)
+                    .with_navigation_ladder_baseline(navigation_ladder_baseline),
+                )
             } else {
                 None
             };
 
             let mut cross_sections = Vec::new();
-            if cross_plan_required && four_panel {
-                for (scope, panel) in cross_section_scopes() {
-                    let surface = self.render_coordination.surface(panel.presentation_slot());
-                    let (Some(presentation), Some(extent)) =
-                        (surface.presentation_viewport(), surface.render_viewport())
-                    else {
+            if cross_plan_required.any() && four_panel {
+                let mut ordered_panels = cross_section_scopes().collect::<Vec<_>>();
+                if let Some(RenderIntentTarget::CrossSection(active)) = active_target {
+                    let active = PanelId::from_application_panel(active);
+                    ordered_panels.sort_by_key(|(_, panel)| usize::from(*panel != active));
+                }
+                for (scope, panel) in ordered_panels {
+                    if !cross_plan_required.contains(panel) {
+                        continue;
+                    }
+                    let panel_signature = planning_signature.cross_sections.panel(panel);
+                    let (Some(presentation), Some(extent)) = (
+                        panel_signature.presentation_viewport,
+                        panel_signature.render_extent,
+                    ) else {
                         continue;
                     };
                     #[cfg(test)]
@@ -938,12 +2092,8 @@ impl MiranteWorkbenchApp {
                         panel,
                         presentation,
                         extent,
-                        DatasetDemandPlanLimits::new(
-                            SEMANTIC_PLAN_CANDIDATES_PER_LAYER,
-                            budget_share_usize(PRODUCT_RENDER_RESOURCE_LIMIT, 1, demand_cohorts),
-                            budget_share_u64(gpu_payload_capacity, 1, demand_cohorts),
-                        ),
-                        scope_baseline(&self.dataset, &self.prepared_scope_render_plans, scope),
+                        global_demand_limits,
+                        scope_baseline(&self.dataset, scope),
                     ));
                 }
             }
@@ -955,59 +2105,64 @@ impl MiranteWorkbenchApp {
                         self.dataset.scope_prepared_body_handle(SCOPE_PLAYBACK),
                         self.dataset.scope_prepared_body_handle(SCOPE_ANALYSIS),
                     ];
-                    if !cross_plan_required {
-                        bodies.extend(
-                            cross_section_scopes()
-                                .map(|(scope, _)| self.dataset.scope_prepared_body_handle(scope)),
-                        );
+                    for (scope, panel) in cross_section_scopes() {
+                        if !cross_plan_required.contains(panel) {
+                            bodies.push(self.dataset.scope_prepared_body_handle(scope));
+                        }
                     }
                     bodies
                 });
+            let cross_section_plan_count = u64::try_from(cross_sections.len()).unwrap_or(u64::MAX);
+            let renderer_requirement_base = self.dataset.renderer_requirement_handle();
             let request = CameraDemandRequest::new(
+                intent_revision,
                 Arc::clone(snapshot.catalog()),
                 self.dataset.cpu_ledger_arc(),
                 view.clone(),
+                global_demand_limits,
                 current_3d,
                 cross_sections,
-                self.dataset.renderer_requirement_handle(),
+                renderer_requirement_base.clone(),
                 unchanged_bodies,
                 promotion_bodies,
+            )
+            .with_previous_renderer_requirement_union_preserved(
+                preserve_previous_renderer_requirement_union,
             );
-            let generation = match self.camera_demand_planner.submit(request) {
-                Ok(generation) => generation,
-                Err(error) => {
-                    let signature = VisibleDemandFailureSignature::new(
-                        planning_signature.clone(),
-                        current_plan_required,
-                        cross_plan_required,
-                        union_plan_required,
-                        unchanged_scope_handles,
-                        cpu_capacity_epoch,
-                        self.viewer_runtime_recovery_epoch,
-                    );
-                    self.visible_demand_failure_latch =
-                        Some(DeterministicFailureLatch::new(signature));
-                    self.dataset.record_plan_error(error.to_string());
-                    self.render_coordination.frame_fidelity.completeness =
-                        FrameCompleteness::Incomplete;
-                    return VisibleBrickRequestOutcome::default();
-                }
-            };
+            if !self.dataset.submit_visible_demand_plan(request) {
+                self.dataset.record_plan_error(
+                    "visible-demand planning received a stale render-intent revision",
+                );
+                self.render_coordination.frame_fidelity.completeness =
+                    FrameCompleteness::Incomplete;
+                return VisibleBrickRequestOutcome::default();
+            }
+            self.resident_plane_async_plan_submissions = self
+                .resident_plane_async_plan_submissions
+                .saturating_add(cross_section_plan_count);
             self.pending_visible_demand_plan = Some(PendingVisibleDemandPlan {
-                generation,
+                revision: intent_revision,
+                planning: planning_signature.clone(),
                 current_3d: current_plan_required.then(|| planning_signature.current_3d.clone()),
                 cross_sections: cross_plan_required
-                    .then(|| planning_signature.cross_sections.clone()),
+                    .any()
+                    .then(|| PendingCrossSectionDemandPlan {
+                        target: planning_signature.cross_sections.clone(),
+                        panels: cross_plan_required,
+                        exact: !matches!(active_target, Some(RenderIntentTarget::CrossSection(_))),
+                    }),
                 union_plan_required,
                 preserve_complete_presentation,
                 unchanged_scope_handles,
+                renderer_requirement_base,
                 cpu_capacity_epoch,
-                runtime_recovery_epoch: self.viewer_runtime_recovery_epoch,
+                dataset_runtime_epoch: self.dataset_runtime_epoch,
             });
         }
 
         let mut pumped = self.pump_unchanged_visible_demand();
         pumped.current_plan_installed |= accepted.current_plan_installed;
+        pumped.cross_section_plan_installed |= accepted.cross_section_plan_installed;
         pumped.current_changed |= accepted.current_changed;
         if self.pending_current_3d_demand() {
             self.render_coordination.frame_fidelity.completeness = FrameCompleteness::Loading;
@@ -1033,16 +2188,17 @@ impl MiranteWorkbenchApp {
             current_3d,
             cross_sections,
             renderer_requirement_update,
+            renderer_requirement_payload_bytes,
             post_refinement_promotion_update,
             candidates_visited,
         } = prepared;
+        let previous_plan_error = self.dataset.last_plan_error().map(str::to_owned);
         if current_3d.is_some() != pending.current_3d.is_some() {
             anyhow::bail!("prepared 3D scope set does not match its pending transaction");
         }
         if pending.cross_sections.is_none() && !cross_sections.is_empty() {
             anyhow::bail!("prepared cross-section scope set was not requested");
         }
-
         // Build and validate the complete transaction before the first scope
         // map changes. Everything below the preflight block is infallible.
         let four_panel = pending
@@ -1051,72 +2207,111 @@ impl MiranteWorkbenchApp {
             .is_some_and(|signature| signature.layout == ViewerLayout::FourPanel);
         let current_install = current_3d
             .map(|current| {
-                let target_scale = current.plan.target.scale;
-                let target_playback_downshifted = current.plan.target.playback_downshifted;
-                let target_visible_count = current.plan.target.primary_resource_count;
-                let reuse_envelope = current.plan.reuse_envelope.clone();
-                let playback_layer_scales = current.plan.target.layer_scales.clone();
-                let current_accounting = if current.current.render_requirements.is_some() {
-                    if current.refinement.render_requirements.is_some() {
-                        current.plan.coarse.as_ref()
+                let PreparedCurrent3dDemand {
+                    plan,
+                    current,
+                    refinement,
+                    playback,
+                    navigation_ladder,
+                } = current;
+                let ideal_scale = plan.ideal_scale;
+                let target_scale = plan.target.scale;
+                let adaptive_capacity_limited = plan.target.layer_scales != plan.ideal_layer_scales;
+                let target_playback_downshifted = plan.target.playback_downshifted;
+                let target_visible_count = plan.target.primary_resource_count;
+                let reuse_envelope = plan.reuse_envelope.clone();
+                let playback_layer_scales = plan.target.layer_scales.clone();
+                let current_plan = if current.render_requirements.is_some() {
+                    if refinement.render_requirements.is_some() {
+                        plan.coarse.as_ref()
                     } else {
-                        Some(&current.plan.target)
+                        Some(&plan.target)
                     }
                 } else {
                     None
-                }
-                .map(|plan| (plan.payload_bytes, plan.primary_resource_count));
-                let refinement_accounting =
-                    current.refinement.render_requirements.is_some().then_some((
-                        current.plan.target.payload_bytes,
-                        current.plan.target.primary_resource_count,
-                    ));
-                let current_render = match (
-                    current.current.render_requirements,
-                    current.current.static_layout,
-                ) {
-                    (Some(requirements), Some(static_layout)) => Some(PreparedScopeRenderPlan {
-                        requirements,
-                        static_layout,
-                        planned_payload_bytes: current_accounting
-                            .expect("a current render owns plan accounting")
-                            .0,
-                        primary_resource_count: current_accounting
-                            .expect("a current render owns plan accounting")
-                            .1,
-                    }),
-                    (None, None) => None,
-                    _ => anyhow::bail!("prepared current render artifacts are incomplete"),
                 };
-                let refinement_render = match (
-                    current.refinement.render_requirements,
-                    current.refinement.static_layout,
-                ) {
-                    (Some(requirements), Some(static_layout)) => Some(PreparedScopeRenderPlan {
-                        requirements,
-                        static_layout,
-                        planned_payload_bytes: refinement_accounting
-                            .expect("a refinement render owns target accounting")
-                            .0,
-                        primary_resource_count: refinement_accounting
-                            .expect("a refinement render owns target accounting")
-                            .1,
-                    }),
-                    (None, None) => None,
-                    _ => anyhow::bail!("prepared refinement render artifacts are incomplete"),
-                };
-                if current.playback.render_requirements.is_some()
-                    || current.playback.static_layout.is_some()
-                {
+                let current_accounting =
+                    current_plan.map(|plan| (plan.payload_bytes, plan.primary_resource_count));
+                let current_layer_scales =
+                    current_plan.map(|plan| Arc::new(plan.layer_scales.clone()));
+                let refinement_accounting = refinement.render_requirements.is_some().then_some((
+                    plan.target.payload_bytes,
+                    plan.target.primary_resource_count,
+                ));
+                let current_scope_requirements = Arc::clone(current.requirements.canonical());
+                let refinement_scope_requirements = Arc::clone(refinement.requirements.canonical());
+                let current_render =
+                    current
+                        .render_requirements
+                        .map(|requirements| PreparedScopeRenderPlan {
+                            selection_required_prefix_len: requirements.first_useful_prefix_len(),
+                            selection_body: requirements.body().clone(),
+                            requirements,
+                            scope_requirements: Arc::clone(&current_scope_requirements),
+                            layer_scales: current_layer_scales
+                                .expect("a current render owns selected layer scales"),
+                            render_payload_bytes: current
+                                .render_payload_bytes
+                                .expect("a current render owns exact payload accounting"),
+                            planned_payload_bytes: current_accounting
+                                .expect("a current render owns plan accounting")
+                                .0,
+                            primary_resource_count: current_accounting
+                                .expect("a current render owns plan accounting")
+                                .1,
+                            plane_reuse_envelope: None,
+                        });
+                let refinement_render =
+                    refinement
+                        .render_requirements
+                        .map(|requirements| PreparedScopeRenderPlan {
+                            selection_required_prefix_len: requirements.first_useful_prefix_len(),
+                            selection_body: requirements.body().clone(),
+                            requirements,
+                            scope_requirements: refinement_scope_requirements,
+                            layer_scales: Arc::new(plan.target.layer_scales.clone()),
+                            render_payload_bytes: refinement
+                                .render_payload_bytes
+                                .expect("a refinement render owns exact payload accounting"),
+                            planned_payload_bytes: refinement_accounting
+                                .expect("a refinement render owns target accounting")
+                                .0,
+                            primary_resource_count: refinement_accounting
+                                .expect("a refinement render owns target accounting")
+                                .1,
+                            plane_reuse_envelope: None,
+                        });
+                if playback.render_requirements.is_some() {
                     anyhow::bail!("prepared playback scope unexpectedly owns render artifacts");
                 }
+                let navigation_render_plans = navigation_ladder
+                    .candidates
+                    .into_iter()
+                    .map(|candidate| PreparedScopeRenderPlan {
+                        selection_required_prefix_len: candidate.selection_body.ranked().len(),
+                        selection_body: candidate.selection_body,
+                        requirements: candidate.render_requirements,
+                        scope_requirements: Arc::clone(&current_scope_requirements),
+                        layer_scales: Arc::new(candidate.layer_scales),
+                        render_payload_bytes: candidate.planned_payload_bytes,
+                        planned_payload_bytes: candidate.planned_payload_bytes,
+                        primary_resource_count: candidate.resource_count,
+                        plane_reuse_envelope: None,
+                    })
+                    .collect::<Vec<_>>();
+                if navigation_render_plans.is_empty() {
+                    anyhow::bail!("prepared 3D navigation ladder is empty");
+                }
                 Ok::<_, anyhow::Error>((
-                    current.plan,
-                    current.playback.requirements,
+                    plan,
+                    playback.requirements,
                     playback_layer_scales,
                     current_render,
                     refinement_render,
+                    navigation_render_plans,
+                    ideal_scale,
                     target_scale,
+                    adaptive_capacity_limited,
                     target_playback_downshifted,
                     target_visible_count,
                     reuse_envelope,
@@ -1126,22 +2321,43 @@ impl MiranteWorkbenchApp {
 
         let mut installed_panels = std::collections::BTreeSet::new();
         let mut cross_installs = Vec::with_capacity(cross_sections.len());
-        if pending.cross_sections.is_some() {
+        if let Some(pending_cross) = pending.cross_sections.as_ref() {
             for cross in cross_sections {
+                if !pending_cross.panels.contains(cross.panel) {
+                    anyhow::bail!(
+                        "prepared cross-section transaction contains an unrequested panel"
+                    );
+                }
                 if !installed_panels.insert(cross.panel) {
                     anyhow::bail!("prepared cross-section transaction contains a duplicate panel");
                 }
+                let render_plan = match cross.render_requirements {
+                    Some(requirements) => Some(PreparedScopeRenderPlan {
+                        selection_required_prefix_len: requirements.first_useful_prefix_len(),
+                        selection_body: requirements.body().clone(),
+                        requirements,
+                        scope_requirements: Arc::clone(cross.plan.requirements.canonical()),
+                        layer_scales: Arc::new(cross.plan.layer_scales.clone()),
+                        render_payload_bytes: cross
+                            .render_payload_bytes
+                            .expect("a cross-section render owns exact payload accounting"),
+                        planned_payload_bytes: cross.plan.payload_bytes,
+                        primary_resource_count: cross.plan.primary_resource_count,
+                        plane_reuse_envelope: cross.reuse_envelope,
+                    }),
+                    None if cross.plan.requirements.canonical().is_empty() => None,
+                    None => {
+                        anyhow::bail!(
+                            "a non-empty prepared cross section omitted render requirements"
+                        )
+                    }
+                };
                 cross_installs.push((
                     cross_section_scope_id(cross.panel),
                     cross.panel,
                     cross.plan.requirements,
                     cross.plan.layer_scales,
-                    PreparedScopeRenderPlan {
-                        requirements: cross.render_requirements,
-                        static_layout: cross.static_layout,
-                        planned_payload_bytes: cross.plan.payload_bytes,
-                        primary_resource_count: cross.plan.primary_resource_count,
-                    },
+                    render_plan,
                 ));
             }
         }
@@ -1153,23 +2369,25 @@ impl MiranteWorkbenchApp {
                     next.current_3d = current.clone();
                 }
                 if let Some(cross) = pending.cross_sections.as_ref() {
-                    next.cross_sections = cross.clone();
+                    if !next.cross_sections.same_common_demand(&cross.target) {
+                        debug_assert_eq!(cross.panels, CrossSectionPlanMask::ALL);
+                        next.cross_sections = cross.target.clone();
+                    } else {
+                        for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
+                            if cross.panels.contains(panel) {
+                                *next.cross_sections.panel_mut(panel) =
+                                    cross.target.panel(panel).clone();
+                            }
+                        }
+                    }
                 }
                 next
             }
-            None => VisibleDemandPlanningSignature {
-                current_3d: pending
-                    .current_3d
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("initial demand result omitted 3D identity"))?,
-                cross_sections: pending.cross_sections.clone().ok_or_else(|| {
-                    anyhow::anyhow!("initial demand result omitted cross-section identity")
-                })?,
-            },
+            None => pending.planning.clone(),
         };
 
         let mut scope_targets = ScopeReconciliationTargets::default();
-        if let Some((plan, playback, _, _, _, _, _, _, _)) = current_install.as_ref() {
+        if let Some((plan, playback, _, _, _, _, _, _, _, _, _, _)) = current_install.as_ref() {
             self.dataset.prepare_progressive_current_scope_targets(
                 plan,
                 four_panel,
@@ -1181,9 +2399,9 @@ impl MiranteWorkbenchApp {
         for (scope, _, requirements, _, _) in &cross_installs {
             scope_targets.replace(*scope, requirements);
         }
-        if pending.cross_sections.is_some() {
+        if let Some(pending_cross) = pending.cross_sections.as_ref() {
             for (scope, panel) in cross_section_scopes() {
-                if !installed_panels.contains(&panel) {
+                if pending_cross.panels.contains(panel) && !installed_panels.contains(&panel) {
                     scope_targets.remove(scope);
                 }
             }
@@ -1193,6 +2411,25 @@ impl MiranteWorkbenchApp {
                 &renderer_requirement_update.previous.requirements,
                 &renderer_requirement_update.next.requirements,
             )?;
+        if let Some(product) = self.native_presentation.product_gpu.as_mut() {
+            let snapshot = self.application.snapshot();
+            match product.renderer.ensure_global_requirement_union(
+                snapshot.catalog(),
+                &renderer_requirement_update.next.requirements,
+            ) {
+                Ok(()) => {}
+                Err(error) => {
+                    if let Some(placement) = PayloadPlacementFacts::from_runtime_error(error) {
+                        return Err(anyhow::Error::new(VisibleDemandPlaceabilityRetry {
+                            target_group: pending.target_group(),
+                            failed_union_payload_bytes: renderer_requirement_payload_bytes,
+                            placement,
+                        }));
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
         if let Some(promotion) = post_refinement_promotion_update.as_ref() {
             if !Arc::ptr_eq(
                 &promotion.previous.requirements,
@@ -1221,7 +2458,10 @@ impl MiranteWorkbenchApp {
             playback_layer_scales,
             current_render,
             refinement_render,
+            navigation_render_plans,
+            ideal_scale,
             target_scale,
+            adaptive_capacity_limited,
             target_playback_downshifted,
             target_visible_count,
             reuse_envelope,
@@ -1237,20 +2477,38 @@ impl MiranteWorkbenchApp {
                 playback,
                 playback_layer_scales,
             );
-            install_scope_render_plan(
-                &mut self.prepared_scope_render_plans,
-                SCOPE_CURRENT_3D,
-                current_render,
-            );
+            if !pending.preserve_complete_presentation {
+                install_scope_render_plan(
+                    &mut self.prepared_scope_render_plans,
+                    SCOPE_CURRENT_3D,
+                    current_render,
+                );
+            }
             install_scope_render_plan(
                 &mut self.prepared_scope_render_plans,
                 SCOPE_CURRENT_3D_REFINEMENT,
                 refinement_render,
             );
+            if pending.preserve_complete_presentation {
+                debug_assert!(
+                    !self.navigation_render_plans.is_empty(),
+                    "preserving a complete presentation requires its installed navigation ladder"
+                );
+            } else {
+                self.navigation_render_plans = navigation_render_plans;
+            }
+            self.render_coordination.frame_fidelity.ideal_scale_level = ideal_scale.get();
             self.render_coordination.frame_fidelity.target_scale_level = target_scale.get();
+            self.render_coordination
+                .frame_fidelity
+                .adaptive_capacity_limited = adaptive_capacity_limited;
+            self.render_coordination.frame_fidelity.refinement_pending =
+                self.dataset.staging_current_refinement();
             self.render_coordination.frame_fidelity.visible_bricks = target_visible_count;
             self.current_camera_reuse_envelope = reuse_envelope;
-            self.render_coordination.frame_fidelity.reason = if target_playback_downshifted {
+            self.render_coordination.frame_fidelity.reason = if adaptive_capacity_limited {
+                LodDecisionReason::AdaptiveCapacity
+            } else if target_playback_downshifted {
                 LodDecisionReason::PlaybackDownshift
             } else if target_scale == mirante4d_domain::ScaleLevel::BASE {
                 LodDecisionReason::ExactS0
@@ -1259,27 +2517,44 @@ impl MiranteWorkbenchApp {
             };
         }
 
-        let mut cross_changed = false;
-        if pending.cross_sections.is_some() {
-            for (scope, _, requirements, layer_scales, render_plan) in cross_installs {
-                cross_changed |= self.dataset.commit_preflighted_scope_replacement(
+        if let Some(pending_cross) = pending.cross_sections.as_ref() {
+            for (scope, panel, requirements, layer_scales, render_plan) in cross_installs {
+                let guarded = render_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.plane_reuse_envelope.is_some());
+                if guarded {
+                    self.resident_plane_guard_body_installs =
+                        self.resident_plane_guard_body_installs.saturating_add(1);
+                } else {
+                    self.resident_plane_exact_body_installs =
+                        self.resident_plane_exact_body_installs.saturating_add(1);
+                }
+                self.dataset.commit_preflighted_scope_replacement(
                     scope,
                     requirements,
                     layer_scales,
                 );
-                self.prepared_scope_render_plans.insert(scope, render_plan);
+                install_scope_render_plan(
+                    &mut self.prepared_scope_render_plans,
+                    scope,
+                    render_plan,
+                );
+                let exact_body = pending_cross.exact.then(|| {
+                    self.installed_cross_section_exact_body_candidate(panel)
+                        .expect("an exact linked install binds its committed immutable body")
+                });
+                self.installed_cross_section_exact_bodies[cross_section_panel_index(panel)] =
+                    exact_body;
             }
             for (scope, panel) in cross_section_scopes() {
-                if !installed_panels.contains(&panel) {
-                    cross_changed |= self.dataset.commit_preflighted_scope_removal(scope);
+                if pending_cross.panels.contains(panel) && !installed_panels.contains(&panel) {
+                    self.dataset.commit_preflighted_scope_removal(scope);
                     self.prepared_scope_render_plans.remove(&scope);
+                    self.installed_cross_section_exact_bodies[cross_section_panel_index(panel)] =
+                        None;
                 }
             }
-            if cross_changed {
-                self.render_coordination.invalidate_cross_sections();
-            }
         }
-
         let crate::camera_demand_cache::PreparedRendererRequirementUpdate {
             previous,
             next,
@@ -1292,17 +2567,59 @@ impl MiranteWorkbenchApp {
             &removals,
             next.charge,
         );
+        if let Some(product) = self.native_presentation.product_gpu.as_mut() {
+            product.renderer.retire_residency_offers(&removals);
+        }
         self.staged_post_promotion_renderer_update = if self.dataset.staging_current_refinement() {
             post_refinement_promotion_update
         } else {
             None
         };
+        if let Some(cross) = pending.cross_sections.as_ref() {
+            self.resident_cross_section_coverage =
+                (!cross.exact).then(|| ResidentCrossSectionCoverage {
+                    revision: pending.revision,
+                    cross_sections: cross.target.clone(),
+                    exact_guard_reuse: false,
+                    rolling_replan: false,
+                    planning_required: false,
+                });
+        }
         self.visible_demand_planning_signature = Some(next_signature);
+        self.visible_demand_placeability_limit = None;
+        self.dataset.clear_plan_error();
+        if previous_plan_error.as_deref().is_some_and(|previous| {
+            self.render_coordination
+                .frame_fidelity
+                .last_capacity_error
+                .as_deref()
+                == Some(previous)
+        }) {
+            self.render_coordination.frame_fidelity.last_failure_kind = None;
+            self.render_coordination.frame_fidelity.last_capacity_error = None;
+        }
         if current_changed {
             self.progressive_display_pacer.reset();
         }
+        if pending.cross_sections.is_some()
+            && [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+                .into_iter()
+                .any(|panel| {
+                    self.render_coordination
+                        .surface(panel.presentation_slot())
+                        .display_current()
+                })
+        {
+            // A cold transient keeps the prior pixels visible while its
+            // latest-only plan is prepared. The atomic plan cutover is the
+            // first point at which those pixels become semantically stale.
+            // Durable view changes already invalidate the linked generation,
+            // so avoid manufacturing a second generation in that case.
+            self.render_coordination.invalidate_cross_sections();
+        }
         Ok(VisibleBrickRequestOutcome {
             current_plan_installed,
+            cross_section_plan_installed: pending.cross_sections.is_some(),
             current_changed,
             resident_changed: false,
             current_frame_ready: false,
@@ -1312,6 +2629,7 @@ impl MiranteWorkbenchApp {
     pub(crate) fn drain_brick_results(&mut self, ctx: &egui::Context) {
         let started = Instant::now();
         let mut current_plan_installed = false;
+        let mut cross_section_plan_installed = false;
         let snapshot = self.application.snapshot();
         if !self.dataset.source_quarantined()
             && self.dataset.resource_identity() == snapshot.catalog().resource_identity()
@@ -1321,6 +2639,7 @@ impl MiranteWorkbenchApp {
             // progressing even when no display refresh was otherwise due.
             let visible = self.request_visible_bricks();
             current_plan_installed = visible.current_plan_installed;
+            cross_section_plan_installed = visible.cross_section_plan_installed;
         }
         let snapshot = self.application.snapshot();
         if self.dataset.source_quarantined()
@@ -1361,7 +2680,7 @@ impl MiranteWorkbenchApp {
         let (dataset, analysis, native_presentation) = (
             &mut self.dataset,
             &mut self.analysis_runtime,
-            &self.native_presentation,
+            &mut self.native_presentation,
         );
         let mut analysis_events = Vec::new();
         let mut analysis_errors = Vec::new();
@@ -1394,7 +2713,19 @@ impl MiranteWorkbenchApp {
                 }
             };
             drained = drained.saturating_add(batch_drained);
-            native_presentation.dirty_progressive_lease_probes_for_keys(batch_installed.keys());
+            if !batch_installed.leases().is_empty()
+                && let Some(product) = native_presentation.product_gpu.as_mut()
+                && let Err(error) = product
+                    .renderer
+                    .offer_residency_leases(batch_installed.leases())
+            {
+                tracing::error!(%error, "renderer rejected a CPU completion lease batch");
+                drain_fault = Some((
+                    RuntimeFault::new(RuntimeFaultCode::InvariantViolation),
+                    dataset.deferred_refill_preserves_presentation(),
+                ));
+                break;
+            }
             installed_current |= batch_installed.in_scope(SCOPE_CURRENT_3D);
             installed_any |= batch_installed.any();
             if dataset.dispatcher().admission_blocked() {
@@ -1445,7 +2776,7 @@ impl MiranteWorkbenchApp {
             let preserve_presentation = self.dataset.deferred_refill_preserves_presentation();
             match pump_interactive_admission_with_renderer(
                 &mut self.dataset,
-                &self.native_presentation,
+                &mut self.native_presentation,
             ) {
                 Ok(_) => self.dataset.finish_deferred_refill_if_unblocked(),
                 Err(fault) => {
@@ -1497,15 +2828,14 @@ impl MiranteWorkbenchApp {
         // not "ready" while the new cohort lives in the refinement scope; this
         // wake is what enters the hidden render and atomic-promotion path.
         let complete_refresh = current_plan_installed
+            || cross_section_plan_installed
             || completion_drain_needs_display_refresh(
                 promoted_current || complete_current_cohort_installed,
             );
         let complete_presentation_held = self
-            .native_presentation
-            .product_gpu
-            .as_ref()
-            .and_then(|product| product.targets.get(&PanelId::ThreeD))
-            .and_then(|target| target.presented.as_ref())
+            .render_coordination
+            .surface(PresentationSlot::ThreeD)
+            .presented_frame()
             .is_some_and(|frame| {
                 frame.progress().completeness()
                     != mirante4d_render_api::FrameCompleteness::Progressive
@@ -1569,6 +2899,18 @@ impl MiranteWorkbenchApp {
         // CPU ledger diagnostics are collected lazily by diagnostics and
         // automation surfaces, never by the interactive demand pump.
         let empty = self.dataset.scope_is_empty(SCOPE_CURRENT_3D);
+        self.render_coordination.frame_fidelity.ideal_scale_level =
+            self.dataset.current_ideal_scale().get();
+        self.render_coordination
+            .frame_fidelity
+            .adaptive_capacity_limited = self.dataset.current_capacity_constrained();
+        self.render_coordination.frame_fidelity.refinement_pending =
+            self.dataset.staging_current_refinement();
+        let presented_completeness = self
+            .render_coordination
+            .surface(PresentationSlot::ThreeD)
+            .presented_frame()
+            .map(|frame| frame.progress().completeness());
         let ready_backend = ready.then(|| {
             let snapshot = self.application.snapshot();
             let view = application_view(&snapshot);
@@ -1579,11 +2921,14 @@ impl MiranteWorkbenchApp {
                 .mode();
             render_backend_for_mode(mode)
         });
-        self.render_coordination.frame_fidelity.completeness = if empty || ready {
-            FrameCompleteness::Complete
-        } else {
-            FrameCompleteness::Loading
-        };
+        self.render_coordination.frame_fidelity.completeness = dataset_fidelity_completeness(
+            empty,
+            self.render_coordination
+                .frame_fidelity
+                .displayed_scale_level,
+            self.render_coordination.frame_fidelity.display_freshness,
+            presented_completeness,
+        );
         self.render_coordination.frame_fidelity.backend = if empty {
             RenderBackend::Empty
         } else if let Some(backend) = ready_backend {
@@ -1591,11 +2936,10 @@ impl MiranteWorkbenchApp {
         } else {
             RenderBackend::Loading
         };
-        self.render_coordination
-            .frame_fidelity
-            .displayed_scale_level = (empty || ready).then_some(self.dataset.current_scale().get());
         if empty {
             self.render_coordination.frame_fidelity.reason = LodDecisionReason::NoVisibleData;
+        } else if ready && self.dataset.current_capacity_constrained() {
+            self.render_coordination.frame_fidelity.reason = LodDecisionReason::AdaptiveCapacity;
         }
     }
 
@@ -1658,10 +3002,15 @@ impl MiranteWorkbenchApp {
     }
 
     fn record_dataset_plan_error(&mut self, error: &anyhow::Error) {
+        tracing::warn!(%error, "visible dataset demand planning failed");
         let message = error.to_string();
-        let capacity = error
+        let aggregate_capacity = error
             .downcast_ref::<DatasetDemandPlanCapacityError>()
             .is_some();
+        let physical_capacity = error
+            .downcast_ref::<VisibleDemandMinimumPlacementError>()
+            .is_some();
+        let capacity = aggregate_capacity || physical_capacity;
         self.dataset.record_plan_error(message.clone());
         self.render_coordination.frame_fidelity.last_failure_kind = Some(if capacity {
             FrameFailureKind::BudgetExceeded
@@ -1675,7 +3024,11 @@ impl MiranteWorkbenchApp {
             FrameCompleteness::Incomplete
         };
         self.render_coordination.frame_fidelity.reason = if capacity {
-            LodDecisionReason::CpuBudgetLimited
+            if physical_capacity {
+                LodDecisionReason::GpuBudgetLimited
+            } else {
+                LodDecisionReason::CpuBudgetLimited
+            }
         } else {
             LodDecisionReason::BackendLimit
         };
@@ -1696,18 +3049,40 @@ pub(crate) const fn runtime_fault_invalidates_verified_source(code: RuntimeFault
     )
 }
 
-fn scope_baseline(
-    dataset: &DatasetDemandState,
-    render_plans: &std::collections::BTreeMap<u64, PreparedScopeRenderPlan>,
-    scope: u64,
-) -> ScopeDemandBaseline {
+fn scope_baseline(dataset: &DatasetDemandState, scope: u64) -> ScopeDemandBaseline {
     let body = dataset.scope_prepared_body_handle(scope);
-    let static_layout = render_plans
-        .get(&scope)
-        .filter(|plan| plan.requirements.body().shares_storage_with(&body))
-        .map(|plan| plan.static_layout.clone());
     ScopeDemandBaseline::new(body, dataset.scope_admitted_prefix_len(scope))
-        .with_static_layout(static_layout)
+}
+
+fn installed_navigation_ladder_baseline(
+    dataset: &DatasetDemandState,
+    navigation_ladder: &[PreparedScopeRenderPlan],
+) -> Option<NavigationLadderBaseline> {
+    if navigation_ladder.is_empty() {
+        return None;
+    }
+    if !dataset.scope_is_installed(SCOPE_CURRENT_3D) {
+        return None;
+    }
+    let installed = dataset.scope_prepared_body_handle(SCOPE_CURRENT_3D);
+    if navigation_ladder
+        .iter()
+        .any(|candidate| !Arc::ptr_eq(&candidate.scope_requirements, installed.canonical()))
+    {
+        return None;
+    }
+    Some(NavigationLadderBaseline::new(
+        navigation_ladder
+            .iter()
+            .map(|candidate| {
+                NavigationCandidateBaseline::new(
+                    candidate.selection_body.clone(),
+                    Arc::clone(&candidate.layer_scales),
+                    candidate.planned_payload_bytes,
+                )
+            })
+            .collect(),
+    ))
 }
 
 fn unchanged_scope_handles_are_current(
@@ -1717,22 +3092,51 @@ fn unchanged_scope_handles_are_current(
     scope_handles_are_current(dataset, &pending.unchanged_scope_handles)
 }
 
+fn renderer_requirement_base_is_current(
+    dataset: &DatasetDemandState,
+    expected: &RetainedRequirementHandle,
+) -> bool {
+    let current = dataset.renderer_requirement_handle();
+    Arc::ptr_eq(&current.requirements, &expected.requirements)
+}
+
 fn visible_demand_failure_signature(
     planning: VisibleDemandPlanningSignature,
     pending: PendingVisibleDemandPlan,
 ) -> VisibleDemandFailureSignature {
     VisibleDemandFailureSignature::new(
+        pending.revision,
         planning,
         pending.current_3d.is_some(),
-        pending.cross_sections.is_some(),
+        pending
+            .cross_sections
+            .as_ref()
+            .map_or_else(CrossSectionPlanMask::default, |cross| cross.panels),
         pending.union_plan_required,
         pending.unchanged_scope_handles,
+        pending.renderer_requirement_base,
         pending.cpu_capacity_epoch,
-        pending.runtime_recovery_epoch,
+        pending.dataset_runtime_epoch,
     )
 }
 
 fn visible_demand_failure_is_deterministic(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<VisibleDemandPlaceabilityRetry>()
+        .is_some()
+        || error
+            .downcast_ref::<mirante4d_render_wgpu::WgpuRenderRuntimeError>()
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    mirante4d_render_wgpu::WgpuRenderRuntimeError::PayloadPlacementUnavailable {
+                        ..
+                    } | mirante4d_render_wgpu::WgpuRenderRuntimeError::PayloadRecoveryDeferred
+                )
+            })
+    {
+        return false;
+    }
     if error
         .downcast_ref::<CpuLedgerError>()
         .is_some_and(|error| matches!(error, CpuLedgerError::ShuttingDown))
@@ -1750,9 +3154,20 @@ fn visible_demand_failure_is_deterministic(error: &anyhow::Error) -> bool {
     })
 }
 
+fn visible_demand_failure_is_recovery_backpressure(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<mirante4d_render_wgpu::WgpuRenderRuntimeError>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                mirante4d_render_wgpu::WgpuRenderRuntimeError::PayloadRecoveryDeferred
+            )
+        })
+}
+
 fn scope_handles_are_current(
     dataset: &DatasetDemandState,
-    handles: &[(u64, Arc<[mirante4d_dataset::DatasetResourceKey]>)],
+    handles: &[(u64, Arc<[mirante4d_dataset::BrickKey]>)],
 ) -> bool {
     handles
         .iter()
@@ -1766,6 +3181,35 @@ fn cross_section_scopes() -> std::array::IntoIter<(u64, PanelId), 3> {
         (SCOPE_CROSS_SECTION_YZ, PanelId::Yz),
     ]
     .into_iter()
+}
+
+fn cross_section_panel_index(panel: PanelId) -> usize {
+    match panel {
+        PanelId::Xy => 0,
+        PanelId::Xz => 1,
+        PanelId::Yz => 2,
+        PanelId::ThreeD => unreachable!("the 3D panel has no cross-section demand index"),
+    }
+}
+
+fn pending_cross_sections_match(
+    pending: Option<&PendingCrossSectionDemandPlan>,
+    target: &CrossSectionDemandPlanningSignature,
+    panels: CrossSectionPlanMask,
+) -> bool {
+    match pending {
+        Some(pending) => pending.panels == panels && pending.target == *target,
+        None => !panels.any(),
+    }
+}
+
+fn render_intent_scope(target: RenderIntentTarget) -> u64 {
+    match target {
+        RenderIntentTarget::ThreeD => SCOPE_CURRENT_3D,
+        RenderIntentTarget::CrossSection(panel) => {
+            cross_section_scope_id(PanelId::from_application_panel(panel))
+        }
+    }
 }
 
 fn cross_section_scope_id(panel: PanelId) -> u64 {
@@ -1805,25 +3249,19 @@ fn next_playback_timepoint(
         .then(|| TimeIndex::new((application_view(snapshot).timepoint().get() + 1) % timepoints))
 }
 
-fn budget_share_usize(total: usize, numerator: usize, denominator: usize) -> usize {
-    total.checked_div(denominator).unwrap_or(0) * numerator
-}
-
 const fn completion_drain_needs_display_refresh(presentation_changed: bool) -> bool {
     presentation_changed
-}
-
-fn budget_share_u64(total: u64, numerator: usize, denominator: usize) -> u64 {
-    total.checked_div(denominator as u64).unwrap_or(0) * numerator as u64
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
         collections::BTreeMap,
+        sync::Arc,
         time::{Duration, Instant},
     };
 
+    use mirante4d_application::RenderIntentRevision;
     use mirante4d_dataset::{
         CpuLedgerCategory, CpuLedgerError, DatasetResourceIdentity, DatasetSourceId,
     };
@@ -1832,18 +3270,27 @@ mod tests {
         CameraView, CrossSectionView, LogicalLayerKey, Projection, ScaleLevel, TimeIndex,
         UnitQuaternion, ViewerLayout, WorldPoint3,
     };
-    use mirante4d_render_api::{PresentationViewport, RenderExtent};
+    use mirante4d_render_api::{
+        FrameCoverage, FrameIdentity, FrameProgress, PresentationTarget, PresentationViewport,
+        PresentedFrame, RenderExtent,
+    };
+
+    use crate::retained_leases::RetainedRequirementHandle;
 
     use super::{
-        CrossSectionDemandPlanningSignature, Current3dDemandPlanningSignature,
-        PROGRESSIVE_DISPLAY_REFRESH_INTERVAL, ProgressiveDisplayRefreshPacer, RESULT_DRAIN_BATCH,
-        RESULT_DRAIN_COUNT_ENVELOPE, RESULT_DRAIN_TIME_BUDGET, VisibleDemandFailureSignature,
-        VisibleDemandPlanningSignature, admission_fault_invalidates_presentation,
-        completion_drain_needs_display_refresh, installed_target_layer_scales,
+        CrossSectionDemandPlanningSignature, CrossSectionPanelDemandPlanningSignature,
+        CrossSectionPlanMask, Current3dDemandPlanningSignature,
+        PROGRESSIVE_DISPLAY_REFRESH_INTERVAL, PayloadPlacementFacts,
+        ProgressiveDisplayRefreshPacer, RESULT_DRAIN_BATCH, RESULT_DRAIN_COUNT_ENVELOPE,
+        RESULT_DRAIN_TIME_BUDGET, VisibleDemandFailureSignature, VisibleDemandPlaceabilityLimit,
+        VisibleDemandPlaceabilityRetry, VisibleDemandPlanningSignature,
+        admission_fault_invalidates_presentation, completion_drain_needs_display_refresh,
+        dataset_fidelity_completeness, installed_target_layer_scales,
         installed_visible_demand_plan_currentness, next_completion_drain_batch,
         runtime_fault_invalidates_verified_source, visible_demand_failure_is_deterministic,
+        visible_demand_failure_is_recovery_backpressure,
     };
-    use crate::DeterministicFailureLatch;
+    use crate::{DeterministicFailureLatch, DisplayedFrameFreshness, FrameCompleteness};
 
     fn planning_signature(source_id: u64) -> VisibleDemandPlanningSignature {
         let resource_identity =
@@ -1881,14 +3328,169 @@ mod tests {
                 active_layer,
                 timepoint: TimeIndex::new(0),
                 layout: ViewerLayout::Single3d,
-                cross_section,
                 layers: Box::new([]),
-                presentation_viewports: [None; 3],
-                render_extents: [None; 3],
+                panels: std::array::from_fn(|_| CrossSectionPanelDemandPlanningSignature {
+                    cross_section,
+                    presentation_viewport: None,
+                    render_extent: None,
+                }),
                 playback_active: false,
                 gpu_payload_capacity: 1,
             },
         }
+    }
+
+    #[test]
+    fn ready_dataset_refresh_preserves_current_exact_s0_presented_fidelity() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = crate::tests::write_target_fixture(temp.path()).unwrap();
+        let opened = crate::tests::open_dataset_and_render_first_frame(&package).unwrap();
+        let mut app = crate::tests::test_workbench_app_without_background_runtime(opened);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app
+            .prepared_scope_render_plans
+            .contains_key(&crate::dataset_requests::SCOPE_CURRENT_3D)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the exact S0 demand plan did not become available"
+            );
+            app.request_visible_bricks();
+            std::thread::yield_now();
+        }
+        let context = eframe::egui::Context::default();
+        let refinement_deadline = Instant::now() + Duration::from_secs(5);
+        while app.dataset.staging_current_refinement() {
+            assert!(
+                Instant::now() < refinement_deadline,
+                "the exact S0 demand plan did not become current"
+            );
+            app.drain_brick_results(&context);
+            app.request_visible_bricks();
+            std::thread::yield_now();
+        }
+        assert_eq!(app.dataset.current_scale(), ScaleLevel::BASE);
+
+        let snapshot = app.application.snapshot();
+        let intent = crate::product_render_intent::volume_intent(
+            &snapshot,
+            FrameIdentity::new(17),
+            app.render_coordination.presentation_viewport,
+            app.render_coordination.render_viewport,
+            None,
+        )
+        .unwrap()
+        .expect("the fixture has a visible volume layer");
+        let prepared = app
+            .prepared_scope_render_plans
+            .values()
+            .find(|plan| {
+                plan.requirements
+                    .body()
+                    .canonical()
+                    .iter()
+                    .all(|key| key.scale() == ScaleLevel::BASE)
+            })
+            .expect("the promoted current frame retains its prepared S0 body");
+        let requirements = prepared.requirements.bind(&intent).unwrap();
+        assert!(
+            requirements
+                .resource_keys()
+                .iter()
+                .all(|key| key.scale() == ScaleLevel::BASE),
+            "the regression frame must be an S0 presentation"
+        );
+        let coverage =
+            FrameCoverage::from_available(&requirements, requirements.resource_keys()).unwrap();
+        assert!(coverage.is_full());
+        let progress = FrameProgress::new(
+            coverage,
+            mirante4d_render_api::FrameCompleteness::Exact,
+            None,
+        )
+        .unwrap();
+        let generation = app
+            .render_coordination
+            .surface(PresentationTarget::ThreeD)
+            .generation();
+        let presented = PresentedFrame::new(
+            PresentationTarget::ThreeD,
+            intent.extent(),
+            progress.clone(),
+        );
+        assert!(
+            !app.render_coordination.record_presented_frame(
+                PresentationTarget::ThreeD,
+                generation.saturating_add(1),
+                presented.clone(),
+            ),
+            "a frame built for another surface generation must remain stale"
+        );
+        assert!(
+            !app.render_coordination.record_presented_frame(
+                PresentationTarget::ThreeD,
+                generation,
+                PresentedFrame::new(
+                    PresentationTarget::ThreeD,
+                    RenderExtent::new(
+                        intent.extent().width_pixels() + 1,
+                        intent.extent().height_pixels(),
+                    )
+                    .unwrap(),
+                    progress,
+                ),
+            ),
+            "a frame built for another render extent must remain stale"
+        );
+        assert!(app.render_coordination.record_presented_frame(
+            PresentationTarget::ThreeD,
+            generation,
+            presented,
+        ));
+        app.render_coordination.frame_fidelity.display_freshness = DisplayedFrameFreshness::Current;
+        app.render_coordination.frame_fidelity.displayed_scale_level = Some(0);
+        app.render_coordination.frame_fidelity.completeness = FrameCompleteness::Exact;
+
+        app.update_dataset_fidelity(true);
+
+        assert_eq!(
+            app.render_coordination.frame_fidelity.completeness,
+            FrameCompleteness::Exact,
+            "a dataset-ready refresh must not downgrade the current full Exact S0 frame",
+        );
+        for (displayed, freshness, presented, expected) in [
+            (
+                Some(1),
+                DisplayedFrameFreshness::Current,
+                Some(mirante4d_render_api::FrameCompleteness::Exact),
+                FrameCompleteness::Complete,
+            ),
+            (
+                Some(0),
+                DisplayedFrameFreshness::Stale,
+                Some(mirante4d_render_api::FrameCompleteness::Exact),
+                FrameCompleteness::Complete,
+            ),
+            (
+                Some(0),
+                DisplayedFrameFreshness::Current,
+                Some(mirante4d_render_api::FrameCompleteness::Complete),
+                FrameCompleteness::Complete,
+            ),
+            (
+                None,
+                DisplayedFrameFreshness::Current,
+                None,
+                FrameCompleteness::Loading,
+            ),
+        ] {
+            assert_eq!(
+                dataset_fidelity_completeness(false, displayed, freshness, presented),
+                expected,
+                "dataset readiness must not manufacture unpublished fidelity",
+            );
+        }
+        app.dataset.request_shutdown().unwrap();
     }
 
     #[test]
@@ -1912,37 +3514,54 @@ mod tests {
     }
 
     #[test]
-    fn render_eligibility_requires_the_installed_signature_for_each_view_family() {
+    fn exact_currentness_requires_geometry_and_installed_body_for_each_view_family() {
         let installed = planning_signature(1);
         assert_eq!(
-            installed_visible_demand_plan_currentness(Some(&installed), &installed),
+            installed_visible_demand_plan_currentness(Some(&installed), &installed, [true; 3],),
             super::VisibleDemandPlanCurrentness {
                 current_3d: true,
                 cross_sections: true,
+                cross_section_panels: [true; 3],
             }
         );
         assert_eq!(
-            installed_visible_demand_plan_currentness(None, &installed),
+            installed_visible_demand_plan_currentness(None, &installed, [true; 3]),
             super::VisibleDemandPlanCurrentness::default()
         );
 
         let mut changed_3d = installed.clone();
         changed_3d.current_3d.render_viewport = RenderExtent::new(32, 16).unwrap();
         assert_eq!(
-            installed_visible_demand_plan_currentness(Some(&installed), &changed_3d),
+            installed_visible_demand_plan_currentness(Some(&installed), &changed_3d, [true; 3],),
             super::VisibleDemandPlanCurrentness {
                 current_3d: false,
                 cross_sections: true,
+                cross_section_panels: [true; 3],
             }
         );
 
         let mut changed_cross = installed.clone();
-        changed_cross.cross_sections.render_extents[0] = Some(RenderExtent::new(32, 16).unwrap());
+        changed_cross.cross_sections.panels[0].render_extent =
+            Some(RenderExtent::new(32, 16).unwrap());
         assert_eq!(
-            installed_visible_demand_plan_currentness(Some(&installed), &changed_cross),
+            installed_visible_demand_plan_currentness(Some(&installed), &changed_cross, [true; 3],),
             super::VisibleDemandPlanCurrentness {
                 current_3d: true,
                 cross_sections: false,
+                cross_section_panels: [false, true, true],
+            }
+        );
+
+        assert_eq!(
+            installed_visible_demand_plan_currentness(
+                Some(&installed),
+                &installed,
+                [true, false, true],
+            ),
+            super::VisibleDemandPlanCurrentness {
+                current_3d: true,
+                cross_sections: false,
+                cross_section_panels: [true, false, true],
             }
         );
     }
@@ -1950,13 +3569,28 @@ mod tests {
     #[test]
     fn deterministic_planning_failure_runs_once_until_signature_or_capacity_changes() {
         let planning = planning_signature(1);
+        let revision = RenderIntentRevision::initial();
+        let renderer_requirement_base = RetainedRequirementHandle {
+            requirements: Arc::from([]),
+            charge: None,
+        };
         let mut latch = None;
         let mut attempts = 0_u64;
         for _ in 0..128 {
             let blocked = latch.as_ref().is_some_and(
                 |latch: &DeterministicFailureLatch<VisibleDemandFailureSignature>| {
                     latch.blocks(|failure| {
-                        failure.matches_inputs(&planning, true, false, true, 7, 11, true)
+                        failure.matches_inputs(
+                            revision,
+                            &planning,
+                            true,
+                            CrossSectionPlanMask::default(),
+                            true,
+                            7,
+                            11,
+                            true,
+                            true,
+                        )
                     })
                 },
             );
@@ -1966,11 +3600,13 @@ mod tests {
             attempts = attempts.saturating_add(1);
             latch = Some(DeterministicFailureLatch::new(
                 VisibleDemandFailureSignature::new(
+                    revision,
                     planning.clone(),
                     true,
-                    false,
+                    CrossSectionPlanMask::default(),
                     true,
                     Vec::new(),
+                    renderer_requirement_base.clone(),
                     7,
                     11,
                 ),
@@ -1980,29 +3616,68 @@ mod tests {
 
         let failed = latch.expect("the deterministic failure was latched");
         assert!(!failed.blocks(|failure| failure.matches_inputs(
+            revision,
             &planning_signature(2),
             true,
-            false,
+            CrossSectionPlanMask::default(),
             true,
             7,
             11,
             true,
+            true,
         )));
-        assert!(
-            !failed.blocks(
-                |failure| failure.matches_inputs(&planning, true, false, true, 8, 11, true,)
+        assert!(!failed.blocks(|failure| {
+            failure.matches_inputs(
+                revision,
+                &planning,
+                true,
+                CrossSectionPlanMask::default(),
+                true,
+                8,
+                11,
+                true,
+                true,
             )
-        );
-        assert!(
-            !failed.blocks(
-                |failure| failure.matches_inputs(&planning, true, false, true, 7, 12, true,)
+        }));
+        assert!(!failed.blocks(|failure| {
+            failure.matches_inputs(
+                revision,
+                &planning,
+                true,
+                CrossSectionPlanMask::default(),
+                true,
+                7,
+                12,
+                true,
+                true,
             )
-        );
-        assert!(
-            !failed.blocks(
-                |failure| failure.matches_inputs(&planning, true, false, true, 7, 11, false,)
+        }));
+        assert!(!failed.blocks(|failure| {
+            failure.matches_inputs(
+                revision,
+                &planning,
+                true,
+                CrossSectionPlanMask::default(),
+                true,
+                7,
+                11,
+                false,
+                true,
             )
-        );
+        }));
+        assert!(!failed.blocks(|failure| {
+            failure.matches_inputs(
+                revision,
+                &planning,
+                true,
+                CrossSectionPlanMask::default(),
+                true,
+                7,
+                11,
+                true,
+                false,
+            )
+        }));
     }
 
     #[test]
@@ -2023,6 +3698,143 @@ mod tests {
         assert!(!visible_demand_failure_is_deterministic(
             &anyhow::Error::new(CpuLedgerError::ShuttingDown)
         ));
+        assert!(!visible_demand_failure_is_deterministic(
+            &anyhow::Error::new(VisibleDemandPlaceabilityRetry {
+                target_group: "linked 2D",
+                failed_union_payload_bytes: 1024,
+                placement: PayloadPlacementFacts {
+                    requested_bytes: 256,
+                    total_free_bytes: 512,
+                    largest_contiguous_bytes: 128,
+                },
+            })
+        ));
+        let recovery_backpressure = anyhow::Error::new(
+            mirante4d_render_wgpu::WgpuRenderRuntimeError::PayloadRecoveryDeferred,
+        );
+        assert!(!visible_demand_failure_is_deterministic(
+            &recovery_backpressure
+        ));
+        assert!(visible_demand_failure_is_recovery_backpressure(
+            &recovery_backpressure
+        ));
+    }
+
+    #[test]
+    fn physical_placeability_limit_tightens_monotonically_and_reopens_for_new_input() {
+        let first_planning = planning_signature(17);
+        let second_planning = planning_signature(18);
+        let first_retry = VisibleDemandPlaceabilityRetry {
+            target_group: "linked 2D",
+            failed_union_payload_bytes: 1_000,
+            placement: PayloadPlacementFacts {
+                requested_bytes: 300,
+                total_free_bytes: 800,
+                largest_contiguous_bytes: 200,
+            },
+        };
+        let first =
+            VisibleDemandPlaceabilityLimit::tightened(None, first_planning.clone(), first_retry);
+        assert_eq!(first.max_gpu_payload_bytes, 999);
+        assert!(first.applies_to(&first_planning));
+        assert!(!first.applies_to(&second_planning));
+
+        let second = VisibleDemandPlaceabilityLimit::tightened(
+            Some(&first),
+            first_planning.clone(),
+            VisibleDemandPlaceabilityRetry {
+                failed_union_payload_bytes: 700,
+                ..first_retry
+            },
+        );
+        assert_eq!(second.max_gpu_payload_bytes, 699);
+        assert_eq!(
+            second.terminal_error().to_string(),
+            "linked 2D minimum navigation demand remains physically unplaceable after bounded \
+             compaction: one 300-byte payload requires a contiguous range; 800 bytes are free in \
+             aggregate and the largest contiguous range is 200 bytes"
+        );
+
+        let reopened = VisibleDemandPlaceabilityLimit::tightened(
+            Some(&second),
+            second_planning.clone(),
+            first_retry,
+        );
+        assert_eq!(reopened.max_gpu_payload_bytes, 999);
+        assert!(reopened.applies_to(&second_planning));
+    }
+
+    #[test]
+    fn residual_coordinated_placement_refusal_forces_adaptive_replan_without_red_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = crate::tests::write_target_fixture(temp.path()).unwrap();
+        let opened = crate::tests::open_dataset_and_render_first_frame(&package).unwrap();
+        let mut app = crate::tests::test_workbench_app_without_background_runtime(opened);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.request_visible_bricks();
+            if app.pending_visible_demand_plan.is_none()
+                && app.visible_demand_planning_signature.is_some()
+                && !app
+                    .dataset
+                    .renderer_requirement_handle()
+                    .requirements
+                    .is_empty()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the fixture did not install its initial visible requirement union"
+            );
+            std::thread::yield_now();
+        }
+        let planning = app
+            .visible_demand_planning_signature
+            .clone()
+            .expect("the initial visible plan installed its signature");
+        let failed_union_payload_bytes = app
+            .dataset
+            .renderer_requirement_handle()
+            .requirements
+            .iter()
+            .try_fold(0_u64, |total, key| {
+                let descriptor = app
+                    .application
+                    .snapshot()
+                    .catalog()
+                    .resource_payload_descriptor(*key)
+                    .unwrap();
+                total.checked_add(
+                    mirante4d_render_wgpu::payload_allocation_bytes(descriptor).unwrap(),
+                )
+            })
+            .unwrap();
+        assert_ne!(failed_union_payload_bytes, 0);
+
+        assert!(app.recover_from_coordinated_payload_placement(
+            "linked 2D",
+            mirante4d_render_wgpu::WgpuRenderRuntimeError::PayloadPlacementUnavailable {
+                requested_bytes: 300,
+                total_free_bytes: 800,
+                largest_contiguous_bytes: 200,
+            },
+        ));
+
+        assert!(app.visible_demand_planning_signature.is_none());
+        let limit = app
+            .visible_demand_placeability_limit
+            .as_ref()
+            .expect("the residual refusal installs a monotone selection bound");
+        assert!(limit.applies_to(&planning));
+        assert_eq!(limit.max_gpu_payload_bytes, failed_union_payload_bytes - 1);
+        assert_eq!(app.dataset.last_plan_error(), None);
+        assert_eq!(
+            app.render_coordination.frame_fidelity.last_capacity_error,
+            None
+        );
+        assert!(app.render_coordination.refresh_requested());
+        app.dataset.request_shutdown().unwrap();
     }
 
     #[test]

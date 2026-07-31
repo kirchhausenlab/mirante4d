@@ -430,6 +430,7 @@ pub(super) enum ProductAutomationCommand {
     },
     CopyDiagnostics,
     CaptureScreenshot {
+        target: ProductAutomationPresentationTarget,
         name: Option<String>,
     },
     Assert {
@@ -707,14 +708,25 @@ impl ProductAutomationWaitCondition {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ProductAutomationAssertCondition {
-    NonblankFrame,
+    NonblankPanel {
+        target: ProductAutomationPresentationTarget,
+    },
     NoRenderError,
     FrameFidelity {
         scale_level: u32,
         complete: bool,
+        #[serde(default)]
+        exact: bool,
     },
     RenderMode {
         mode: ProductAutomationRenderMode,
+    },
+    LayerRenderMode {
+        layer_index: usize,
+        mode: ProductAutomationRenderMode,
+    },
+    PickEvidence {
+        policy: ProductAutomationPickPolicy,
     },
     Projection {
         projection: ProductAutomationProjection,
@@ -782,16 +794,18 @@ impl ProductAutomationAssertCondition {
     fn requires_validation_capture(&self) -> bool {
         matches!(
             self,
-            Self::NonblankFrame | Self::FourPanelImagesDistinct { .. }
+            Self::NonblankPanel { .. } | Self::FourPanelImagesDistinct { .. }
         )
     }
 
     pub(super) fn name(&self) -> &'static str {
         match self {
-            Self::NonblankFrame => "nonblank_frame",
+            Self::NonblankPanel { .. } => "nonblank_panel",
             Self::NoRenderError => "no_render_error",
             Self::FrameFidelity { .. } => "frame_fidelity",
             Self::RenderMode { .. } => "render_mode",
+            Self::LayerRenderMode { .. } => "layer_render_mode",
+            Self::PickEvidence { .. } => "pick_evidence",
             Self::Projection { .. } => "projection",
             Self::LayerSampling { .. } => "layer_sampling",
             Self::LayerIsoShading { .. } => "layer_iso_shading",
@@ -871,6 +885,37 @@ pub(super) enum ProductAutomationPanelId {
     Yz,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProductAutomationPresentationTarget {
+    ThreeD,
+    Xy,
+    Xz,
+    Yz,
+}
+
+impl ProductAutomationPresentationTarget {
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::ThreeD => "three_d",
+            Self::Xy => "xy",
+            Self::Xz => "xz",
+            Self::Yz => "yz",
+        }
+    }
+}
+
+impl From<ProductAutomationPresentationTarget> for PanelId {
+    fn from(value: ProductAutomationPresentationTarget) -> Self {
+        match value {
+            ProductAutomationPresentationTarget::ThreeD => Self::ThreeD,
+            ProductAutomationPresentationTarget::Xy => Self::Xy,
+            ProductAutomationPresentationTarget::Xz => Self::Xz,
+            ProductAutomationPresentationTarget::Yz => Self::Yz,
+        }
+    }
+}
+
 impl From<ProductAutomationPanelId> for PanelId {
     fn from(value: ProductAutomationPanelId) -> Self {
         match value {
@@ -895,6 +940,24 @@ impl ProductAutomationRenderMode {
             Self::Mip => "mip",
             Self::Dvr => "dvr",
             Self::Iso => "iso",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProductAutomationPickPolicy {
+    FirstThresholdHit,
+    MipArgmax,
+    MaximumOpacityContribution,
+}
+
+impl ProductAutomationPickPolicy {
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::FirstThresholdHit => "first_threshold_hit",
+            Self::MipArgmax => "mip_argmax",
+            Self::MaximumOpacityContribution => "maximum_opacity_contribution",
         }
     }
 }

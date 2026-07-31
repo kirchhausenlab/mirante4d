@@ -15,11 +15,10 @@ use std::{
 };
 
 use mirante4d_dataset::{
-    CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError, DatasetCatalog,
-    DatasetCatalogError, DatasetLayer, DatasetResourceKey, DatasetScale, DatasetSource,
-    DatasetSourceFault, DatasetSourceId, DecodeSinkError, ReservedDecodeSink,
-    ResourceContractError, ResourcePayloadDescriptor, ResourcePayloadFacts, ResourceValidity,
-    ScientificIdentityStatus,
+    BrickKey, CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError, DatasetCatalog,
+    DatasetCatalogError, DatasetLayer, DatasetScale, DatasetSource, DatasetSourceFault,
+    DatasetSourceId, DecodeSinkError, ReservedDecodeSink, ResourceContractError,
+    ResourcePayloadDescriptor, ResourcePayloadFacts, ResourceValidity, ScientificIdentityStatus,
 };
 use mirante4d_domain::{GridToWorld, IntensityDType, ScaleLevel, Shape3D};
 use mirante4d_identity::PackageId;
@@ -392,7 +391,7 @@ struct LayerStorageMapping {
 #[derive(Clone, Copy)]
 struct AlignedCohortMember {
     sink_index: usize,
-    key: DatasetResourceKey,
+    key: BrickKey,
     descriptor: ResourcePayloadDescriptor,
     mapping: LayerStorageMapping,
     coordinates: PackedIndexCoordinates,
@@ -401,7 +400,7 @@ struct AlignedCohortMember {
 #[derive(Clone, Copy)]
 struct UnalignedCohortMember {
     sink_index: usize,
-    key: DatasetResourceKey,
+    key: BrickKey,
     descriptor: ResourcePayloadDescriptor,
     mapping: LayerStorageMapping,
 }
@@ -428,12 +427,12 @@ struct UnalignedPhysicalWork {
 struct PhysicalFanoutCancellationSink<'sinks, 'sink> {
     sinks: &'sinks [&'sink mut dyn ReservedDecodeSink],
     sink_indices: &'sinks [usize],
-    key: DatasetResourceKey,
+    key: BrickKey,
     descriptor: ResourcePayloadDescriptor,
 }
 
 impl ReservedDecodeSink for PhysicalFanoutCancellationSink<'_, '_> {
-    fn resource_key(&self) -> DatasetResourceKey {
+    fn resource_key(&self) -> BrickKey {
         self.key
     }
 
@@ -1162,7 +1161,7 @@ impl LocalDatasetSource {
         Ok(())
     }
 
-    fn mapping(&self, key: DatasetResourceKey) -> Result<LayerStorageMapping, DatasetSourceFault> {
+    fn mapping(&self, key: BrickKey) -> Result<LayerStorageMapping, DatasetSourceFault> {
         let index = usize::try_from(key.layer().ordinal())
             .map_err(|_| DatasetSourceFault::DecodeFailed { key })?;
         self.mappings
@@ -1171,10 +1170,7 @@ impl LocalDatasetSource {
             .ok_or(DatasetSourceFault::DecodeFailed { key })
     }
 
-    fn checkpoint(
-        sink: &dyn ReservedDecodeSink,
-        key: DatasetResourceKey,
-    ) -> Result<(), DatasetSourceFault> {
+    fn checkpoint(sink: &dyn ReservedDecodeSink, key: BrickKey) -> Result<(), DatasetSourceFault> {
         if sink.is_cancelled() {
             Err(DatasetSourceFault::Cancelled { key })
         } else {
@@ -1184,7 +1180,7 @@ impl LocalDatasetSource {
 
     fn acquire_semantic_staging(
         &self,
-        key: DatasetResourceKey,
+        key: BrickKey,
         descriptor: ResourcePayloadDescriptor,
     ) -> Result<Box<dyn CpuByteLease>, DatasetSourceFault> {
         let bytes = descriptor.byte_len();
@@ -1201,7 +1197,7 @@ impl LocalDatasetSource {
 
     fn acquire_unaligned_control(
         &self,
-        key: DatasetResourceKey,
+        key: BrickKey,
         bytes: u64,
     ) -> Result<Box<dyn CpuByteLease>, DatasetSourceFault> {
         let lease = self
@@ -1217,7 +1213,7 @@ impl LocalDatasetSource {
 
     fn acquire_physical_decode_scratch(
         &self,
-        key: DatasetResourceKey,
+        key: BrickKey,
         descriptor: ResourcePayloadDescriptor,
         mapping: LayerStorageMapping,
     ) -> Result<PhysicalDecodeScratch, DatasetSourceFault> {
@@ -1300,7 +1296,7 @@ impl LocalDatasetSource {
     fn read_physical_brick(
         &self,
         sink: &dyn ReservedDecodeSink,
-        key: DatasetResourceKey,
+        key: BrickKey,
         coordinates: PackedIndexCoordinates,
         descriptor: ResourcePayloadDescriptor,
         mapping: LayerStorageMapping,
@@ -1311,7 +1307,7 @@ impl LocalDatasetSource {
     fn read_physical_brick_with_cohort(
         &self,
         sink: &dyn ReservedDecodeSink,
-        key: DatasetResourceKey,
+        key: BrickKey,
         coordinates: PackedIndexCoordinates,
         descriptor: ResourcePayloadDescriptor,
         mapping: LayerStorageMapping,
@@ -1873,7 +1869,7 @@ impl LocalDatasetSource {
 
     fn aligned_physical_coordinates(
         &self,
-        key: DatasetResourceKey,
+        key: BrickKey,
         mapping: LayerStorageMapping,
     ) -> Result<Option<PackedIndexCoordinates>, DatasetSourceFault> {
         let origin = key.region().origin();
@@ -2343,7 +2339,7 @@ impl DatasetSource for LocalDatasetSource {
 
     fn minimum_decode_working_bytes(
         &self,
-        key: DatasetResourceKey,
+        key: BrickKey,
         descriptor: ResourcePayloadDescriptor,
     ) -> Result<u64, DatasetSourceFault> {
         let expected = self
@@ -2637,7 +2633,7 @@ const fn pixel_brick_shape(kind: ShardProfileKind) -> Option<[u64; 3]> {
 }
 
 fn physical_brick_working_bytes(
-    key: DatasetResourceKey,
+    key: BrickKey,
     dtype: IntensityDType,
     validity: ResourceValidity,
     two_dimensional: bool,
@@ -2667,7 +2663,7 @@ fn physical_brick_working_bytes(
 }
 
 fn physical_brick_retention_bytes_max(
-    key: DatasetResourceKey,
+    key: BrickKey,
     dtype: IntensityDType,
     validity: ResourceValidity,
     two_dimensional: bool,
@@ -2702,7 +2698,7 @@ fn physical_brick_retention_bytes_max(
 }
 
 fn aligned_direct_working_bytes(
-    key: DatasetResourceKey,
+    key: BrickKey,
     dtype: IntensityDType,
     validity: ResourceValidity,
     two_dimensional: bool,
@@ -2724,7 +2720,7 @@ fn aligned_direct_working_bytes(
 }
 
 fn component_working_bytes(
-    key: DatasetResourceKey,
+    key: BrickKey,
     kind: ShardProfileKind,
 ) -> Result<u64, DatasetSourceFault> {
     u64::try_from(kind.decoded_inner_bytes())
@@ -2743,11 +2739,7 @@ struct PayloadFactsAccumulator {
 }
 
 impl PayloadFactsAccumulator {
-    fn include_value(
-        &mut self,
-        key: DatasetResourceKey,
-        value: f32,
-    ) -> Result<(), DatasetSourceFault> {
+    fn include_value(&mut self, key: BrickKey, value: f32) -> Result<(), DatasetSourceFault> {
         if !value.is_finite() {
             return Err(DatasetSourceFault::CorruptResource { key });
         }
@@ -2768,7 +2760,7 @@ impl PayloadFactsAccumulator {
 
     fn include_bytes(
         &mut self,
-        key: DatasetResourceKey,
+        key: BrickKey,
         dtype: IntensityDType,
         bytes: &[u8],
     ) -> Result<(), DatasetSourceFault> {
@@ -2795,11 +2787,7 @@ impl PayloadFactsAccumulator {
         Ok(())
     }
 
-    fn include_zeros(
-        &mut self,
-        key: DatasetResourceKey,
-        count: usize,
-    ) -> Result<(), DatasetSourceFault> {
+    fn include_zeros(&mut self, key: BrickKey, count: usize) -> Result<(), DatasetSourceFault> {
         if count == 0 {
             return Ok(());
         }
@@ -2822,7 +2810,7 @@ impl PayloadFactsAccumulator {
 
     fn finish(
         self,
-        key: DatasetResourceKey,
+        key: BrickKey,
         descriptor: ResourcePayloadDescriptor,
     ) -> Result<ResourcePayloadFacts, DatasetSourceFault> {
         let any_valid = self.valid_samples != 0;
@@ -2897,7 +2885,7 @@ fn append_unaligned_member_work(
 }
 
 fn unaligned_control_bytes(
-    key: DatasetResourceKey,
+    key: BrickKey,
     members: usize,
     physical_work: usize,
     snapshot_capacity: usize,
@@ -2944,7 +2932,7 @@ const fn packed_coordinates_sort_key(
 #[allow(clippy::too_many_arguments)]
 fn copy_brick_intersection(
     sink: &dyn ReservedDecodeSink,
-    key: DatasetResourceKey,
+    key: BrickKey,
     descriptor: ResourcePayloadDescriptor,
     brick_shape: [u64; 3],
     brick_coordinates: [u64; 3],
@@ -3067,7 +3055,7 @@ fn copy_brick_intersection(
 }
 
 fn set_validity_range(
-    key: DatasetResourceKey,
+    key: BrickKey,
     bits: &mut [u8],
     start: usize,
     count: usize,
@@ -3111,7 +3099,7 @@ fn set_validity_range(
 }
 
 fn resource_payload_facts(
-    key: DatasetResourceKey,
+    key: BrickKey,
     facts: crate::package_read::LocalBrickPayloadFacts,
 ) -> Result<ResourcePayloadFacts, DatasetSourceFault> {
     ResourcePayloadFacts::from_validated_range(
@@ -3123,17 +3111,17 @@ fn resource_payload_facts(
     .map_err(|_| DatasetSourceFault::CorruptResource { key })
 }
 
-fn coordinate_u32(key: DatasetResourceKey, value: u64) -> Result<u32, DatasetSourceFault> {
+fn coordinate_u32(key: BrickKey, value: u64) -> Result<u32, DatasetSourceFault> {
     u32::try_from(value).map_err(|_| DatasetSourceFault::CorruptResource { key })
 }
 
-fn checked_mul(key: DatasetResourceKey, left: u64, right: u64) -> Result<u64, DatasetSourceFault> {
+fn checked_mul(key: BrickKey, left: u64, right: u64) -> Result<u64, DatasetSourceFault> {
     left.checked_mul(right)
         .ok_or(DatasetSourceFault::DecodeFailed { key })
 }
 
 fn checked_end(
-    key: DatasetResourceKey,
+    key: BrickKey,
     start: [u64; 3],
     extent: [u64; 3],
 ) -> Result<[u64; 3], DatasetSourceFault> {
@@ -3151,7 +3139,7 @@ fn checked_end(
 }
 
 fn linear_3d(
-    key: DatasetResourceKey,
+    key: BrickKey,
     coordinate: [u64; 3],
     shape: [u64; 3],
 ) -> Result<usize, DatasetSourceFault> {
@@ -3166,7 +3154,7 @@ fn linear_3d(
 
 fn write_sink_bytes(
     sink: &mut dyn ReservedDecodeSink,
-    key: DatasetResourceKey,
+    key: BrickKey,
     bytes: &[u8],
     counters: &LocalDatasetSourceCounters,
 ) -> Result<(), DatasetSourceFault> {
@@ -3383,7 +3371,7 @@ fn subtract_reader_diagnostics(
     }
 }
 
-fn invalid_resource(key: DatasetResourceKey, reason: ResourceContractError) -> DatasetSourceFault {
+fn invalid_resource(key: BrickKey, reason: ResourceContractError) -> DatasetSourceFault {
     DatasetSourceFault::InvalidResource {
         key,
         reason: Box::new(reason),
@@ -3391,7 +3379,7 @@ fn invalid_resource(key: DatasetResourceKey, reason: ResourceContractError) -> D
 }
 
 fn map_ledger_error(
-    key: DatasetResourceKey,
+    key: BrickKey,
     requested_bytes: u64,
     error: CpuLedgerError,
 ) -> DatasetSourceFault {
@@ -3415,7 +3403,7 @@ fn map_ledger_error(
     }
 }
 
-fn map_sink_error(key: DatasetResourceKey, reason: DecodeSinkError) -> DatasetSourceFault {
+fn map_sink_error(key: BrickKey, reason: DecodeSinkError) -> DatasetSourceFault {
     match reason {
         DecodeSinkError::Cancelled => DatasetSourceFault::Cancelled { key },
         reason => DatasetSourceFault::SinkRejected {
@@ -3425,7 +3413,7 @@ fn map_sink_error(key: DatasetResourceKey, reason: DecodeSinkError) -> DatasetSo
     }
 }
 
-fn map_read_error(key: DatasetResourceKey, error: PackageReadError) -> DatasetSourceFault {
+fn map_read_error(key: BrickKey, error: PackageReadError) -> DatasetSourceFault {
     match error {
         PackageReadError::Cancelled => DatasetSourceFault::Cancelled { key },
         PackageReadError::Range(RangeReadError::Io {
@@ -3494,7 +3482,7 @@ impl SharedSourceFault {
         }
     }
 
-    fn for_key(self, key: DatasetResourceKey) -> DatasetSourceFault {
+    fn for_key(self, key: BrickKey) -> DatasetSourceFault {
         match self {
             Self::Cancelled => DatasetSourceFault::Cancelled { key },
             Self::ResourceUnavailable => DatasetSourceFault::ResourceUnavailable { key },
@@ -3528,10 +3516,7 @@ fn saturating_counter_add(counter: &AtomicU64, value: u64) {
     });
 }
 
-fn map_direct_read_error(
-    key: DatasetResourceKey,
-    error: LocalDirectBrickReadError,
-) -> DatasetSourceFault {
+fn map_direct_read_error(key: BrickKey, error: LocalDirectBrickReadError) -> DatasetSourceFault {
     match error {
         LocalDirectBrickReadError::Package(error) => map_read_error(key, error),
         LocalDirectBrickReadError::Sink(error) => map_sink_error(key, error),
@@ -3821,7 +3806,7 @@ mod tests {
 
         fn minimum_decode_working_bytes(
             &self,
-            key: DatasetResourceKey,
+            key: BrickKey,
             descriptor: ResourcePayloadDescriptor,
         ) -> Result<u64, DatasetSourceFault> {
             self.inner.minimum_decode_working_bytes(key, descriptor)
@@ -3884,7 +3869,7 @@ mod tests {
     }
 
     struct TestSink {
-        key: DatasetResourceKey,
+        key: BrickKey,
         descriptor: ResourcePayloadDescriptor,
         bytes: Vec<u8>,
         finished: bool,
@@ -3897,7 +3882,7 @@ mod tests {
     }
 
     impl TestSink {
-        fn new(key: DatasetResourceKey, descriptor: ResourcePayloadDescriptor) -> Self {
+        fn new(key: BrickKey, descriptor: ResourcePayloadDescriptor) -> Self {
             Self {
                 key,
                 descriptor,
@@ -3914,7 +3899,7 @@ mod tests {
     }
 
     impl ReservedDecodeSink for TestSink {
-        fn resource_key(&self) -> DatasetResourceKey {
+        fn resource_key(&self) -> BrickKey {
             self.key
         }
 
@@ -4601,7 +4586,7 @@ mod tests {
     }
 
     impl ReservedDecodeSink for RejectDirectSpanSink {
-        fn resource_key(&self) -> DatasetResourceKey {
+        fn resource_key(&self) -> BrickKey {
             self.inner.resource_key()
         }
 
@@ -4646,7 +4631,7 @@ mod tests {
     }
 
     impl ReservedDecodeSink for MutateAfterFullDirectSink {
-        fn resource_key(&self) -> DatasetResourceKey {
+        fn resource_key(&self) -> BrickKey {
             self.inner.resource_key()
         }
 
@@ -4706,7 +4691,7 @@ mod tests {
     }
 
     impl ReservedDecodeSink for MutateAfterPhysicalDecodeSink {
-        fn resource_key(&self) -> DatasetResourceKey {
+        fn resource_key(&self) -> BrickKey {
             self.inner.resource_key()
         }
 
@@ -4771,7 +4756,7 @@ mod tests {
     }
 
     impl ReservedDecodeSink for CancelAfterBytesSink {
-        fn resource_key(&self) -> DatasetResourceKey {
+        fn resource_key(&self) -> BrickKey {
             self.inner.resource_key()
         }
 
@@ -4819,7 +4804,7 @@ mod tests {
     }
 
     impl CancelOnSecondCheckSink {
-        fn new(key: DatasetResourceKey, descriptor: ResourcePayloadDescriptor) -> Self {
+        fn new(key: BrickKey, descriptor: ResourcePayloadDescriptor) -> Self {
             Self {
                 inner: TestSink::new(key, descriptor),
                 checks: AtomicU64::new(0),
@@ -4828,7 +4813,7 @@ mod tests {
     }
 
     impl ReservedDecodeSink for CancelOnSecondCheckSink {
-        fn resource_key(&self) -> DatasetResourceKey {
+        fn resource_key(&self) -> BrickKey {
             self.inner.resource_key()
         }
 
@@ -4870,7 +4855,7 @@ mod tests {
 
     #[test]
     fn contiguous_validity_ranges_match_scalar_bit_setting() {
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(DatasetSourceId::new(1)),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -4912,7 +4897,7 @@ mod tests {
             &ScientificIdentityStatus::Unverified(source_id)
         );
         let region = ResourceRegion::new([0, 256, 255], Shape3D::new(1, 1, 770).unwrap()).unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -4962,8 +4947,8 @@ mod tests {
             (source, ledger, source_id, fixture)
         }
 
-        fn quadrant_key(source_id: DatasetSourceId, y: u64, x: u64) -> DatasetResourceKey {
-            DatasetResourceKey::new(
+        fn quadrant_key(source_id: DatasetSourceId, y: u64, x: u64) -> BrickKey {
+            BrickKey::new(
                 DatasetResourceIdentity::Unverified(source_id),
                 LogicalLayerKey::new(0),
                 TimeIndex::new(0),
@@ -5036,7 +5021,7 @@ mod tests {
         let catalog = source.catalog().unwrap();
         let mut owned = (0..MEMBERS)
             .map(|x| {
-                let key = DatasetResourceKey::new(
+                let key = BrickKey::new(
                     DatasetResourceIdentity::Unverified(source_id),
                     LogicalLayerKey::new(0),
                     TimeIndex::new(0),
@@ -5103,8 +5088,9 @@ mod tests {
         .unwrap();
         let source = source_slot.lock().unwrap().take().unwrap();
 
+        let mut blocker_tickets = Vec::with_capacity(WORKERS);
         for index in 0..WORKERS {
-            let key = DatasetResourceKey::new(
+            let key = BrickKey::new(
                 DatasetResourceIdentity::Unverified(source_id),
                 LogicalLayerKey::new(0),
                 TimeIndex::new(0),
@@ -5115,13 +5101,15 @@ mod tests {
                 )
                 .unwrap(),
             );
-            runtime
-                .submit(ResourceRequest::new(
-                    key,
-                    RequestPriority::Analysis,
-                    CancellationGeneration::for_scope(100 + u64::try_from(index).unwrap(), 0),
-                ))
-                .unwrap();
+            blocker_tickets.push(
+                runtime
+                    .submit(ResourceRequest::new(
+                        key,
+                        RequestPriority::Analysis,
+                        CancellationGeneration::for_scope(100 + u64::try_from(index).unwrap(), 0),
+                    ))
+                    .unwrap(),
+            );
         }
         gate.wait_for(
             |state| state.blocker_members_entered == WORKERS,
@@ -5129,7 +5117,7 @@ mod tests {
         );
 
         for index in 0..TARGETS {
-            let key = DatasetResourceKey::new(
+            let key = BrickKey::new(
                 catalog.resource_identity(),
                 LogicalLayerKey::new(0),
                 TimeIndex::new(0),
@@ -5160,6 +5148,9 @@ mod tests {
                 state.peak_active_target_cohorts,
             )
         };
+        for ticket in blocker_tickets {
+            runtime.cancel(ticket).unwrap();
+        }
         let before_targets = source.diagnostics();
         gate.release_targets();
         // Which worker wins each first claim is intentionally unspecified.
@@ -5186,10 +5177,19 @@ mod tests {
                 thread::sleep(Duration::from_millis(1));
             }
         }
-        assert!(
+        assert_eq!(
             completions
                 .iter()
-                .all(|completion| matches!(completion.outcome(), RuntimeOutcome::Ready(_)))
+                .filter(|completion| matches!(completion.outcome(), RuntimeOutcome::Ready(_)))
+                .count(),
+            TARGETS
+        );
+        assert_eq!(
+            completions
+                .iter()
+                .filter(|completion| matches!(completion.outcome(), RuntimeOutcome::Cancelled))
+                .count(),
+            WORKERS
         );
 
         let after_targets = source.diagnostics();
@@ -5222,7 +5222,7 @@ mod tests {
             Arc::new(TestLedger::default()),
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -5354,7 +5354,7 @@ mod tests {
             injected,
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -5422,7 +5422,7 @@ mod tests {
             injected,
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -5555,7 +5555,7 @@ mod tests {
             injected,
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -5627,7 +5627,7 @@ mod tests {
             Arc::new(TestLedger::default()),
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Verified(scientific_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -5664,7 +5664,7 @@ mod tests {
         let injected: Arc<dyn CpuByteLedger> = ledger.clone();
         let source =
             LocalDatasetSource::from_verified(verified, "Verified cohort", injected).unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Verified(scientific_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -5734,7 +5734,7 @@ mod tests {
             Arc::new(TestLedger::default()),
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -5784,7 +5784,7 @@ mod tests {
             Arc::new(TestLedger::default()),
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Verified(scientific_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -5856,7 +5856,7 @@ mod tests {
             Arc::new(TestLedger::default()),
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Verified(scientific_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -5957,7 +5957,7 @@ mod tests {
         let source =
             LocalDatasetSource::from_verified(verified, "Verified 8-consumer diagnostic", injected)
                 .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Verified(scientific_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -6078,7 +6078,7 @@ mod tests {
             ledger.clone(),
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -6115,7 +6115,7 @@ mod tests {
             Arc::new(TestLedger::default()),
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -6188,7 +6188,7 @@ mod tests {
             &ScientificIdentityStatus::Verified(expected_scientific_id)
         );
         let region = ResourceRegion::new([0, 0, 0], Shape3D::new(1, 1, 16).unwrap()).unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Verified(expected_scientific_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -6246,7 +6246,7 @@ mod tests {
             Arc::new(TestLedger::default()),
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Verified(scientific_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -6293,7 +6293,7 @@ mod tests {
             .validate_scientific_content(|| false)
             .unwrap();
         let expected_package_id = verified.package_id();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -6363,7 +6363,7 @@ mod tests {
             .validate_scientific_content(|| false)
             .unwrap();
         let expected_package_id = verified.package_id();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -6447,7 +6447,7 @@ mod tests {
             injected,
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -6531,7 +6531,7 @@ mod tests {
             ledger,
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -6615,7 +6615,7 @@ mod tests {
             injected,
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             DatasetResourceIdentity::Unverified(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),

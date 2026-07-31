@@ -1,6 +1,6 @@
 # Current State
 
-Last reviewed: 2026-07-26
+Last reviewed: 2026-07-31
 
 Mirante4D is public, pre-alpha academic research software. Persisted formats
 and APIs can change through explicit hard cutovers; there is no supported
@@ -101,72 +101,282 @@ becomes visible only after one atomic project-store commit, and authenticated
 pairs are restored when the project reopens. There is one live canonical
 application reducer and one canonical project model.
 
-The viewer hot path now uses one persistent, byte-accounted logical WGPU
-storage-buffer arena, segmented across at most four maximal bindings to honor
-adapter binding limits, with direct `uint8`, `uint16`, and `float32` loads. A
-single allocator, residency epoch, eviction policy, and byte ledger govern the
-segments; they are not alternate representations. Each active
-layer has one compact sparse hash page table, so shader lookup no longer scans
-the resident-resource list for every sample. The renderer traverses volume
-bricks, skips missing, all-invalid, and mode-noncontributing bricks, applies
-DVR early termination, and jointly integrates multichannel DVR even for
-smooth sampling or mixed affine grids. DVR opacity uses physical world-step
-length for off-axis and affine-transformed rays. Exact FirstThreshold ISO picks
-include the six-sample gradient halo before reporting complete. All-invalid
-bricks are metadata-only residents. Uploads use one bounded persistent mapped
-staging pool, and exact residency addition/removal deltas coordinate CPU-lease
-retirement and recovery. Reused mapped slots clear only alignment gaps and
+The viewer hot path now has one private renderer `ResidencyOwner`. It owns one
+persistent, byte-accounted logical WGPU storage-buffer arena segmented across
+at most four maximal bindings, one exact physical-resident map, LRUs, the
+bounded mapped staging pool, an optional fixed compaction scratch buffer
+inside surplus transfer budget, fixed page records, and one sparse open-addressed
+directory shared by every target and render mode. Per-segment exact-byte
+allocators report aggregate free and largest-contiguous ranges separately.
+The logical payload allowance is no longer allocated eagerly: normal startup
+commits at most 64 MiB of usable payload backing plus minimum dummy bindings,
+and exact-union preflight grows selected segments toward bounded geometric
+targets no more than 128 MiB beyond their exact per-segment placement
+high-watermarks. Empty segments are preferred before a populated-prefix copy.
+Growth preserves offsets and bytes, rebuilds all payload bind groups, and
+remains capped by the configured logical maximum.
+Diagnostics distinguish logical capacity, committed usable capacity, physical
+buffer allocation, resident payload, free/placeable spans, growth count, and
+growth-copy bytes.
+Directory entries carry the exact compact layer/time/scale/cell key and
+page-record index, so masked-hash collisions and tombstones are resolved by
+exact key comparison rather than a per-presentation table or a resident-list
+scan. `uint8`, `uint16`, and `float32` samples are loaded directly from the
+arena. All-invalid bricks remain metadata-only residents.
+
+Presentation state retains only an opaque resident-frame lease. Immutable
+requirement bodies, exact pin counts, payload slots, transfer state, and
+eviction policy remain inside `ResidencyOwner`; neither the app nor the CPU
+data plane mirrors them. Decoded leases enter one bounded renderer-global
+first-seen queue. Each live opaque frame lease has a derived relevant-order
+index, so a resident target does not scan up to 65,536 unrelated offers on
+every execution or dirty query. Completion and retirement remove an exact
+batch from the global queue and all live derived indexes.
+
+Destructive residency changes publish bounded, sequenced eviction events that
+remain retryable until acknowledged. A CPU lease handle is reoffered directly
+when it still exists; otherwise the normal dataset dispatcher submits the one
+missing demanded key. The app keeps no GPU-resident set or per-scope recovery
+set. Event-capacity refusal is typed and transient for render retry, and
+transactional preflight accounts for same-batch readmissions before any
+directory mutation or queue submission.
+
+The renderer traverses volume bricks, skips missing, all-invalid, and
+mode-noncontributing bricks, applies DVR early termination, and jointly
+integrates multichannel DVR even for smooth sampling or mixed affine grids.
+DVR opacity uses physical world-step length for off-axis and affine-transformed
+rays. Exact FirstThreshold ISO picks include the six-sample gradient halo
+before reporting complete. Reused staging slots clear only alignment gaps and
 tails, not payload spans that the upload immediately overwrites. GPU timestamp
 results and volume picks are asynchronous; neither requires the UI thread to
-wait for a GPU mapping operation. One first-cause terminal GPU latch classifies
-device loss, out-of-memory, backend-internal, and validation failures before
-later frame, poll, submission, or mapped-buffer work; it does not create a
-fallback or recovery epoch.
-Full static render-control publication uses three queue writes regardless of
-the 65,536-entry availability pattern. Compatible exact successor bodies with
-at most 32 total added-and-removed keys preserve stable record/hash slots,
-publish copy-on-write cell deltas, and reconcile pins/LRU proportional to that
-delta;
-larger or incompatible changes use the sole dense builder. Individual
-residency changes patch only their stable records, including record-only
-dormant-prefetch uploads. Incremental runtime publication is
-capped at 64 writes before issuing any GPU operation and replaces a more
-fragmented delta with one bounded dense record-slab write. Diagnostics expose
-the total, per-frame peak, and fallback count.
+wait for GPU mapping. One first-cause terminal GPU latch classifies device
+loss, out-of-memory, backend-internal, and validation failures before later
+frame, poll, submission, or mapped-buffer work; it creates no fallback or
+device-recovery epoch.
+
+Normal native startup queries memory facts from the exact eframe-selected
+adapter before deriving default settings. Linux Vulkan reports adapter
+identity, device type, device-local heap bytes, and optional
+`VK_EXT_memory_budget` budget/usage facts. Only a discrete-device result can
+supply the existing dedicated-memory recommendation policy; shared/unified
+heaps remain labelled shared, and unsupported discovery retains the explicit
+unknown-device default. Persisted settings remain explicit overrides, and the
+same stored facts drive the `Use recommended settings` action.
+
+Native existing-device startup no longer blocks product command admission on
+driver pipeline compilation. After fixed buffers and layouts exist, one
+capacity-two renderer worker compiles dedicated Plane, MIP, DVR, ISO, and
+Mixed color pipelines, then the separate Pick compute pipeline. The UI
+consumes at most one ordered readiness event per turn, keeps
+demand/decode/lease work live, and cannot publish rendered 3D, cross-section,
+or pick currentness before the corresponding capability exists. A terminal
+no-data 3D result is not GPU work: it publishes independently through the same
+surface-generation check and cannot manufacture pixels or accept a stale
+generation. A truthful renderer-initializing projection repaints at a bounded
+50 ms cadence. The first failing shader/pipeline operation and typed cause are
+retained. Closing
+during an uninterruptible cold driver call cancels remaining stages and
+detaches rather than waiting on the UI thread.
+
+Per-target control now contains camera, layer, mode, grid, and global-directory
+parameters only; it does not rebuild or own residency layout. Resident
+camera motion therefore reuses the same directory, page records, arena
+allocations, and pins. One private renderer frame coordinator owns the four
+fixed target fronts, a private eager 3D replacement, texture revisions,
+currentness, target retry, completion leases, recording order, capture
+freshness, and color submission. Changed targets record active first, linked
+2D next, and passive 3D last into one color encoder and one queue submission.
+Application presentation records are accepted only for the target's current
+surface generation and exact extent; a stale generation can retain its old
+display identity for truthful diagnostics but cannot become current.
+An exact 3D replacement swaps only after its coordinated color submission;
+the prior complete front remains visible and pickable until then. Same-body
+resident movement rebinds an opaque lease and shared pin cohort without
+entering residency transfer or arena allocation.
+
+Resident 3D color work is no longer assumed cheap merely because residency is
+complete. The application classifies the exact visible-layer/mode/scale/output
+profile through one bounded work controller. It receives every complete
+full-volume navigation rung retained from terminal toward fine plus the
+camera-local exact target, rejects incomplete, nonresident, finer-than-target,
+or interaction-unsafe bodies, and selects the finest remaining body. Only the
+terminal rung may bootstrap a cold renderer from retained CPU payload; it is
+not reported resident or presented until its upload completes. Every preview
+request uses the physical 3D panel extent; reduced internal textures, dynamic
+resolution, preview upscaling, and visible timing probes are deleted. One
+gesture freezes the selected per-layer scale map, so timing or resource
+arrival cannot make its LOD or resolution flicker.
+
+The private 3D replacement renders the selected uniform exact body through one
+renderer-owned latest-only worker. It submits and waits for one bounded
+horizontal row batch at a time, adapts the next batch toward a 3 ms target,
+and checks cancellation between submissions. Partial rows publish no frame,
+capture, pick target, or texture revision; only a complete matching candidate
+can swap atomically. Hidden work advances while the visible UI is idle and
+requests one wake for exact handoff rather than one repaint per row. The
+same preview remains visible and labelled after release, with no intermediate
+`pending output` transition. A newer camera waits behind at most one submitted
+batch. Application staging must explicitly authorize the final promotion
+after its own fallible preflight, which closes the worker-completion race.
+GPU timing may supply conservative initial work facts but cannot change
+visible navigation policy. ISO timing identity includes one of 32
+display-threshold bands. Inspector and automation report native preview,
+direct output, and exact screen-row progress rather than data-tile counts.
+
+The terminal scale is a geometry contract, not a fixed ordinal. New imports
+factor-two reduce spatial dimensions until both the maximum dimension is at
+most 64 and the spatial volume is at most 262,144 voxels per layer/timepoint.
+Small datasets may remain S0; the largest representable dimension terminates
+within the profile's 64-level bound. The active terminal body remains in the
+ordinary global requirement union. When one canonical resource covers the
+complete layer, renderer control names that page directly and volume kernels
+bypass repeated sparse-directory hashing. Voxel-exact rays reuse its decoded
+address, and smooth-linear rays reuse the same address for all eight taps.
+
+The 3D navigation planner keeps that terminal body mandatory and admits
+successively finer coherent full-volume rungs while an optional tail bounded
+to one quarter of the configured logical payload/resource limits, at most
+512 MiB and 16,384 resources, fits the exact global union. Each candidate
+wrapper ranks only its own one-scale body as frame-required. The rest of the
+same canonical aggregate is a permanently dormant residency-prefetch suffix:
+the sole renderer residency owner may upload it terminal-to-fine, but it
+cannot affect coverage, control, pixels, fidelity, or prefetch promotion.
+
+The transient mailbox is the sole render-revision allocator and now allocates
+the render API's `FrameIdentity` directly; the duplicate application
+`RenderIntentRevision` value type is gone. The fixed target identity is
+`mirante4d_render_api::PresentationTarget::{ThreeD,Xy,Xz,Yz}`. The
+application's `PresentationSlot` name is only a type re-export, so no target
+identity allocator or numeric conversion remains at that boundary.
+
+One monotone sequence supplies unique values, while the mailbox retains
+independent latest identities for 3D and linked 2D. Camera/3D-viewport input
+advances 3D; cross-section/linked-viewport input advances linked 2D; shared
+render changes advance both once. A gesture's durable commit keeps its final
+sample identity instead of allocating a second frame. A linked-only change
+therefore leaves an unchanged visible 3D front and hidden exact candidate
+intact.
+
+One accepted `FrameIdentity` may first render from a provisional immutable
+requirement body and later replace it with the latest worker-prepared body.
+That cutover does not manufacture another input revision. The application
+asks the renderer whether the exact frame, extent, body identity, and prefetch
+role have already been presented; frame identity alone cannot adopt retained
+pixels. The renderer accepts a different same-frame body, retains its
+resources before releasing the predecessor, rebuilds coverage for that body,
+and treats it as dirty color work. The same-frame eviction-regression guard
+applies only while the exact rendered body remains active. The 3D hidden
+candidate remains exact-only and atomic.
 
 Application demand is signature-diffed and split by 3D, linked-panel,
 playback, and analysis scope. Every visible layer independently selects LOD
 from its affine cell footprint in the physical pixels of the actual 3D or
-cross-section view; installed and staged reuse requires the same projected
-selection map. One bounded latest-only worker performs exact camera candidate
-testing, contribution ranking, canonicalization, scope deltas,
-render-requirement preparation, and static sparse-page preparation; the UI
-swaps completed immutable artifacts instead of rebuilding a large camera
-cohort. Sustained orbit replaces one pending request and cancels the older
-traversal while retaining the last exact presentation. A full-volume resident
-cohort bypasses camera planning entirely. A bounded 17/16 camera guard appends
-at most one quarter of the primary resources plus two as a dormant prefetch
-suffix. It may decode and publish GPU control records after visible work, but
-does not affect readiness, coverage, fidelity, rendering, or picks until an
-O(1) scalar promotion. Contained camera and full-volume reuse promote the
-installed dataset/render wrappers without a membership walk or static rebuild.
+cross-section view. Each nonempty linked-panel body starts with a complete
+coarsest full-volume navigation floor as its first-useful prefix, then the
+directly selected plane target, then an optional bounded rolling fine guard.
+The final deduplicated union and its exact host/GPU obligations are admitted
+once; a discarded trial does not retain a false ledger charge. The renderer
+receives an explicit target-to-coarser scale chain per visible Plane layer.
+Already-resident intermediate scales may be sampled, but they are not load
+dependencies and do not delay the latest selected target.
+
+Incremental linked-2D settlement keeps current-geometry floor coverage
+separate from installed exact-demand identity; fallback can make the newest
+geometry renderable but cannot make a changed scale/body exact. One bounded
+latest-only worker performs exact camera/plane candidate testing,
+contribution ranking, canonicalization, scope deltas, and render-requirement
+preparation. Newer scale or guard requests replace obsolete work and plan the
+latest projected target directly. The UI swaps completed immutable artifacts
+instead of rebuilding a large cohort and prepares no renderer page table or
+GPU slot layout.
+
+For 3D, sustained orbit replaces one pending request and cancels the older
+traversal while retaining the last complete uniform presentation. A complete
+resident target body still rebinds without decode, transfer, allocation, or
+residency rebuild, but it renders natively during input only when its exact
+work profile is conservatively safe. Otherwise current camera geometry uses
+the finest complete resident target-eligible navigation rung inside the native
+interaction-work envelope; the terminal rung is only the last emergency floor.
+Exact replacement then follows the asynchronous hidden row-batch route above.
+A full-volume resident cohort bypasses camera planning entirely. A bounded
+17/16 camera guard appends at most one quarter of the primary resources plus
+two as a dormant prefetch suffix. It may decode and enter global GPU residency
+after visible work, but does not affect readiness, coverage, fidelity,
+rendering, or picks until an O(1) scalar promotion. Contained camera and
+full-volume reuse promote the installed dataset/render wrappers without a
+membership walk or residency rebuild.
 A queued guard is reprioritized in place without a duplicate waiter, decode,
 or queue slot, and exact admission-cursor rewinds preserve canceled staged
 guard work across atomic promotion.
 
-Raw wheel and drag samples now remain transient UI/render state. They do not
-dispatch the durable application reducer, extend project history, or invoke
-the demand planner. Drag completion and a short scroll-settle boundary commit
-only the latest camera. A transient camera may rebind the renderer only inside
-an installed geometrically valid body whose complete resource set is already
-resident; otherwise the previous complete image remains until the committed
-camera follows normal planning. Canonical view, source, project, and tool
-transitions retire stale previews.
+One constant-size framework-neutral render-intent mailbox owns raw camera and
+linked-cross-section wheel/drag samples. Egui emits typed samples and finish
+events but owns no second latest-camera or durable-currentness authority. Raw
+samples do not dispatch the application reducer or extend project history.
+Resident camera samples reuse the installed geometrically valid body without a
+planner run. Every active cross-section sample applies one effective mailbox
+geometry to XY, XZ, and YZ. It first proves all three installed navigation
+floors complete. A complete fine guard that contains the geometry remains the
+exact fast path; once a contained footprint consumes 70% of its acceptance
+radius, the latest-only planner starts an overlapping successor. Crossing the
+guard before that successor is ready still renders all three panels at the
+latest geometry through their installed scale chains, ultimately the complete
+navigation floor. The active panel is scheduling priority rather than an
+exclusion rule, and a finite fine guard is no longer a presentation boundary.
+Drag completion and a short scroll-settle boundary commit only the latest
+value once. When projected durable LOD still matches and the target body is
+complete, all three exact transient frames are adopted atomically into the new
+durable linked generation with the same frame, texture, and binding identities
+and no replacement GPU work.
 
-Candidate bricks come from the selected-scale view volume rather than
-per-pixel ray discovery. Bounded admission cursors, exact eviction-recovery
-sets, and retained leases preserve overlapping work. Worker-prepared retained-
-union removal deltas and one atomically prevalidated batch cancellation make
+When projected durable LOD differs after contained incremental linked zoom,
+the exact-demand comparison includes the selected scale map and immutable body
+identity and prepares the selected feasible replacement. Plane targets publish
+the newest geometry after their complete first-useful floor is resident, then
+replace fallback regions in bounded batches as target bricks arrive.
+Voxel-exact sampling selects one level per sample. Smooth-linear sampling
+retries the whole interpolation footprint at one coarser level if any fine tap
+is missing; a resident invalid fine result is terminal and never exposes
+coarse data. Volume targets do not use this plane fallback.
+
+The owner has confirmed that ordinary linked zoom can reach visibly fine S0
+output and that the progressive four-panel presentation behaves as intended
+on the representative mapped workload.
+The inspector reports the independent `3D scale` separately from linked-2D
+shown, selected, ideal, exact/provisional, refining, target completion, and
+display-current facts. A provably uniform level is reported as one `sN`;
+partial target coverage reports `mixed target–floor`, while zero target
+coverage with reusable intermediate levels reports a conservative fallback
+range. It splits XY/XZ/YZ into separate rows if they diverge.
+
+Terminal empty geometry clears all three superseded linked presentations.
+Product automation uses the same mailbox and waits for its final transient
+sample to become current before emitting the durable finish. Canonical view,
+source, project, layout, and tool transitions retire stale intents.
+
+The logical decoded-resource identity is named `BrickKey` consistently from
+demand through dataset scheduling, decoded leases, render requirements, and
+GPU residency. It remains the same storage-independent identity over source,
+layer, timepoint, scale, and exact logical region/shape; physical package
+chunks and shards are not product brick identities, and no compatibility key
+or adapter exists.
+
+Volume candidate bricks come from the selected-scale view volume rather than
+per-pixel ray discovery. Cross-section candidates instead come from physical
+render-pixel centers projected through the selected scale's affine transform.
+The plane planner traverses the two projected brick axes, analytically clips
+the dominant axis, and includes only the declared sampling-support halo plus a
+bounded outward envelope for the renderer's f32 arithmetic. Controls that
+cannot preserve a sub-half-voxel addressing envelope fail with a typed
+precision error; an outside-volume plane installs a terminal empty scope and
+clears the superseded panel presentation without retrying.
+
+Bounded admission cursors, separate monotone visible/full-body readiness
+cursors, and retained leases preserve overlapping work without a GPU
+residency mirror. Exact renderer eviction events rewind only affected scope
+positions and reoffer an existing CPU lease or use the normal dispatcher.
+Worker-prepared retained-union removal deltas and one atomically prevalidated
+batch cancellation make
 accepted plan publication proportional to changed waiters; rejected plans
 leave installed scopes and useful pending work intact. The shared runtime uses
 a lazy versioned priority heap, generation-predicated ledger/scheduler wakeups,
@@ -180,16 +390,38 @@ reports cohort membership plus cancelled decode execution count, time, and
 bytes as explicit waste. A short fixed post-interaction grace keeps background
 verification below warm resident navigation. Verification blocks on a
 condition variable instead of periodically polling, then resumes after
-interaction settles.
+interaction settles. If all workers are occupied by playback, analysis, or
+prefetch, newly admitted foreground work cancels one low-priority execution at
+a source checkpoint, preserves its logical job, ticket, waiters, and dedupe
+identity, runs the foreground cohort, and then resumes the interrupted job.
 
-Cold refinement uses one atomic visible/hidden handoff. Any existing complete
-visible presentation remains exact-frame-only through every retry. The hidden
-replacement can promote only when its presented and requested frame identity,
-extent, requirement count, and actual GPU coverage match and are Exact;
-dormant prefetch does not count toward completeness. Current 3D and
-cross-section rendering also requires the installed demand signature to match
-the current snapshot, so new intent cannot bind an old body after planning
-fails. No partial refinement frame is published as current.
+Cold volume refinement uses one atomic visible/hidden handoff. Any existing
+complete 3D presentation remains exact-frame-only through every retry. The
+hidden replacement can promote only when its presented and requested frame
+identity, extent, requirement count, and actual GPU coverage match and are
+Exact; dormant prefetch does not count toward completeness. No partial or
+mixed-scale volume frame is published as current.
+
+Plane presentation is deliberately different: a frame may publish whenever
+its complete navigation-floor prefix is resident, because plane-only
+multiscale sampling guarantees valid current geometry without dark missing
+regions. Its target completion remains provisional until every selected
+target requirement is resident and shown. Current 3D and exact
+cross-section settlement still require the installed demand signature to
+match the current snapshot, so fallback coverage cannot bind an old body as a
+new exact result.
+
+When a cold 3D bootstrap first publishes a complete coarse frame, it queues the
+successor refresh needed to render its already staged hidden exact target and
+requests an egui repaint if event-driven idle would otherwise strand that
+work. Static-layout deltas are accepted only from the predecessor layout
+actually installed on the exact presentation token that will execute them; a
+semantically matching plan that was never installed on a blank, recycled, or
+deactivated target cannot authorize incremental preparation. Successful
+presentation records that token-local lineage, and target reset or atomic
+handoff clears it. Exact transient cross-section finish adopts the retained
+frame without rerendering it, while terminal empty intent makes the target
+current and clears the superseded pixels.
 
 Normal local reads retain one accounted package-root descriptor, resolve
 named objects beneath it with Linux `openat2` no-symlink/no-magic-link
@@ -250,16 +482,295 @@ The damaged unpublished linked worktree was independently preserved and
 reconstructed. Its 199 recoverable commits through `3d967f0` plus the surviving
 seven-file delta exist as clean recovery commit `3dfe9de` in a verified
 external bundle. Only reviewed product mechanisms were reimplemented on
-`main`; the remainder is rejected research rather than an alternate product.
+`main`; the remainder is not an alternate product or merge candidate. A
+2026-07-28 read-only audit identified selected plane-demand, residency,
+frame-coordination, and kernel mechanisms as possible donors for a proposed
+single-authority overhaul. The reviewed projected-demand and global-residency
+mechanisms have since been reimplemented through the normal product
+authorities; recovered session, transaction, qualification, and provenance
+machinery remains rejected and inactive.
 
-The resident-interaction/per-view-LOD slice is product-validated. Transient
-wheel and drag input no longer reconstructs durable state per sample, and a
-preview renders only from a complete geometrically valid resident body. Warm
-resident navigation caused no reads, decodes, requests, or uploads, and
-settled idle caused no queue submissions. The normal release app passed the
-real-display resident-navigation, compound-camera, 103-command render-mode,
-and four-panel workflows, alongside the independent projected-LOD oracle and
-full affected-package checks.
+The resident-interaction/per-view-LOD slice is implemented. Transient wheel
+and drag input no longer reconstructs durable state per sample, and a preview
+renders only from a complete geometrically valid resident body. Narrow mapped
+scenarios reported zero reads, decodes, requests, or uploads during their warm
+resident motions, and settled idle caused no queue submissions. Those
+scenarios did not exercise sustained real oblique-control input and do not
+product-validate interaction continuity.
+
+The global-residency slice is implemented and product-integrated. Exact
+Vulkan checks cover masked-hash collision, tombstone lookup, zero-upload
+cross-target reuse, eviction and reupload, multi-presentation pin unions,
+independent plane/MIP/ISO/depth/pick values, and multichannel order
+independence. The mapped release resident-navigation scenario on the NVIDIA
+RTX 3070 Ti/Vulkan adapter published two exact warm camera frames with zero
+new physical reads, codec decodes, dataset requests, uploaded resources, or
+uploaded bytes. Its GPU render passes were approximately 1.38–1.39 ms, and
+120 settled frames added zero queue submissions. The mapped MIP/DVR/ISO
+scenario also passed with zero WGPU validation errors. This closes the P2
+authority/correctness milestone on the small target fixture; it is not an
+absolute or representative large-data performance claim.
+
+The native terminal-navigation cut has a separate trusted Vulkan measurement
+on the NVIDIA GeForce RTX 3070 Ti Laptop GPU. For one warm resident 64³
+full-volume page at 1920×1080, five-trial p95 GPU pass times were 1.247 ms
+MIP voxel-exact, 3.253 ms DVR voxel-exact, 9.988 ms ISO voxel-exact,
+6.776 ms MIP smooth-linear, 10.278 ms DVR smooth-linear, and 11.128 ms ISO
+smooth-linear. All six satisfy the 16.667 ms product guideline. This is
+repeatable component evidence for the terminal floor, not a claim about every
+finer exact body or monitor-visible interaction.
+
+The normal release application also completed the representative Cell
+native-navigation scenario. Its 60 commands exercised four-panel linked
+rotation, 3D zoom/orbit, linked-only movement during hidden 3D settlement,
+voxel-exact and smooth-linear sampling, MIP, DVR, ISO, final exact settlement,
+and standalone 3D. Nine GPU readback captures were nonblank. The terminal
+report was complete/current at the physical 1280×720 output, with zero target
+revision gaps and no validation, capacity, demand, or renderer fault.
+
+After the resident-navigation-ladder cut, the same mapped scenario passed
+again on the NVIDIA GeForce RTX 3070 Ti Laptop GPU/Vulkan adapter. Cell
+retained complete S6, S5, S4, and S3 navigation candidates plus the exact S2
+target. At the recorded 1280×720 camera/profile, the selector chose resident
+S4 (1,916,928,000 neutral work units), kept S6/S5 eligible, and truthfully
+rejected resident S3 and S2 as interaction-unsafe. The run finished all 60
+commands, uploaded the bounded 1,629-resource aggregate through the sole
+residency owner, and reported zero WGPU validation errors.
+
+The owner subsequently exercised the normal application and reported that the
+four-panel and 3D navigation behavior works as expected. This closes the
+viewer performance refactor as a product program on 2026-07-31. No rendering
+implementation or validation backlog remains. Smooth-linear sampling remains
+functionally supported and covered, but its fine-scale refinement can be much
+slower than voxel-exact on the representative Cell workload; that is a known
+non-blocking limitation and any optimization or product-surface removal is a
+separate future decision.
+
+The frame-coordination slice is implemented and product-integrated. The app
+no longer owns per-panel encoders, submits, texture allocation, a fifth
+staging target, or presentation/capture scheduling. A direct Vulkan
+four-target check produced distinct nonblank images matching the independent
+CPU oracle, recorded XY/XZ/YZ/3D in active-first order, submitted the color
+work once, mutated no residency or allocator state, and submitted nothing for
+an identical idle cutoff. Focused real-GPU product-path checks cover
+coarse-to-exact hidden 3D wake and atomic swap plus linked-plane retained-frame
+finish and terminal empty clearing.
+
+The named mapped release resident-navigation scenario published two warm
+camera changes using exactly two color submissions. Those changes added zero
+physical reads, codec decodes, dataset requests, uploads, evictions, arena
+allocator plans, directory/page writes, buffers, bind groups, pipelines, or
+staging allocations; GPU timing was disabled and post-settle idle added zero
+submissions. The separate 103-command MIP/DVR/ISO mapped walkthrough passed.
+This closes P3 authority and structural resident-work acceptance on the small
+fixture; it is not the representative large-data performance claim required
+at final acceptance.
+
+The dedicated-kernel slice has completed its hard cut. One private exhaustive
+selector classifies Plane, MIP, DVR, ISO, and heterogeneous Mixed volume
+intent, and every production color-recording site routes through it. Plane is
+now a separate 53-line color module over shared accepted
+binding/directory/payload/sampling code. Its source contains no volume ray,
+page DDA, MIP, DVR, ISO, pick, alpha-termination, or dynamic view-kind branch;
+the predecessor cross-section function and branch are deleted. The direct
+Vulkan four-target coordinator check
+rendered the three Plane views plus MIP 3D as distinct nonblank CPU-oracle
+matching images in one color submission, with zero residency/allocator
+mutation and zero identical-idle work.
+
+MIP is also a dedicated module. A shared volume source contains only ray and
+page-segment mechanics, while one canonical MIP core retains the current raw-
+maximum, missing-coverage, page-local sampling, and transfer-once semantics.
+The dedicated Mixed path calls that core but cannot redefine it; the old
+standalone MIP fragment and entrypoints are deleted.
+A focused real-Vulkan 65x65 float32 voxel-exact off-axis perspective frame
+matched RGBA, coverage, and validity at pixel `[48,32]` to the independent
+numerical oracle. No terminal-maximum or donor evidence path was restored.
+
+DVR is also a dedicated module. Its homogeneous pipeline alone owns
+compatible-grid fused traversal and common-world joint-medium integration;
+Mixed shares only the single-layer emission-absorption primitive. Homogeneous
+DVR layer records are
+CPU-canonicalized once by logical key, with one order-reversal regression
+covering different scales, transforms, transfers, and logical cell shapes.
+The focused off-axis Vulkan oracle matched RGBA8 `[109, 0, 0, 151]`, coverage,
+validity, and maximum-contribution pick facts.
+
+ISO and Mixed are dedicated modules and pipelines. ISO owns the six-tap
+inverse-transpose world gradient, attached/detached lighting, physical hit
+depth, depth-sorted homogeneous composition, and its color/validation entries.
+Mixed alone owns explicit MIP/DVR/ISO per-layer dispatch and authored-order
+over-composition; invalid modes fail closed and heterogeneous subsets cannot
+reach homogeneous joint-DVR or ISO-stack algorithms. Focused Vulkan checks
+passed affine lighting, incomplete/exact gradient halo color and Pick facts,
+off-axis physical ISO depth/order, and authored-order Mixed hand facts
+`[26, 69, 0, 194]` and `[10, 115, 0, 194]`.
+
+Pick compiles only shared binding/sampling, volume ray/page, scalar DVR
+optical, six-tap ISO-gradient, and compute-program code. It contains no color
+kernel, fragment entry, or compositor. The former general pipeline and
+monolithic shader are deleted.
+
+The owner-observed failure on 2026-07-29 remains the qualitative baseline: in
+the normal application on the representative dataset, four-panel layout, and
+S3, continuous oblique dragging froze every one or two seconds and sometimes
+took several seconds to resume. The linked-cross-section authority correction
+described below remains implemented, and the owner later observed smooth
+ordinary S3 interaction away from a separate resident-envelope boundary.
+
+The former three-session command and command-driven resident-navigation
+cadence proxy are deleted. They did not traverse the real UI gesture,
+independently drive input while the UI was blocked, or measure visibly changed
+presentation.
+
+The first replacement `viewer-oblique-continuity` implementation did not
+measure human-visible output. Its linked “visible” samples were synthesized
+from internal target-publication events, while its `XGetImage` artifacts read
+the X11 client surface and could change even when the mapped monitor remained
+static. All linked visible-change counts, visible gaps, input-to-visible
+latencies, and resulting pass/fail conclusions are withdrawn.
+
+The first blocking production boundary was the split linked-cross-section
+authority: common transient geometry was applied only to the active panel
+while XY, XZ, and YZ actually form one linked interaction. The corrected
+runtime applies one latest geometry to all three panels and renders them with
+active-first priority. Exact resident guards still promote atomically, but a
+cold or exhausted fine guard now keeps the latest geometry visible through
+the complete multiscale navigation floor while the replacement refines.
+Durable release adopts all three exact rendered frames together. No storage
+format or logical-brick change was involved.
+
+The linked-wheel workflow now retains only endpoint-correctness claims for an
+ordinary S3-to-S0-to-S3 path. Client-surface artifacts, internal publication,
+input receipt, and settlement metadata are labelled at those actual
+boundaries. They are not compositor or monitor evidence, and the owner's
+direct observation remains authoritative for human-visible continuity.
+
+A separate diagnostic workload now drives bounded nonstationary 60 Hz
+Shift-drag at exact warm S3, S1, and S0 in the normal release application. It
+records generated and received input, UI-update duration, demand planning,
+read/decode/upload counters, renderer CPU work, linked GPU timings, and egui
+texture-paint command queuing. It explicitly reports surface present and
+monitor continuity as unobserved and applies no performance threshold.
+
+The first full diagnostic attempt completed its generated S3 and S1 phases,
+then froze the desktop while trying to reach S0. A reboot left the app trace
+empty. The prior boot contains no OOM kill, NVIDIA Xid, GPU reset, or kernel
+hang report, so neither a performance result nor a freeze cause is established.
+The two linked S0 workflows are quarantined by default behind
+`--allow-host-stress`. Scale selection is capped at 16 inputs, every wheel
+input requires app receipt before another is sent, settlement supervises live
+UI turns, Shift-drag receipt is checked twice per second, and held input is
+released on failure. The bounded timeline checkpoints on input/UI heartbeats
+instead of waiting for graceful exit. Those safeguards pass focused static
+tests but have not been product-validated after the reboot.
+
+The progressive multiscale correction is now implemented and
+automated-verified without rerunning that quarantined workflow. Focused
+backend-neutral coverage tests distinguish a single fallback, a conservative
+fallback range, partial target mixing, and complete target. A trusted
+headless Vulkan fixture independently renders coarse fallback, proves a
+partially resident fine interpolation footprint returns the identical coarse
+pixel, proves complete fine residency replaces it, and proves invalid fine
+data remains invalid. Serial application integration crosses repeated former
+guard windows with current fallback and latest-only settlement, and a
+separate regression proves a complete resident 3D target rebind creates no
+new planning or decode work. These are correctness and internal-continuity
+facts, not mapped monitor evidence. Separately, the owner exercised the normal
+mapped four-panel viewer and reported the progressive result working as
+intended. After the same-intent requirement-body cutover correction, the owner
+observed at most a millisecond-scale S4-or-S5 safety image during change before
+the proper scale returned; the former indefinite coarse display did not
+recur.
+
+The later owner-observed finer-LOD aggregate-capacity freeze is corrected. The
+viewer keeps screen-derived ideal LOD, feasible selected LOD, and complete
+displayed LOD as separate transient facts. Generic catalog selection begins
+from a complete coarsest valid navigation floor and admits deterministic
+per-layer refinements only when the exact global requirement union fits. The
+renderer's sole residency owner preflights that union, including existing
+fronts, shared resources, and replacement overlap. Fixed equal panel quotas
+and terminal latching of an unaffordable ordinary refinement are deleted.
+
+The subsequent physical-placeability defect is also implemented and
+automated-verified. Aggregate free payload bytes are no longer described as
+one allocatable range. A placement-only refusal names the requested
+allocation, aggregate free bytes, largest contiguous range, and per-segment
+state. `ResidencyOwner` may stably compact allocations within each segment,
+rewrite their canonical page records, and retry the exact union once. The
+copy is queue-ordered after prior users and before later work, uses bounded
+scratch, preserves logical residency and pins, and respects the existing
+in-flight submission ceiling.
+
+If the union remains physically unplaceable, the application excludes that
+aggregate body with a strictly smaller scalar payload bound and reruns the
+same catalog selector. Repeated refusals therefore move monotonically toward
+a feasible coarser candidate without scale-specific branches. Saturated
+in-flight work defers compaction and retries without a red error. Only failure
+of the minimum valid candidate is terminal, and later view/layout/layer/time,
+dataset, or physical-capacity input reopens selection.
+
+The installed 3D navigation ladder and each linked navigation floor remain
+ordinary canonical residency. The 3D controller uses the finest complete
+resident target-eligible rung inside its fixed native work envelope while
+finer work is cold or unaffordable; the mandatory terminal rung remains the
+last emergency floor.
+Complete old pixels remain visible until an exact hidden replacement can swap.
+The UI reports the actual shown scale, selected scale, ideal scale, refinement,
+and neutral adaptive-capacity state. Successful linked-only installation
+clears its matching historical planning/capacity warning; successful
+presentation clears renderer failure state when no plan error remains. A red
+hard capacity failure is reserved for the exceptional case where no
+catalog-provided minimum navigation plan is physically feasible.
+
+Visible-demand worker results bind the renderer-union base against which their
+O(delta) update was prepared. If an earlier hidden refinement changes that
+base before installation, the result is stale and replanned; it is not
+misreported as a user-visible capacity error. Camera and cross-section wheel
+input also consumes only current-frame raw wheel or pinch events. Egui's
+multi-frame smoothing tail is no longer reused as authoritative input and
+cannot recursively create camera revisions and repaints.
+
+Three 30-second mapped normal-app 3D-panel zoom sessions passed on the
+representative four-panel workload and NVIDIA GeForce RTX 3070 Ti Laptop GPU.
+Every run
+observed both a feasible finer displayed level and an ideal boundary
+constrained to a coarser selected/displayed level, followed by complete S3
+recovery. Across them the worst input, window-receipt, main-loop, externally
+visible-change, and p99 input-to-visible observations were 31.096 ms,
+35.838 ms, 33.638 ms, 54.763 ms, and 28.945 ms.
+
+The five-minute combined normal-app exercise passed after an exact
+1854×1011 → 1100×650 → 1854×1011 real-window resize and a 120-sample real 3D
+orbit round trip. It generated 18,004 independently clocked wheel inputs and
+the app applied 17,910 authoritative camera samples. Worst input, receipt,
+main-loop, and external visible-change gaps were 32.714 ms, 39.150 ms,
+34.181 ms, and 86.384 ms; p99 input-to-visible latency was 46.697 ms. Both LOD
+boundary classes were observed, no ordinary hard capacity error occurred, and
+the final frame was complete S3. The
+[adaptive LOD and global capacity plan](plans/active/VIEWER_ADAPTIVE_LOD_AND_GLOBAL_CAPACITY.md)
+preserves the approved design and implementation/evidence handoff.
+
+The final adaptive-LOD integration gate passed formatting, exact verification
+registry synchronization, fixture validation, architecture, documentation,
+dependency and workflow policy, zero-warning workspace Clippy, exact ignored
+lane discovery, and its then-current 1,239 PR-lane unit, contract, and UI
+tests. The final refactor checkpoint later passed all 1,298 current PR-lane
+cases.
+
+Those results support the narrower 3D adaptive-capacity path. They do not
+validate linked-oblique monitor continuity or linked-2D LOD-transition
+performance. Generic product capture still implicitly selects the 3D target,
+and metadata-only `Current`, `Exact`, settlement, and idle facts are not
+independent evidence of the scale represented by linked-panel pixels.
+
+The cold pipeline-admission prerequisite is also product-integrated. With a
+fresh NVIDIA shader-cache directory, command zero was admitted in 46 ms while
+the first-frame wait continued for roughly 20 seconds with live progress
+heartbeats. The same mapped run then produced current pixels and passed warm
+resident navigation and idle-settlement checks. Focused worker tests cover
+ordered capability publication, first-operation failure, cancellation, and
+nonblocking drop; real-Vulkan readiness and resident rendering also pass.
 
 The cold-refinement slice is also product-validated. On a real-display
 65×1025×1537 public import fixture with four scales, the previous visible frame
@@ -290,11 +801,17 @@ terminal failures preserve the first typed cause and stop later unsafe work;
 focused classification, first-cause, mapped-access, and app-mapping checks
 passed. Actual hardware device loss or out-of-memory was not destructively
 induced, so that part is automated-verified rather than product-validated.
-A storage-format rewrite remains unauthorized unless later measurement shows
-storage geometry is still a dominant blocker.
+The former P6 storage conclusion is revoked with the invalid performance
+boundary. The current package format and `64³` logical renderer/cache brick
+edge remain unchanged defaults, not a newly accepted performance result.
+Storage work remains outside the active correction unless a faithful failing
+profile identifies required unavailable-brick physical I/O/decode as the first
+blocking boundary; any format experiment or cutover would still require an
+owner-approved amendment.
 
-No absolute performance, comparison-viewer, successor-completion, or release
-claim follows from current evidence.
+No universal all-hardware performance, comparison-viewer, or release claim
+follows from this closeout. The owner-observed product acceptance above closes
+the refactor without broadening those public claims.
 
 ## Import And Preprocessing Performance
 
@@ -381,6 +898,23 @@ historical T5 performance claim.
 - Terminal GPU loss, out-of-memory, backend-internal, and validation failures
   are typed and latched, but there is no device-recovery path or CPU fallback.
   Actual hardware loss/OOM fault injection remains unperformed.
+- Incremental linked-2D zoom now separates provisional resident coverage from
+  exact settled demand, and the owner has observed ordinary S0 output. There
+  is still no valid automated linked monitor-continuity or LOD-transition
+  performance result. The first faithful S3/S1/S0 diagnostic froze the
+  desktop while approaching S0 and lost its app timeline at reboot; the S0
+  workflows remain quarantined and are not a product-closeout prerequisite.
+  The later fragmented payload-placeability correction is implemented,
+  automated-verified, and owner product-validated in the normal viewer. The
+  [GPU placeability plan](plans/active/VIEWER_GPU_PLACEABILITY_AND_RECOVERY.md)
+  owns that correctness handoff; the
+  [closed corrective handoff](plans/active/VIEWER_LINKED_2D_LOD_TRUTH_AND_SETTLEMENT.md)
+  owns the evidence correction and diagnostic handoff.
+- Smooth-linear sampling remains scientifically supported and covered by the
+  renderer/product checks, but fine-scale exact refinement on the
+  representative Cell workload is substantially slower than voxel-exact.
+  This does not block the closed performance refactor. Removing or
+  redesigning that option requires a separate product decision.
 - Exact linked-panel cursor readout remains lease-backed. The 3D viewer now
   submits latest-only asynchronous picks against the exact presented GPU
   residency for MIP, DVR, and ISO; stale or retired frames fail visibly rather

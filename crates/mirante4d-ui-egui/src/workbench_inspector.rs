@@ -10,11 +10,12 @@ use mirante4d_application::{
 };
 
 use crate::{
-    EguiUiState, RuntimeDiagnosticsView, SettingsUiView, StatusTone, WorkbenchAnalysisKind,
-    WorkbenchLayoutSpec, WorkbenchUiAction, WorkbenchUiOutput, application_problem_message,
-    iso_shading_policy_label, panel_scroll, property_row, render_sampling_policy_label, section,
-    show_analysis_workspace, show_frame_fidelity_property_rows, show_runtime_diagnostics_body,
-    show_settings_body, status_badge, toolbar_button,
+    EguiUiState, Linked2dFidelityStatus, RuntimeDiagnosticsView, SettingsUiView, StatusTone,
+    WorkbenchAnalysisKind, WorkbenchLayoutSpec, WorkbenchUiAction, WorkbenchUiOutput,
+    application_problem_message, iso_shading_policy_label, panel_scroll, property_row,
+    render_sampling_policy_label, section, show_analysis_workspace,
+    show_frame_fidelity_property_rows, show_linked_2d_fidelity_property_rows,
+    show_runtime_diagnostics_body, show_settings_body, status_badge, toolbar_button,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +38,7 @@ pub struct InspectorWorkbenchView<'a> {
     pub application: &'a ApplicationSnapshot,
     pub histogram: &'a LayerHistogramSummary,
     pub frame_fidelity: &'a FrameFidelityStatus,
+    pub linked_2d_fidelity: Linked2dFidelityStatus,
     pub render_viewport: RenderExtent,
     pub dvr_density_scale_range: [f64; 2],
     pub no_data_policy_label: Option<&'a str>,
@@ -70,7 +72,12 @@ pub(crate) fn show_workbench_inspector(
                     );
                 });
                 section(ui, "Frame", |ui| {
-                    show_frame_inspector(ui, view.frame_fidelity, view.render_viewport);
+                    show_frame_inspector(
+                        ui,
+                        view.frame_fidelity,
+                        view.linked_2d_fidelity,
+                        view.render_viewport,
+                    );
                 });
                 section(ui, "Viewer Tools", |ui| {
                     show_viewer_tools(ui, view.application, state, output);
@@ -389,9 +396,11 @@ fn show_channel_inspector(
 fn show_frame_inspector(
     ui: &mut egui::Ui,
     fidelity: &FrameFidelityStatus,
+    linked_2d_fidelity: Linked2dFidelityStatus,
     render_viewport: RenderExtent,
 ) {
     show_frame_fidelity_property_rows(ui, fidelity);
+    show_linked_2d_fidelity_property_rows(ui, linked_2d_fidelity);
     property_row(
         ui,
         "pixels",

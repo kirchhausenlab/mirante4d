@@ -705,7 +705,7 @@ pub struct NumericalConformanceContract {
 }
 
 impl NumericalConformanceContract {
-    pub const fn ep00() -> Self {
+    pub const fn independent() -> Self {
         Self {
             scalar_absolute_tolerance: 1.0e-6,
             scalar_relative_tolerance: 4.0 * f32::EPSILON as f64,
@@ -1736,7 +1736,7 @@ mod tests {
         };
         let scaled = render([3.0, 4.0, 0.0]);
         let unit = render([0.6, 0.8, 0.0]);
-        let contract = NumericalConformanceContract::ep00();
+        let contract = NumericalConformanceContract::independent();
         assert!(contract.premultiplied_rgba_matches(
             scaled.color().premultiplied_rgba(),
             unit.color().premultiplied_rgba()
@@ -1929,7 +1929,7 @@ mod tests {
         assert_eq!(red_first.color().rgba8(), [128, 64, 0, 191]);
         assert_eq!(green_first.color().rgba8(), [64, 128, 0, 191]);
 
-        let contract = NumericalConformanceContract::ep00();
+        let contract = NumericalConformanceContract::independent();
         assert!(contract.scalar_matches(65_535.0, 65_535.02));
         assert!(!contract.scalar_matches(65_535.0, 65_535.1));
         assert!(contract.ray_distance_matches(10.0, 10.0 + 1.0e-5));

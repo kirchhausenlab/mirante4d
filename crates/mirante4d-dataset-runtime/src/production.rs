@@ -11,8 +11,8 @@ use std::{
 };
 
 use mirante4d_dataset::{
-    CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError, DatasetCatalog,
-    DatasetResourceKey, DatasetSource, DatasetSourceFault, DecodeSinkError, ReservedDecodeSink,
+    BrickKey, CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError, DatasetCatalog,
+    DatasetSource, DatasetSourceFault, DecodeSinkError, ReservedDecodeSink,
     ResourcePayloadDescriptor, ResourcePayloadFacts,
 };
 
@@ -68,9 +68,9 @@ struct RuntimeState {
     queued_size_counts: BTreeMap<u64, usize>,
     queued_priority_counts: [usize; 6],
     completions: VecDeque<RuntimeCompletion>,
-    cache: BTreeMap<DatasetResourceKey, CacheEntry>,
-    decoded_cache_lru: BTreeSet<(u64, DatasetResourceKey)>,
-    prefetch_cache_lru: BTreeSet<(u64, DatasetResourceKey)>,
+    cache: BTreeMap<BrickKey, CacheEntry>,
+    decoded_cache_lru: BTreeSet<(u64, BrickKey)>,
+    prefetch_cache_lru: BTreeSet<(u64, BrickKey)>,
     submitted_requests: u64,
     started_decodes: u64,
     completed_decodes: u64,
@@ -127,6 +127,9 @@ enum JobPhase {
     Queued,
     Claimed,
     InFlight,
+    // The source observes its existing cancellation checkpoint, while this
+    // phase keeps cooperative yield distinct from terminal waiter retirement.
+    Yielding,
     Aborting,
 }
 
@@ -162,7 +165,7 @@ struct CacheEntry {
 
 struct JobClaim {
     job_id: u64,
-    key: DatasetResourceKey,
+    key: BrickKey,
     descriptor: ResourcePayloadDescriptor,
     admission_bytes: u64,
     priority: RequestPriority,
@@ -310,7 +313,38 @@ impl RuntimeState {
             .map(|(bytes, _)| *bytes)
     }
 
-    fn cache_lru(&self, category: CpuLedgerCategory) -> &BTreeSet<(u64, DatasetResourceKey)> {
+    fn request_foreground_preemption(
+        &mut self,
+        incoming: RequestPriority,
+        worker_limit: usize,
+    ) -> bool {
+        if !matches!(
+            incoming,
+            RequestPriority::CurrentView | RequestPriority::LinkedView
+        ) || self.active_decode_cohorts < worker_limit
+        {
+            return false;
+        }
+
+        let mut requested = false;
+        for job in self.jobs.values_mut() {
+            if job.phase == JobPhase::InFlight
+                && matches!(
+                    job.priority,
+                    RequestPriority::Playback
+                        | RequestPriority::Analysis
+                        | RequestPriority::Prefetch
+                )
+            {
+                job.phase = JobPhase::Yielding;
+                job.cancellation.store(true, AtomicOrdering::Release);
+                requested = true;
+            }
+        }
+        requested
+    }
+
+    fn cache_lru(&self, category: CpuLedgerCategory) -> &BTreeSet<(u64, BrickKey)> {
         if category == CpuLedgerCategory::Prefetch {
             &self.prefetch_cache_lru
         } else {
@@ -319,10 +353,7 @@ impl RuntimeState {
         }
     }
 
-    fn cache_lru_mut(
-        &mut self,
-        category: CpuLedgerCategory,
-    ) -> &mut BTreeSet<(u64, DatasetResourceKey)> {
+    fn cache_lru_mut(&mut self, category: CpuLedgerCategory) -> &mut BTreeSet<(u64, BrickKey)> {
         if category == CpuLedgerCategory::Prefetch {
             &mut self.prefetch_cache_lru
         } else {
@@ -331,7 +362,7 @@ impl RuntimeState {
         }
     }
 
-    fn insert_cache_entry(&mut self, key: DatasetResourceKey, entry: CacheEntry) {
+    fn insert_cache_entry(&mut self, key: BrickKey, entry: CacheEntry) {
         if let Some(replaced) = self.remove_cache_entry(&key) {
             drop(replaced);
         }
@@ -340,7 +371,7 @@ impl RuntimeState {
         self.cache.insert(key, entry);
     }
 
-    fn remove_cache_entry(&mut self, key: &DatasetResourceKey) -> Option<CacheEntry> {
+    fn remove_cache_entry(&mut self, key: &BrickKey) -> Option<CacheEntry> {
         let entry = self.cache.remove(key)?;
         let category = entry.lease.ledger_category();
         let removed = self
@@ -350,7 +381,7 @@ impl RuntimeState {
         Some(entry)
     }
 
-    fn touch_cache_entry(&mut self, key: DatasetResourceKey) {
+    fn touch_cache_entry(&mut self, key: BrickKey) {
         let (category, old_touch) = {
             let entry = self
                 .cache
@@ -370,7 +401,7 @@ impl RuntimeState {
 
     fn reclassify_cache_entry_index(
         &mut self,
-        key: DatasetResourceKey,
+        key: BrickKey,
         old: CpuLedgerCategory,
         new: CpuLedgerCategory,
     ) {
@@ -390,8 +421,8 @@ impl RuntimeState {
     fn oldest_cache_key(
         &self,
         category: CpuLedgerCategory,
-        excluded: Option<DatasetResourceKey>,
-    ) -> Option<DatasetResourceKey> {
+        excluded: Option<BrickKey>,
+    ) -> Option<BrickKey> {
         self.cache_lru(category)
             .iter()
             .map(|(_, key)| *key)
@@ -540,7 +571,7 @@ impl RuntimeShared {
         for job in state.jobs.values_mut() {
             if matches!(
                 job.phase,
-                JobPhase::Claimed | JobPhase::InFlight | JobPhase::Aborting
+                JobPhase::Claimed | JobPhase::InFlight | JobPhase::Yielding | JobPhase::Aborting
             ) {
                 job.phase = JobPhase::Aborting;
                 job.cancellation.store(true, AtomicOrdering::Release);
@@ -765,6 +796,55 @@ impl RuntimeShared {
         state.enqueue_version(entry, self.config.request_queue_limit());
         self.work_available.notify_one();
         Ok(())
+    }
+
+    fn retry_preempted(&self, job_id: u64) -> Result<bool, RuntimeFaultCode> {
+        let mut state = self.lock_state();
+        if state.shutdown != ShutdownState::Running {
+            return Ok(false);
+        }
+        if !state
+            .jobs
+            .get(&job_id)
+            .is_some_and(|job| job.phase == JobPhase::Yielding && !job.waiters.is_empty())
+        {
+            return Ok(false);
+        }
+        let sequence = state.allocate_queue_sequence()?;
+        let (admission_bytes, priority, entry, waiters, reserved_bytes) = {
+            let job = state
+                .jobs
+                .get_mut(&job_id)
+                .expect("the prevalidated yielded job remains installed");
+            job.cancellation.store(false, AtomicOrdering::Release);
+            job.phase = JobPhase::Queued;
+            job.queue_version = job.queue_version.saturating_add(1);
+            job.queue_sequence = sequence;
+            (
+                job.admission_bytes,
+                job.priority,
+                QueueEntry {
+                    priority: job.priority,
+                    sequence,
+                    job_id,
+                    version: job.queue_version,
+                },
+                job.waiters.clone(),
+                job.descriptor.byte_len(),
+            )
+        };
+        for id in waiters {
+            if let Some(record) = state.requests.get_mut(&id)
+                && !record.terminal
+            {
+                record.progress = RuntimeRequestProgress::new(record.ticket, 0, reserved_bytes)
+                    .expect("a yielded decode restarts within its original reservation");
+            }
+        }
+        state.add_queued_job(admission_bytes, priority);
+        state.enqueue_version(entry, self.config.request_queue_limit());
+        self.work_available.notify_one();
+        Ok(true)
     }
 
     fn activate_claim(&self, claim: &JobClaim) -> bool {
@@ -1248,8 +1328,14 @@ impl ProductionDatasetRuntime {
             },
         );
         state.submitted_requests = state.submitted_requests.saturating_add(1);
+        let preemption_requested = state
+            .request_foreground_preemption(request.priority(), self.shared.config.worker_limit());
         drop(state);
-        self.shared.work_available.notify_one();
+        if preemption_requested {
+            self.shared.work_available.notify_all();
+        } else {
+            self.shared.work_available.notify_one();
+        }
         Ok(ticket)
     }
 }
@@ -1338,8 +1424,14 @@ impl DatasetRuntime for ProductionDatasetRuntime {
         if let Some(entry) = queue_update {
             state.enqueue_version(entry, self.shared.config.request_queue_limit());
         }
+        let preemption_requested =
+            state.request_foreground_preemption(priority, self.shared.config.worker_limit());
         drop(state);
-        self.shared.work_available.notify_one();
+        if preemption_requested {
+            self.shared.work_available.notify_all();
+        } else {
+            self.shared.work_available.notify_one();
+        }
         Ok(true)
     }
 
@@ -1604,7 +1696,10 @@ fn cancel_request_ids(
                 JobPhase::Queued => {
                     state.remove_job(job_id);
                 }
-                JobPhase::Claimed | JobPhase::InFlight | JobPhase::Aborting => {
+                JobPhase::Claimed
+                | JobPhase::InFlight
+                | JobPhase::Yielding
+                | JobPhase::Aborting => {
                     let key = job.key;
                     let cancellation = Arc::clone(&job.cancellation);
                     if state.dedupe.get(&key).copied() == Some(job_id) {
@@ -1829,6 +1924,25 @@ fn worker_loop(shared: Arc<RuntimeShared>) {
             match outcome {
                 None => shared.finish_failure(job_id, RuntimeFaultCode::InvariantViolation, true),
                 Some(Err(code)) => {
+                    if code == RuntimeFaultCode::Cancelled {
+                        let written = sink.written as u64;
+                        drop(sink);
+                        // Only a runtime-issued Yielding phase may convert the
+                        // source's cancellation outcome back into queued work.
+                        // Ordinary cancellation first moves the job to
+                        // Aborting and therefore remains terminal.
+                        match shared.retry_preempted(job_id) {
+                            Ok(true) => continue,
+                            Ok(false) => {
+                                shared.record_cancelled_decode_waste(member_elapsed, written);
+                                shared.finish_failure(job_id, code, true);
+                            }
+                            Err(retry_code) => {
+                                shared.finish_failure(job_id, retry_code, true);
+                            }
+                        }
+                        continue;
+                    }
                     if sink.written == 0
                         && !sink.finished
                         && matches!(
@@ -1850,9 +1964,6 @@ fn worker_loop(shared: Arc<RuntimeShared>) {
                             shared.finish_failure(job_id, retry_code, true);
                         }
                         continue;
-                    }
-                    if code == RuntimeFaultCode::Cancelled {
-                        shared.record_cancelled_decode_waste(member_elapsed, sink.written as u64);
                     }
                     shared.finish_failure(job_id, code, true);
                 }
@@ -1882,7 +1993,7 @@ impl Drop for WorkerClaimGuard {
 struct RuntimeDecodeSink {
     shared: Arc<RuntimeShared>,
     job_id: u64,
-    key: DatasetResourceKey,
+    key: BrickKey,
     descriptor: ResourcePayloadDescriptor,
     cancellation: Arc<AtomicBool>,
     buffer: Vec<u8>,
@@ -1924,7 +2035,7 @@ impl RuntimeDecodeSink {
 }
 
 impl ReservedDecodeSink for RuntimeDecodeSink {
-    fn resource_key(&self) -> DatasetResourceKey {
+    fn resource_key(&self) -> BrickKey {
         self.key
     }
 
@@ -2090,7 +2201,7 @@ fn duration_ns(duration: Duration) -> u64 {
 
 fn reclassify_cached_with_eviction(
     state: &mut RuntimeState,
-    current_key: DatasetResourceKey,
+    current_key: BrickKey,
     charge: &LedgerCharge,
     target: CpuLedgerCategory,
 ) -> Result<(), CpuLedgerError> {
@@ -2661,7 +2772,7 @@ mod tests {
 
         fn minimum_decode_working_bytes(
             &self,
-            _key: DatasetResourceKey,
+            _key: BrickKey,
             _descriptor: ResourcePayloadDescriptor,
         ) -> Result<u64, DatasetSourceFault> {
             Ok(64)
@@ -2713,7 +2824,7 @@ mod tests {
 
         fn minimum_decode_working_bytes(
             &self,
-            _key: DatasetResourceKey,
+            _key: BrickKey,
             descriptor: ResourcePayloadDescriptor,
         ) -> Result<u64, DatasetSourceFault> {
             Ok(if descriptor.byte_len() == 1 {
@@ -2893,8 +3004,8 @@ mod tests {
         runtime
     }
 
-    fn key(origin_x: u64, samples: u64) -> DatasetResourceKey {
-        DatasetResourceKey::new(
+    fn key(origin_x: u64, samples: u64) -> BrickKey {
+        BrickKey::new(
             DatasetResourceIdentity::Unverified(DatasetSourceId::new(41)),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -2904,7 +3015,7 @@ mod tests {
     }
 
     fn request(
-        resource: DatasetResourceKey,
+        resource: BrickKey,
         priority: RequestPriority,
         scope: u64,
         generation: u64,
@@ -3396,7 +3507,11 @@ mod tests {
             .unwrap();
         source.release();
         let _ = wait_completions(&runtime, 5);
-        assert_eq!(*source.decode_order.lock().unwrap(), vec![0, 10, 30, 20]);
+        assert_eq!(
+            *source.decode_order.lock().unwrap(),
+            vec![0, 10, 30, 20, 0],
+            "foreground admission must yield and later resume the occupied prefetch decode"
+        );
     }
 
     #[test]
@@ -3432,6 +3547,57 @@ mod tests {
 
         assert_eq!(*source.decode_order.lock().unwrap(), vec![0, 10, 30, 20]);
         assert_eq!(runtime.diagnostics().unwrap().submitted_requests(), 4);
+    }
+
+    #[test]
+    fn foreground_preemption_resumes_the_same_low_priority_job_after_foreground_completes() {
+        let source = TestSource::new(ResourceValidity::AllValid, GatePoint::AfterFirstByte);
+        let runtime = start(Arc::clone(&source), 1, 4, 4);
+        let low = runtime
+            .submit(request(key(0, 4), RequestPriority::Prefetch, 1, 0))
+            .unwrap();
+        source.wait_first_byte();
+
+        let foreground = runtime
+            .submit(request(
+                key(VISIBLE_BURST_ORIGIN, 4),
+                RequestPriority::CurrentView,
+                2,
+                0,
+            ))
+            .unwrap();
+        source.wait_entered(2);
+        assert_eq!(
+            *source.decode_order.lock().unwrap(),
+            vec![0, VISIBLE_BURST_ORIGIN]
+        );
+
+        source.release();
+        let completions = wait_completions(&runtime, 2);
+        assert_eq!(completions[0].ticket(), foreground);
+        assert_eq!(completions[1].ticket(), low);
+        let RuntimeOutcome::Ready(foreground_lease) = completions[0].outcome() else {
+            panic!("foreground request must complete with its decoded payload");
+        };
+        let RuntimeOutcome::Ready(resumed_lease) = completions[1].outcome() else {
+            panic!("resumed low-priority request must complete with its decoded payload");
+        };
+        assert_eq!(foreground_lease.payload().value_bytes(), &[16, 17, 18, 19]);
+        assert_eq!(resumed_lease.payload().value_bytes(), &[0, 1, 2, 3]);
+        assert_eq!(
+            *source.decode_order.lock().unwrap(),
+            vec![0, VISIBLE_BURST_ORIGIN, 0]
+        );
+
+        let diagnostics = runtime.diagnostics().unwrap();
+        assert_eq!(diagnostics.submitted_requests(), 2);
+        assert_eq!(diagnostics.started_decodes(), 2);
+        assert_eq!(diagnostics.completed_decodes(), 2);
+        assert_eq!(diagnostics.ready_requests(), 2);
+        assert_eq!(diagnostics.resident_resources(), 2);
+        assert_eq!(diagnostics.cancelled_requests(), 0);
+        assert_eq!(diagnostics.failed_requests(), 0);
+        assert_eq!(source.decode_count.load(AtomicOrdering::SeqCst), 3);
     }
 
     #[test]
@@ -3511,8 +3677,8 @@ mod tests {
                 .all(|completion| matches!(completion.outcome(), RuntimeOutcome::Ready(_)))
         );
         let performance = runtime.diagnostics().unwrap().performance();
-        assert_eq!(performance.decode_cohorts(), (WORKERS * 2) as u64);
-        assert_eq!(performance.decode_cohort_members(), (WORKERS * 2) as u64);
+        assert_eq!(performance.decode_cohorts(), (WORKERS * 3) as u64);
+        assert_eq!(performance.decode_cohort_members(), (WORKERS * 3) as u64);
         assert_eq!(performance.peak_decode_cohort_members(), 1);
     }
 

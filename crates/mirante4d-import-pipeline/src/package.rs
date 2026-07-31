@@ -25,7 +25,6 @@ use crate::ImportError;
 
 const IMAGE_ORDINAL: u32 = 0;
 const PACKED_INDEX_RECORD_BYTES: u64 = 64;
-const MAX_LEVELS: usize = 7;
 const MAX_SOURCE_FILES: usize = 4_096;
 const EXECUTABLE_HASH_BUFFER_BYTES: usize = 64 * 1024;
 const BASE_OPERATION_REGISTRY_V1: &[u8] = b"mirante4d-import-pipeline-base-operation-registry-v1";
@@ -138,12 +137,9 @@ fn validate_input(input: &PackageMetadataInput) -> Result<(), ImportError> {
             "package metadata requires at least one channel",
         ));
     }
-    if input.pyramid_shapes.is_empty()
-        || input.pyramid_shapes.len() > MAX_LEVELS
-        || input.pyramid_shapes[0] != input.base_shape
-    {
+    if input.pyramid_shapes.is_empty() || input.pyramid_shapes[0] != input.base_shape {
         return Err(ImportError::InvalidRequest(
-            "pyramid shapes must begin with the base shape and contain one through seven levels",
+            "pyramid shapes must begin with the base shape",
         ));
     }
     for pair in input.pyramid_shapes.windows(2) {
@@ -751,6 +747,27 @@ mod tests {
                 PortableRecordKind::Recipe,
                 PortableRecordKind::Derivation,
             ]
+        );
+    }
+
+    #[test]
+    fn package_metadata_accepts_a_geometry_required_15_level_pyramid() {
+        let shapes = [
+            1_048_576, 524_288, 262_144, 131_072, 65_536, 32_768, 16_384, 8_192, 4_096, 2_048,
+            1_024, 512, 256, 128, 64,
+        ]
+        .into_iter()
+        .map(|x| Shape4D::new(1, 1, 1, x).unwrap())
+        .collect::<Vec<_>>();
+        let metadata = build_package_metadata(&input(shapes[0], shapes)).unwrap();
+
+        assert_eq!(metadata.profile.images()[0].levels().len(), 15);
+        assert_eq!(metadata.ome_images[0].level_transforms().len(), 15);
+        assert_eq!(metadata.arrays.len(), 30);
+        assert!(
+            String::from_utf8(metadata.ome_images[0].deterministic_bytes().unwrap())
+                .unwrap()
+                .contains("\"path\":\"s14\"")
         );
     }
 

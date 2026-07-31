@@ -32,7 +32,30 @@ pub(crate) fn runtime_diagnostics_view(app: &MiranteWorkbenchApp) -> RuntimeDiag
         "source".to_owned(),
         app.dataset.selected_path().display().to_string(),
     ));
-    let camera_demand = app.camera_demand_planner.diagnostics();
+    rows.push((
+        "selected GPU memory".to_owned(),
+        format!(
+            "{} {:?} {:?}, {} {}, device-local {}, driver budget {}, driver usage {}, failure {}",
+            app.selected_adapter_memory.adapter_name(),
+            app.selected_adapter_memory.backend(),
+            app.selected_adapter_memory.device_type(),
+            app.selected_adapter_memory.memory_model(),
+            app.selected_adapter_memory.source(),
+            app.selected_adapter_memory
+                .device_local_bytes()
+                .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
+            app.selected_adapter_memory
+                .driver_budget_bytes()
+                .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
+            app.selected_adapter_memory
+                .driver_usage_bytes()
+                .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
+            app.selected_adapter_memory
+                .failure()
+                .map_or_else(|| "none".to_owned(), ToString::to_string),
+        ),
+    ));
+    let camera_demand = app.dataset.visible_demand_diagnostics();
     rows.push((
         "camera demand".to_owned(),
         format!(
@@ -178,14 +201,10 @@ pub(crate) fn runtime_diagnostics_view(app: &MiranteWorkbenchApp) -> RuntimeDiag
     rows.push((
         "renderer leases".to_owned(),
         format!(
-            "{} / {} CPU-retained, {} GPU-only, {} unavailable",
+            "{} / {} CPU-retained, {} CPU-absent",
             app.dataset.retained_leases().retained_len(),
             app.dataset.retained_leases().required_len(),
-            app.dataset.gpu_only_display_payloads(),
-            app.dataset
-                .retained_leases()
-                .missing_len()
-                .saturating_sub(app.dataset.gpu_only_display_payloads()),
+            app.dataset.retained_leases().missing_len(),
         ),
     ));
     rows.push((
@@ -196,6 +215,28 @@ pub(crate) fn runtime_diagnostics_view(app: &MiranteWorkbenchApp) -> RuntimeDiag
             app.render_coordination.frame_fidelity.target_scale_level,
         ),
     ));
+    for (index, candidate) in app
+        .volume_presentation
+        .latest_candidate_facts()
+        .iter()
+        .enumerate()
+    {
+        rows.push((
+            format!("3D candidate {index} {}", candidate.kind.label()),
+            format!(
+                "s{}; {} resources / {} payload bytes; {} native work units; resident {}; target-eligible {}; interaction-safe {}; full-volume {}; {}",
+                candidate.active_scale.get(),
+                candidate.resource_count,
+                candidate.payload_bytes,
+                candidate.native_work_units,
+                candidate.complete_and_resident,
+                candidate.target_quality_eligible,
+                candidate.interaction_safe,
+                candidate.full_volume,
+                candidate.disposition.label(),
+            ),
+        ));
+    }
     let milestones = app.display_performance_milestones;
     rows.push((
         "display milestones".to_owned(),
@@ -224,15 +265,55 @@ pub(crate) fn runtime_diagnostics_view(app: &MiranteWorkbenchApp) -> RuntimeDiag
         }
     }
     if let Some(product) = app.native_presentation.product_gpu.as_ref() {
+        rows.push((
+            "renderer pipelines".to_owned(),
+            product.renderer.pipeline_readiness().map_or_else(
+                |error| format!("failed: {error}"),
+                |state| format!("{state:?}"),
+            ),
+        ));
         let diagnostics = product.renderer.diagnostics();
         rows.push((
             "GPU residency".to_owned(),
             format!(
-                "{} / {} bytes, {} frames, {} submissions",
+                "{} resident / {} committed / {} logical bytes ({} physical buffer bytes, {} uncommitted), {} growths / {} copied bytes; {} frames, {} submissions",
                 diagnostics.resident_payload_bytes(),
+                diagnostics.payload_committed_capacity_bytes(),
                 diagnostics.payload_capacity_bytes(),
+                diagnostics.payload_arena_allocated_bytes(),
+                diagnostics.payload_uncommitted_capacity_bytes(),
+                diagnostics.payload_growths(),
+                diagnostics.payload_growth_copy_bytes(),
                 diagnostics.frames_executed(),
                 diagnostics.queue_submissions(),
+            ),
+        ));
+        rows.push((
+            "hidden exact".to_owned(),
+            format!(
+                "{} started / {} completed / {} cancelled / {} failed; {} batches / {} rows / {:.2} ms, last batch {} rows",
+                diagnostics.hidden_refinement_jobs_started(),
+                diagnostics.hidden_refinement_jobs_completed(),
+                diagnostics.hidden_refinement_jobs_cancelled(),
+                diagnostics.hidden_refinement_jobs_failed(),
+                diagnostics.hidden_refinement_batches(),
+                diagnostics.hidden_refinement_rows(),
+                diagnostics.hidden_refinement_elapsed_ns() as f64 / 1_000_000.0,
+                diagnostics
+                    .hidden_refinement_last_batch_rows()
+                    .map_or_else(|| "none".to_owned(), |rows| rows.to_string()),
+            ),
+        ));
+        rows.push((
+            "GPU placeability".to_owned(),
+            format!(
+                "{} aggregate free / {} largest contiguous bytes; {} refusals, {} compactions ({} resources / {} bytes moved)",
+                diagnostics.payload_free_bytes(),
+                diagnostics.payload_largest_contiguous_bytes(),
+                diagnostics.payload_placeability_failures(),
+                diagnostics.payload_compactions(),
+                diagnostics.payload_compaction_resources_moved(),
+                diagnostics.payload_compaction_bytes_moved(),
             ),
         ));
         rows.push((
@@ -246,12 +327,22 @@ pub(crate) fn runtime_diagnostics_view(app: &MiranteWorkbenchApp) -> RuntimeDiag
             ),
         ));
         rows.push((
-            "GPU control".to_owned(),
+            "GPU directory".to_owned(),
             format!(
-                "{} publication writes, peak {} / frame, {} dense fallbacks",
-                diagnostics.control_publication_writes(),
-                diagnostics.peak_control_publication_writes_per_frame(),
-                diagnostics.control_dense_fallbacks(),
+                "{} publications / {} mutations / {} rebuilds; {} slot writes / {} page-record writes",
+                diagnostics.directory_publications(),
+                diagnostics.directory_mutations(),
+                diagnostics.directory_rebuilds(),
+                diagnostics.directory_slot_writes(),
+                diagnostics.page_record_writes(),
+            ),
+        ));
+        rows.push((
+            "GPU target control".to_owned(),
+            format!(
+                "{} updates / {} bytes",
+                diagnostics.target_control_updates(),
+                diagnostics.target_control_upload_bytes(),
             ),
         ));
         rows.push((
@@ -449,16 +540,11 @@ pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {
     text.push_str(&format!(
         "renderer_required_leases: {}\n\
          renderer_retained_leases: {}\n\
-         renderer_gpu_only_leases: {}\n\
-         renderer_unavailable_leases: {}\n\
+         renderer_cpu_absent_leases: {}\n\
          current_scale_level: {}\n",
         app.dataset.retained_leases().required_len(),
         app.dataset.retained_leases().retained_len(),
-        app.dataset.gpu_only_display_payloads(),
-        app.dataset
-            .retained_leases()
-            .missing_len()
-            .saturating_sub(app.dataset.gpu_only_display_payloads()),
+        app.dataset.retained_leases().missing_len(),
         app.dataset.current_scale().get(),
     ));
     for (slot, panel) in app.render_coordination.iter() {
@@ -504,20 +590,33 @@ pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {
     if let Some(product) = app.native_presentation.product_gpu.as_ref() {
         let diagnostics = product.renderer.diagnostics();
         text.push_str(&format!(
-            "gpu_uploaded_resources: {}\n\
+            "renderer_pipeline_readiness: {}\n\
+             gpu_uploaded_resources: {}\n\
              gpu_uploaded_payload_bytes: {}\n\
              gpu_render_thread_payload_fact_scan_bytes: {}\n\
              gpu_upload_staging_padding_zero_bytes: {}\n\
-             gpu_control_publication_writes: {}\n\
-             gpu_peak_control_publication_writes_per_frame: {}\n\
-             gpu_control_dense_fallbacks: {}\n",
+             gpu_directory_publications: {}\n\
+             gpu_directory_mutations: {}\n\
+             gpu_directory_rebuilds: {}\n\
+             gpu_directory_slot_writes: {}\n\
+             gpu_page_record_writes: {}\n\
+             gpu_target_control_updates: {}\n\
+             gpu_target_control_upload_bytes: {}\n",
+            product.renderer.pipeline_readiness().map_or_else(
+                |error| format!("failed: {error}"),
+                |state| format!("{state:?}")
+            ),
             diagnostics.uploaded_resources(),
             diagnostics.uploaded_payload_bytes(),
             diagnostics.render_thread_payload_fact_scan_bytes(),
             diagnostics.upload_staging_padding_zero_bytes(),
-            diagnostics.control_publication_writes(),
-            diagnostics.peak_control_publication_writes_per_frame(),
-            diagnostics.control_dense_fallbacks(),
+            diagnostics.directory_publications(),
+            diagnostics.directory_mutations(),
+            diagnostics.directory_rebuilds(),
+            diagnostics.directory_slot_writes(),
+            diagnostics.page_record_writes(),
+            diagnostics.target_control_updates(),
+            diagnostics.target_control_upload_bytes(),
         ));
     }
     text

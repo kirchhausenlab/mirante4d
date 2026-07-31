@@ -161,7 +161,7 @@ impl ProfileImage {
             }
         }
         if levels.is_empty() || levels.len() > LEVEL_COUNT_MAX {
-            return invalid("each image must contain one through seven levels");
+            return invalid("each image must contain one through 64 levels");
         }
         for (expected, level) in levels.iter().enumerate() {
             if level.image_ordinal != image_ordinal || level.scale_ordinal != expected as u32 {
@@ -723,5 +723,11 @@ mod tests {
                 .is_err()
         );
         assert!(ProfileHeader::parse_canonical(&vec![b' '; MAX_PROFILE_HEADER_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn profile_level_bound_accepts_every_representable_geometry_chain() {
+        assert!(ProfileLevel::new(0, 63, ProfileValidityMode::AllValid).is_ok());
+        assert!(ProfileLevel::new(0, 64, ProfileValidityMode::AllValid).is_err());
     }
 }

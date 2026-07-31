@@ -9,7 +9,7 @@ use std::{
 use crate::product_render_intent::PRODUCT_RENDER_RESOURCE_LIMIT;
 use crate::semantic_tiles::SEMANTIC_TILE_SIDE;
 use mirante4d_dataset::{
-    CpuByteLease, DatasetResourceIdentity, DatasetResourceKey, ResourceLease, ResourcePayloadView,
+    BrickKey, CpuByteLease, DatasetResourceIdentity, ResourceLease, ResourcePayloadView,
 };
 use mirante4d_domain::{IntensityDType, LogicalLayerKey, ScaleLevel, TimeIndex};
 
@@ -18,8 +18,8 @@ pub(crate) const MAX_RETAINED_LEASE_REQUIREMENTS: usize = PRODUCT_RENDER_RESOURC
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetainedLeaseError {
     TooManyRequirements { actual: usize, maximum: usize },
-    ResourceNotRequired { key: DatasetResourceKey },
-    ConflictingLeaseAllocation { key: DatasetResourceKey },
+    ResourceNotRequired { key: BrickKey },
+    ConflictingLeaseAllocation { key: BrickKey },
     PreparedRequirementsChanged,
 }
 
@@ -51,11 +51,11 @@ impl std::error::Error for RetainedLeaseError {}
 /// and validity masks stay owned by their leases and are only borrowed here.
 #[derive(Default)]
 pub(crate) struct RetainedLeases {
-    requirements: Arc<[DatasetResourceKey]>,
+    requirements: Arc<[BrickKey]>,
     requirement_charge: Option<Arc<dyn CpuByteLease>>,
-    leases: BTreeMap<DatasetResourceKey, Arc<dyn ResourceLease>>,
+    leases: BTreeMap<BrickKey, Arc<dyn ResourceLease>>,
     generation: u64,
-    spatial_index: HashMap<RetainedSpatialKey, Vec<DatasetResourceKey>>,
+    spatial_index: HashMap<RetainedSpatialKey, Vec<BrickKey>>,
     #[cfg(test)]
     spatial_lookup_visits: std::cell::Cell<u64>,
     #[cfg(test)]
@@ -72,7 +72,7 @@ pub(crate) struct RetainedLeases {
 /// request or prepared result still references the old key body.
 #[derive(Clone)]
 pub(crate) struct RetainedRequirementHandle {
-    pub(crate) requirements: Arc<[DatasetResourceKey]>,
+    pub(crate) requirements: Arc<[BrickKey]>,
     pub(crate) charge: Option<Arc<dyn CpuByteLease>>,
 }
 
@@ -86,7 +86,7 @@ struct RetainedSpatialKey {
 }
 
 impl RetainedSpatialKey {
-    fn for_resource(key: DatasetResourceKey) -> Self {
+    fn for_resource(key: BrickKey) -> Self {
         Self {
             identity: key.identity(),
             layer: key.layer(),
@@ -130,7 +130,7 @@ impl<'a> RetainedLeaseResource<'a> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RetainedLeaseCohort<'a> {
     leases: &'a RetainedLeases,
-    requirements: Option<&'a [DatasetResourceKey]>,
+    requirements: Option<&'a [BrickKey]>,
     identity: DatasetResourceIdentity,
     layer: LogicalLayerKey,
     timepoint: TimeIndex,
@@ -190,7 +190,7 @@ impl RetainedLeases {
     #[cfg(test)]
     pub(crate) fn replace_requirements(
         &mut self,
-        requirements: impl IntoIterator<Item = DatasetResourceKey>,
+        requirements: impl IntoIterator<Item = BrickKey>,
     ) -> Result<usize, RetainedLeaseError> {
         self.replace_requirements_with_limit(requirements, MAX_RETAINED_LEASE_REQUIREMENTS)
     }
@@ -198,7 +198,7 @@ impl RetainedLeases {
     #[cfg(test)]
     fn replace_requirements_with_limit(
         &mut self,
-        requirements: impl IntoIterator<Item = DatasetResourceKey>,
+        requirements: impl IntoIterator<Item = BrickKey>,
         maximum: usize,
     ) -> Result<usize, RetainedLeaseError> {
         let mut next = requirements.into_iter().collect::<Vec<_>>();
@@ -213,7 +213,7 @@ impl RetainedLeases {
     #[cfg(test)]
     pub(crate) fn replace_prepared_requirements(
         &mut self,
-        requirements: Arc<[DatasetResourceKey]>,
+        requirements: Arc<[BrickKey]>,
     ) -> Result<usize, RetainedLeaseError> {
         self.replace_prepared_requirements_with_limit(requirements, MAX_RETAINED_LEASE_REQUIREMENTS)
     }
@@ -221,7 +221,7 @@ impl RetainedLeases {
     #[cfg(test)]
     fn replace_prepared_requirements_with_limit(
         &mut self,
-        next: Arc<[DatasetResourceKey]>,
+        next: Arc<[BrickKey]>,
         maximum: usize,
     ) -> Result<usize, RetainedLeaseError> {
         debug_assert!(next.is_sorted());
@@ -255,8 +255,8 @@ impl RetainedLeases {
     /// key body. Arc identity binds the removal delta to the exact old union.
     pub(crate) fn preflight_prepared_requirement_update(
         &self,
-        previous: &Arc<[DatasetResourceKey]>,
-        next: &Arc<[DatasetResourceKey]>,
+        previous: &Arc<[BrickKey]>,
+        next: &Arc<[BrickKey]>,
     ) -> Result<(), RetainedLeaseError> {
         Self::preflight_prepared_requirements(next)?;
         if !Arc::ptr_eq(&self.requirements, previous) {
@@ -270,9 +270,9 @@ impl RetainedLeases {
     /// touch the retained map and their directly addressed spatial buckets.
     pub(crate) fn commit_prepared_requirement_update(
         &mut self,
-        previous: Arc<[DatasetResourceKey]>,
-        next: Arc<[DatasetResourceKey]>,
-        removals: &[DatasetResourceKey],
+        previous: Arc<[BrickKey]>,
+        next: Arc<[BrickKey]>,
+        removals: &[BrickKey],
         charge: Arc<dyn CpuByteLease>,
     ) -> usize {
         debug_assert!(Arc::ptr_eq(&self.requirements, &previous));
@@ -306,7 +306,7 @@ impl RetainedLeases {
     }
 
     pub(crate) fn preflight_prepared_requirements(
-        requirements: &Arc<[DatasetResourceKey]>,
+        requirements: &Arc<[BrickKey]>,
     ) -> Result<(), RetainedLeaseError> {
         Self::preflight_prepared_requirements_with_limit(
             requirements,
@@ -315,7 +315,7 @@ impl RetainedLeases {
     }
 
     fn preflight_prepared_requirements_with_limit(
-        requirements: &Arc<[DatasetResourceKey]>,
+        requirements: &Arc<[BrickKey]>,
         maximum: usize,
     ) -> Result<(), RetainedLeaseError> {
         if requirements.len() > maximum {
@@ -361,12 +361,12 @@ impl RetainedLeases {
     }
 
     #[cfg(test)]
-    pub(crate) fn required_keys(&self) -> impl ExactSizeIterator<Item = DatasetResourceKey> + '_ {
+    pub(crate) fn required_keys(&self) -> impl ExactSizeIterator<Item = BrickKey> + '_ {
         self.requirements.iter().copied()
     }
 
     #[cfg(test)]
-    pub(crate) fn requirement_handle(&self) -> Arc<[DatasetResourceKey]> {
+    pub(crate) fn requirement_handle(&self) -> Arc<[BrickKey]> {
         Arc::clone(&self.requirements)
     }
 
@@ -403,23 +403,20 @@ impl RetainedLeases {
         !self.requirements.is_empty() && self.missing_len() == 0
     }
 
-    pub(crate) fn requires(&self, key: DatasetResourceKey) -> bool {
+    pub(crate) fn requires(&self, key: BrickKey) -> bool {
         self.requirements.binary_search(&key).is_ok()
     }
 
     #[cfg(test)]
-    fn retained_lease(&self, key: DatasetResourceKey) -> Option<&Arc<dyn ResourceLease>> {
+    fn retained_lease(&self, key: BrickKey) -> Option<&Arc<dyn ResourceLease>> {
         self.leases.get(&key)
     }
 
-    pub(crate) fn payload(&self, key: DatasetResourceKey) -> Option<ResourcePayloadView<'_>> {
+    pub(crate) fn payload(&self, key: BrickKey) -> Option<ResourcePayloadView<'_>> {
         self.leases.get(&key).map(|lease| lease.payload())
     }
 
-    pub(crate) fn lease_handle(
-        &self,
-        requirement: DatasetResourceKey,
-    ) -> Option<Arc<dyn ResourceLease>> {
+    pub(crate) fn lease_handle(&self, requirement: BrickKey) -> Option<Arc<dyn ResourceLease>> {
         self.leases.get(&requirement).cloned()
     }
 
@@ -427,7 +424,7 @@ impl RetainedLeases {
     /// exact immutable resource to GPU residency. The semantic requirement
     /// remains installed so an eviction can re-admit the same key without
     /// replanning or changing renderer slot identity.
-    pub(crate) fn retire_payload_handle(&mut self, key: DatasetResourceKey) -> bool {
+    pub(crate) fn retire_payload_handle(&mut self, key: BrickKey) -> bool {
         if self.leases.remove(&key).is_none() {
             return false;
         }
@@ -436,7 +433,7 @@ impl RetainedLeases {
         true
     }
 
-    fn remove_spatial_key(&mut self, key: DatasetResourceKey) {
+    fn remove_spatial_key(&mut self, key: BrickKey) {
         let spatial = RetainedSpatialKey::for_resource(key);
         if let Some(bucket) = self.spatial_index.get_mut(&spatial) {
             bucket.retain(|candidate| *candidate != key);
@@ -453,7 +450,7 @@ impl RetainedLeases {
 
     pub(crate) fn retained_payloads(
         &self,
-    ) -> impl ExactSizeIterator<Item = (DatasetResourceKey, ResourcePayloadView<'_>)> + '_ {
+    ) -> impl ExactSizeIterator<Item = (BrickKey, ResourcePayloadView<'_>)> + '_ {
         self.leases
             .iter()
             .map(|(key, lease)| (*key, lease.payload()))
@@ -478,7 +475,7 @@ impl RetainedLeases {
 
     pub(crate) fn resident_subset<'a>(
         &'a self,
-        requirements: &'a [DatasetResourceKey],
+        requirements: &'a [BrickKey],
         identity: DatasetResourceIdentity,
         layer: LogicalLayerKey,
         timepoint: TimeIndex,
@@ -501,7 +498,7 @@ impl RetainedLeases {
         timepoint: TimeIndex,
         scale: ScaleLevel,
     ) -> RetainedLeaseStatus {
-        let matches = |key: &&DatasetResourceKey| {
+        let matches = |key: &&BrickKey| {
             key.identity() == identity
                 && key.layer() == layer
                 && key.timepoint() == timepoint
@@ -525,7 +522,7 @@ impl<'a> RetainedLeaseCohort<'a> {
         let layer = self.layer;
         let timepoint = self.timepoint;
         let scale = self.scale;
-        let matches_cohort = move |key: DatasetResourceKey| {
+        let matches_cohort = move |key: BrickKey| {
             key.identity() == identity
                 && key.layer() == layer
                 && key.timepoint() == timepoint
@@ -567,7 +564,7 @@ impl<'a> RetainedLeaseCohort<'a> {
 
     pub(crate) fn status(&self) -> RetainedLeaseStatus {
         if let Some(requirements) = self.requirements {
-            let matches = |key: &&DatasetResourceKey| {
+            let matches = |key: &&BrickKey| {
                 key.identity() == self.identity
                     && key.layer() == self.layer
                     && key.timepoint() == self.timepoint
@@ -693,7 +690,7 @@ mod tests {
 
     #[derive(Debug)]
     struct FixtureLease {
-        key: DatasetResourceKey,
+        key: BrickKey,
         descriptor: ResourcePayloadDescriptor,
         values: Box<[u8]>,
         validity: Option<Box<[u8]>>,
@@ -701,7 +698,7 @@ mod tests {
 
     impl FixtureLease {
         fn u16(
-            key: DatasetResourceKey,
+            key: BrickKey,
             values: &[u16],
             validity: Option<&[u8]>,
         ) -> Result<Self, ResourceContractError> {
@@ -731,7 +728,7 @@ mod tests {
     }
 
     impl ResourceLease for FixtureLease {
-        fn key(&self) -> DatasetResourceKey {
+        fn key(&self) -> BrickKey {
             self.key
         }
 
@@ -764,7 +761,7 @@ mod tests {
     }
 
     impl ResourceLease for OuterLease {
-        fn key(&self) -> DatasetResourceKey {
+        fn key(&self) -> BrickKey {
             self.0.key()
         }
 
@@ -777,8 +774,8 @@ mod tests {
         }
     }
 
-    fn key(x: u64) -> DatasetResourceKey {
-        DatasetResourceKey::new(
+    fn key(x: u64) -> BrickKey {
+        BrickKey::new(
             DatasetResourceIdentity::Unverified(DatasetSourceId::new(7)),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -787,16 +784,12 @@ mod tests {
         )
     }
 
-    fn lease(
-        key: DatasetResourceKey,
-        values: &[u16],
-        validity: Option<&[u8]>,
-    ) -> Arc<dyn ResourceLease> {
+    fn lease(key: BrickKey, values: &[u16], validity: Option<&[u8]>) -> Arc<dyn ResourceLease> {
         Arc::new(FixtureLease::u16(key, values, validity).unwrap())
     }
 
-    fn semantic_key(layer: u32, tile_x: u64) -> DatasetResourceKey {
-        DatasetResourceKey::new(
+    fn semantic_key(layer: u32, tile_x: u64) -> BrickKey {
+        BrickKey::new(
             DatasetResourceIdentity::Unverified(DatasetSourceId::new(17)),
             LogicalLayerKey::new(layer),
             TimeIndex::new(0),
@@ -916,7 +909,7 @@ mod tests {
             .unwrap();
         let visits_before = retained.prepared_removal_delta_visits();
         let charge: Arc<dyn CpuByteLease> = Arc::new(FixtureCpuCharge(
-            u64::try_from(next.len() * std::mem::size_of::<DatasetResourceKey>()).unwrap(),
+            u64::try_from(next.len() * std::mem::size_of::<BrickKey>()).unwrap(),
         ));
         assert_eq!(
             retained.commit_prepared_requirement_update(
@@ -1018,7 +1011,7 @@ mod tests {
         let first = key(0);
         let second = key(2);
         let missing = key(4);
-        let other_timepoint = DatasetResourceKey::new(
+        let other_timepoint = BrickKey::new(
             first.identity(),
             first.layer(),
             TimeIndex::new(1),

@@ -27,6 +27,7 @@ use mirante4d_storage::{
 use crate::{
     FrameCompleteness, FrameFidelityStatus, LodDecisionReason, StartupDiagnostics,
     analysis_session::AnalysisProductRuntime,
+    camera_demand_cache::CameraDemandPlannerError,
     collect_startup_diagnostics,
     dataset_requests::DatasetDemandState,
     default_camera_for_shape,
@@ -57,6 +58,7 @@ pub(crate) enum UnifiedVerifiedSourceOpenError {
     RuntimeConfiguration(RuntimeFaultCode),
     Adapter(LocalDatasetSourceOpenError),
     Runtime(RuntimeFault),
+    DemandPlanner(CameraDemandPlannerError),
     MissingCpuLedger,
     MissingLocalSource,
 }
@@ -149,7 +151,7 @@ pub(crate) fn open(
         resource_identity,
         selected_path,
         local_source,
-    );
+    )?;
     Ok(UnifiedOpenedSource {
         dataset,
         catalog,
@@ -259,7 +261,8 @@ pub(crate) fn open_verified(
         resource_identity,
         selected_path,
         local_source,
-    );
+    )
+    .map_err(UnifiedVerifiedSourceOpenError::DemandPlanner)?;
     Ok(UnifiedVerifiedSource { dataset, catalog })
 }
 

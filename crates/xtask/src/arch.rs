@@ -755,14 +755,14 @@ fn check_render_ownership(
     }
 
     let app_root = repo_root.join("crates/mirante4d-app/src");
-    let successor_references = collect_rust_source_files(&app_root)?
+    let renderer_references = collect_rust_source_files(&app_root)?
         .into_iter()
         .map(fs::read_to_string)
         .collect::<Result<Vec<_>, _>>()?
         .iter()
         .map(|source| source.matches("WgpuRenderRuntime").count())
         .sum::<usize>();
-    if successor_references == 0 {
+    if renderer_references == 0 {
         bail!("native app does not construct WgpuRenderRuntime");
     }
     Ok(())

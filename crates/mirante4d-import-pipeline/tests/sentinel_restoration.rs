@@ -155,18 +155,19 @@ fn oracle_next(parent: &DenseLevel, two_dimensional: bool) -> DenseLevel {
 fn oracle_pyramid(raw: &[u8], shape_zyx: [usize; 3], sentinel: u8) -> Vec<DenseLevel> {
     let two_dimensional = shape_zyx[0] == 1;
     let mut levels = vec![oracle_base(raw, shape_zyx, sentinel)];
-    if shape_zyx.into_iter().max().unwrap() <= 256 {
-        return levels;
-    }
-    loop {
+    while levels.last().unwrap().shape_zyx.into_iter().max().unwrap() > 64
+        || levels
+            .last()
+            .unwrap()
+            .shape_zyx
+            .into_iter()
+            .product::<usize>()
+            > 262_144
+    {
         let next = oracle_next(levels.last().unwrap(), two_dimensional);
-        let terminal = next.shape_zyx.into_iter().max().unwrap() <= 64
-            || next.shape_zyx.into_iter().product::<usize>() <= 262_144;
         levels.push(next);
-        if terminal {
-            return levels;
-        }
     }
+    levels
 }
 
 fn neighbors(
@@ -350,7 +351,7 @@ fn production_packages_support_zero_and_non_255_sentinels_without_reclassifying_
     for (name, shape, sentinel, raw) in cases {
         let expected = oracle_pyramid(&raw, shape, sentinel);
         if sentinel == 7 {
-            assert_eq!(expected.len(), 2);
+            assert_eq!(expected.len(), 4);
             assert_eq!((expected[1].values[0], expected[1].validity[0]), (7, 1));
         }
         let root = tempfile::tempdir().unwrap();
@@ -481,10 +482,13 @@ fn guarded_sentinel_resume_matches_a_fresh_import() {
 #[test]
 fn restored_2d_package_matches_oracle_at_every_lod_and_chunk_seam() {
     const SHAPE: [usize; 3] = [1, 1_025, 1_025];
-    const EXPECTED_DIGESTS: [&str; 3] = [
+    const EXPECTED_DIGESTS: [&str; 6] = [
         "92ca12df47cfe1308fcfb94868e8e95650a28f878b08f8f72187b2bb69595c2a",
         "300cbd68dc41d0779f1ec6f50aaad96b01addee64d1175488bd584e0454d58ae",
         "9aa80d765ff31b903ea6143575430c0ab0e6250ca15873bddad131fa605a08b3",
+        "eaecab00d480d137a00ee92dca399a6d1e71ba3067ce7c8910196495fddd4920",
+        "092cba51d0e68b72e06bb087229cb521814ab5d3f00ea97695a1589940a7a250",
+        "9be02d22d929a5c31ac3db72cb6c2d2086166cc6090c4d91d504d9bdcabf2d40",
     ];
 
     let raw = boundary_fixture_2d(SHAPE);
@@ -510,9 +514,11 @@ fn restored_2d_package_matches_oracle_at_every_lod_and_chunk_seam() {
 #[test]
 fn restored_3d_package_matches_oracle_across_z_and_x_chunk_faces() {
     const SHAPE: [usize; 3] = [65, 17, 257];
-    const EXPECTED_DIGESTS: [&str; 2] = [
+    const EXPECTED_DIGESTS: [&str; 4] = [
         "e34e7c5b4cc869e1a6f563579d8814987cd1f15033a4f0bc5b744dcf2ea16225",
         "79df180e2a35b340971d3f7175b961ecc6dc27242a877506bc9231f6a4ad9e63",
+        "99e4ee71eab3338e3881cb67a8ecc1a4af3df1989e10f235a91a4f72c72c982a",
+        "60dc2c0867ee60a46a4b685dcb7011341bc0d4fc5e0e31ab3695cf37fb2f2efb",
     ];
 
     let raw = boundary_fixture_3d(SHAPE);

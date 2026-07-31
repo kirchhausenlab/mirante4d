@@ -30,8 +30,8 @@ use crate::{
 const PRODUCT_VALIDATION_SCHEMA: &str = "mirante4d-product-validation-report";
 pub(crate) const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 pub(crate) const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-pub(crate) const SCRIPT_SCHEMA_VERSION: u32 = 6;
-pub(crate) const REPORT_SCHEMA_VERSION: u32 = 7;
+pub(crate) const SCRIPT_SCHEMA_VERSION: u32 = 7;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 8;
 pub(crate) const IMPORT_OPEN_READY_COMPLETE_STATUS: &str = "open_ready_complete";
 pub(crate) const PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS: [&str; 12] = [
     "max_cpu_total_bytes",
@@ -60,8 +60,7 @@ const SCENARIO_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_SCENARIO";
 const PREFLIGHT_ONLY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_PREFLIGHT_ONLY";
 const GENERATED_FIXTURE_SCENARIO: &str = "target_fixture_camera_smoke";
 const GENERATED_RENDER_MODES_SCENARIO: &str = "target_fixture_render_modes";
-const GENERATED_RESIDENT_NAVIGATION_SCENARIO: &str =
-    "target_fixture_resident_navigation_no_readback";
+const REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO: &str = "representative_native_navigation";
 const B3_SOURCE_VERIFICATION_SCENARIO: &str = "target_source_verification";
 const IMPORT_PREPROCESSING_SCENARIO: &str = "import_preprocessing";
 const B4_PROJECT_PERSISTENCE_SCENARIO: &str = "b4_project_persistence";
@@ -550,10 +549,6 @@ fn product_validate_report_inner(
     let (mut validation_status, mut failure_reason) = completed_product_validation_outcome(
         app_exited_successfully,
         automation_report.as_ref(),
-        !matches!(
-            scenario,
-            ProductValidationScenario::GeneratedFixtureResidentNavigation
-        ),
         &script,
         &script_path,
     );
@@ -567,16 +562,6 @@ fn product_validate_report_inner(
     if validation_status == ProductValidationStatus::Passed
         && matches!(scenario, ProductValidationScenario::ImportPreprocessing)
         && let Err(reason) = import_preprocessing_evidence(automation_report.as_ref())
-    {
-        validation_status = ProductValidationStatus::Failed;
-        failure_reason = Some(reason);
-    }
-    if validation_status == ProductValidationStatus::Passed
-        && matches!(
-            scenario,
-            ProductValidationScenario::GeneratedFixtureResidentNavigation
-        )
-        && let Err(reason) = resident_navigation_evidence(automation_report.as_ref())
     {
         validation_status = ProductValidationStatus::Failed;
         failure_reason = Some(reason);
@@ -622,7 +607,7 @@ fn product_validate_report_inner(
 enum ProductValidationScenario {
     GeneratedFixtureCameraSmoke,
     GeneratedFixtureRenderModes,
-    GeneratedFixtureResidentNavigation,
+    RepresentativeNativeNavigation,
     B3SourceVerification,
     ImportPreprocessing,
     B4ProjectPersistence,
@@ -633,7 +618,7 @@ impl ProductValidationScenario {
         match self {
             Self::GeneratedFixtureCameraSmoke => GENERATED_FIXTURE_SCENARIO,
             Self::GeneratedFixtureRenderModes => GENERATED_RENDER_MODES_SCENARIO,
-            Self::GeneratedFixtureResidentNavigation => GENERATED_RESIDENT_NAVIGATION_SCENARIO,
+            Self::RepresentativeNativeNavigation => REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO,
             Self::B3SourceVerification => B3_SOURCE_VERIFICATION_SCENARIO,
             Self::ImportPreprocessing => IMPORT_PREPROCESSING_SCENARIO,
             Self::B4ProjectPersistence => B4_PROJECT_PERSISTENCE_SCENARIO,
@@ -645,15 +630,15 @@ impl ProductValidationScenario {
         match requested.unwrap_or(GENERATED_FIXTURE_SCENARIO) {
             GENERATED_FIXTURE_SCENARIO => Ok(Self::GeneratedFixtureCameraSmoke),
             GENERATED_RENDER_MODES_SCENARIO => Ok(Self::GeneratedFixtureRenderModes),
-            GENERATED_RESIDENT_NAVIGATION_SCENARIO => Ok(Self::GeneratedFixtureResidentNavigation),
+            REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO => Ok(Self::RepresentativeNativeNavigation),
             B3_SOURCE_VERIFICATION_SCENARIO => Ok(Self::B3SourceVerification),
             IMPORT_PREPROCESSING_SCENARIO => Ok(Self::ImportPreprocessing),
             B4_PROJECT_PERSISTENCE_SCENARIO => Ok(Self::B4ProjectPersistence),
             other => bail!(
                 "unknown product validation scenario {other:?}; expected \
                  {GENERATED_FIXTURE_SCENARIO}, {GENERATED_RENDER_MODES_SCENARIO}, \
-                 {GENERATED_RESIDENT_NAVIGATION_SCENARIO}, {B3_SOURCE_VERIFICATION_SCENARIO}, \
-                 {IMPORT_PREPROCESSING_SCENARIO}, or \
+                 {REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO}, \
+                 {B3_SOURCE_VERIFICATION_SCENARIO}, {IMPORT_PREPROCESSING_SCENARIO}, or \
                  {B4_PROJECT_PERSISTENCE_SCENARIO}"
             ),
         }
@@ -664,7 +649,7 @@ impl ProductValidationScenario {
             name,
             GENERATED_FIXTURE_SCENARIO
                 | GENERATED_RENDER_MODES_SCENARIO
-                | GENERATED_RESIDENT_NAVIGATION_SCENARIO
+                | REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO
                 | B3_SOURCE_VERIFICATION_SCENARIO
                 | IMPORT_PREPROCESSING_SCENARIO
                 | B4_PROJECT_PERSISTENCE_SCENARIO
@@ -673,9 +658,8 @@ impl ProductValidationScenario {
 
     fn default_timeout_secs(&self) -> u64 {
         match self {
-            Self::GeneratedFixtureCameraSmoke
-            | Self::GeneratedFixtureRenderModes
-            | Self::GeneratedFixtureResidentNavigation => 60,
+            Self::GeneratedFixtureCameraSmoke | Self::GeneratedFixtureRenderModes => 60,
+            Self::RepresentativeNativeNavigation => B3_SCENARIO_TIMEOUT_SECS,
             Self::B3SourceVerification => B3_SCENARIO_TIMEOUT_SECS,
             Self::ImportPreprocessing => IMPORT_SCENARIO_TIMEOUT_SECS,
             Self::B4ProjectPersistence => B4_PHASE_TIMEOUT_SECS * 3,
@@ -1197,7 +1181,6 @@ fn require_b4_x11_tools() -> anyhow::Result<()> {
 fn completed_product_validation_outcome(
     app_exited_successfully: bool,
     automation_report: Option<&Value>,
-    require_nonblank_capture: bool,
     automation_script: &Value,
     automation_script_path: &Path,
 ) -> (ProductValidationStatus, Option<String>) {
@@ -1239,53 +1222,11 @@ fn completed_product_validation_outcome(
         );
     }
 
-    let evidence = if require_nonblank_capture {
-        qualifying_nonblank_viewport_capture(Some(automation_report)).map(|_| ())
-    } else {
-        qualifying_resident_navigation_presentation(Some(automation_report))
-    };
+    let evidence = qualifying_nonblank_viewport_capture(Some(automation_report)).map(|_| ());
     match evidence {
         Ok(_) => (ProductValidationStatus::Passed, None),
         Err(reason) => (ProductValidationStatus::Failed, Some(reason)),
     }
-}
-
-fn qualifying_resident_navigation_presentation(
-    automation_report: Option<&Value>,
-) -> Result<(), String> {
-    let report = automation_report
-        .ok_or_else(|| "resident-navigation automation report is missing".to_owned())?;
-    let mapped = report
-        .pointer("/viewport_evidence/requested_mapped_client_pixels")
-        .ok_or_else(|| "resident-navigation report lacks mapped client pixels".to_owned())?;
-    let mapped_width = mapped.get("width").and_then(Value::as_u64).unwrap_or(0);
-    let mapped_height = mapped.get("height").and_then(Value::as_u64).unwrap_or(0);
-    let final_diagnostics = report
-        .get("final_diagnostics")
-        .ok_or_else(|| "resident-navigation report lacks final diagnostics".to_owned())?;
-    let fidelity = final_diagnostics
-        .pointer("/render/frame_fidelity")
-        .ok_or_else(|| "resident-navigation report lacks final frame fidelity".to_owned())?;
-    if mapped_width == 0
-        || mapped_height == 0
-        || final_diagnostics
-            .pointer("/render/gpu_display_frame_present")
-            .and_then(Value::as_bool)
-            != Some(true)
-        || fidelity.get("target_scale_level").and_then(Value::as_u64) != Some(0)
-        || fidelity
-            .get("displayed_scale_level")
-            .and_then(Value::as_u64)
-            != Some(0)
-        || fidelity.get("completeness").and_then(Value::as_str) != Some("Complete")
-        || fidelity.get("display_freshness").and_then(Value::as_str) != Some("Current")
-    {
-        return Err(
-            "resident-navigation report did not prove a mapped current exact s0 GPU presentation"
-                .to_owned(),
-        );
-    }
-    Ok(())
 }
 
 fn qualifying_nonblank_viewport_capture(
@@ -1324,6 +1265,18 @@ fn nonblank_gpu_viewport_capture(artifact: &Value) -> bool {
     let Some(path) = artifact.get("path").and_then(Value::as_str) else {
         return false;
     };
+    let target_is_explicit = artifact
+        .get("target")
+        .and_then(Value::as_str)
+        .is_some_and(valid_product_presentation_target);
+    let frame_identity_is_explicit = artifact
+        .get("frame_identity")
+        .and_then(Value::as_u64)
+        .is_some();
+    let surface_generation_is_explicit = artifact
+        .get("surface_generation")
+        .and_then(Value::as_u64)
+        .is_some();
     let pixel_stats = artifact.get("pixel_stats");
     let pixel_count = pixel_stats
         .and_then(|stats| stats.get("pixel_count"))
@@ -1338,6 +1291,9 @@ fn nonblank_gpu_viewport_capture(artifact: &Value) -> bool {
     width > 0
         && height > 0
         && !path.trim().is_empty()
+        && target_is_explicit
+        && frame_identity_is_explicit
+        && surface_generation_is_explicit
         && width.checked_mul(height) == pixel_count
         && nonzero_rgb_pixels.is_some_and(|count| count > 0 && Some(count) <= pixel_count)
         && max_rgb.is_some_and(|value| value > 0)
@@ -1617,314 +1573,6 @@ fn validate_publication_currentness_execution(transfer: &Value) -> Result<(), St
     Ok(())
 }
 
-fn resident_navigation_counter(
-    snapshot: &Value,
-    pointer: &str,
-    label: &str,
-) -> Result<u64, String> {
-    snapshot
-        .pointer(pointer)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("resident-navigation diagnostics omitted {label} at {pointer}"))
-}
-
-fn resident_navigation_delta(
-    before: &Value,
-    after: &Value,
-    pointer: &str,
-    label: &str,
-) -> Result<u64, String> {
-    let before = resident_navigation_counter(before, pointer, label)?;
-    let after = resident_navigation_counter(after, pointer, label)?;
-    after.checked_sub(before).ok_or_else(|| {
-        format!("resident-navigation counter {label} regressed from {before} to {after}")
-    })
-}
-
-/// Structural, same-process proof for the warm resident path. This does not
-/// claim a latency threshold: it proves that navigation reuses the installed
-/// cohort and that settled repaints do not keep submitting GPU work.
-fn resident_navigation_evidence(report: Option<&Value>) -> Result<Value, String> {
-    let snapshots = report
-        .and_then(|report| report.get("diagnostics"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| "resident-navigation report has no diagnostics snapshots".to_owned())?;
-    if snapshots.len() < 3 {
-        return Err(format!(
-            "resident-navigation requires baseline, post-navigation, and post-idle diagnostics; observed {}",
-            snapshots.len()
-        ));
-    }
-    let baseline = &snapshots[0];
-    let navigated = &snapshots[1];
-    let idle = &snapshots[2];
-    let warm_zero_paths = [
-        (
-            "/dataset_source_io/reader/physical_range_read_operations",
-            "physical range reads",
-        ),
-        (
-            "/dataset_source_io/reader/codec_decode_operations",
-            "codec decodes",
-        ),
-        (
-            "/dataset_source_io/physical_bricks/unique_decodes",
-            "unique brick decodes",
-        ),
-        (
-            "/dataset_runtime/counters/submitted_requests",
-            "dataset requests",
-        ),
-        ("/gpu_adapter/uploads/resources", "GPU uploaded resources"),
-        (
-            "/gpu_adapter/uploads/payload_bytes",
-            "GPU uploaded payload bytes",
-        ),
-    ];
-    let mut warm_deltas = serde_json::Map::new();
-    for (pointer, label) in warm_zero_paths {
-        let delta = resident_navigation_delta(baseline, navigated, pointer, label)?;
-        if delta != 0 {
-            return Err(format!(
-                "warm resident navigation added {delta} {label}; expected structurally zero"
-            ));
-        }
-        warm_deltas.insert(label.replace(' ', "_"), Value::from(delta));
-    }
-    let retained_navigation_frames = resident_navigation_delta(
-        baseline,
-        navigated,
-        "/gpu_adapter/retained_navigation_frames",
-        "retained navigation frames",
-    )?;
-    if retained_navigation_frames == 0 {
-        return Err(
-            "warm resident navigation never exercised the retained-navigation GPU path".to_owned(),
-        );
-    }
-    let navigation_queue_submissions = resident_navigation_delta(
-        baseline,
-        navigated,
-        "/gpu_adapter/queue_submissions",
-        "navigation GPU queue submissions",
-    )?;
-    let idle_queue_submissions = resident_navigation_delta(
-        navigated,
-        idle,
-        "/gpu_adapter/queue_submissions",
-        "post-settle GPU queue submissions",
-    )?;
-    if idle_queue_submissions != 0 {
-        return Err(format!(
-            "120 settled frames added {idle_queue_submissions} GPU queue submissions"
-        ));
-    }
-    if idle
-        .pointer("/gpu_adapter/timing/enabled")
-        .and_then(Value::as_bool)
-        != Some(true)
-    {
-        return Err("resident-navigation GPU timing was requested but is not enabled".to_owned());
-    }
-    let navigation_timing_prelude_submissions = resident_navigation_delta(
-        baseline,
-        navigated,
-        "/gpu_adapter/timing/gpu_timing_prelude_submissions",
-        "GPU timing prelude submissions",
-    )?;
-    let idle_timing_prelude_submissions = resident_navigation_delta(
-        navigated,
-        idle,
-        "/gpu_adapter/timing/gpu_timing_prelude_submissions",
-        "post-settle GPU timing prelude submissions",
-    )?;
-    if idle_timing_prelude_submissions != 0 {
-        return Err(format!(
-            "120 settled frames added {idle_timing_prelude_submissions} GPU timing prelude submissions"
-        ));
-    }
-    let completed_gpu_timings = resident_navigation_delta(
-        baseline,
-        navigated,
-        "/gpu_adapter/timing/completed",
-        "completed GPU timings",
-    )?;
-    if completed_gpu_timings == 0 {
-        return Err("resident-navigation completed no new asynchronous GPU timing".to_owned());
-    }
-    let idle_gpu_timings = resident_navigation_delta(
-        navigated,
-        idle,
-        "/gpu_adapter/timing/completed",
-        "post-settle completed GPU timings",
-    )?;
-    if idle_gpu_timings != 0 {
-        return Err(format!(
-            "120 settled frames completed {idle_gpu_timings} late GPU timings after runtime idle"
-        ));
-    }
-    let completed_cpu_timings = resident_navigation_delta(
-        baseline,
-        navigated,
-        "/gpu_adapter/timing/cpu/completed",
-        "completed CPU renderer timings",
-    )?;
-    if completed_cpu_timings == 0 {
-        return Err("resident-navigation collected no new CPU renderer timing".to_owned());
-    }
-    let idle_cpu_timings = resident_navigation_delta(
-        navigated,
-        idle,
-        "/gpu_adapter/timing/cpu/completed",
-        "post-settle CPU renderer timings",
-    )?;
-    if idle_cpu_timings != 0 {
-        return Err(format!(
-            "120 settled frames added {idle_cpu_timings} CPU renderer timings"
-        ));
-    }
-    let publication_pointer =
-        "/render/progressive_presentation/presented_frame_intervals/total_publications";
-    let baseline_publications =
-        resident_navigation_counter(baseline, publication_pointer, "baseline publications")?;
-    let navigated_publications =
-        resident_navigation_counter(navigated, publication_pointer, "navigated publications")?;
-    let idle_publications =
-        resident_navigation_counter(idle, publication_pointer, "post-settle publications")?;
-    let navigation_publications = navigated_publications
-        .checked_sub(baseline_publications)
-        .ok_or_else(|| "resident-navigation publication counter regressed".to_owned())?;
-    if navigation_publications == 0 {
-        return Err("resident-navigation published no current 3D frame".to_owned());
-    }
-    let navigation_execution_submissions = navigation_queue_submissions
-        .checked_sub(navigation_timing_prelude_submissions)
-        .ok_or_else(|| {
-            "resident-navigation GPU timing preludes exceeded total queue submissions".to_owned()
-        })?;
-    if retained_navigation_frames != navigation_publications
-        || navigation_execution_submissions != navigation_publications
-        || navigation_timing_prelude_submissions != navigation_publications
-        || completed_gpu_timings != navigation_publications
-        || completed_cpu_timings != navigation_publications
-    {
-        return Err(format!(
-            "resident-navigation execution/publication counts disagree: publications={navigation_publications}, retained_frames={retained_navigation_frames}, queue_submissions={navigation_queue_submissions}, execution_submissions={navigation_execution_submissions}, GPU_timing_prelude_submissions={navigation_timing_prelude_submissions}, GPU_timings={completed_gpu_timings}, CPU_timings={completed_cpu_timings}"
-        ));
-    }
-    if idle_publications != navigated_publications {
-        return Err(format!(
-            "120 settled frames added {} current 3D publications",
-            idle_publications.saturating_sub(navigated_publications)
-        ));
-    }
-    if navigated
-        .pointer("/render/progressive_presentation/presented_frame_intervals/enabled")
-        .and_then(Value::as_bool)
-        != Some(true)
-    {
-        return Err("resident-navigation presented-frame timing is disabled".to_owned());
-    }
-    let frame_timing_samples = navigated
-        .pointer("/render/progressive_presentation/presented_frame_intervals/samples")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            "resident-navigation diagnostics omitted presented-frame timing samples".to_owned()
-        })?;
-    let navigated_samples = frame_timing_samples
-        .iter()
-        .filter(|sample| {
-            sample
-                .get("sequence")
-                .and_then(Value::as_u64)
-                .is_some_and(|sequence| sequence > baseline_publications)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let expected_sample_count = usize::try_from(navigation_publications).map_err(|_| {
-        "resident-navigation publication count does not fit the evidence host".to_owned()
-    })?;
-    if navigated_samples.len() != expected_sample_count {
-        return Err(
-            "resident-navigation did not retain one timing sample per new publication".to_owned(),
-        );
-    }
-    let mut gpu_execution_ids = BTreeSet::new();
-    let mut gpu_targets = BTreeSet::new();
-    let mut previous_gpu_generation = None;
-    for (index, sample) in navigated_samples.iter().enumerate() {
-        let sequence = sample.get("sequence").and_then(Value::as_u64);
-        let frame = sample.get("frame").and_then(Value::as_u64);
-        let gpu_execution_id = sample.get("gpu_execution_id").and_then(Value::as_u64);
-        let gpu_target = sample.get("gpu_target").and_then(Value::as_u64);
-        let gpu_generation = sample.get("gpu_generation").and_then(Value::as_u64);
-        let gpu_renderer_frame = sample.get("gpu_renderer_frame").and_then(Value::as_u64);
-        let expected_sequence = baseline_publications
-            .checked_add(index as u64 + 1)
-            .ok_or_else(|| "resident-navigation sample sequence overflowed".to_owned())?;
-        if sequence != Some(expected_sequence)
-            || sample
-                .get("interval_ns")
-                .and_then(Value::as_u64)
-                .is_none_or(|value| value == 0)
-            || frame.is_none()
-            || sample
-                .get("cpu_planning_ns")
-                .and_then(Value::as_u64)
-                .is_none()
-            || sample
-                .get("cpu_queue_submit_ns")
-                .and_then(Value::as_u64)
-                .is_none()
-            || gpu_execution_id.is_none_or(|identity| identity == 0)
-            || gpu_target.is_none_or(|target| target == 0)
-            || gpu_generation.is_none_or(|generation| generation == 0)
-            || previous_gpu_generation.is_some_and(|previous| {
-                gpu_generation.is_some_and(|generation| generation <= previous)
-            })
-            || gpu_renderer_frame != frame
-            || sample.get("panel").and_then(Value::as_str) != Some("3D")
-            || sample.get("gpu_pass_kind").and_then(Value::as_str) != Some("Volume")
-            || sample.get("gpu_timing_complete").and_then(Value::as_bool) != Some(true)
-            || sample
-                .get("gpu_render_pass_ns")
-                .and_then(Value::as_u64)
-                .is_none()
-            || sample.get("gpu_presentation").is_some()
-            || sample.get("gpu_frame").is_some()
-            || sample.get("gpu_volume_pass_ns").is_some()
-            || !gpu_execution_ids.insert(gpu_execution_id.expect("checked above"))
-        {
-            return Err(
-                "resident-navigation did not bind every new publication to one unique exact-execution CPU/GPU timing"
-                    .to_owned(),
-            );
-        }
-        gpu_targets.insert(gpu_target.expect("checked above"));
-        previous_gpu_generation = gpu_generation;
-    }
-    if gpu_targets.len() != 1 {
-        return Err(
-            "resident-navigation publications did not retain one exact 3D GPU target".to_owned(),
-        );
-    }
-    Ok(json!({
-        "warm_navigation": warm_deltas,
-        "retained_navigation_frames": retained_navigation_frames,
-        "navigation_queue_submissions": navigation_queue_submissions,
-        "navigation_execution_submissions": navigation_execution_submissions,
-        "navigation_gpu_timing_prelude_submissions": navigation_timing_prelude_submissions,
-        "post_settle_idle_queue_submissions": idle_queue_submissions,
-        "post_settle_gpu_timing_prelude_submissions": idle_timing_prelude_submissions,
-        "completed_gpu_timings": completed_gpu_timings,
-        "post_settle_completed_gpu_timings": idle_gpu_timings,
-        "cpu_renderer_timing": {
-            "completed": completed_cpu_timings,
-        },
-        "presented_frame_timing_samples": navigated_samples,
-    }))
-}
-
 fn product_validation_package_and_script(
     package: Option<&Path>,
     scenario: &ProductValidationScenario,
@@ -1946,12 +1594,11 @@ fn product_validation_package_and_script(
             let script = target_fixture_render_modes_script(&package);
             Ok((package, script, None))
         }
-        ProductValidationScenario::GeneratedFixtureResidentNavigation => {
-            let package = match package {
-                Some(package) => package.to_path_buf(),
-                None => default_target_fixture()?,
-            };
-            let script = target_fixture_resident_navigation_script(&package);
+        ProductValidationScenario::RepresentativeNativeNavigation => {
+            let package = package
+                .context("representative_native_navigation requires an explicit target package")?
+                .to_path_buf();
+            let script = representative_native_navigation_script(&package);
             Ok((package, script, None))
         }
         ProductValidationScenario::B3SourceVerification => {
@@ -2085,48 +1732,112 @@ fn target_fixture_camera_smoke_script(package: &Path) -> Value {
             { "command": "camera_zoom", "scroll_y_points": -120.0 },
             { "command": "sleep_frames", "frames": 2 },
             { "command": "probe_hover", "x_fraction": 0.42, "y_fraction": 0.58 },
-            { "command": "capture_screenshot", "name": "post-camera-sequence" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "post-camera-sequence" },
             { "command": "copy_diagnostics" },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
             { "command": "quit" }
         ]
     })
 }
 
-fn target_fixture_resident_navigation_script(package: &Path) -> Value {
-    json!({
+fn representative_native_navigation_script(package: &Path) -> Value {
+    let mut script = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": SCRIPT_SCHEMA_VERSION,
-        "scenario": GENERATED_RESIDENT_NAVIGATION_SCENARIO,
-        "gpu_timing": true,
-        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 64),
+        "scenario": REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO,
+        "gpu_timing": false,
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(2_048 * MIB, 16_384),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
-            { "command": "set_viewer_layout", "layout": "single3d" },
-            { "command": "set_mapped_client_pixels", "width": GENERATED_VIEWPORT_WIDTH, "height": GENERATED_VIEWPORT_HEIGHT },
+            { "command": "set_viewport_size", "width": GENERATED_VIEWPORT_WIDTH, "height": GENERATED_VIEWPORT_HEIGHT },
             { "command": "set_render_target_size", "width": GENERATED_VIEWPORT_WIDTH, "height": GENERATED_VIEWPORT_HEIGHT },
+            { "command": "set_render_mode", "mode": "mip" },
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "voxel_exact" },
             { "command": "camera_fit_data" },
-            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
-            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
-            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
-            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true } } },
+            { "command": "sleep_frames", "frames": 3 },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 60000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "copy_diagnostics" },
-            { "command": "camera_orbit", "yaw_points": 12.0, "pitch_points": 6.0 },
-            { "command": "camera_pan", "x_points": 4.0, "y_points": -3.0 },
-            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
-            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
-            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true } } },
+            { "command": "capture_screenshot", "target": "three_d", "name": "representative-mip-voxel-settled" }
+        ]
+    });
+    let Value::Array(four_panel) = json!([
+            { "command": "set_viewer_layout", "layout": "four_panel" },
+            { "command": "assert", "condition": { "viewer_layout": { "layout": "four_panel" } } },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "cross_section_rotate_sequence", "panel": "xy", "samples": 24, "duration_ms": 400, "x_points_per_sample": 0.5, "y_points_per_sample": 0.125, "radians_per_point": 0.005 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "camera_zoom_sequence", "samples": 24, "duration_ms": 400, "scroll_y_points_per_sample": -1.0 },
+            { "command": "camera_orbit_sequence", "samples": 48, "duration_ms": 800, "yaw_points_per_sample": 1.0, "pitch_points_per_sample": 0.25 },
+            { "command": "cross_section_rotate_sequence", "panel": "xy", "samples": 24, "duration_ms": 400, "x_points_per_sample": 0.5, "y_points_per_sample": 0.125, "radians_per_point": 0.005 },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 60000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "assert", "condition": { "four_panel_images_distinct": { "min_different_pixels": 1 } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "copy_diagnostics" },
-            { "command": "sleep_frames", "frames": 120 },
+            { "command": "capture_screenshot", "target": "three_d", "name": "representative-four-panel-3d" },
+            { "command": "capture_screenshot", "target": "xy", "name": "representative-four-panel-xy" },
+            { "command": "capture_screenshot", "target": "xz", "name": "representative-four-panel-xz" },
+            { "command": "capture_screenshot", "target": "yz", "name": "representative-four-panel-yz" }
+    ]) else {
+        unreachable!("the representative four-panel commands are an array")
+    };
+    script["commands"]
+        .as_array_mut()
+        .expect("the representative script has commands")
+        .extend(four_panel);
+    let Value::Array(smooth_and_dvr) = json!([
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "smooth_linear" },
+            { "command": "camera_orbit_sequence", "samples": 48, "duration_ms": 800, "yaw_points_per_sample": -1.0, "pitch_points_per_sample": 0.25 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "assert", "condition": { "layer_sampling": { "layer_index": 0, "sampling": "smooth_linear" } } },
             { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "representative-mip-smooth-settled" },
+
+            { "command": "set_render_mode", "mode": "dvr" },
+            { "command": "set_dvr_density_scale", "density_scale": 12.0 },
+            { "command": "camera_orbit_sequence", "samples": 48, "duration_ms": 800, "yaw_points_per_sample": 0.75, "pitch_points_per_sample": -0.25 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "assert", "condition": { "render_mode": { "mode": "dvr" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "representative-dvr-smooth-settled" }
+    ]) else {
+        unreachable!("the representative smooth and DVR commands are an array")
+    };
+    script["commands"]
+        .as_array_mut()
+        .expect("the representative script has commands")
+        .extend(smooth_and_dvr);
+    let Value::Array(iso_and_tail) = json!([
+            { "command": "set_render_mode", "mode": "iso" },
+            { "command": "set_layer_iso_shading", "layer_index": 0, "shading": "gradient_lighting" },
+            { "command": "set_iso_display_level", "display_level": 0.5 },
+            { "command": "camera_orbit_sequence", "samples": 48, "duration_ms": 800, "yaw_points_per_sample": -0.75, "pitch_points_per_sample": -0.25 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "assert", "condition": { "render_mode": { "mode": "iso" } } },
+            { "command": "assert", "condition": { "layer_iso_shading": { "layer_index": 0, "shading": "gradient_lighting" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "representative-iso-smooth-settled" },
+
+            { "command": "set_viewer_layout", "layout": "single3d" },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 60000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "assert", "condition": "cross_section_retired" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "representative-single3d-final" },
             { "command": "copy_diagnostics" },
             { "command": "quit" }
-        ]
-    })
+    ]) else {
+        unreachable!("the representative ISO and closeout commands are an array")
+    };
+    script["commands"]
+        .as_array_mut()
+        .expect("the representative script has commands")
+        .extend(iso_and_tail);
+    script
 }
 
 fn target_fixture_render_modes_script(package: &Path) -> Value {
@@ -2134,6 +1845,7 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": GENERATED_RENDER_MODES_SCENARIO,
+        "gpu_timing": false,
         "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 192),
         "commands": [
             { "command": "open_dataset", "path": package },
@@ -2151,14 +1863,18 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
             { "command": "set_render_mode", "mode": "mip" },
             { "command": "set_layer_render_mode", "layer_index": 1, "mode": "mip" },
             { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
             { "command": "assert", "condition": { "render_mode": { "mode": "mip" } } },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "layer_render_mode": { "layer_index": 1, "mode": "mip" } } },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
             { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
             { "command": "set_active_tool", "tool": "inspect" },
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
+            { "command": "assert", "condition": { "pick_evidence": { "policy": "mip_argmax" } } },
             { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "generated-mip" }
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-mip" }
         ]
     });
     let Value::Array(middle) = json!([
@@ -2166,40 +1882,27 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
             { "command": "set_layer_sampling", "layer_index": 0, "sampling": "smooth_linear" },
             { "command": "set_layer_sampling", "layer_index": 1, "sampling": "smooth_linear" },
             { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
             { "command": "assert", "condition": { "projection": { "projection": "perspective" } } },
             { "command": "assert", "condition": { "layer_sampling": { "layer_index": 0, "sampling": "smooth_linear" } } },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "capture_screenshot", "name": "generated-perspective-smooth" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-perspective-smooth" },
             { "command": "set_render_mode", "mode": "dvr" },
             { "command": "set_layer_render_mode", "layer_index": 1, "mode": "dvr" },
             { "command": "set_dvr_density_scale", "density_scale": 12.0 },
             { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
             { "command": "assert", "condition": { "render_mode": { "mode": "dvr" } } },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "layer_render_mode": { "layer_index": 1, "mode": "dvr" } } },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
+            { "command": "assert", "condition": { "pick_evidence": { "policy": "maximum_opacity_contribution" } } },
             { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "generated-dvr" },
-            { "command": "set_render_mode", "mode": "iso" },
-            { "command": "set_layer_render_mode", "layer_index": 1, "mode": "iso" },
-            { "command": "set_layer_iso_shading", "layer_index": 0, "shading": "gradient_lighting" },
-            { "command": "set_layer_iso_shading", "layer_index": 1, "shading": "gradient_lighting" },
-            { "command": "set_iso_display_level", "display_level": 0.05 },
-            { "command": "set_iso_light", "light": { "kind": "detached_screen", "x": 0.25, "y": -0.35 } },
-            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
-            { "command": "assert", "condition": { "render_mode": { "mode": "iso" } } },
-            { "command": "assert", "condition": { "layer_iso_shading": { "layer_index": 0, "shading": "gradient_lighting" } } },
-            { "command": "assert", "condition": { "iso_light": { "light": { "kind": "detached_screen", "x": 0.25, "y": -0.35 } } } },
-            { "command": "assert", "condition": "nonblank_frame" },
-            { "command": "assert", "condition": "no_render_error" },
-            { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
-            { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "generated-iso-detached-light" },
-            { "command": "set_iso_light", "light": { "kind": "attached_camera" } },
-            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
-            { "command": "assert", "condition": { "iso_light": { "light": { "kind": "attached_camera" } } } },
-            { "command": "capture_screenshot", "name": "generated-iso-attached-light" }
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-dvr" }
     ]) else {
         unreachable!("the product validation command middle is an array")
     };
@@ -2207,6 +1910,61 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
         .as_array_mut()
         .expect("the generated product validation script has commands")
         .extend(middle);
+    let Value::Array(iso) = json!([
+            { "command": "set_render_mode", "mode": "iso" },
+            { "command": "set_layer_render_mode", "layer_index": 1, "mode": "iso" },
+            { "command": "set_layer_iso_shading", "layer_index": 0, "shading": "gradient_lighting" },
+            { "command": "set_layer_iso_shading", "layer_index": 1, "shading": "gradient_lighting" },
+            { "command": "set_iso_display_level", "display_level": 0.05 },
+            { "command": "set_iso_light", "light": { "kind": "detached_screen", "x": 0.25, "y": -0.35 } },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
+            { "command": "assert", "condition": { "render_mode": { "mode": "iso" } } },
+            { "command": "assert", "condition": { "layer_render_mode": { "layer_index": 1, "mode": "iso" } } },
+            { "command": "assert", "condition": { "layer_iso_shading": { "layer_index": 0, "shading": "gradient_lighting" } } },
+            { "command": "assert", "condition": { "iso_light": { "light": { "kind": "detached_screen", "x": 0.25, "y": -0.35 } } } },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
+            { "command": "assert", "condition": { "pick_evidence": { "policy": "first_threshold_hit" } } },
+            { "command": "copy_diagnostics" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-iso-detached-light" },
+            { "command": "set_iso_light", "light": { "kind": "attached_camera" } },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
+            { "command": "assert", "condition": { "iso_light": { "light": { "kind": "attached_camera" } } } },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-iso-attached-light" }
+    ]) else {
+        unreachable!("the product validation ISO commands are an array")
+    };
+    script["commands"]
+        .as_array_mut()
+        .expect("the generated product validation script has commands")
+        .extend(iso);
+    let Value::Array(mixed) = json!([
+            { "command": "set_render_mode", "mode": "mip" },
+            { "command": "set_layer_render_mode", "layer_index": 1, "mode": "dvr" },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
+            { "command": "assert", "condition": { "render_mode": { "mode": "mip" } } },
+            { "command": "assert", "condition": { "layer_render_mode": { "layer_index": 1, "mode": "dvr" } } },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "copy_diagnostics" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-mixed-mip-dvr" }
+    ]) else {
+        unreachable!("the product validation mixed commands are an array")
+    };
+    script["commands"]
+        .as_array_mut()
+        .expect("the generated product validation script has commands")
+        .extend(mixed);
     let Value::Array(tail) = json!([
             { "command": "set_projection", "projection": "orthographic" },
             { "command": "set_layer_sampling", "layer_index": 0, "sampling": "voxel_exact" },
@@ -2214,10 +1972,14 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
             { "command": "set_render_mode", "mode": "mip" },
             { "command": "set_layer_render_mode", "layer_index": 1, "mode": "mip" },
             { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
             { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
+            { "command": "assert", "condition": { "layer_render_mode": { "layer_index": 1, "mode": "mip" } } },
             { "command": "set_active_tool", "tool": "inspect" },
             { "command": "assert", "condition": { "active_tool": { "tool": "inspect" } } },
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
+            { "command": "assert", "condition": { "pick_evidence": { "policy": "mip_argmax" } } },
             { "command": "set_active_tool", "tool": "crosshair" },
             { "command": "primary_click", "x_fraction": 0.5, "y_fraction": 0.5 },
             { "command": "assert", "condition": "crosshair_linked" },
@@ -2231,8 +1993,9 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
             { "command": "assert", "condition": "distance_committed" },
             { "command": "set_active_tool", "tool": "navigate" },
             { "command": "set_viewer_layout", "layout": "four_panel" },
-            { "command": "sleep_frames", "frames": 8 },
             { "command": "assert", "condition": { "viewer_layout": { "layout": "four_panel" } } },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
             { "command": "assert", "condition": { "cross_section_panel_schedule": {
                 "panel": "xz",
                 "min_generation": 1,
@@ -2243,7 +2006,10 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
                 "min_different_pixels": 1
             } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "capture_screenshot", "name": "generated-linked-panels" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-linked-panels-3d" },
+            { "command": "capture_screenshot", "target": "xy", "name": "generated-linked-panels-xy" },
+            { "command": "capture_screenshot", "target": "xz", "name": "generated-linked-panels-xz" },
+            { "command": "capture_screenshot", "target": "yz", "name": "generated-linked-panels-yz" },
             { "command": "set_viewer_layout", "layout": "single3d" },
             { "command": "sleep_frames", "frames": 3 },
             { "command": "assert", "condition": "cross_section_retired" },
@@ -2254,9 +2020,9 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
                 "width": GENERATED_RESIZED_VIEWPORT_WIDTH,
                 "height": GENERATED_RESIZED_VIEWPORT_HEIGHT
             } } },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "capture_screenshot", "name": "generated-resized-1920x1080" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-resized-1920x1080" },
             { "command": "copy_diagnostics" },
             { "command": "quit" }
     ]) else {
@@ -2282,9 +2048,9 @@ fn target_source_verification_script(package: &Path) -> Value {
             { "command": "set_render_target_size", "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT },
             { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": { "render_target_pixels": { "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT } } },
-            { "command": "capture_screenshot", "name": "b3-before-cancel-1280x720" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "b3-before-cancel-1280x720" },
             { "command": "cancel_source_verification" },
             { "command": "wait_for", "condition": "source_verification_required", "timeout_ms": 30000 },
             { "command": "assert", "condition": {
@@ -2307,16 +2073,16 @@ fn target_source_verification_script(package: &Path) -> Value {
                     "min_accepted_successes": 1
                 }
             } },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": { "render_target_pixels": { "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT } } },
-            { "command": "capture_screenshot", "name": "b3-after-success-1280x720" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "b3-after-success-1280x720" },
             { "command": "set_viewport_size", "width": B3_SECOND_VIEWPORT_WIDTH, "height": B3_SECOND_VIEWPORT_HEIGHT },
             { "command": "set_render_target_size", "width": B3_SECOND_VIEWPORT_WIDTH, "height": B3_SECOND_VIEWPORT_HEIGHT },
             { "command": "sleep_frames", "frames": 3 },
             { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": { "render_target_pixels": { "width": B3_SECOND_VIEWPORT_WIDTH, "height": B3_SECOND_VIEWPORT_HEIGHT } } },
-            { "command": "capture_screenshot", "name": "b3-after-success-1920x1080" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "b3-after-success-1920x1080" },
             { "command": "copy_diagnostics" },
             { "command": "quit" }
         ]
@@ -2394,9 +2160,9 @@ fn import_preprocessing_script(
             { "command": "camera_fit_data" },
             { "command": "camera_orbit", "yaw_points": 48.0, "pitch_points": 16.0 },
             { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 60_000 },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "capture_screenshot", "name": "import-preprocessing-open-ready-navigation" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "import-preprocessing-open-ready-navigation" },
             { "command": "copy_diagnostics" },
             { "command": "quit" }
         ]
@@ -2415,7 +2181,7 @@ fn b4_launch_one_script(package: &Path, project: &Path, checkpoint: &Path) -> Va
             { "command": "set_mapped_client_pixels", "width": B4_PRIMARY_CLIENT_WIDTH, "height": B4_PRIMARY_CLIENT_HEIGHT },
             { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "new_project" },
             { "command": "initial_save_with_edit", "path": project },
             { "command": "wait_for", "condition": "project_store_idle", "timeout_ms": 30000 },
@@ -2439,7 +2205,7 @@ fn b4_launch_one_script(package: &Path, project: &Path, checkpoint: &Path) -> Va
                 "autosave": true
             } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "capture_screenshot", "name": "b4-launch-1-before-kill-1280x720" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "b4-launch-1-before-kill-1280x720" },
             { "command": "write_external_kill_checkpoint", "path": checkpoint, "stage": B4_CHECKPOINT_STAGE },
             { "command": "hold_for_external_kill" }
         ]
@@ -2482,9 +2248,9 @@ fn b4_launch_two_script(package: &Path, original: &Path, save_as: &Path) -> Valu
                 "manual": true,
                 "autosave": false
             } } },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "capture_screenshot", "name": "b4-launch-2-recovered-save-as-1920x1080" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "b4-launch-2-recovered-save-as-1920x1080" },
             { "command": "close_project_store" },
             { "command": "wait_for", "condition": "project_store_closed", "timeout_ms": 30000 },
             { "command": "quit" }
@@ -2515,9 +2281,9 @@ fn b4_launch_three_script(package: &Path, save_as: &Path) -> Value {
                 "manual": true,
                 "autosave": false
             } } },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "capture_screenshot", "name": "b4-launch-3-final-reopen-clean-1920x1080" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "b4-launch-3-final-reopen-clean-1920x1080" },
             { "command": "close_project_store" },
             { "command": "wait_for", "condition": "project_store_closed", "timeout_ms": 30000 },
             { "command": "quit" }
@@ -2576,8 +2342,41 @@ pub(crate) fn validate_product_automation_script(script: &Value) -> anyhow::Resu
     if !matches!(terminal_command, Some("quit" | "hold_for_external_kill")) {
         bail!("automation script final command must be quit or hold_for_external_kill");
     }
+    for command in commands {
+        let command_name = command
+            .get("command")
+            .and_then(Value::as_str)
+            .context("automation command must name its command")?;
+        if command_name == "capture_screenshot" {
+            let target = command
+                .get("target")
+                .and_then(Value::as_str)
+                .context("capture_screenshot requires an explicit target")?;
+            if !valid_product_presentation_target(target) {
+                bail!("capture_screenshot target {target:?} is invalid");
+            }
+        }
+        if command_name == "assert"
+            && command.get("condition").and_then(Value::as_str) == Some("nonblank_frame")
+        {
+            bail!("nonblank_frame was removed; use target-explicit nonblank_panel");
+        }
+        if let Some(nonblank) = command.pointer("/condition/nonblank_panel") {
+            let target = nonblank
+                .get("target")
+                .and_then(Value::as_str)
+                .context("nonblank_panel requires an explicit target")?;
+            if !valid_product_presentation_target(target) {
+                bail!("nonblank_panel target {target:?} is invalid");
+            }
+        }
+    }
     validate_product_automation_hard_safety_limits(script)?;
     Ok(())
+}
+
+fn valid_product_presentation_target(target: &str) -> bool {
+    matches!(target, "three_d" | "xy" | "xz" | "yz")
 }
 
 fn validate_product_automation_hard_safety_limits(script: &Value) -> anyhow::Result<()> {
@@ -3414,7 +3213,10 @@ fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<Produ
         .stderr(Stdio::from(stderr));
     isolate_process_tree(&mut command);
     run.progress_launch.apply_to_command(&mut command);
-    println!("running product validation: {:?}", command);
+    println!(
+        "running normal-app product validation scenario {:?}",
+        run.scenario
+    );
     let started = Instant::now();
     let mut child = command.spawn().with_context(|| {
         format!(
@@ -3545,6 +3347,8 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let scenario_name = report.scenario_name;
+    let claim_source = "instrumented_application_commands_internal_state_and_readback";
+    let pixel_content_observed = Value::Null;
     let b3_e1_capture_evidence = if scenario_name == B3_SOURCE_VERIFICATION_SCENARIO {
         match b3_exact_e1_capture_evidence(report.automation_report_value) {
             Ok(evidence) => evidence,
@@ -3567,22 +3371,6 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
                 "required": true,
                 "accepted": true,
                 "workflow": evidence,
-            }),
-            Err(reason) => json!({
-                "required": true,
-                "accepted": false,
-                "failure_reason": reason,
-            }),
-        }
-    } else {
-        Value::Null
-    };
-    let resident_navigation_evidence = if scenario_name == GENERATED_RESIDENT_NAVIGATION_SCENARIO {
-        match resident_navigation_evidence(report.automation_report_value) {
-            Ok(evidence) => json!({
-                "required": true,
-                "accepted": true,
-                "structural_deltas": evidence,
             }),
             Err(reason) => json!({
                 "required": true,
@@ -3656,7 +3444,8 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         "evidence_level": "E1",
         "claim_boundary": {
             "evidence_type": "internal_native_window_product_automation",
-            "source": "instrumented_application_commands_internal_state_and_readback",
+            "source": claim_source,
+            "pixel_content_observed": pixel_content_observed,
             "closure_authority": "integration_support_only_not_black_box_product_open",
             "e4_product_open_satisfied": false,
         },
@@ -3684,7 +3473,6 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
             "render_target_pixels": render_target_pixels,
             "b3_exact_e1_capture_evidence": b3_e1_capture_evidence,
             "import_preprocessing_evidence": import_evidence,
-            "resident_navigation_evidence": resident_navigation_evidence,
             "render_modes": render_modes,
         },
         "limits": {

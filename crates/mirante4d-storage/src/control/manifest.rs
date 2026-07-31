@@ -1028,7 +1028,7 @@ mod tests {
                 PackageObjectKind::ZarrImageGroup,
             ),
             (
-                "images/i00000000/s07/zarr.json",
+                "images/i00000000/s64/zarr.json",
                 PackageObjectKind::ZarrPixelArray,
             ),
             (

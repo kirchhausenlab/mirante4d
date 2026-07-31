@@ -9,7 +9,7 @@
 use std::{cmp::Ordering, fmt, num::NonZeroU64, sync::Arc};
 
 use mirante4d_dataset::{
-    CpuByteLease, CpuByteLedger, CpuLedgerCategory, DatasetResourceKey, ResourceLease,
+    BrickKey, CpuByteLease, CpuByteLedger, CpuLedgerCategory, ResourceLease,
     ResourcePayloadDescriptor, ResourcePayloadFacts, ResourcePayloadView,
 };
 use thiserror::Error;
@@ -145,10 +145,10 @@ impl Ord for RequestPriority {
 /// may wait on one semantic resource without duplicating decode or payload
 /// allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RequestDedupeKey(DatasetResourceKey);
+pub struct RequestDedupeKey(BrickKey);
 
 impl RequestDedupeKey {
-    pub const fn resource(self) -> DatasetResourceKey {
+    pub const fn resource(self) -> BrickKey {
         self.0
     }
 }
@@ -156,14 +156,14 @@ impl RequestDedupeKey {
 /// One bounded semantic demand submitted to the unified runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResourceRequest {
-    resource: DatasetResourceKey,
+    resource: BrickKey,
     priority: RequestPriority,
     generation: CancellationGeneration,
 }
 
 impl ResourceRequest {
     pub const fn new(
-        resource: DatasetResourceKey,
+        resource: BrickKey,
         priority: RequestPriority,
         generation: CancellationGeneration,
     ) -> Self {
@@ -174,7 +174,7 @@ impl ResourceRequest {
         }
     }
 
-    pub const fn resource(self) -> DatasetResourceKey {
+    pub const fn resource(self) -> BrickKey {
         self.resource
     }
 
@@ -199,7 +199,7 @@ impl ResourceRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestTicket {
     id: RuntimeRequestId,
-    resource: DatasetResourceKey,
+    resource: BrickKey,
     generation: CancellationGeneration,
 }
 
@@ -220,7 +220,7 @@ impl RequestTicket {
         self.id
     }
 
-    pub const fn resource(self) -> DatasetResourceKey {
+    pub const fn resource(self) -> BrickKey {
         self.resource
     }
 
@@ -792,7 +792,7 @@ impl AccountedCpuLease {
 
 #[derive(Debug)]
 struct AccountedPayload {
-    key: DatasetResourceKey,
+    key: BrickKey,
     descriptor: ResourcePayloadDescriptor,
     facts: ResourcePayloadFacts,
     bytes: Box<[u8]>,
@@ -829,7 +829,7 @@ impl AccountedResourceLease {
 }
 
 impl ResourceLease for AccountedResourceLease {
-    fn key(&self) -> DatasetResourceKey {
+    fn key(&self) -> BrickKey {
         self.inner.key
     }
 
@@ -940,7 +940,7 @@ struct RuntimeFaultContext {
     code: RuntimeFaultCode,
     request_id: Option<RuntimeRequestId>,
     generation: Option<CancellationGeneration>,
-    resource: Option<DatasetResourceKey>,
+    resource: Option<BrickKey>,
 }
 
 impl RuntimeFault {
@@ -989,7 +989,7 @@ impl RuntimeFault {
         self.inner.generation
     }
 
-    pub fn resource(&self) -> Option<DatasetResourceKey> {
+    pub fn resource(&self) -> Option<BrickKey> {
         self.inner.resource
     }
 }
@@ -1105,8 +1105,8 @@ mod tests {
     const SCIENTIFIC_ID: &str =
         "m4d-sc-v1-sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-    fn key(region_origin: u64) -> DatasetResourceKey {
-        DatasetResourceKey::new(
+    fn key(region_origin: u64) -> BrickKey {
+        BrickKey::new(
             DatasetResourceIdentity::Verified(ScientificContentId::parse(SCIENTIFIC_ID).unwrap()),
             LogicalLayerKey::new(2),
             TimeIndex::new(3),
@@ -1115,18 +1115,15 @@ mod tests {
         )
     }
 
-    fn request_at(
-        resource: DatasetResourceKey,
-        generation: CancellationGeneration,
-    ) -> ResourceRequest {
+    fn request_at(resource: BrickKey, generation: CancellationGeneration) -> ResourceRequest {
         ResourceRequest::new(resource, RequestPriority::CurrentView, generation)
     }
 
-    fn request(resource: DatasetResourceKey) -> ResourceRequest {
+    fn request(resource: BrickKey) -> ResourceRequest {
         request_at(resource, CancellationGeneration::new(7))
     }
 
-    fn lease(resource: DatasetResourceKey) -> AccountedResourceLease {
+    fn lease(resource: BrickKey) -> AccountedResourceLease {
         let descriptor = ResourcePayloadDescriptor::new(
             IntensityDType::Uint16,
             resource.region().shape(),
@@ -1247,7 +1244,7 @@ mod tests {
             usize::try_from(self.state.lock().unwrap().completed_decodes).unwrap()
         }
 
-        fn capture_decode(&self, resource: DatasetResourceKey) -> CapturedDecode {
+        fn capture_decode(&self, resource: BrickKey) -> CapturedDecode {
             let key = RequestDedupeKey(resource);
             let mut state = self.state.lock().unwrap();
             let job = state
@@ -1297,7 +1294,7 @@ mod tests {
             assert!(state.completions.len() <= self.config.completion_queue_limit());
         }
 
-        fn complete(&self, resource: DatasetResourceKey) {
+        fn complete(&self, resource: BrickKey) {
             let captured = self.capture_decode(resource);
             self.complete_captured(captured);
         }

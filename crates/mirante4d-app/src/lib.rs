@@ -21,6 +21,7 @@ mod diagnostics;
 mod display_graph;
 mod display_refresh;
 mod fidelity;
+mod gpu_memory;
 mod histogram;
 mod import_worker_service;
 mod import_workflow;
@@ -31,6 +32,7 @@ mod process_termination;
 mod product_automation;
 mod product_render_intent;
 mod projected_lod;
+mod real_interaction_trace;
 mod render_state;
 mod retained_leases;
 mod runtime_diagnostics_panel;
@@ -42,6 +44,7 @@ mod unified_source_open;
 mod viewer_layout;
 mod viewer_pick_runtime;
 mod viewport;
+mod volume_presentation;
 mod workbench_brick_runtime;
 mod workbench_controls;
 mod workbench_import;
@@ -64,18 +67,20 @@ use import_workflow::{ImportWorkflow, reset_checkpoint_directory};
 use mirante4d_application::LayerHistogramSummary;
 use mirante4d_application::{
     ApplicationCommand, ApplicationCommandKind, ApplicationEvent, ApplicationFault,
-    ApplicationFaultCode, ApplicationSnapshot, ApplicationState, CommandEffect, DisplayRefreshPath,
-    DisplayRefreshTiming, OperationCompletion, OperationFailureCode, OperationKind, OperationToken,
-    PresentationSlot, PresentationSnapshot, PresentationSurface, ProjectRecoveryStoreLocator,
-    ProjectStoreApplicationService, ProjectStoreLifecycle, ProjectStoreServiceEvent,
-    RenderCoordinationState, ResidentRenderFailureStatus, SourceSessionGeneration,
+    ApplicationFaultCode, ApplicationSnapshot, ApplicationState, CommandEffect,
+    CompletedRenderIntent, DisplayRefreshPath, DisplayRefreshTiming, OperationCompletion,
+    OperationFailureCode, OperationKind, OperationToken, PresentationSlot, PresentationSnapshot,
+    PresentationSurface, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,
+    ProjectStoreLifecycle, ProjectStoreServiceEvent, RenderCoordinationState, RenderIntentBase,
+    RenderIntentFamily, RenderIntentMailbox, RenderIntentMailboxError, RenderIntentPayload,
+    RenderIntentTarget, ResidentRenderFailureStatus, SourceSessionGeneration,
     SourceVerificationSnapshot, SystemMonotonicClock, VolumePickTicket, WorkspaceSnapshot,
     import_workflow::{ImportCommand, ImportReviewId},
     viewer_tools::ViewerToolState,
     viewport_interaction::default_camera_for_shape,
 };
 pub use mirante4d_application::{
-    CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
+    CoordinatedPresentationGroup, CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
     CrossSectionPanelScheduleStatus, DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind,
     FrameFidelityStatus, LodDecisionReason, RenderBackend,
 };
@@ -98,21 +103,21 @@ use mirante4d_project_store::{
     ProjectGenerationId, ProjectOpenMode, ProjectRecoveryCandidate, ProjectStoreConfig,
     ProjectStoreFault, ProjectStorePath, ProjectStoreRequestId,
 };
-use mirante4d_render_api::{PresentationToken, PresentationViewport};
+use mirante4d_render_api::PresentationViewport;
 use mirante4d_render_wgpu::{WgpuRenderRuntime, WgpuRenderRuntimeConfig};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy, recommended_for_current_system};
 use mirante4d_ui_egui as ui_kit;
 pub use process_termination::ProcessTerminationLatch;
 use product_automation::ProductAutomationController;
-use render_state::set_render_viewport;
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
 use ui_kit::{
     DirtyProjectCloseView, DirtyProjectSaveAction, ProjectRecoveryCandidateView,
-    ProjectRecoveryView, RenderUiRequest, ViewportCameraInteraction, ViewportObservation,
-    WorkbenchAnalysisKind, WorkbenchUiAction, WorkbenchUiOutput,
+    ProjectRecoveryView, RenderIntentInteraction, ViewportObservation, WorkbenchAnalysisKind,
+    WorkbenchUiAction, WorkbenchUiOutput,
 };
 #[cfg(test)]
 use ui_kit::{histogram_bins_label, playback_status_label};
+use viewer_layout::PanelId;
 use workbench_controls::{
     dataset_path_status_label, request_background_work_repaint,
     request_background_work_repaint_after,
@@ -134,6 +139,11 @@ impl<S> DeterministicFailureLatch<S> {
 }
 
 const BACKGROUND_WORK_REPAINT_INTERVAL: Duration = Duration::from_millis(50);
+/// Missing resources for an on-screen linked panel are foreground latency,
+/// not background maintenance. Polling at this cadence lets the bounded
+/// runtime queue refill within a display frame while still avoiding a busy
+/// loop for unrelated slow I/O.
+const FOREGROUND_VISIBLE_WORK_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 pub(crate) const CROSS_SECTION_INTERACTION_SETTLE_DURATION: Duration = Duration::from_millis(120);
 /// Verification is intentionally held off for a short, fixed interval after
 /// real viewer input or a render submission. Warm-resident navigation has no
@@ -151,6 +161,28 @@ fn viewer_verification_grace_active(deadline: Option<Instant>, now: Instant) -> 
 
 fn application_view(snapshot: &ApplicationSnapshot) -> &ViewState {
     snapshot.view()
+}
+
+fn render_intent_family_for_view_change(
+    previous: &ViewState,
+    current: &ViewState,
+    playback_changed: bool,
+) -> Option<RenderIntentFamily> {
+    let shared_changed = previous.layers() != current.layers()
+        || previous.active_layer() != current.active_layer()
+        || previous.timepoint() != current.timepoint()
+        || previous.layout() != current.layout()
+        || playback_changed;
+    let three_d_changed = shared_changed
+        || previous.camera() != current.camera()
+        || previous.iso_light() != current.iso_light();
+    let linked_2d_changed = shared_changed || previous.cross_section() != current.cross_section();
+    match (three_d_changed, linked_2d_changed) {
+        (true, true) => Some(RenderIntentFamily::Both),
+        (true, false) => Some(RenderIntentFamily::ThreeD),
+        (false, true) => Some(RenderIntentFamily::Linked2d),
+        (false, false) => None,
+    }
 }
 
 fn project_failure_code(
@@ -482,19 +514,20 @@ pub struct MiranteWorkbenchApp {
     render_coordination: RenderCoordinationState,
     native_presentation: native_presentation::NativePresentationBridge,
     viewer_pick_queue: viewer_pick_runtime::ViewerPickQueue<VolumePickTicket>,
+    volume_presentation: volume_presentation::VolumePresentationController,
     progressive_display_pacer: workbench_brick_runtime::ProgressiveDisplayRefreshPacer,
     display_performance_milestones: display_refresh::DisplayPerformanceMilestones,
     display_instrumentation_epoch: Instant,
-    camera_demand_planner: camera_demand_cache::CameraDemandPlanner,
     pending_visible_demand_plan: Option<workbench_brick_runtime::PendingVisibleDemandPlan>,
     visible_demand_failure_latch:
         Option<DeterministicFailureLatch<workbench_brick_runtime::VisibleDemandFailureSignature>>,
-    viewer_render_failure_latches: BTreeMap<
-        PresentationToken,
-        DeterministicFailureLatch<display_refresh::ProductRenderFailureSignature>,
-    >,
-    viewer_runtime_recovery_epoch: u64,
+    visible_demand_placeability_limit:
+        Option<workbench_brick_runtime::VisibleDemandPlaceabilityLimit>,
+    viewer_render_failure_latch:
+        Option<DeterministicFailureLatch<display_refresh::ProductRenderFailureSignature>>,
+    dataset_runtime_epoch: u64,
     prepared_scope_render_plans: BTreeMap<u64, workbench_brick_runtime::PreparedScopeRenderPlan>,
+    navigation_render_plans: Vec<workbench_brick_runtime::PreparedScopeRenderPlan>,
     last_visible_demand_candidates_visited: Option<usize>,
     staged_post_promotion_renderer_update:
         Option<camera_demand_cache::PreparedRendererRequirementUpdate>,
@@ -502,9 +535,16 @@ pub struct MiranteWorkbenchApp {
     current_camera_reuse_envelope: Option<semantic_demand::SemanticCameraReuseEnvelope>,
     visible_demand_planning_signature:
         Option<workbench_brick_runtime::VisibleDemandPlanningSignature>,
+    installed_cross_section_exact_bodies:
+        [Option<workbench_brick_runtime::InstalledCrossSectionExactBody>; 3],
+    resident_cross_section_coverage: Option<workbench_brick_runtime::ResidentCrossSectionCoverage>,
+    resident_plane_guard_reuses: u64,
+    resident_plane_async_plan_submissions: u64,
+    resident_plane_guard_body_installs: u64,
+    resident_plane_exact_body_installs: u64,
     viewer_verification_busy_until: Option<Instant>,
     active_histogram_cache: histogram::ActiveLayerHistogramCache,
-    camera_preview: Option<CameraView>,
+    render_intent_mailbox: RenderIntentMailbox,
     egui_ui: ui_kit::EguiUiState,
     import: ImportWorkflow,
     analysis_runtime: analysis_session::AnalysisProductRuntime,
@@ -521,6 +561,8 @@ pub struct MiranteWorkbenchApp {
     cross_section_demand_plan_calls: u64,
     #[cfg(test)]
     product_render_attempts: u64,
+    #[cfg(test)]
+    refresh_frame_calls: u64,
     project_store: Option<ProjectStoreApplicationService<SystemMonotonicClock>>,
     project_recovery_root: Option<PathBuf>,
     project_recovery_candidates: Vec<ProjectRecoveryCandidate>,
@@ -540,6 +582,7 @@ pub struct MiranteWorkbenchApp {
     pending_viewport_close: bool,
     pending_source_install: Option<PendingSourceInstall>,
     settings_connection: current_settings_connection::CurrentSettingsConnection,
+    selected_adapter_memory: gpu_memory::SelectedAdapterMemoryFacts,
     source_open_service: Option<current_source_open_service::CurrentSourceOpenService>,
     source_verification_service:
         Option<current_source_verification_service::CurrentSourceVerificationService>,
@@ -570,14 +613,24 @@ impl MiranteWorkbenchApp {
         if let Some(termination) = process_termination.as_ref() {
             termination.bind_egui_context(&cc.egui_ctx);
         }
+        let render_state = cc
+            .wgpu_render_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("the interactive viewer requires the WGPU renderer"))?;
+        let selected_adapter_memory =
+            gpu_memory::SelectedAdapterMemoryFacts::discover(&render_state.adapter);
+        let recommended =
+            recommended_for_current_system(selected_adapter_memory.recommended_capacity_bytes())
+                .unwrap_or_default();
         let (settings_connection, resource_policy) =
-            current_settings_connection::CurrentSettingsConnection::start();
+            current_settings_connection::CurrentSettingsConnection::start(recommended);
         let opened = unified_source_open::open(path, resource_policy, DatasetSourceId::new(1))?;
         Self::new_with_settings(
             cc,
             opened,
             settings_connection,
             resource_policy,
+            selected_adapter_memory,
             process_termination,
         )
     }
@@ -587,6 +640,7 @@ impl MiranteWorkbenchApp {
         opened: unified_source_open::UnifiedOpenedSource,
         settings_connection: current_settings_connection::CurrentSettingsConnection,
         resource_policy: ResourcePolicy,
+        selected_adapter_memory: gpu_memory::SelectedAdapterMemoryFacts,
         process_termination: Option<Arc<ProcessTerminationLatch>>,
     ) -> anyhow::Result<Self> {
         ui_kit::configure_visuals(&cc.egui_ctx);
@@ -614,10 +668,15 @@ impl MiranteWorkbenchApp {
         let validation_capture = product_automation
             .as_ref()
             .is_some_and(ProductAutomationController::requires_validation_capture);
-        let gpu_timing = product_automation
+        let _explicit_gpu_timing_request = product_automation
             .as_ref()
-            .is_some_and(ProductAutomationController::requires_gpu_timing);
-        let product_renderer = WgpuRenderRuntime::from_existing_device(
+            .is_some_and(ProductAutomationController::requires_gpu_timing)
+            || real_interaction_trace::enabled();
+        // Adaptive 3D presentation consumes bounded asynchronous timestamps in
+        // the normal product. Unsupported adapters retain the conservative
+        // work model; no UI-thread wait or alternate renderer is introduced.
+        let gpu_timing = true;
+        let mut product_renderer = WgpuRenderRuntime::from_existing_device(
             &render_state.adapter,
             render_state.device.clone(),
             render_state.queue.clone(),
@@ -626,12 +685,33 @@ impl MiranteWorkbenchApp {
                 .with_gpu_timing(gpu_timing),
         )
         .map_err(|error| anyhow::anyhow!("the progressive GPU renderer is required: {error}"))?;
+        let hidden_refinement_context = cc.egui_ctx.clone();
+        product_renderer.set_hidden_refinement_wake(Arc::new(move || {
+            hidden_refinement_context.request_repaint();
+        }));
+        product_renderer
+            .activate_dataset_generation(catalog.as_ref())
+            .map_err(|error| anyhow::anyhow!("the dataset GPU grid is invalid: {error}"))?;
         let renderer_diagnostics = product_renderer.diagnostics();
         startup_diagnostics.gpu_adapter = Some(format!(
-            "{} {} driver={}",
+            "{} {} driver={} memory_source={} memory_model={} device_local_bytes={} driver_budget_bytes={} driver_usage_bytes={} memory_failure={}",
             renderer_diagnostics.backend(),
             renderer_diagnostics.adapter_name(),
             renderer_diagnostics.driver(),
+            selected_adapter_memory.source(),
+            selected_adapter_memory.memory_model(),
+            selected_adapter_memory
+                .device_local_bytes()
+                .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
+            selected_adapter_memory
+                .driver_budget_bytes()
+                .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
+            selected_adapter_memory
+                .driver_usage_bytes()
+                .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
+            selected_adapter_memory
+                .failure()
+                .map_or_else(|| "none".to_owned(), ToString::to_string),
         ));
         let native_presentation = native_presentation::NativePresentationBridge::new(
             render_state.renderer.clone(),
@@ -655,25 +735,33 @@ impl MiranteWorkbenchApp {
             render_coordination,
             native_presentation,
             viewer_pick_queue: viewer_pick_runtime::ViewerPickQueue::default(),
+            volume_presentation: volume_presentation::VolumePresentationController::default(),
             progressive_display_pacer:
                 workbench_brick_runtime::ProgressiveDisplayRefreshPacer::default(),
             display_performance_milestones: display_refresh::DisplayPerformanceMilestones::default(
             ),
             display_instrumentation_epoch: Instant::now(),
-            camera_demand_planner: camera_demand_cache::CameraDemandPlanner::new()?,
             pending_visible_demand_plan: None,
             visible_demand_failure_latch: None,
-            viewer_render_failure_latches: BTreeMap::new(),
-            viewer_runtime_recovery_epoch: 0,
+            visible_demand_placeability_limit: None,
+            viewer_render_failure_latch: None,
+            dataset_runtime_epoch: 0,
             prepared_scope_render_plans: BTreeMap::new(),
+            navigation_render_plans: Vec::new(),
             last_visible_demand_candidates_visited: None,
             staged_post_promotion_renderer_update: None,
             last_camera_demand_planning_duration: None,
             current_camera_reuse_envelope: None,
             visible_demand_planning_signature: None,
+            installed_cross_section_exact_bodies: std::array::from_fn(|_| None),
+            resident_cross_section_coverage: None,
+            resident_plane_guard_reuses: 0,
+            resident_plane_async_plan_submissions: 0,
+            resident_plane_guard_body_installs: 0,
+            resident_plane_exact_body_installs: 0,
             viewer_verification_busy_until: None,
             active_histogram_cache: histogram::ActiveLayerHistogramCache::default(),
-            camera_preview: None,
+            render_intent_mailbox: RenderIntentMailbox::new(),
             egui_ui,
             import: ImportWorkflow::new(),
             analysis_runtime,
@@ -690,6 +778,8 @@ impl MiranteWorkbenchApp {
             cross_section_demand_plan_calls: 0,
             #[cfg(test)]
             product_render_attempts: 0,
+            #[cfg(test)]
+            refresh_frame_calls: 0,
             project_store,
             project_recovery_root,
             project_recovery_candidates: Vec::new(),
@@ -709,16 +799,15 @@ impl MiranteWorkbenchApp {
             pending_viewport_close: false,
             pending_source_install: None,
             settings_connection,
+            selected_adapter_memory,
             source_open_service: Some(current_source_open_service::CurrentSourceOpenService::new()),
             source_verification_service: Some(
                 current_source_verification_service::CurrentSourceVerificationService::new(),
             ),
             pending_automatic_source_verification: None,
         };
-        // Establish visible interactive demand before the verifier can reserve
-        // its scan workspace. The verifier observes the busy predicate when
-        // its worker starts and therefore cannot overlap the initial decode
-        // cohort merely because thread scheduling happened to favor it.
+        // Ordinary startup establishes visible interactive demand before the
+        // verifier can reserve its scan workspace.
         app.request_opened_state_visible_work(Some(&cc.egui_ctx));
         app.request_current_source_verification();
         app.pump_application_services();
@@ -1241,7 +1330,7 @@ impl MiranteWorkbenchApp {
         {
             Ok(_) => {
                 if replaces_project_view {
-                    self.clear_viewport_camera_preview();
+                    self.cancel_render_intent();
                 }
                 true
             }
@@ -2354,15 +2443,18 @@ impl MiranteWorkbenchApp {
     }
 
     fn retire_invalidated_source_runtime(&mut self) {
-        self.clear_viewport_camera_preview();
-        if let Err(error) = self.camera_demand_planner.invalidate() {
-            tracing::warn!(%error, "camera-demand planner invalidation failed during source quarantine");
-        }
+        self.cancel_render_intent();
+        let intent_revision = self.render_intent_mailbox.snapshot().latest_revision;
+        self.dataset.invalidate_visible_demand_plan(intent_revision);
         self.pending_visible_demand_plan = None;
         self.visible_demand_planning_signature = None;
+        self.visible_demand_placeability_limit = None;
+        self.installed_cross_section_exact_bodies = std::array::from_fn(|_| None);
+        self.resident_cross_section_coverage = None;
         self.current_camera_reuse_envelope = None;
         self.visible_demand_failure_latch = None;
         self.prepared_scope_render_plans.clear();
+        self.navigation_render_plans.clear();
         self.staged_post_promotion_renderer_update = None;
         self.last_camera_demand_planning_duration = None;
         if let Err(error) = self.dataset.cancel_and_clear_interactive_demand() {
@@ -2382,7 +2474,7 @@ impl MiranteWorkbenchApp {
     }
 
     fn source_verification_interactive_busy(&self) -> bool {
-        self.camera_demand_planner.has_outstanding_request()
+        self.dataset.visible_demand_plan_outstanding()
             || self.pending_visible_demand_plan.is_some()
             || self.dataset.dispatcher().has_pending_work()
             || self.application.snapshot().transient().playback_active()
@@ -2687,26 +2779,29 @@ impl MiranteWorkbenchApp {
         &mut self,
         transfer: current_source_open_service::CurrentSourceRuntimeTransfer,
     ) {
-        self.clear_viewport_camera_preview();
+        self.cancel_render_intent();
+        let intent_revision = self.render_intent_mailbox.snapshot().latest_revision;
         let current_source_open_service::CurrentSourceRuntimeTransfer {
             dataset,
             render_coordination,
             analysis_runtime,
         } = transfer;
         self.retire_product_dataset_generation();
-        if let Err(error) = self.camera_demand_planner.invalidate() {
-            tracing::warn!(%error, "camera-demand planner invalidation failed during source replacement");
-        }
+        self.dataset.invalidate_visible_demand_plan(intent_revision);
         self.pending_visible_demand_plan = None;
         self.visible_demand_failure_latch = None;
-        self.viewer_render_failure_latches.clear();
-        self.viewer_runtime_recovery_epoch = self.viewer_runtime_recovery_epoch.saturating_add(1);
+        self.visible_demand_placeability_limit = None;
+        self.viewer_render_failure_latch = None;
+        self.dataset_runtime_epoch = self.dataset_runtime_epoch.saturating_add(1);
         self.prepared_scope_render_plans.clear();
+        self.navigation_render_plans.clear();
         self.staged_post_promotion_renderer_update = None;
         self.last_camera_demand_planning_duration = None;
         self.current_camera_reuse_envelope = None;
         let old_dataset = std::mem::replace(&mut self.dataset, dataset);
         self.visible_demand_planning_signature = None;
+        self.installed_cross_section_exact_bodies = std::array::from_fn(|_| None);
+        self.resident_cross_section_coverage = None;
         self.active_histogram_cache = histogram::ActiveLayerHistogramCache::default();
         let old_render_coordination =
             std::mem::replace(&mut self.render_coordination, render_coordination);
@@ -2723,6 +2818,11 @@ impl MiranteWorkbenchApp {
             tracing::warn!(%error, "replaced dataset runtime shutdown request failed");
         }
         let snapshot = self.application.snapshot();
+        if let Some(product) = self.native_presentation.product_gpu.as_mut() {
+            product
+                .activate_dataset_generation(snapshot.catalog())
+                .expect("a retired renderer accepts the installed source generation");
+        }
         self.pending_automatic_source_verification =
             matches!(snapshot.source(), SourceVerificationSnapshot::Required)
                 .then(|| snapshot.source_generation());
@@ -2775,12 +2875,21 @@ impl MiranteWorkbenchApp {
         command: ApplicationCommand,
         ctx: &egui::Context,
     ) -> Result<CommandEffect, ApplicationFault> {
+        self.apply_application_command_with_revision_policy(command, ctx, true)
+    }
+
+    fn apply_application_command_with_revision_policy(
+        &mut self,
+        command: ApplicationCommand,
+        ctx: &egui::Context,
+        allocate_render_revision: bool,
+    ) -> Result<CommandEffect, ApplicationFault> {
         let command_kind = command.kind();
         if matches!(
             command_kind,
             ApplicationCommandKind::SetCamera | ApplicationCommandKind::SetActiveTool
         ) {
-            self.clear_viewport_camera_preview();
+            self.cancel_render_intent();
         }
         let interaction_started = matches!(
             command_kind,
@@ -2799,12 +2908,20 @@ impl MiranteWorkbenchApp {
                 self.render_coordination.record_durable_gesture_commit();
             }
             let after = self.application.snapshot();
-            if previous_view != *application_view(&after) {
-                // A transient preview is valid only for the exact canonical
-                // view against which its resident body was checked. Undo,
-                // redo, ReplaceView, and non-camera view edits must retire it
-                // before reconciliation can trigger another render.
-                self.clear_viewport_camera_preview();
+            if let Some(family) = render_intent_family_for_view_change(
+                &previous_view,
+                application_view(&after),
+                previous_playback_active != after.transient().playback_active(),
+            ) {
+                // Durable render-affecting changes and raw gesture samples
+                // share one uniqueness sequence while each presentation
+                // family advances only for input that can change its pixels.
+                if allocate_render_revision
+                    && let Err(error) = self.render_intent_mailbox.observe_durable_intent(family)
+                {
+                    tracing::error!(%error, "render-intent revision could not advance");
+                }
+                self.egui_ui.cancel_viewport_drag();
             }
             self.reconcile_application_change(
                 &previous_view,
@@ -2844,7 +2961,16 @@ impl MiranteWorkbenchApp {
                 && (previous_view.layout() == CanonicalViewerLayout::FourPanel
                     || next_view.layout() == CanonicalViewerLayout::FourPanel);
         if volume_render_changed || linked_runtime_changed || playback_lod_changed {
-            self.begin_display_input_generation();
+            let required_group = match (
+                volume_render_changed || playback_lod_changed,
+                linked_runtime_changed,
+            ) {
+                (true, true) => CoordinatedPresentationGroup::FullLayout,
+                (true, false) => CoordinatedPresentationGroup::ThreeD,
+                (false, true) => CoordinatedPresentationGroup::Linked2d,
+                (false, false) => unreachable!("a display input requires an affected group"),
+            };
+            self.begin_display_input_generation(required_group);
         }
         if volume_render_changed || playback_lod_changed {
             self.note_viewer_render_submission();
@@ -2875,46 +3001,73 @@ impl MiranteWorkbenchApp {
         if previous_view.layout() != next_view.layout() {
             self.egui_ui.hovered_pixel = None;
             self.egui_ui.hovered_source_readout = None;
-            self.clear_viewport_camera_preview();
+            self.cancel_render_intent();
             if next_view.layout() == CanonicalViewerLayout::Single3d {
                 self.clear_cross_section_product_presentations();
             }
         }
         if source_selection_changed {
             self.clear_3d_product_presentation();
+        } else if linked_runtime_changed {
+            self.invalidate_cross_section_panel_display_frames();
+        }
+        if source_selection_changed {
             self.request_visible_bricks();
         } else {
-            if linked_runtime_changed {
-                self.invalidate_cross_section_panel_display_frames();
-            }
             if volume_render_changed {
-                if let Err(error) = self.rerender_display_state() {
+                if let Err(error) = self.rerender_coordinated_display_state() {
                     tracing::error!(%error, "failed to render the accepted canonical view");
                     self.dataset.record_plan_error(error.to_string());
                     self.render_coordination.frame_fidelity.completeness =
                         FrameCompleteness::Incomplete;
                 }
             } else if linked_runtime_changed {
-                // Replan only linked scopes. The demand planner's independent
-                // signatures reuse the unchanged 3D plan in O(1), and linked
-                // panels render through their own dirty callbacks.
-                self.request_visible_bricks();
+                // A settled transient may already be inside every immutable
+                // panel guard. Rebind those complete bodies before submitting
+                // any worker request; otherwise retain the ordinary
+                // latest-only exact replacement path.
+                if self.prepare_resident_durable_cross_sections() {
+                    // The finishing interaction can atomically adopt the
+                    // already-rendered exact linked textures after this
+                    // durable command returns. Ordinary durable commands are
+                    // rendered by the queued coordinated refresh below.
+                    self.render_coordination.request_refresh();
+                } else {
+                    self.request_visible_bricks();
+                }
             }
         }
         ctx.request_repaint();
         ctx.request_repaint_after(CROSS_SECTION_INTERACTION_SETTLE_DURATION);
     }
 
-    pub(crate) fn clear_viewport_camera_preview(&mut self) {
-        self.camera_preview = None;
-        self.egui_ui.cancel_viewport_camera_interaction();
+    pub(crate) fn cancel_render_intent(&mut self) {
+        let snapshot = self.application.snapshot();
+        let base = RenderIntentBase::from_snapshot(&snapshot);
+        let restore_linked_durable_view = application_view(&snapshot).layout()
+            == CanonicalViewerLayout::FourPanel
+            && matches!(
+                self.render_intent_mailbox.active_target(base),
+                Some(RenderIntentTarget::CrossSection(_))
+            );
+        self.render_intent_mailbox.cancel();
+        self.resident_cross_section_coverage = None;
+        self.egui_ui.cancel_viewport_drag();
+        if restore_linked_durable_view {
+            self.render_coordination.invalidate_cross_sections();
+            self.request_visible_bricks();
+            self.render_coordination.request_refresh();
+        }
     }
 
-    pub(crate) fn begin_display_input_generation(&mut self) {
+    pub(crate) fn begin_display_input_generation(
+        &mut self,
+        required_group: CoordinatedPresentationGroup,
+    ) {
         let now_ns = self.display_instrumentation_now_ns();
         let generation = self
             .render_coordination
-            .begin_display_input_generation(now_ns);
+            .begin_display_input_generation(now_ns, required_group);
         self.display_performance_milestones
             .begin_generation(generation);
     }
@@ -2922,8 +3075,10 @@ impl MiranteWorkbenchApp {
     pub(crate) fn record_current_layout_presentation_if_complete(&mut self) {
         let snapshot = self.application.snapshot();
         let view = application_view(&snapshot);
+        let demand_currentness = self.visible_demand_plan_currentness();
         let three_d_current = self.render_coordination.frame_fidelity.display_freshness
             == DisplayedFrameFreshness::Current
+            && demand_currentness.current_3d
             && matches!(
                 self.render_coordination.frame_fidelity.completeness,
                 FrameCompleteness::Exact | FrameCompleteness::Complete
@@ -2936,38 +3091,53 @@ impl MiranteWorkbenchApp {
                 .all(|layer| {
                     layer.current && layer.available_requirements == layer.total_requirements
                 });
-        let current = match view.layout() {
+        let linked_2d_current = [
+            PresentationSlot::Xy,
+            PresentationSlot::Xz,
+            PresentationSlot::Yz,
+        ]
+        .into_iter()
+        .all(|slot| {
+            let surface = self.render_coordination.surface(slot);
+            surface.display_current()
+                && demand_currentness.cross_section(PanelId::from_presentation_slot(slot))
+                && surface.cross_section_schedule().is_some_and(|schedule| {
+                    matches!(
+                        schedule.status,
+                        CrossSectionPanelScheduleStatus::Current
+                            | CrossSectionPanelScheduleStatus::Empty
+                    )
+                })
+                && surface.layer_presentations().iter().all(|layer| {
+                    layer.current && layer.available_requirements == layer.total_requirements
+                })
+        });
+        let full_layout_current = match view.layout() {
             CanonicalViewerLayout::Single3d => three_d_current,
-            CanonicalViewerLayout::FourPanel => {
-                three_d_current
-                    && [
-                        PresentationSlot::Xy,
-                        PresentationSlot::Xz,
-                        PresentationSlot::Yz,
-                    ]
-                    .into_iter()
-                    .all(|slot| {
-                        let surface = self.render_coordination.surface(slot);
-                        surface.display_current()
-                            && surface.cross_section_schedule().is_some_and(|schedule| {
-                                schedule.status == CrossSectionPanelScheduleStatus::Current
-                            })
-                            && surface.layer_presentations().iter().all(|layer| {
-                                layer.current
-                                    && layer.available_requirements == layer.total_requirements
-                            })
-                    })
-            }
+            CanonicalViewerLayout::FourPanel => three_d_current && linked_2d_current,
         };
-        if current {
+        let group_current = match self
+            .render_coordination
+            .required_coordinated_presentation_group()
+        {
+            CoordinatedPresentationGroup::ThreeD => three_d_current,
+            CoordinatedPresentationGroup::Linked2d => linked_2d_current,
+            CoordinatedPresentationGroup::FullLayout => full_layout_current,
+        };
+        if group_current {
             let now_ns = self.display_instrumentation_now_ns();
-            self.render_coordination.record_current_presentation(now_ns);
+            self.render_coordination
+                .record_current_group_presentation(now_ns);
+            if full_layout_current {
+                self.render_coordination.record_current_presentation(now_ns);
+            }
         }
     }
 
     pub(crate) fn observe_coordinated_display_milestones(&mut self, foreground_idle: bool) {
         let snapshot = self.application.snapshot();
         let view = application_view(&snapshot);
+        let demand_currentness = self.visible_demand_plan_currentness();
         let visible_slots: &[PresentationSlot] = match view.layout() {
             CanonicalViewerLayout::Single3d => &[PresentationSlot::ThreeD],
             CanonicalViewerLayout::FourPanel => &PresentationSlot::ALL,
@@ -2981,8 +3151,10 @@ impl MiranteWorkbenchApp {
             let display_current = if slot == PresentationSlot::ThreeD {
                 self.render_coordination.frame_fidelity.display_freshness
                     == DisplayedFrameFreshness::Current
+                    && demand_currentness.current_3d
             } else {
                 surface.display_current()
+                    && demand_currentness.cross_section(PanelId::from_presentation_slot(slot))
             };
             let layers = surface.layer_presentations();
             if layers.is_empty() {
@@ -2990,16 +3162,18 @@ impl MiranteWorkbenchApp {
                 {
                     let fidelity = &self.render_coordination.frame_fidelity;
                     let displayed = fidelity.displayed_scale_level;
+                    let terminal_empty = fidelity.backend == RenderBackend::Empty;
                     (
-                        fidelity.resident_bricks > 0 || fidelity.backend == RenderBackend::Empty,
+                        fidelity.resident_bricks > 0 || terminal_empty,
                         display_current
                             && matches!(
                                 fidelity.completeness,
                                 FrameCompleteness::Exact | FrameCompleteness::Complete
                             ),
-                        displayed.is_some_and(|scale| scale > fidelity.target_scale_level),
+                        !terminal_empty
+                            && displayed.is_some_and(|scale| scale > fidelity.target_scale_level),
                         display_current
-                            && displayed == Some(fidelity.target_scale_level)
+                            && (terminal_empty || displayed == Some(fidelity.target_scale_level))
                             && matches!(
                                 fidelity.completeness,
                                 FrameCompleteness::Exact | FrameCompleteness::Complete
@@ -3007,14 +3181,21 @@ impl MiranteWorkbenchApp {
                     )
                 } else {
                     let schedule = surface.cross_section_schedule();
+                    let terminal_empty = display_current
+                        && schedule.is_some_and(|schedule| {
+                            schedule.status == CrossSectionPanelScheduleStatus::Empty
+                        });
                     (
-                        schedule.is_some_and(|schedule| schedule.occupied_selected_bricks > 0),
+                        terminal_empty
+                            || schedule
+                                .is_some_and(|schedule| schedule.occupied_selected_bricks > 0),
                         display_current
                             && schedule.is_some_and(|schedule| {
                                 matches!(
                                     schedule.status,
                                     CrossSectionPanelScheduleStatus::Current
                                         | CrossSectionPanelScheduleStatus::Coarse
+                                        | CrossSectionPanelScheduleStatus::Empty
                                 )
                             }),
                         schedule.is_some_and(|schedule| {
@@ -3025,7 +3206,11 @@ impl MiranteWorkbenchApp {
                         }),
                         display_current
                             && schedule.is_some_and(|schedule| {
-                                schedule.status == CrossSectionPanelScheduleStatus::Current
+                                matches!(
+                                    schedule.status,
+                                    CrossSectionPanelScheduleStatus::Current
+                                        | CrossSectionPanelScheduleStatus::Empty
+                                )
                             }),
                     )
                 };

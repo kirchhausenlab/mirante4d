@@ -1,14 +1,14 @@
 //! Pure semantic demand planning for the unified runtime.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     error::Error,
     fmt,
     sync::Arc,
 };
 
 use mirante4d_dataset::{
-    CpuByteLease, CpuByteLedger, CpuLedgerCategory, DatasetCatalog, DatasetResourceKey,
+    BrickKey, CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError, DatasetCatalog,
     ResourceRegion,
 };
 use mirante4d_domain::{
@@ -24,12 +24,19 @@ use crate::{
     projected_lod::{select_cross_section_level, select_volume_level},
     semantic_demand::{
         CrossSectionPlane, SemanticCameraReuseEnvelope, SemanticPlanError, SemanticPlanLimits,
-        SemanticRegionGridSpec, plan_cross_section_resource_regions_cancellable,
+        SemanticPlaneLayerReuseGuard, SemanticPlaneReuseEnvelope, SemanticRegionGridSpec,
+        plan_cross_section_resource_regions_cancellable,
+        plan_guarded_cross_section_resource_regions_cancellable,
         plan_prioritized_visible_resource_regions_cancellable,
     },
-    semantic_tiles::SEMANTIC_TILE_SIDE,
+    semantic_tiles::{SEMANTIC_TILE_SIDE, SemanticTileGrid, SemanticTileIndex},
     viewer_layout::PanelId,
 };
+
+const NAVIGATION_TAIL_PAYLOAD_DIVISOR: u64 = 4;
+const NAVIGATION_TAIL_MAX_PAYLOAD_BYTES: u64 = 512 * 1024 * 1024;
+const NAVIGATION_TAIL_RESOURCE_DIVISOR: usize = 4;
+const NAVIGATION_TAIL_MAX_RESOURCES: usize = 16_384;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DatasetDemandPlan {
@@ -37,19 +44,28 @@ pub(crate) struct DatasetDemandPlan {
     /// `layer_scales` and in its semantic resource keys.
     pub(crate) scale: ScaleLevel,
     pub(crate) layer_scales: BTreeMap<LogicalLayerKey, ScaleLevel>,
-    pub(crate) resources: Vec<DatasetResourceKey>,
+    pub(crate) resources: Vec<BrickKey>,
     pub(crate) payload_bytes: u64,
     pub(crate) playback_downshifted: bool,
     pub(crate) covers_full_volume: bool,
     /// Exact current-camera prefix. Remaining resources, if any, are the
     /// fixed bounded guard tier and never precede current-view I/O.
     pub(crate) primary_resource_count: usize,
+    /// Camera target plus its optional guard before the independent resident
+    /// navigation ladder is appended. Playback may prefetch this prefix but
+    /// must not duplicate the active timepoint's full ladder.
+    pub(crate) playback_resource_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProgressiveDatasetDemandPlan {
+    pub(crate) ideal_scale: ScaleLevel,
+    pub(crate) ideal_layer_scales: BTreeMap<LogicalLayerKey, ScaleLevel>,
     pub(crate) target: DatasetDemandPlan,
     pub(crate) coarse: Option<DatasetDemandPlan>,
+    /// Complete full-volume candidates ordered from the mandatory terminal
+    /// body toward successively finer coherent per-layer scale maps.
+    pub(crate) navigation_candidates: Vec<DatasetDemandPlan>,
 }
 
 pub(crate) struct ProgressiveDatasetDemandPlanning {
@@ -63,23 +79,76 @@ pub(crate) struct DatasetDemandPlanning {
     pub(crate) plan: DatasetDemandPlan,
     pub(crate) candidates_visited: usize,
     guard_retained: bool,
+    pub(crate) plane_reuse_envelope: Option<SemanticPlaneReuseEnvelope>,
     pub(crate) scratch_charges: Vec<Box<dyn CpuByteLease>>,
+}
+
+/// One immutable, already-installed full-volume navigation rung.
+#[derive(Debug, Clone)]
+pub(crate) struct NavigationCandidateBaseline {
+    body: PreparedResourceBody,
+    layer_scales: Arc<BTreeMap<LogicalLayerKey, ScaleLevel>>,
+    planned_payload_bytes: u64,
+}
+
+impl NavigationCandidateBaseline {
+    pub(crate) fn new(
+        body: PreparedResourceBody,
+        layer_scales: Arc<BTreeMap<LogicalLayerKey, ScaleLevel>>,
+        planned_payload_bytes: u64,
+    ) -> Self {
+        Self {
+            body,
+            layer_scales,
+            planned_payload_bytes,
+        }
+    }
+}
+
+/// Immutable, already-installed resident ladder which can seed a replacement
+/// camera plan without traversing every complete full-volume rung again.
+///
+/// The application only constructs this from prepared navigation render bodies
+/// sharing the installed current-3D residency union. The planner still
+/// revalidates source, timepoint, visible layers, scale adjacency, semantic
+/// tiling, payload accounting, and the current byte/resource limits before
+/// adopting any rung.
+#[derive(Debug, Clone)]
+pub(crate) struct NavigationLadderBaseline {
+    candidates: Arc<[NavigationCandidateBaseline]>,
+}
+
+impl NavigationLadderBaseline {
+    pub(crate) fn new(candidates: Vec<NavigationCandidateBaseline>) -> Self {
+        Self {
+            candidates: candidates.into(),
+        }
+    }
+
+    fn terminal(&self) -> Option<&NavigationCandidateBaseline> {
+        self.candidates.first()
+    }
 }
 
 impl DatasetDemandPlanning {
     pub(crate) fn prepare_accounted(
         self,
         reservations: &mut PreparedAllocationReservations<'_>,
-    ) -> anyhow::Result<(PreparedDatasetDemandPlan, usize)> {
+    ) -> anyhow::Result<(
+        PreparedDatasetDemandPlan,
+        usize,
+        Option<SemanticPlaneReuseEnvelope>,
+    )> {
         let Self {
             plan,
             candidates_visited,
             guard_retained: _,
+            plane_reuse_envelope,
             scratch_charges,
         } = self;
         let prepared = PreparedDatasetDemandPlan::from_plan_accounted(plan, reservations)?;
         drop(scratch_charges);
-        Ok((prepared, candidates_visited))
+        Ok((prepared, candidates_visited, plane_reuse_envelope))
     }
 }
 
@@ -171,6 +240,7 @@ impl CpuByteLease for PreparedResultLeaseBundle {
 pub(crate) struct PreparedDemandRequirements {
     body: PreparedResourceBody,
     admitted_prefix_len: usize,
+    first_useful_prefix_len: usize,
     /// Contribution-ranked resources before this boundary are required by
     /// the current semantic view. The remaining suffix is a resident camera
     /// guard and cannot delay readiness until explicitly promoted.
@@ -179,8 +249,24 @@ pub(crate) struct PreparedDemandRequirements {
 
 impl PreparedDemandRequirements {
     #[cfg(test)]
+    pub(crate) fn from_prepared_body_for_test(
+        body: PreparedResourceBody,
+        admitted_prefix_len: usize,
+        required_prefix_len: usize,
+    ) -> Self {
+        assert!(admitted_prefix_len <= body.ranked().len());
+        assert!(required_prefix_len <= body.ranked().len());
+        Self {
+            body,
+            admitted_prefix_len,
+            first_useful_prefix_len: required_prefix_len.min(1),
+            required_prefix_len,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_ranked(
-        ranked: impl Into<Arc<[DatasetResourceKey]>>,
+        ranked: impl Into<Arc<[BrickKey]>>,
     ) -> Result<Self, PreparedDemandPlanError> {
         let ranked = ranked.into();
         let mut canonical = ranked.to_vec();
@@ -193,16 +279,36 @@ impl PreparedDemandRequirements {
         Ok(Self {
             body: PreparedResourceBody::new(canonical.into(), ranked, None)?,
             admitted_prefix_len: 0,
+            first_useful_prefix_len: usize::from(required_prefix_len != 0),
             required_prefix_len,
         })
     }
 
     pub(crate) fn from_ranked_accounted(
-        ranked: Vec<DatasetResourceKey>,
+        ranked: Vec<BrickKey>,
         required_prefix_len: usize,
         reservations: &mut PreparedAllocationReservations<'_>,
     ) -> anyhow::Result<Self> {
-        if required_prefix_len > ranked.len() {
+        Self::from_ranked_with_prefixes_accounted(
+            ranked,
+            usize::from(required_prefix_len != 0),
+            required_prefix_len,
+            reservations,
+        )
+    }
+
+    pub(crate) fn from_ranked_with_prefixes_accounted(
+        ranked: Vec<BrickKey>,
+        first_useful_prefix_len: usize,
+        required_prefix_len: usize,
+        reservations: &mut PreparedAllocationReservations<'_>,
+    ) -> anyhow::Result<Self> {
+        let empty = ranked.is_empty() && first_useful_prefix_len == 0 && required_prefix_len == 0;
+        if !empty
+            && (first_useful_prefix_len == 0
+                || first_useful_prefix_len > required_prefix_len
+                || required_prefix_len > ranked.len())
+        {
             return Err(PreparedDemandPlanError::RequiredPrefixOutOfBounds.into());
         }
         let retained_bytes =
@@ -221,6 +327,52 @@ impl PreparedDemandRequirements {
         Ok(Self {
             body,
             admitted_prefix_len: 0,
+            first_useful_prefix_len,
+            required_prefix_len,
+        })
+    }
+
+    /// Replaces this body's ranked/canonical allocation while transferring its
+    /// existing retained reservation and acquiring only the exact growth.
+    ///
+    /// The old and new bodies coexist briefly while the floor is merged, so a
+    /// temporary lease accounts that overlap. The finished result must not pin
+    /// the discarded target-only body's full byte charge.
+    pub(crate) fn into_merged_ranked_with_prefixes_accounted(
+        self,
+        ranked: Vec<BrickKey>,
+        first_useful_prefix_len: usize,
+        required_prefix_len: usize,
+        reservations: &mut PreparedAllocationReservations<'_>,
+    ) -> anyhow::Result<Self> {
+        if ranked.is_empty()
+            || first_useful_prefix_len == 0
+            || first_useful_prefix_len > required_prefix_len
+            || required_prefix_len > ranked.len()
+        {
+            return Err(PreparedDemandPlanError::RequiredPrefixOutOfBounds.into());
+        }
+        let old_body_bytes = self.body.host_allocation_bytes();
+        let new_body_bytes =
+            PreparedResourceBody::preflight_host_allocation_bytes(ranked.len(), ranked.len())?;
+        let retained_growth = new_body_bytes
+            .checked_sub(old_body_bytes)
+            .ok_or_else(|| anyhow::anyhow!("merged prepared body unexpectedly shrank"))?;
+        reservations.reserve_result(retained_growth)?;
+        let overlap_charge = reservations.reserve_temporary(old_body_bytes)?;
+        let mut canonical = ranked.clone();
+        canonical.sort_unstable();
+        canonical.dedup();
+        if canonical.len() != ranked.len() {
+            return Err(PreparedDemandPlanError::DuplicateRequirement.into());
+        }
+        let body = PreparedResourceBody::new(canonical.into(), ranked.into(), None)?;
+        drop(self);
+        drop(overlap_charge);
+        Ok(Self {
+            body,
+            admitted_prefix_len: 0,
+            first_useful_prefix_len,
             required_prefix_len,
         })
     }
@@ -231,12 +383,13 @@ impl PreparedDemandRequirements {
     #[cfg(test)]
     pub(crate) fn preserving_admitted_prefix(
         &self,
-        admitted_prefix: &[DatasetResourceKey],
+        admitted_prefix: &[BrickKey],
     ) -> Result<Self, PreparedDemandPlanError> {
         if admitted_prefix.is_empty() {
             return Ok(Self {
                 body: self.body.clone(),
                 admitted_prefix_len: 0,
+                first_useful_prefix_len: self.first_useful_prefix_len,
                 required_prefix_len: self.required_prefix_len,
             });
         }
@@ -267,19 +420,21 @@ impl PreparedDemandRequirements {
         Ok(Self {
             body: PreparedResourceBody::new(Arc::clone(self.canonical()), merged.into(), None)?,
             admitted_prefix_len: preserved.len(),
+            first_useful_prefix_len: self.first_useful_prefix_len,
             required_prefix_len: self.required_prefix_len,
         })
     }
 
     pub(crate) fn into_preserving_admitted_prefix_accounted(
         self,
-        admitted_prefix: &[DatasetResourceKey],
+        admitted_prefix: &[BrickKey],
         reservations: &PreparedAllocationReservations<'_>,
     ) -> anyhow::Result<Self> {
         if admitted_prefix.is_empty() {
             return Ok(Self {
                 body: self.body,
                 admitted_prefix_len: 0,
+                first_useful_prefix_len: self.first_useful_prefix_len,
                 required_prefix_len: self.required_prefix_len,
             });
         }
@@ -314,6 +469,7 @@ impl PreparedDemandRequirements {
         // old ranked/body allocation plus the exact-capacity merge overlap.
         let canonical = Arc::clone(self.canonical());
         let required_prefix_len = self.required_prefix_len;
+        let first_useful_prefix_len = self.first_useful_prefix_len;
         let mut merged = Vec::with_capacity(self.ranked().len());
         merged.extend_from_slice(&preserved);
         merged.extend(
@@ -328,6 +484,7 @@ impl PreparedDemandRequirements {
         Ok(Self {
             body,
             admitted_prefix_len: preserved.len(),
+            first_useful_prefix_len,
             required_prefix_len,
         })
     }
@@ -337,6 +494,7 @@ impl PreparedDemandRequirements {
             body: PreparedResourceBody::new(Arc::from([]), Arc::from([]), None)
                 .expect("an empty prepared application body is valid"),
             admitted_prefix_len: 0,
+            first_useful_prefix_len: 0,
             required_prefix_len: 0,
         }
     }
@@ -361,11 +519,11 @@ impl PreparedDemandRequirements {
         &self.body
     }
 
-    pub(crate) fn canonical(&self) -> &Arc<[DatasetResourceKey]> {
+    pub(crate) fn canonical(&self) -> &Arc<[BrickKey]> {
         self.body.canonical()
     }
 
-    pub(crate) fn ranked(&self) -> &Arc<[DatasetResourceKey]> {
+    pub(crate) fn ranked(&self) -> &Arc<[BrickKey]> {
         self.body.ranked()
     }
 
@@ -383,71 +541,8 @@ impl PreparedDemandRequirements {
         self.required_prefix_len
     }
 
-    pub(crate) fn bounded_delta_from(
-        &self,
-        previous: &[DatasetResourceKey],
-        maximum_changes: usize,
-    ) -> Option<PreparedRequirementDelta> {
-        let mut additions = Vec::new();
-        let mut removals = Vec::new();
-        let mut previous_index = 0;
-        let mut next_index = 0;
-        while previous_index < previous.len() && next_index < self.canonical().len() {
-            match previous[previous_index].cmp(&self.canonical()[next_index]) {
-                std::cmp::Ordering::Less => {
-                    if additions.len().saturating_add(removals.len()) == maximum_changes {
-                        return None;
-                    }
-                    removals.push(previous[previous_index]);
-                    previous_index += 1;
-                }
-                std::cmp::Ordering::Greater => {
-                    if additions.len().saturating_add(removals.len()) == maximum_changes {
-                        return None;
-                    }
-                    additions.push(self.canonical()[next_index]);
-                    next_index += 1;
-                }
-                std::cmp::Ordering::Equal => {
-                    previous_index += 1;
-                    next_index += 1;
-                }
-            }
-        }
-        let trailing_changes = previous
-            .len()
-            .saturating_sub(previous_index)
-            .saturating_add(self.canonical().len().saturating_sub(next_index));
-        if additions
-            .len()
-            .saturating_add(removals.len())
-            .saturating_add(trailing_changes)
-            > maximum_changes
-        {
-            return None;
-        }
-        removals.extend_from_slice(&previous[previous_index..]);
-        additions.extend_from_slice(&self.canonical()[next_index..]);
-        Some(PreparedRequirementDelta {
-            additions: additions.into(),
-            removals: removals.into(),
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PreparedRequirementDelta {
-    additions: Arc<[DatasetResourceKey]>,
-    removals: Arc<[DatasetResourceKey]>,
-}
-
-impl PreparedRequirementDelta {
-    pub(crate) fn additions(&self) -> &Arc<[DatasetResourceKey]> {
-        &self.additions
-    }
-
-    pub(crate) fn removals(&self) -> &Arc<[DatasetResourceKey]> {
-        &self.removals
+    pub(crate) const fn first_useful_prefix_len(&self) -> usize {
+        self.first_useful_prefix_len
     }
 }
 
@@ -460,6 +555,7 @@ pub(crate) struct PreparedDatasetDemandPlan {
     pub(crate) playback_downshifted: bool,
     pub(crate) covers_full_volume: bool,
     pub(crate) primary_resource_count: usize,
+    pub(crate) playback_resource_count: usize,
 }
 
 impl PreparedDatasetDemandPlan {
@@ -480,14 +576,18 @@ impl PreparedDatasetDemandPlan {
             playback_downshifted: plan.playback_downshifted,
             covers_full_volume: plan.covers_full_volume,
             primary_resource_count: plan.primary_resource_count,
+            playback_resource_count: plan.playback_resource_count,
         })
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedProgressiveDatasetDemandPlan {
+    pub(crate) ideal_scale: ScaleLevel,
+    pub(crate) ideal_layer_scales: BTreeMap<LogicalLayerKey, ScaleLevel>,
     pub(crate) target: PreparedDatasetDemandPlan,
     pub(crate) coarse: Option<PreparedDatasetDemandPlan>,
+    pub(crate) navigation_candidates: Vec<PreparedDatasetDemandPlan>,
     pub(crate) reuse_envelope: Option<SemanticCameraReuseEnvelope>,
 }
 
@@ -502,12 +602,24 @@ impl PreparedProgressiveDatasetDemandPlan {
             reuse_envelope,
             scratch_charges,
         } = planning;
-        let ProgressiveDatasetDemandPlan { target, coarse } = plan;
+        let ProgressiveDatasetDemandPlan {
+            ideal_scale,
+            ideal_layer_scales,
+            target,
+            coarse,
+            navigation_candidates,
+        } = plan;
         let prepared = Self {
+            ideal_scale,
+            ideal_layer_scales,
             target: PreparedDatasetDemandPlan::from_plan_accounted(target, reservations)?,
             coarse: coarse
                 .map(|plan| PreparedDatasetDemandPlan::from_plan_accounted(plan, reservations))
                 .transpose()?,
+            navigation_candidates: navigation_candidates
+                .into_iter()
+                .map(|plan| PreparedDatasetDemandPlan::from_plan_accounted(plan, reservations))
+                .collect::<anyhow::Result<Vec<_>>>()?,
             reuse_envelope,
         };
         drop(scratch_charges);
@@ -517,26 +629,10 @@ impl PreparedProgressiveDatasetDemandPlan {
 
 pub(crate) fn key_array_bytes(length: usize) -> anyhow::Result<u64> {
     let bytes = length
-        .checked_mul(std::mem::size_of::<DatasetResourceKey>())
+        .checked_mul(std::mem::size_of::<BrickKey>())
         .ok_or_else(|| anyhow::anyhow!("prepared key-array byte accounting overflow"))?;
     u64::try_from(bytes)
         .map_err(|_| anyhow::anyhow!("prepared key-array byte accounting exceeds u64"))
-}
-
-/// Conservative fixed scratch for a bounded requirement delta. Two growing
-/// vectors can retain rounded-up capacities while one exact `Arc` payload is
-/// materialized; the extra eight keys cover both small-vector capacity floors.
-pub(crate) fn bounded_requirement_delta_scratch_bytes(
-    maximum_changes: usize,
-) -> anyhow::Result<u64> {
-    if maximum_changes == 0 {
-        return Ok(0);
-    }
-    let capacity_keys = maximum_changes
-        .checked_mul(3)
-        .and_then(|count| count.checked_add(8))
-        .ok_or_else(|| anyhow::anyhow!("requirement-delta scratch byte overflow"))?;
-    key_array_bytes(capacity_keys)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -634,58 +730,115 @@ impl DatasetDemandPlanLimits {
             max_gpu_payload_bytes,
         }
     }
-
-    const fn reserve_playback_half(self, playback_active: bool) -> Self {
-        if playback_active {
-            Self {
-                max_candidates_per_layer: self.max_candidates_per_layer,
-                max_resources: self.max_resources / 2,
-                max_gpu_payload_bytes: self.max_gpu_payload_bytes / 2,
-            }
-        } else {
-            self
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DatasetDemandPlanCapacityError {
     limits: DatasetDemandPlanLimits,
     selected_scale: Option<ScaleLevel>,
+    target: &'static str,
+    excess: Option<DatasetDemandCapacityExcess>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatasetDemandCapacityDimension {
+    Candidates,
+    Resources,
+    GpuPayloadBytes,
+    ScratchBytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DatasetDemandCapacityExcess {
+    dimension: DatasetDemandCapacityDimension,
+    required: u64,
+    available: u64,
 }
 
 impl DatasetDemandPlanCapacityError {
-    const fn new(limits: DatasetDemandPlanLimits) -> Self {
-        Self {
-            limits,
-            selected_scale: None,
-        }
+    pub(crate) const fn is_gpu_payload_capacity(self) -> bool {
+        matches!(
+            self.excess,
+            Some(DatasetDemandCapacityExcess {
+                dimension: DatasetDemandCapacityDimension::GpuPayloadBytes,
+                ..
+            })
+        )
     }
 
-    const fn at_selected_scale(
+    const fn at_selected_scale_with_excess(
         limits: DatasetDemandPlanLimits,
+        target: &'static str,
         selected_scale: ScaleLevel,
+        excess: DatasetDemandCapacityExcess,
     ) -> Self {
         Self {
             limits,
             selected_scale: Some(selected_scale),
+            target,
+            excess: Some(excess),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) const fn selected_scale(self) -> Option<ScaleLevel> {
-        self.selected_scale
+    pub(crate) fn for_global_usage(
+        limits: DatasetDemandPlanLimits,
+        target: &'static str,
+        selected_scale: Option<ScaleLevel>,
+        required_resources: usize,
+        required_payload_bytes: u64,
+    ) -> Self {
+        let excess = if required_resources > limits.max_resources {
+            Some(DatasetDemandCapacityExcess {
+                dimension: DatasetDemandCapacityDimension::Resources,
+                required: u64::try_from(required_resources).unwrap_or(u64::MAX),
+                available: u64::try_from(limits.max_resources).unwrap_or(u64::MAX),
+            })
+        } else if required_payload_bytes > limits.max_gpu_payload_bytes {
+            Some(DatasetDemandCapacityExcess {
+                dimension: DatasetDemandCapacityDimension::GpuPayloadBytes,
+                required: required_payload_bytes,
+                available: limits.max_gpu_payload_bytes,
+            })
+        } else {
+            None
+        };
+        Self {
+            limits,
+            selected_scale,
+            target,
+            excess,
+        }
     }
 }
 
 impl fmt::Display for DatasetDemandPlanCapacityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(scale) = self.selected_scale {
-            write!(formatter, "screen-selected scale s{} ", scale.get())?;
+            write!(
+                formatter,
+                "{} minimum navigation scale s{} ",
+                self.target,
+                scale.get()
+            )?;
+        } else {
+            write!(formatter, "{} minimum navigation demand ", self.target)?;
+        }
+        if let Some(excess) = self.excess {
+            let dimension = match excess.dimension {
+                DatasetDemandCapacityDimension::Candidates => "planning candidates",
+                DatasetDemandCapacityDimension::Resources => "resources",
+                DatasetDemandCapacityDimension::GpuPayloadBytes => "GPU payload bytes",
+                DatasetDemandCapacityDimension::ScratchBytes => "planning scratch bytes",
+            };
+            return write!(
+                formatter,
+                "requires {} {}, but the renderer-global capacity provides {}",
+                excess.required, dimension, excess.available
+            );
         }
         write!(
             formatter,
-            "dataset demand cannot fit within {} resources, {} decoded bytes, and {} candidates per visible layer; fidelity was not silently reduced",
+            "exceeded one of the bounded planning limits: {} resources, {} GPU payload bytes, or {} candidates per visible layer",
             self.limits.max_resources,
             self.limits.max_gpu_payload_bytes,
             self.limits.max_candidates_per_layer,
@@ -696,7 +849,7 @@ impl fmt::Display for DatasetDemandPlanCapacityError {
 impl Error for DatasetDemandPlanCapacityError {}
 
 enum PlanAttemptError {
-    Capacity,
+    Capacity(DatasetDemandCapacityExcess),
     Cancelled,
     Other(anyhow::Error),
 }
@@ -704,7 +857,7 @@ enum PlanAttemptError {
 type PlanAttemptResult<T> = Result<T, PlanAttemptError>;
 
 struct PlanAccumulator {
-    resources: Vec<DatasetResourceKey>,
+    resources: Vec<BrickKey>,
     layer_scales: BTreeMap<LogicalLayerKey, ScaleLevel>,
     payload_bytes: u64,
     primary_payload_bytes: u64,
@@ -712,6 +865,7 @@ struct PlanAccumulator {
     primary_resource_counts_by_layer: BTreeMap<LogicalLayerKey, usize>,
     candidates_visited: usize,
     guard_retained: bool,
+    plane_reuse_guards: Vec<SemanticPlaneLayerReuseGuard>,
     scratch_charges: Vec<Box<dyn CpuByteLease>>,
 }
 
@@ -726,6 +880,7 @@ impl Default for PlanAccumulator {
             primary_resource_counts_by_layer: BTreeMap::new(),
             candidates_visited: 0,
             guard_retained: true,
+            plane_reuse_guards: Vec::new(),
             scratch_charges: Vec::new(),
         }
     }
@@ -736,7 +891,8 @@ struct SelectedCurrent3dLevels {
     camera: CameraFrame,
     active_level: ScaleLevel,
     layer_scales: BTreeMap<LogicalLayerKey, ScaleLevel>,
-    effective_limits: DatasetDemandPlanLimits,
+    ideal_active_level: ScaleLevel,
+    ideal_layer_scales: BTreeMap<LogicalLayerKey, ScaleLevel>,
     playback_downshifted: bool,
 }
 
@@ -785,30 +941,20 @@ pub(crate) fn plan_current_3d(
         playback_active,
     )?;
     let mut never_cancelled = || false;
-    match plan_level(
+    let adaptive = plan_adaptive_current_3d_exact(
         catalog,
         view,
-        selected.camera,
-        None,
+        selected,
         viewport,
-        selected.active_level,
-        &selected.layer_scales,
-        selected.effective_limits,
-        selected.playback_downshifted,
+        limits,
+        None,
+        &[],
+        None,
         None,
         &mut never_cancelled,
-    ) {
-        Ok(planning) => Ok(planning.plan),
-        Err(PlanAttemptError::Capacity) => Err(DatasetDemandPlanCapacityError::at_selected_scale(
-            selected.effective_limits,
-            selected.active_level,
-        )
-        .into()),
-        Err(PlanAttemptError::Cancelled) => {
-            unreachable!("the synchronous planner cannot be cancelled")
-        }
-        Err(PlanAttemptError::Other(error)) => Err(error),
-    }
+    )?
+    .expect("the synchronous planner cannot be cancelled");
+    Ok(adaptive.target.plan)
 }
 
 fn select_current_3d_levels(
@@ -819,16 +965,8 @@ fn select_current_3d_levels(
     limits: DatasetDemandPlanLimits,
     playback_active: bool,
 ) -> anyhow::Result<SelectedCurrent3dLevels> {
-    let (camera, active_level, layer_scales, playback_downshifted) =
-        projected_current_3d_levels(catalog, view, presentation, viewport, playback_active)?;
-    let effective_limits = limits.reserve_playback_half(playback_active);
-    Ok(SelectedCurrent3dLevels {
-        camera,
-        active_level,
-        layer_scales,
-        effective_limits,
-        playback_downshifted,
-    })
+    let _ = limits;
+    projected_current_3d_levels(catalog, view, presentation, viewport, playback_active)
 }
 
 pub(crate) fn current_3d_projected_layer_scales(
@@ -839,7 +977,37 @@ pub(crate) fn current_3d_projected_layer_scales(
     playback_active: bool,
 ) -> anyhow::Result<BTreeMap<LogicalLayerKey, ScaleLevel>> {
     projected_current_3d_levels(catalog, view, presentation, viewport, playback_active)
-        .map(|(_, _, layer_scales, _)| layer_scales)
+        .map(|selected| selected.ideal_layer_scales)
+}
+
+pub(crate) fn cross_section_projected_layer_scales(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    panel: PanelId,
+    presentation: PresentationViewport,
+    viewport: RenderExtent,
+) -> anyhow::Result<BTreeMap<LogicalLayerKey, ScaleLevel>> {
+    let mut layer_scales = BTreeMap::new();
+    for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
+        let key = view_layer.layer_key();
+        let layer = catalog.layer(key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "visible layer {} is absent from the dataset catalog",
+                key.ordinal()
+            )
+        })?;
+        layer_scales.insert(
+            key,
+            select_cross_section_level(
+                layer,
+                *view.cross_section(),
+                panel,
+                presentation,
+                viewport,
+            )?,
+        );
+    }
+    Ok(layer_scales)
 }
 
 fn projected_current_3d_levels(
@@ -848,12 +1016,7 @@ fn projected_current_3d_levels(
     presentation: PresentationViewport,
     viewport: RenderExtent,
     playback_active: bool,
-) -> anyhow::Result<(
-    CameraFrame,
-    ScaleLevel,
-    BTreeMap<LogicalLayerKey, ScaleLevel>,
-    bool,
-)> {
+) -> anyhow::Result<SelectedCurrent3dLevels> {
     let active = catalog
         .layer(view.active_layer())
         .ok_or_else(|| anyhow::anyhow!("active layer is absent from the dataset catalog"))?;
@@ -862,6 +1025,7 @@ fn projected_current_3d_levels(
     let active_level = playback_level(active, ideal_active, playback_active);
     let mut playback_downshifted = active_level != ideal_active;
     let mut layer_scales = BTreeMap::new();
+    let mut ideal_layer_scales = BTreeMap::new();
     for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
         let key = view_layer.layer_key();
         let layer = catalog.layer(key).ok_or_else(|| {
@@ -873,9 +1037,17 @@ fn projected_current_3d_levels(
         let ideal = select_volume_level(layer, camera, viewport)?;
         let selected = playback_level(layer, ideal, playback_active);
         playback_downshifted |= selected != ideal;
+        ideal_layer_scales.insert(key, ideal);
         layer_scales.insert(key, selected);
     }
-    Ok((camera, active_level, layer_scales, playback_downshifted))
+    Ok(SelectedCurrent3dLevels {
+        camera,
+        active_level,
+        layer_scales,
+        ideal_active_level: ideal_active,
+        ideal_layer_scales,
+        playback_downshifted,
+    })
 }
 
 fn playback_level(
@@ -894,10 +1066,1119 @@ fn playback_level(
         .unwrap_or(ideal)
 }
 
-/// Plans the target view plus an optional complete coarse cohort that fits in
-/// the target plan's remaining count/byte budget. The target is never silently
-/// coarsened merely to make room for progressive presentation; when no coarse
-/// cohort fits, initial target loading remains honestly partial.
+struct AdaptiveCurrent3dPlanning {
+    target: DatasetDemandPlanning,
+    floor: DatasetDemandPlanning,
+    navigation_candidates: Vec<DatasetDemandPlan>,
+}
+
+pub(crate) fn coarsest_visible_layer_scales(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+) -> anyhow::Result<BTreeMap<LogicalLayerKey, ScaleLevel>> {
+    view.layers()
+        .iter()
+        .filter(|layer| layer.visible())
+        .map(|view_layer| {
+            let key = view_layer.layer_key();
+            let layer = catalog.layer(key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "visible layer {} is absent from the dataset catalog",
+                    key.ordinal()
+                )
+            })?;
+            let coarsest = layer
+                .scales()
+                .map(|scale| scale.level())
+                .max()
+                .expect("DatasetLayer always has at least one scale");
+            Ok((key, coarsest))
+        })
+        .collect()
+}
+
+fn next_finer_catalog_level(
+    catalog: &DatasetCatalog,
+    layer: LogicalLayerKey,
+    current: ScaleLevel,
+    ideal: ScaleLevel,
+) -> anyhow::Result<Option<ScaleLevel>> {
+    let layer = catalog.layer(layer).ok_or_else(|| {
+        anyhow::anyhow!(
+            "visible layer {} is absent from the dataset catalog",
+            layer.ordinal()
+        )
+    })?;
+    Ok(layer
+        .scales()
+        .map(|scale| scale.level())
+        .filter(|level| *level >= ideal && *level < current)
+        .max())
+}
+
+fn current_plan_union_usage(
+    catalog: &DatasetCatalog,
+    obligated_resources: &[BrickKey],
+    floor: &DatasetDemandPlan,
+    target: &DatasetDemandPlan,
+    next_playback_timepoint: Option<mirante4d_domain::TimeIndex>,
+) -> anyhow::Result<(usize, u64)> {
+    let mut keys = BTreeSet::new();
+    keys.extend(obligated_resources.iter().copied());
+    keys.extend(floor.resources.iter().copied());
+    keys.extend(target.resources.iter().copied());
+    if let Some(timepoint) = next_playback_timepoint {
+        keys.extend(
+            target
+                .resources
+                .iter()
+                .take(target.playback_resource_count)
+                .map(|key| {
+                    BrickKey::new(
+                        key.identity(),
+                        key.layer(),
+                        timepoint,
+                        key.scale(),
+                        key.region(),
+                    )
+                }),
+        );
+    }
+    let mut payload_bytes = 0_u64;
+    for key in &keys {
+        let descriptor = catalog.resource_payload_descriptor(*key)?;
+        payload_bytes = payload_bytes
+            .checked_add(mirante4d_render_wgpu::payload_allocation_bytes(descriptor)?)
+            .ok_or_else(|| anyhow::anyhow!("global GPU payload accounting overflow"))?;
+    }
+    Ok((keys.len(), payload_bytes))
+}
+
+fn current_plan_union_fits(
+    catalog: &DatasetCatalog,
+    obligated_resources: &[BrickKey],
+    floor: &DatasetDemandPlan,
+    target: &DatasetDemandPlan,
+    next_playback_timepoint: Option<mirante4d_domain::TimeIndex>,
+    limits: DatasetDemandPlanLimits,
+) -> anyhow::Result<bool> {
+    let (resources, payload_bytes) = current_plan_union_usage(
+        catalog,
+        obligated_resources,
+        floor,
+        target,
+        next_playback_timepoint,
+    )?;
+    Ok(resources <= limits.max_resources && payload_bytes <= limits.max_gpu_payload_bytes)
+}
+
+fn retryable_refinement_capacity(error: &PlanAttemptError) -> bool {
+    match error {
+        PlanAttemptError::Capacity(_) => true,
+        PlanAttemptError::Other(error) => {
+            error.downcast_ref::<CpuLedgerError>().is_some()
+                || error
+                    .downcast_ref::<SemanticPlanError>()
+                    .is_some_and(|error| matches!(error, SemanticPlanError::ScratchCapacity(_)))
+        }
+        PlanAttemptError::Cancelled => false,
+    }
+}
+
+fn plan_attempt_from_scratch_error(error: anyhow::Error) -> PlanAttemptError {
+    if let Some(CpuLedgerError::CapacityExceeded {
+        requested_bytes,
+        available_bytes,
+        ..
+    }) = error.downcast_ref::<CpuLedgerError>()
+    {
+        PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+            dimension: DatasetDemandCapacityDimension::ScratchBytes,
+            required: *requested_bytes,
+            available: *available_bytes,
+        })
+    } else {
+        PlanAttemptError::Other(error)
+    }
+}
+
+fn adopt_navigation_candidate_baseline(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    baseline: &NavigationCandidateBaseline,
+    limits: DatasetDemandPlanLimits,
+    playback_downshifted: bool,
+    require_terminal: bool,
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+) -> PlanAttemptResult<Option<DatasetDemandPlanning>> {
+    let visible_layer_count = view.layers().iter().filter(|layer| layer.visible()).count();
+    if baseline.body.ranked().is_empty()
+        || baseline.body.ranked().len() != baseline.body.canonical().len()
+        || baseline.layer_scales.len() != visible_layer_count
+    {
+        return Ok(None);
+    }
+
+    let mut expected_resource_count = 0_usize;
+    for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
+        let layer_key = view_layer.layer_key();
+        let Some(level) = baseline.layer_scales.get(&layer_key).copied() else {
+            return Ok(None);
+        };
+        let Some(scale) = catalog
+            .layer(layer_key)
+            .and_then(|layer| layer.scale(level))
+        else {
+            return Ok(None);
+        };
+        let terminal = catalog
+            .layer(layer_key)
+            .expect("the selected scale proved that the layer exists")
+            .scales()
+            .map(|scale| scale.level())
+            .max()
+            .expect("a dataset layer has at least one scale");
+        if require_terminal && level != terminal {
+            // The first ladder rung is geometry-derived. A formerly installed
+            // finer full-volume body may remain ordinary target residency, but
+            // it cannot be re-adopted as the unconditional safety floor.
+            return Ok(None);
+        }
+        let dimensions = SemanticTileGrid::new(scale.shape())
+            .grid_shape()
+            .dimensions();
+        let layer_count_u64 = dimensions.into_iter().try_fold(1_u64, |total, value| {
+            total.checked_mul(value).ok_or_else(|| {
+                PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+                    dimension: DatasetDemandCapacityDimension::Candidates,
+                    required: u64::MAX,
+                    available: u64::try_from(limits.max_candidates_per_layer).unwrap_or(u64::MAX),
+                })
+            })
+        })?;
+        let layer_count = usize::try_from(layer_count_u64).map_err(|_| {
+            PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+                dimension: DatasetDemandCapacityDimension::Candidates,
+                required: layer_count_u64,
+                available: u64::try_from(limits.max_candidates_per_layer).unwrap_or(u64::MAX),
+            })
+        })?;
+        if layer_count > limits.max_candidates_per_layer {
+            return Err(PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+                dimension: DatasetDemandCapacityDimension::Candidates,
+                required: layer_count_u64,
+                available: u64::try_from(limits.max_candidates_per_layer).unwrap_or(u64::MAX),
+            }));
+        }
+        if baseline
+            .body
+            .ranked()
+            .iter()
+            .filter(|key| key.layer() == layer_key)
+            .count()
+            != layer_count
+        {
+            return Ok(None);
+        }
+        expected_resource_count = expected_resource_count
+            .checked_add(layer_count)
+            .ok_or_else(|| {
+                PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+                    dimension: DatasetDemandCapacityDimension::Resources,
+                    required: u64::MAX,
+                    available: u64::try_from(limits.max_resources).unwrap_or(u64::MAX),
+                })
+            })?;
+    }
+    if expected_resource_count != baseline.body.ranked().len() {
+        return Ok(None);
+    }
+    if expected_resource_count > limits.max_resources {
+        return Err(PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+            dimension: DatasetDemandCapacityDimension::Resources,
+            required: u64::try_from(expected_resource_count).unwrap_or(u64::MAX),
+            available: u64::try_from(limits.max_resources).unwrap_or(u64::MAX),
+        }));
+    }
+
+    let mut payload_bytes = 0_u64;
+    for key in baseline.body.ranked().iter().copied() {
+        let Some(level) = baseline.layer_scales.get(&key.layer()).copied() else {
+            return Ok(None);
+        };
+        if key.identity() != catalog.resource_identity()
+            || key.timepoint() != view.timepoint()
+            || key.scale() != level
+            || catalog.validate_resource_key(key).is_err()
+        {
+            return Ok(None);
+        }
+        let scale = catalog
+            .layer(key.layer())
+            .and_then(|layer| layer.scale(level))
+            .expect("the visible-layer validation proved this scale exists");
+        let origin = key.region().origin();
+        if origin
+            .into_iter()
+            .any(|component| !component.is_multiple_of(SEMANTIC_TILE_SIDE))
+        {
+            return Ok(None);
+        }
+        let grid = SemanticTileGrid::new(scale.shape());
+        let index = SemanticTileIndex {
+            z: origin[0] / SEMANTIC_TILE_SIDE,
+            y: origin[1] / SEMANTIC_TILE_SIDE,
+            x: origin[2] / SEMANTIC_TILE_SIDE,
+        };
+        if grid.region(index).ok() != Some(key.region()) {
+            return Ok(None);
+        }
+        let descriptor = catalog
+            .resource_payload_descriptor(key)
+            .map_err(|error| PlanAttemptError::Other(anyhow::Error::new(error)))?;
+        let resource_bytes = mirante4d_render_wgpu::payload_allocation_bytes(descriptor)
+            .map_err(|error| PlanAttemptError::Other(anyhow::Error::new(error)))?;
+        payload_bytes = payload_bytes.checked_add(resource_bytes).ok_or_else(|| {
+            PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+                dimension: DatasetDemandCapacityDimension::GpuPayloadBytes,
+                required: u64::MAX,
+                available: limits.max_gpu_payload_bytes,
+            })
+        })?;
+    }
+    if payload_bytes != baseline.planned_payload_bytes {
+        return Err(PlanAttemptError::Other(anyhow::anyhow!(
+            "installed navigation-candidate payload accounting changed from {} to {} bytes",
+            baseline.planned_payload_bytes,
+            payload_bytes
+        )));
+    }
+    if payload_bytes > limits.max_gpu_payload_bytes {
+        return Err(PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+            dimension: DatasetDemandCapacityDimension::GpuPayloadBytes,
+            required: payload_bytes,
+            available: limits.max_gpu_payload_bytes,
+        }));
+    }
+
+    let scratch_charge = reserve_key_scratch(scratch_ledger, expected_resource_count)
+        .map_err(plan_attempt_from_scratch_error)?;
+    let layer_scales = baseline.layer_scales.as_ref().clone();
+    let active_level = layer_scales
+        .get(&view.active_layer())
+        .copied()
+        .ok_or_else(|| {
+            PlanAttemptError::Other(anyhow::anyhow!(
+                "the active visible layer has no installed navigation-candidate scale"
+            ))
+        })?;
+    Ok(Some(DatasetDemandPlanning {
+        plan: DatasetDemandPlan {
+            scale: active_level,
+            layer_scales,
+            resources: baseline.body.ranked().to_vec(),
+            payload_bytes,
+            playback_downshifted,
+            covers_full_volume: true,
+            primary_resource_count: expected_resource_count,
+            playback_resource_count: expected_resource_count,
+        },
+        candidates_visited: 0,
+        guard_retained: false,
+        plane_reuse_envelope: None,
+        scratch_charges: scratch_charge.into_iter().collect(),
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adopt_navigation_ladder_baseline(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    baseline: &NavigationLadderBaseline,
+    limits: DatasetDemandPlanLimits,
+    playback_downshifted: bool,
+    next_playback_timepoint: Option<mirante4d_domain::TimeIndex>,
+    obligated_resources: &[BrickKey],
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+) -> PlanAttemptResult<Option<(DatasetDemandPlanning, Vec<DatasetDemandPlan>)>> {
+    let Some(terminal_baseline) = baseline.terminal() else {
+        return Ok(None);
+    };
+    let Some(mut aggregate) = adopt_navigation_candidate_baseline(
+        catalog,
+        view,
+        terminal_baseline,
+        limits,
+        playback_downshifted,
+        true,
+        scratch_ledger,
+    )?
+    else {
+        return Ok(None);
+    };
+    let terminal_plan = aggregate.plan.clone();
+    let (tail_resource_limit, tail_payload_limit) = navigation_tail_limits(limits, &terminal_plan);
+    let mut candidates = vec![terminal_plan];
+    let mut previous_scales = aggregate.plan.layer_scales.clone();
+
+    for candidate_baseline in baseline.candidates.iter().skip(1) {
+        let Some(mut candidate) = (match adopt_navigation_candidate_baseline(
+            catalog,
+            view,
+            candidate_baseline,
+            limits,
+            playback_downshifted,
+            false,
+            scratch_ledger,
+        ) {
+            Ok(candidate) => candidate,
+            // A finer installed rung is optional under the current limits.
+            // Capacity contraction keeps the validated prefix rather than
+            // invalidating the mandatory terminal body.
+            Err(PlanAttemptError::Capacity(_)) => break,
+            Err(error) => return Err(error),
+        }) else {
+            // A malformed or stale optional suffix is never partially
+            // skipped: doing so would turn a contiguous scale ladder into an
+            // unreported discontinuity.
+            break;
+        };
+
+        let mut advanced = false;
+        let mut adjacent = true;
+        for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
+            let layer = view_layer.layer_key();
+            let Some(previous) = previous_scales.get(&layer).copied() else {
+                adjacent = false;
+                break;
+            };
+            let expected = next_finer_catalog_level(catalog, layer, previous, ScaleLevel::BASE)
+                .map_err(PlanAttemptError::Other)?
+                .unwrap_or(previous);
+            let actual = candidate.plan.layer_scales.get(&layer).copied();
+            if actual != Some(expected) {
+                adjacent = false;
+                break;
+            }
+            advanced |= expected != previous;
+        }
+        if !adjacent || !advanced {
+            break;
+        }
+
+        let scratch_count = aggregate
+            .plan
+            .resources
+            .len()
+            .checked_add(candidate.plan.resources.len())
+            .ok_or_else(|| {
+                PlanAttemptError::Other(anyhow::anyhow!(
+                    "installed navigation-ladder scratch count overflow"
+                ))
+            })?;
+        let membership_charge = reserve_key_scratch(scratch_ledger, scratch_count)
+            .map_err(plan_attempt_from_scratch_error)?;
+        let mut membership = aggregate.plan.resources.clone();
+        membership.sort_unstable();
+        membership.dedup();
+        let missing = candidate
+            .plan
+            .resources
+            .iter()
+            .copied()
+            .filter(|key| membership.binary_search(key).is_err())
+            .collect::<Vec<_>>();
+        let next_resource_count = aggregate
+            .plan
+            .resources
+            .len()
+            .checked_add(missing.len())
+            .ok_or_else(|| {
+                PlanAttemptError::Other(anyhow::anyhow!(
+                    "installed navigation-ladder resource count overflow"
+                ))
+            })?;
+        let missing_payload_bytes = missing.iter().try_fold(0_u64, |total, key| {
+            let descriptor = catalog
+                .resource_payload_descriptor(*key)
+                .map_err(|error| PlanAttemptError::Other(anyhow::Error::new(error)))?;
+            let bytes = mirante4d_render_wgpu::payload_allocation_bytes(descriptor)
+                .map_err(|error| PlanAttemptError::Other(anyhow::Error::new(error)))?;
+            total.checked_add(bytes).ok_or_else(|| {
+                PlanAttemptError::Other(anyhow::anyhow!(
+                    "installed navigation-ladder payload accounting overflow"
+                ))
+            })
+        })?;
+        let next_payload_bytes = aggregate
+            .plan
+            .payload_bytes
+            .checked_add(missing_payload_bytes)
+            .ok_or_else(|| {
+                PlanAttemptError::Other(anyhow::anyhow!(
+                    "installed navigation-ladder payload accounting overflow"
+                ))
+            })?;
+        if next_resource_count > tail_resource_limit || next_payload_bytes > tail_payload_limit {
+            drop(membership_charge);
+            break;
+        }
+
+        let previous_resource_count = aggregate.plan.resources.len();
+        let previous_payload_bytes = aggregate.plan.payload_bytes;
+        aggregate.plan.resources.extend(missing);
+        aggregate.plan.payload_bytes = next_payload_bytes;
+        let (global_resources, global_payload_bytes) = current_plan_union_usage(
+            catalog,
+            obligated_resources,
+            &aggregate.plan,
+            &aggregate.plan,
+            next_playback_timepoint,
+        )
+        .map_err(PlanAttemptError::Other)?;
+        if global_resources > limits.max_resources
+            || global_payload_bytes > limits.max_gpu_payload_bytes
+        {
+            aggregate.plan.resources.truncate(previous_resource_count);
+            aggregate.plan.payload_bytes = previous_payload_bytes;
+            drop(membership_charge);
+            break;
+        }
+        drop(membership_charge);
+        previous_scales = candidate.plan.layer_scales.clone();
+        candidates.push(candidate.plan.clone());
+        aggregate
+            .scratch_charges
+            .append(&mut candidate.scratch_charges);
+    }
+
+    Ok(Some((aggregate, candidates)))
+}
+
+fn plan_full_volume_navigation_floor(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    layer_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
+    limits: DatasetDemandPlanLimits,
+    playback_downshifted: bool,
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+    cancelled: &mut impl FnMut() -> bool,
+) -> PlanAttemptResult<DatasetDemandPlanning> {
+    let mut plan = PlanAccumulator::default();
+    for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
+        if cancelled() {
+            return Err(PlanAttemptError::Cancelled);
+        }
+        let layer_key = view_layer.layer_key();
+        let layer = catalog.layer(layer_key).ok_or_else(|| {
+            PlanAttemptError::Other(anyhow::anyhow!(
+                "visible layer {} is absent from the dataset catalog",
+                layer_key.ordinal()
+            ))
+        })?;
+        let level = layer_scales.get(&layer_key).copied().ok_or_else(|| {
+            PlanAttemptError::Other(anyhow::anyhow!(
+                "visible layer {} has no navigation-floor scale",
+                layer_key.ordinal()
+            ))
+        })?;
+        let scale = layer.scale(level).ok_or_else(|| {
+            PlanAttemptError::Other(anyhow::anyhow!(
+                "visible layer {} has no navigation-floor scale {}",
+                layer_key.ordinal(),
+                level.get()
+            ))
+        })?;
+        let grid = SemanticTileGrid::new(scale.shape());
+        let dimensions = grid.grid_shape().dimensions();
+        let candidate_count_u64 = dimensions.into_iter().try_fold(1_u64, |total, value| {
+            total.checked_mul(value).ok_or_else(|| {
+                PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+                    dimension: DatasetDemandCapacityDimension::Candidates,
+                    required: u64::MAX,
+                    available: u64::try_from(limits.max_candidates_per_layer).unwrap_or(u64::MAX),
+                })
+            })
+        })?;
+        let candidate_count = usize::try_from(candidate_count_u64).map_err(|_| {
+            PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+                dimension: DatasetDemandCapacityDimension::Candidates,
+                required: candidate_count_u64,
+                available: u64::try_from(limits.max_candidates_per_layer).unwrap_or(u64::MAX),
+            })
+        })?;
+        if candidate_count > limits.max_candidates_per_layer {
+            return Err(PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+                dimension: DatasetDemandCapacityDimension::Candidates,
+                required: candidate_count_u64,
+                available: u64::try_from(limits.max_candidates_per_layer).unwrap_or(u64::MAX),
+            }));
+        }
+        let result_charge = reserve_key_scratch(scratch_ledger, candidate_count)
+            .map_err(plan_attempt_from_scratch_error)?;
+        let mut regions = Vec::with_capacity(candidate_count);
+        for (offset, index) in grid.indices().enumerate() {
+            if offset.is_multiple_of(256) && cancelled() {
+                return Err(PlanAttemptError::Cancelled);
+            }
+            regions.push(
+                grid.region(index)
+                    .map_err(|error| PlanAttemptError::Other(anyhow::Error::new(error)))?,
+            );
+        }
+        plan.candidates_visited = plan.candidates_visited.saturating_add(candidate_count);
+        append_layer_resources(
+            catalog,
+            view,
+            layer_key,
+            level,
+            regions,
+            candidate_count,
+            &mut plan,
+            limits,
+            cancelled,
+        )?;
+        if let Some(charge) = result_charge {
+            plan.scratch_charges.push(charge);
+        }
+    }
+    if let Some(charge) = reserve_interleave_scratch(scratch_ledger, plan.resources.len())
+        .map_err(plan_attempt_from_scratch_error)?
+    {
+        plan.scratch_charges.push(charge);
+    }
+    let primary_resource_count = plan.resources.len();
+    plan.resources =
+        interleave_visible_layers(view, plan.resources, &plan.primary_resource_counts_by_layer);
+    let active_level = layer_scales
+        .get(&view.active_layer())
+        .copied()
+        .ok_or_else(|| {
+            PlanAttemptError::Other(anyhow::anyhow!(
+                "the active visible layer has no navigation-floor scale"
+            ))
+        })?;
+    Ok(DatasetDemandPlanning {
+        candidates_visited: plan.candidates_visited,
+        plan: DatasetDemandPlan {
+            scale: active_level,
+            layer_scales: plan.layer_scales,
+            resources: plan.resources,
+            payload_bytes: plan.payload_bytes,
+            playback_downshifted,
+            covers_full_volume: true,
+            primary_resource_count,
+            playback_resource_count: primary_resource_count,
+        },
+        guard_retained: false,
+        plane_reuse_envelope: None,
+        scratch_charges: plan.scratch_charges,
+    })
+}
+
+fn navigation_tail_limits(
+    limits: DatasetDemandPlanLimits,
+    terminal: &DatasetDemandPlan,
+) -> (usize, u64) {
+    let optional_resources = limits
+        .max_resources
+        .checked_div(NAVIGATION_TAIL_RESOURCE_DIVISOR)
+        .unwrap_or(0)
+        .min(NAVIGATION_TAIL_MAX_RESOURCES);
+    let optional_payload_bytes = limits
+        .max_gpu_payload_bytes
+        .checked_div(NAVIGATION_TAIL_PAYLOAD_DIVISOR)
+        .unwrap_or(0)
+        .min(NAVIGATION_TAIL_MAX_PAYLOAD_BYTES);
+    // The terminal body is the mandatory geometry-safe floor and is outside
+    // the optional retention allowance. These are aggregate ceilings, so add
+    // the bounded tail to the terminal rather than making the terminal consume
+    // its own allowance.
+    (
+        terminal
+            .resources
+            .len()
+            .saturating_add(optional_resources)
+            .min(limits.max_resources),
+        terminal
+            .payload_bytes
+            .saturating_add(optional_payload_bytes)
+            .min(limits.max_gpu_payload_bytes),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_full_volume_navigation_ladder(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    terminal: DatasetDemandPlanning,
+    limits: DatasetDemandPlanLimits,
+    next_playback_timepoint: Option<mirante4d_domain::TimeIndex>,
+    obligated_resources: &[BrickKey],
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+    cancelled: &mut impl FnMut() -> bool,
+) -> anyhow::Result<Option<(DatasetDemandPlanning, Vec<DatasetDemandPlan>)>> {
+    let mut aggregate = terminal;
+    let terminal_plan = aggregate.plan.clone();
+    let (tail_resource_limit, tail_payload_limit) = navigation_tail_limits(limits, &terminal_plan);
+    let mut candidates = vec![terminal_plan];
+    let mut current_scales = aggregate.plan.layer_scales.clone();
+
+    loop {
+        if cancelled() {
+            return Ok(None);
+        }
+        let mut next_scales = current_scales.clone();
+        let mut advanced = false;
+        for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
+            let layer = view_layer.layer_key();
+            let current = current_scales.get(&layer).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "visible layer {} has no navigation-ladder scale",
+                    layer.ordinal()
+                )
+            })?;
+            if let Some(finer) =
+                next_finer_catalog_level(catalog, layer, current, ScaleLevel::BASE)?
+            {
+                next_scales.insert(layer, finer);
+                advanced = true;
+            }
+        }
+        if !advanced {
+            break;
+        }
+
+        let candidate = match plan_full_volume_navigation_floor(
+            catalog,
+            view,
+            &next_scales,
+            limits,
+            aggregate.plan.playback_downshifted,
+            scratch_ledger,
+            cancelled,
+        ) {
+            Ok(candidate) => candidate,
+            Err(PlanAttemptError::Cancelled) => return Ok(None),
+            // The ladder is optional after its terminal candidate. A complete
+            // finer rung is indivisible, so the first capacity refusal closes
+            // the contiguous tail rather than skipping over it.
+            Err(PlanAttemptError::Capacity(_)) => break,
+            Err(PlanAttemptError::Other(error)) => return Err(error),
+        };
+        aggregate.candidates_visited = aggregate
+            .candidates_visited
+            .saturating_add(candidate.candidates_visited);
+
+        let scratch_count = aggregate
+            .plan
+            .resources
+            .len()
+            .checked_add(candidate.plan.resources.len())
+            .ok_or_else(|| anyhow::anyhow!("navigation-ladder scratch count overflow"))?;
+        let membership_charge = reserve_key_scratch(scratch_ledger, scratch_count)?;
+        let mut membership = aggregate.plan.resources.clone();
+        membership.sort_unstable();
+        membership.dedup();
+        let missing = candidate
+            .plan
+            .resources
+            .iter()
+            .copied()
+            .filter(|key| membership.binary_search(key).is_err())
+            .collect::<Vec<_>>();
+        let next_resource_count = aggregate
+            .plan
+            .resources
+            .len()
+            .checked_add(missing.len())
+            .ok_or_else(|| anyhow::anyhow!("navigation-ladder resource count overflow"))?;
+        let missing_payload_bytes = missing.iter().try_fold(0_u64, |total, key| {
+            let descriptor = catalog.resource_payload_descriptor(*key)?;
+            total
+                .checked_add(mirante4d_render_wgpu::payload_allocation_bytes(descriptor)?)
+                .ok_or_else(|| anyhow::anyhow!("navigation-ladder payload accounting overflow"))
+        })?;
+        let next_payload_bytes = aggregate
+            .plan
+            .payload_bytes
+            .checked_add(missing_payload_bytes)
+            .ok_or_else(|| anyhow::anyhow!("navigation-ladder payload accounting overflow"))?;
+        if next_resource_count > tail_resource_limit || next_payload_bytes > tail_payload_limit {
+            drop(membership_charge);
+            break;
+        }
+
+        let previous_resource_count = aggregate.plan.resources.len();
+        let previous_payload_bytes = aggregate.plan.payload_bytes;
+        aggregate.plan.resources.extend(missing);
+        aggregate.plan.payload_bytes = next_payload_bytes;
+        let (global_resources, global_payload_bytes) = current_plan_union_usage(
+            catalog,
+            obligated_resources,
+            &aggregate.plan,
+            &aggregate.plan,
+            next_playback_timepoint,
+        )?;
+        if global_resources > limits.max_resources
+            || global_payload_bytes > limits.max_gpu_payload_bytes
+        {
+            aggregate.plan.resources.truncate(previous_resource_count);
+            aggregate.plan.payload_bytes = previous_payload_bytes;
+            drop(membership_charge);
+            break;
+        }
+        drop(membership_charge);
+        candidates.push(candidate.plan.clone());
+        aggregate.scratch_charges.extend(candidate.scratch_charges);
+        current_scales = next_scales;
+    }
+
+    Ok(Some((aggregate, candidates)))
+}
+
+fn retain_navigation_ladder_in_target(
+    catalog: &DatasetCatalog,
+    floor: &DatasetDemandPlan,
+    target: &mut DatasetDemandPlanning,
+    limits: DatasetDemandPlanLimits,
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+) -> PlanAttemptResult<()> {
+    if target.plan.resources == floor.resources {
+        return Ok(());
+    }
+    let membership_charge = reserve_key_scratch(scratch_ledger, target.plan.resources.len())
+        .map_err(plan_attempt_from_scratch_error)?;
+    let mut membership = target.plan.resources.clone();
+    membership.sort_unstable();
+    membership.dedup();
+    let missing_floor_charge = reserve_key_scratch(scratch_ledger, floor.resources.len())
+        .map_err(plan_attempt_from_scratch_error)?;
+    let missing_floor = floor
+        .resources
+        .iter()
+        .copied()
+        .filter(|resource| membership.binary_search(resource).is_err())
+        .collect::<Vec<_>>();
+    drop(membership_charge);
+    let combined_count = target
+        .plan
+        .resources
+        .len()
+        .checked_add(missing_floor.len())
+        .ok_or_else(|| {
+            PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+                dimension: DatasetDemandCapacityDimension::Resources,
+                required: u64::MAX,
+                available: u64::try_from(limits.max_resources).unwrap_or(u64::MAX),
+            })
+        })?;
+    if combined_count > limits.max_resources {
+        return Err(PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+            dimension: DatasetDemandCapacityDimension::Resources,
+            required: u64::try_from(combined_count).unwrap_or(u64::MAX),
+            available: u64::try_from(limits.max_resources).unwrap_or(u64::MAX),
+        }));
+    }
+    let charge = reserve_key_scratch(scratch_ledger, combined_count)
+        .map_err(plan_attempt_from_scratch_error)?;
+    target.plan.resources.extend(missing_floor);
+    drop(missing_floor_charge);
+    let payload_bytes = target.plan.resources.iter().try_fold(0_u64, |total, key| {
+        let descriptor = catalog
+            .resource_payload_descriptor(*key)
+            .map_err(|error| PlanAttemptError::Other(anyhow::Error::new(error)))?;
+        let bytes = mirante4d_render_wgpu::payload_allocation_bytes(descriptor)
+            .map_err(|error| PlanAttemptError::Other(anyhow::Error::new(error)))?;
+        total.checked_add(bytes).ok_or_else(|| {
+            PlanAttemptError::Other(anyhow::anyhow!(
+                "navigation-ladder target payload accounting overflow"
+            ))
+        })
+    })?;
+    if payload_bytes > limits.max_gpu_payload_bytes {
+        return Err(PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+            dimension: DatasetDemandCapacityDimension::GpuPayloadBytes,
+            required: payload_bytes,
+            available: limits.max_gpu_payload_bytes,
+        }));
+    }
+    target.plan.payload_bytes = payload_bytes;
+    if let Some(charge) = charge {
+        target.scratch_charges.push(charge);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_current_3d_configuration(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    camera: CameraFrame,
+    priority_camera: Option<CameraFrame>,
+    viewport: RenderExtent,
+    layer_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
+    limits: DatasetDemandPlanLimits,
+    playback_downshifted: bool,
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+    cancelled: &mut impl FnMut() -> bool,
+) -> PlanAttemptResult<DatasetDemandPlanning> {
+    let active_level = layer_scales
+        .get(&view.active_layer())
+        .copied()
+        .ok_or_else(|| {
+            PlanAttemptError::Other(anyhow::anyhow!(
+                "the active visible layer has no adaptive LOD candidate"
+            ))
+        })?;
+    plan_level(
+        catalog,
+        view,
+        camera,
+        priority_camera,
+        viewport,
+        active_level,
+        layer_scales,
+        limits,
+        playback_downshifted,
+        scratch_ledger,
+        cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_adaptive_current_3d_exact(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    ideal: SelectedCurrent3dLevels,
+    viewport: RenderExtent,
+    limits: DatasetDemandPlanLimits,
+    next_playback_timepoint: Option<mirante4d_domain::TimeIndex>,
+    obligated_resources: &[BrickKey],
+    navigation_ladder_baseline: Option<&NavigationLadderBaseline>,
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+    cancelled: &mut impl FnMut() -> bool,
+) -> anyhow::Result<Option<AdaptiveCurrent3dPlanning>> {
+    if cancelled() {
+        return Ok(None);
+    }
+    let baseline_ladder = navigation_ladder_baseline
+        .map(|baseline| {
+            adopt_navigation_ladder_baseline(
+                catalog,
+                view,
+                baseline,
+                limits,
+                ideal.playback_downshifted,
+                next_playback_timepoint,
+                obligated_resources,
+                scratch_ledger,
+            )
+        })
+        .transpose()
+        .map_err(|error| match error {
+            PlanAttemptError::Capacity(excess) => {
+                DatasetDemandPlanCapacityError::at_selected_scale_with_excess(
+                    limits,
+                    "3D",
+                    navigation_ladder_baseline
+                        .and_then(NavigationLadderBaseline::terminal)
+                        .and_then(|candidate| {
+                            candidate.layer_scales.get(&view.active_layer()).copied()
+                        })
+                        .unwrap_or(ideal.active_level),
+                    excess,
+                )
+                .into()
+            }
+            PlanAttemptError::Cancelled => anyhow::anyhow!("adaptive planning was cancelled"),
+            PlanAttemptError::Other(error) => error,
+        })?
+        .flatten();
+    let (floor, navigation_candidates) = if let Some(ladder) = baseline_ladder {
+        ladder
+    } else {
+        let selected_scales = coarsest_visible_layer_scales(catalog, view)?;
+        let terminal = match plan_full_volume_navigation_floor(
+            catalog,
+            view,
+            &selected_scales,
+            limits,
+            ideal.playback_downshifted,
+            scratch_ledger,
+            cancelled,
+        ) {
+            Ok(planning) => planning,
+            Err(PlanAttemptError::Capacity(excess)) => {
+                let scale = selected_scales
+                    .get(&view.active_layer())
+                    .copied()
+                    .unwrap_or(ideal.active_level);
+                return Err(
+                    DatasetDemandPlanCapacityError::at_selected_scale_with_excess(
+                        limits, "3D", scale, excess,
+                    )
+                    .into(),
+                );
+            }
+            Err(PlanAttemptError::Cancelled) => return Ok(None),
+            Err(PlanAttemptError::Other(error)) => return Err(error),
+        };
+        let Some(ladder) = plan_full_volume_navigation_ladder(
+            catalog,
+            view,
+            terminal,
+            limits,
+            next_playback_timepoint,
+            obligated_resources,
+            scratch_ledger,
+            cancelled,
+        )?
+        else {
+            return Ok(None);
+        };
+        ladder
+    };
+    let mut selected_scales = floor.plan.layer_scales.clone();
+    let (floor_union_resources, floor_union_payload_bytes) = current_plan_union_usage(
+        catalog,
+        obligated_resources,
+        &floor.plan,
+        &floor.plan,
+        next_playback_timepoint,
+    )?;
+    if floor_union_resources > limits.max_resources
+        || floor_union_payload_bytes > limits.max_gpu_payload_bytes
+    {
+        return Err(DatasetDemandPlanCapacityError::for_global_usage(
+            limits,
+            "3D",
+            Some(floor.plan.scale),
+            floor_union_resources,
+            floor_union_payload_bytes,
+        )
+        .into());
+    }
+
+    let mut layer_priority = view
+        .layers()
+        .iter()
+        .filter(|layer| layer.visible())
+        .map(|layer| layer.layer_key())
+        .collect::<Vec<_>>();
+    if let Some(active_index) = layer_priority
+        .iter()
+        .position(|layer| *layer == view.active_layer())
+    {
+        layer_priority.swap(0, active_index);
+    }
+    // The installed navigation body is a terminal-first, bounded full-volume
+    // ladder. Memory admission decides which rungs may be retained; the
+    // presentation work controller independently decides which complete rung
+    // may be shown during native-resolution input.
+
+    let mut target = None;
+    let mut selected_is_floor = true;
+    for layer in layer_priority {
+        loop {
+            if cancelled() {
+                return Ok(None);
+            }
+            let current = selected_scales
+                .get(&layer)
+                .copied()
+                .expect("every visible layer owns an adaptive candidate");
+            let ideal_level = ideal.layer_scales.get(&layer).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "visible layer {} has no projected LOD selection",
+                    layer.ordinal()
+                )
+            })?;
+            let Some(finer) = next_finer_catalog_level(catalog, layer, current, ideal_level)?
+            else {
+                break;
+            };
+            let mut trial_scales = selected_scales.clone();
+            trial_scales.insert(layer, finer);
+            let mut trial = match plan_current_3d_configuration(
+                catalog,
+                view,
+                ideal.camera,
+                None,
+                viewport,
+                &trial_scales,
+                limits,
+                ideal.playback_downshifted,
+                scratch_ledger,
+                cancelled,
+            ) {
+                Ok(planning) => planning,
+                Err(PlanAttemptError::Cancelled) => return Ok(None),
+                Err(error) if retryable_refinement_capacity(&error) => break,
+                Err(PlanAttemptError::Other(error)) => return Err(error),
+                Err(PlanAttemptError::Capacity(_)) => unreachable!("capacity was handled above"),
+            };
+            if trial.plan.primary_resource_count == 0 {
+                // A view with no fine-scale contribution still needs a real
+                // frame so the latest camera can publish background pixels.
+                // The complete navigation floor is that renderable frame;
+                // an empty refinement body must not replace it.
+                break;
+            }
+            if let Err(error) = retain_navigation_ladder_in_target(
+                catalog,
+                &floor.plan,
+                &mut trial,
+                limits,
+                scratch_ledger,
+            ) {
+                if retryable_refinement_capacity(&error) {
+                    break;
+                }
+                match error {
+                    PlanAttemptError::Cancelled => return Ok(None),
+                    PlanAttemptError::Other(error) => return Err(error),
+                    PlanAttemptError::Capacity(_) => {
+                        unreachable!("retryable refinement capacity was handled above")
+                    }
+                }
+            }
+            if !current_plan_union_fits(
+                catalog,
+                obligated_resources,
+                &floor.plan,
+                &trial.plan,
+                next_playback_timepoint,
+                limits,
+            )? {
+                break;
+            }
+            selected_scales = trial_scales;
+            target = Some(trial);
+            selected_is_floor = false;
+        }
+    }
+    let target = if selected_is_floor {
+        DatasetDemandPlanning {
+            plan: floor.plan.clone(),
+            candidates_visited: 0,
+            guard_retained: false,
+            plane_reuse_envelope: None,
+            scratch_charges: Vec::new(),
+        }
+    } else {
+        target.expect("a non-floor adaptive selection owns its accepted plan")
+    };
+    Ok(Some(AdaptiveCurrent3dPlanning {
+        target,
+        floor,
+        navigation_candidates,
+    }))
+}
+
+/// Plans the finest globally feasible target plus a complete catalog-provided
+/// navigation floor. The screen-derived level is an ideal, not an admission
+/// requirement; only failure of the coarsest configuration is terminal.
 #[cfg(test)]
 pub(crate) fn plan_progressive_current_3d(
     catalog: &DatasetCatalog,
@@ -947,6 +2228,9 @@ pub(crate) fn plan_progressive_current_3d_cancellable(
         viewport,
         limits,
         playback_active,
+        None,
+        &[],
+        None,
         scratch_ledger,
         None,
         None,
@@ -958,6 +2242,7 @@ pub(crate) fn plan_progressive_current_3d_cancellable(
 /// guard that cannot fit the ordinary hard limits is discarded and retried as
 /// the exact current view; fidelity and capacity are never traded for reuse.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn plan_guarded_progressive_current_3d_cancellable(
     catalog: &DatasetCatalog,
     view: &ViewState,
@@ -965,6 +2250,35 @@ pub(crate) fn plan_guarded_progressive_current_3d_cancellable(
     viewport: RenderExtent,
     limits: DatasetDemandPlanLimits,
     playback_active: bool,
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+    mut cancelled: impl FnMut() -> bool,
+) -> anyhow::Result<Option<ProgressiveDatasetDemandPlanning>> {
+    plan_guarded_progressive_current_3d_with_obligations_cancellable(
+        catalog,
+        view,
+        presentation,
+        viewport,
+        limits,
+        playback_active,
+        None,
+        &[],
+        None,
+        scratch_ledger,
+        &mut cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_guarded_progressive_current_3d_with_obligations_cancellable(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    presentation: PresentationViewport,
+    viewport: RenderExtent,
+    limits: DatasetDemandPlanLimits,
+    playback_active: bool,
+    next_playback_timepoint: Option<mirante4d_domain::TimeIndex>,
+    obligated_resources: &[BrickKey],
+    navigation_ladder_baseline: Option<&NavigationLadderBaseline>,
     scratch_ledger: Option<&dyn CpuByteLedger>,
     mut cancelled: impl FnMut() -> bool,
 ) -> anyhow::Result<Option<ProgressiveDatasetDemandPlanning>> {
@@ -978,6 +2292,9 @@ pub(crate) fn plan_guarded_progressive_current_3d_cancellable(
         viewport,
         limits,
         playback_active,
+        next_playback_timepoint,
+        obligated_resources,
+        navigation_ladder_baseline,
         scratch_ledger,
         Some(guard_camera),
         Some(primary_camera),
@@ -996,6 +2313,9 @@ pub(crate) fn plan_guarded_progressive_current_3d_cancellable(
                 viewport,
                 limits,
                 playback_active,
+                next_playback_timepoint,
+                obligated_resources,
+                navigation_ladder_baseline,
                 scratch_ledger,
                 None,
                 None,
@@ -1014,6 +2334,9 @@ fn plan_progressive_current_3d_with_visibility_cancellable(
     viewport: RenderExtent,
     limits: DatasetDemandPlanLimits,
     playback_active: bool,
+    next_playback_timepoint: Option<mirante4d_domain::TimeIndex>,
+    obligated_resources: &[BrickKey],
+    navigation_ladder_baseline: Option<&NavigationLadderBaseline>,
     scratch_ledger: Option<&dyn CpuByteLedger>,
     visibility_camera: Option<CameraFrame>,
     priority_camera: Option<CameraFrame>,
@@ -1022,7 +2345,7 @@ fn plan_progressive_current_3d_with_visibility_cancellable(
     if cancelled() {
         return Ok(None);
     }
-    let selected = select_current_3d_levels(
+    let ideal = select_current_3d_levels(
         catalog,
         view,
         presentation,
@@ -1030,96 +2353,93 @@ fn plan_progressive_current_3d_with_visibility_cancellable(
         limits,
         playback_active,
     )?;
-    let target = match plan_level(
+    let Some(mut adaptive) = plan_adaptive_current_3d_exact(
         catalog,
         view,
-        visibility_camera.unwrap_or(selected.camera),
-        priority_camera,
+        ideal.clone(),
         viewport,
-        selected.active_level,
-        &selected.layer_scales,
-        selected.effective_limits,
-        selected.playback_downshifted,
+        limits,
+        next_playback_timepoint,
+        obligated_resources,
+        navigation_ladder_baseline,
         scratch_ledger,
         cancelled,
-    ) {
-        Ok(planning) => planning,
-        Err(PlanAttemptError::Capacity) => {
-            return Err(DatasetDemandPlanCapacityError::at_selected_scale(
-                selected.effective_limits,
-                selected.active_level,
-            )
-            .into());
+    )?
+    else {
+        return Ok(None);
+    };
+    if cancelled() {
+        return Ok(None);
+    }
+
+    let mut guard_adopted = false;
+    if let Some(guard_camera) = visibility_camera
+        && adaptive.floor.plan.resources != adaptive.target.plan.resources
+    {
+        let guarded_target = plan_current_3d_configuration(
+            catalog,
+            view,
+            guard_camera,
+            priority_camera,
+            viewport,
+            &adaptive.target.plan.layer_scales,
+            limits,
+            adaptive.target.plan.playback_downshifted,
+            scratch_ledger,
+            cancelled,
+        )
+        .and_then(|mut target| {
+            retain_navigation_ladder_in_target(
+                catalog,
+                &adaptive.floor.plan,
+                &mut target,
+                limits,
+                scratch_ledger,
+            )?;
+            Ok(target)
+        });
+        match guarded_target {
+            Err(PlanAttemptError::Cancelled) => return Ok(None),
+            Ok(target)
+                if target.plan.primary_resource_count != 0
+                    && target.guard_retained
+                    && current_plan_union_fits(
+                        catalog,
+                        obligated_resources,
+                        &adaptive.floor.plan,
+                        &target.plan,
+                        next_playback_timepoint,
+                        limits,
+                    )? =>
+            {
+                adaptive.target = target;
+                guard_adopted = true;
+            }
+            _ => {
+                // A visibility guard is a reuse optimization. The exact
+                // adaptive target and full-volume ladder remain authoritative.
+            }
         }
-        Err(PlanAttemptError::Cancelled) => return Ok(None),
-        Err(PlanAttemptError::Other(error)) => return Err(error),
-    };
+    }
     if cancelled() {
         return Ok(None);
     }
-    let playback_resource_reserve = if playback_active {
-        target.plan.resources.len()
-    } else {
-        0
-    };
-    let playback_byte_reserve = if playback_active {
-        target.plan.payload_bytes
-    } else {
-        0
-    };
-    let remaining = DatasetDemandPlanLimits::new(
-        limits.max_candidates_per_layer,
-        limits
-            .max_resources
-            .saturating_sub(target.plan.resources.len())
-            .saturating_sub(playback_resource_reserve),
-        limits
-            .max_gpu_payload_bytes
-            .saturating_sub(target.plan.payload_bytes)
-            .saturating_sub(playback_byte_reserve),
-    );
-    let (coarse_visibility_camera, coarse_priority_camera) = if target.guard_retained {
-        (visibility_camera, priority_camera)
-    } else {
-        (None, None)
-    };
-    let coarse = match plan_complete_coarse_3d(
-        catalog,
-        view,
-        presentation,
-        viewport,
-        remaining,
-        target.plan.scale,
-        &target.plan.layer_scales,
-        scratch_ledger,
-        coarse_visibility_camera,
-        coarse_priority_camera,
-        cancelled,
-    ) {
-        Ok(coarse) => coarse,
-        Err(PlanAttemptError::Cancelled) => return Ok(None),
-        Err(PlanAttemptError::Capacity) => unreachable!("coarse capacity is optional"),
-        Err(PlanAttemptError::Other(error)) => return Err(error),
-    };
-    if cancelled() {
-        return Ok(None);
-    }
-    let coarse = coarse.filter(|coarse| coarse.plan.resources != target.plan.resources);
-    let candidates_visited = target.candidates_visited.saturating_add(
-        coarse
-            .as_ref()
-            .map_or(0, |planning| planning.candidates_visited),
-    );
-    let reuse_envelope = if target.guard_retained
-        && coarse
-            .as_ref()
-            .is_none_or(|planning| planning.guard_retained)
+
+    let navigation_candidates = adaptive.navigation_candidates;
+    let target = adaptive.target;
+    let target_is_navigation_ladder = target.plan.layer_scales == adaptive.floor.plan.layer_scales
+        && target.plan.resources == adaptive.floor.plan.resources;
+    let mut navigation = adaptive.floor;
+    let candidates_visited = target
+        .candidates_visited
+        .saturating_add(navigation.candidates_visited);
+    let reuse_envelope = if guard_adopted
+        && target.guard_retained
+        && navigation.guard_retained
         && let Some(visibility_camera) = visibility_camera
     {
         let mut specs = plan_visibility_specs(catalog, &target.plan)?;
-        if let Some(coarse) = coarse.as_ref() {
-            specs.extend(plan_visibility_specs(catalog, &coarse.plan)?);
-        }
+        specs.extend(plan_visibility_specs(catalog, &navigation.plan)?);
         Some(SemanticCameraReuseEnvelope::new(
             visibility_camera,
             viewport,
@@ -1130,18 +2450,15 @@ fn plan_progressive_current_3d_with_visibility_cancellable(
         None
     };
     let mut scratch_charges = target.scratch_charges;
-    if let Some(coarse) = coarse.as_ref() {
-        // Move below with the optional plan after borrowing its work count.
-        scratch_charges.reserve(coarse.scratch_charges.len());
-    }
-    let coarse_plan = coarse.map(|mut planning| {
-        scratch_charges.append(&mut planning.scratch_charges);
-        planning.plan
-    });
+    scratch_charges.append(&mut navigation.scratch_charges);
+    let coarse_plan = (!target_is_navigation_ladder).then_some(navigation.plan);
     Ok(Some(ProgressiveDatasetDemandPlanning {
         plan: ProgressiveDatasetDemandPlan {
+            ideal_scale: ideal.ideal_active_level,
+            ideal_layer_scales: ideal.ideal_layer_scales,
             target: target.plan,
             coarse: coarse_plan,
+            navigation_candidates,
         },
         candidates_visited,
         reuse_envelope,
@@ -1175,82 +2492,11 @@ fn plan_visibility_specs(
         .collect()
 }
 
-// Keep the coarse attempt's complete planning contract explicit at this sole
-// call boundary instead of introducing a one-use parameter object.
+/// Builds a bounded plane guard first. If its candidate, resource, byte, or
+/// ledger cost does not fit, the same exact current plane is planned without
+/// a guard. Capacity fallback changes no LOD or scientific coverage.
 #[allow(clippy::too_many_arguments)]
-fn plan_complete_coarse_3d(
-    catalog: &DatasetCatalog,
-    view: &ViewState,
-    presentation: PresentationViewport,
-    viewport: RenderExtent,
-    limits: DatasetDemandPlanLimits,
-    target_active_level: ScaleLevel,
-    target_layer_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
-    scratch_ledger: Option<&dyn CpuByteLedger>,
-    visibility_camera: Option<CameraFrame>,
-    priority_camera: Option<CameraFrame>,
-    cancelled: &mut impl FnMut() -> bool,
-) -> PlanAttemptResult<Option<DatasetDemandPlanning>> {
-    if limits.max_resources == 0 || limits.max_gpu_payload_bytes == 0 {
-        return Ok(None);
-    }
-    if cancelled() {
-        return Err(PlanAttemptError::Cancelled);
-    }
-    let active = catalog.layer(view.active_layer()).ok_or_else(|| {
-        PlanAttemptError::Other(anyhow::anyhow!(
-            "active layer is absent from the dataset catalog"
-        ))
-    })?;
-    let active_level = active
-        .scales()
-        .map(|scale| scale.level())
-        .max()
-        .expect("DatasetLayer always has at least one scale");
-    let mut layer_scales = BTreeMap::new();
-    for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
-        let key = view_layer.layer_key();
-        let layer = catalog.layer(key).ok_or_else(|| {
-            PlanAttemptError::Other(anyhow::anyhow!(
-                "visible layer {} is absent from the dataset catalog",
-                key.ordinal()
-            ))
-        })?;
-        let level = layer
-            .scales()
-            .map(|scale| scale.level())
-            .max()
-            .expect("DatasetLayer always has at least one scale");
-        layer_scales.insert(key, level);
-    }
-    if active_level == target_active_level && &layer_scales == target_layer_scales {
-        return Ok(None);
-    }
-    let camera = visibility_camera
-        .map_or_else(|| CameraFrame::new(*view.camera(), presentation), Ok)
-        .map_err(|error| PlanAttemptError::Other(error.into()))?;
-    match plan_level(
-        catalog,
-        view,
-        camera,
-        priority_camera,
-        viewport,
-        active_level,
-        &layer_scales,
-        limits,
-        false,
-        scratch_ledger,
-        cancelled,
-    ) {
-        Ok(plan) => Ok(Some(plan)),
-        Err(PlanAttemptError::Capacity) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-// These are the immutable panel-planner inputs plus its ledger and
-// cancellation authorities; a wrapper would not reduce owned work.
-#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn plan_cross_section_panel_cancellable(
     catalog: &DatasetCatalog,
     view: &ViewState,
@@ -1260,6 +2506,283 @@ pub(crate) fn plan_cross_section_panel_cancellable(
     limits: DatasetDemandPlanLimits,
     scratch_ledger: Option<&dyn CpuByteLedger>,
     mut cancelled: impl FnMut() -> bool,
+) -> anyhow::Result<Option<DatasetDemandPlanning>> {
+    match plan_cross_section_panel_attempt(
+        catalog,
+        view,
+        panel,
+        presentation,
+        viewport,
+        limits,
+        scratch_ledger,
+        None,
+        true,
+        &mut cancelled,
+    ) {
+        Ok(result) => Ok(result),
+        Err(error) if plane_guard_attempt_should_retry_exact(&error) => {
+            plan_cross_section_panel_attempt(
+                catalog,
+                view,
+                panel,
+                presentation,
+                viewport,
+                limits,
+                scratch_ledger,
+                None,
+                false,
+                &mut cancelled,
+            )
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn plane_guard_attempt_should_retry_exact(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<DatasetDemandPlanCapacityError>()
+        .is_some()
+        || error.downcast_ref::<CpuLedgerError>().is_some()
+        || error
+            .downcast_ref::<SemanticPlanError>()
+            .is_some_and(|error| matches!(error, SemanticPlanError::ScratchCapacity(_)))
+}
+
+fn adaptive_attempt_error_is_capacity(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<DatasetDemandPlanCapacityError>()
+        .is_some()
+        || error.downcast_ref::<CpuLedgerError>().is_some()
+        || error
+            .downcast_ref::<SemanticPlanError>()
+            .is_some_and(|error| matches!(error, SemanticPlanError::ScratchCapacity(_)))
+}
+
+fn cross_plan_union_fits(
+    catalog: &DatasetCatalog,
+    obligated_resources: &[BrickKey],
+    plan: &DatasetDemandPlan,
+    limits: DatasetDemandPlanLimits,
+) -> anyhow::Result<bool> {
+    let (resources, payload_bytes) = cross_plan_union_usage(catalog, obligated_resources, plan)?;
+    Ok(resources <= limits.max_resources && payload_bytes <= limits.max_gpu_payload_bytes)
+}
+
+fn cross_plan_union_usage(
+    catalog: &DatasetCatalog,
+    obligated_resources: &[BrickKey],
+    plan: &DatasetDemandPlan,
+) -> anyhow::Result<(usize, u64)> {
+    let mut keys = BTreeSet::new();
+    keys.extend(obligated_resources.iter().copied());
+    keys.extend(plan.resources.iter().copied());
+    let resource_count = keys.len();
+    let mut payload_bytes = 0_u64;
+    for key in keys {
+        let descriptor = catalog.resource_payload_descriptor(key)?;
+        payload_bytes = payload_bytes
+            .checked_add(mirante4d_render_wgpu::payload_allocation_bytes(descriptor)?)
+            .ok_or_else(|| anyhow::anyhow!("global GPU payload accounting overflow"))?;
+    }
+    Ok((resource_count, payload_bytes))
+}
+
+const fn panel_capacity_target(panel: PanelId) -> &'static str {
+    match panel {
+        PanelId::ThreeD => "3D",
+        PanelId::Xy => "XY",
+        PanelId::Xz => "XZ",
+        PanelId::Yz => "YZ",
+    }
+}
+
+/// Builds the geometry-independent coarsest full-volume floor retained by
+/// linked Plane targets. The floor uses the same semantic tiles and global
+/// capacity contract as 3D navigation; it creates no second physical cache.
+pub(crate) fn plan_cross_section_navigation_floor_cancellable(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    limits: DatasetDemandPlanLimits,
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+    cancelled: &mut impl FnMut() -> bool,
+) -> anyhow::Result<Option<DatasetDemandPlanning>> {
+    let layer_scales = coarsest_visible_layer_scales(catalog, view)?;
+    let active_level = layer_scales
+        .get(&view.active_layer())
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("the active layer has no linked navigation scale"))?;
+    match plan_full_volume_navigation_floor(
+        catalog,
+        view,
+        &layer_scales,
+        limits,
+        false,
+        scratch_ledger,
+        cancelled,
+    ) {
+        Ok(planning) => Ok(Some(planning)),
+        Err(PlanAttemptError::Cancelled) => Ok(None),
+        Err(PlanAttemptError::Capacity(excess)) => Err(
+            DatasetDemandPlanCapacityError::at_selected_scale_with_excess(
+                limits,
+                "linked 2D navigation",
+                active_level,
+                excess,
+            )
+            .into(),
+        ),
+        Err(PlanAttemptError::Other(error)) => Err(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_adaptive_cross_section_panel_with_obligations_cancellable(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    panel: PanelId,
+    presentation: PresentationViewport,
+    viewport: RenderExtent,
+    limits: DatasetDemandPlanLimits,
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+    ideal_layer_scales: Option<&BTreeMap<LogicalLayerKey, ScaleLevel>>,
+    obligated_resources: &[BrickKey],
+    guarded: bool,
+    cancelled: &mut impl FnMut() -> bool,
+) -> anyhow::Result<Option<DatasetDemandPlanning>> {
+    if cancelled() {
+        return Ok(None);
+    }
+    let ideal_layer_scales = ideal_layer_scales.cloned().map_or_else(
+        || cross_section_projected_layer_scales(catalog, view, panel, presentation, viewport),
+        Ok,
+    )?;
+    let mut selected_scales = coarsest_visible_layer_scales(catalog, view)?;
+    let Some(mut selected) = plan_cross_section_panel_attempt(
+        catalog,
+        view,
+        panel,
+        presentation,
+        viewport,
+        limits,
+        scratch_ledger,
+        Some(&selected_scales),
+        false,
+        cancelled,
+    )?
+    else {
+        return Ok(None);
+    };
+    let (minimum_resources, minimum_payload_bytes) =
+        cross_plan_union_usage(catalog, obligated_resources, &selected.plan)?;
+    if minimum_resources > limits.max_resources
+        || minimum_payload_bytes > limits.max_gpu_payload_bytes
+    {
+        return Err(DatasetDemandPlanCapacityError::for_global_usage(
+            limits,
+            panel_capacity_target(panel),
+            Some(selected.plan.scale),
+            minimum_resources,
+            minimum_payload_bytes,
+        )
+        .into());
+    }
+
+    let mut layer_priority = view
+        .layers()
+        .iter()
+        .filter(|layer| layer.visible())
+        .map(|layer| layer.layer_key())
+        .collect::<Vec<_>>();
+    if let Some(active_index) = layer_priority
+        .iter()
+        .position(|layer| *layer == view.active_layer())
+    {
+        layer_priority.swap(0, active_index);
+    }
+    for layer in layer_priority {
+        loop {
+            if cancelled() {
+                return Ok(None);
+            }
+            let current = selected_scales
+                .get(&layer)
+                .copied()
+                .expect("every visible layer owns an adaptive plane candidate");
+            let ideal = ideal_layer_scales.get(&layer).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "visible layer {} has no projected cross-section LOD",
+                    layer.ordinal()
+                )
+            })?;
+            let Some(finer) = next_finer_catalog_level(catalog, layer, current, ideal)? else {
+                break;
+            };
+            let mut trial_scales = selected_scales.clone();
+            trial_scales.insert(layer, finer);
+            let trial = match plan_cross_section_panel_attempt(
+                catalog,
+                view,
+                panel,
+                presentation,
+                viewport,
+                limits,
+                scratch_ledger,
+                Some(&trial_scales),
+                false,
+                cancelled,
+            ) {
+                Ok(Some(planning)) => planning,
+                Ok(None) => return Ok(None),
+                Err(error) if adaptive_attempt_error_is_capacity(&error) => break,
+                Err(error) => return Err(error),
+            };
+            if !cross_plan_union_fits(catalog, obligated_resources, &trial.plan, limits)? {
+                break;
+            }
+            selected_scales = trial_scales;
+            selected = trial;
+        }
+    }
+
+    if guarded {
+        match plan_cross_section_panel_attempt(
+            catalog,
+            view,
+            panel,
+            presentation,
+            viewport,
+            limits,
+            scratch_ledger,
+            Some(&selected_scales),
+            true,
+            cancelled,
+        ) {
+            Ok(Some(guarded))
+                if cross_plan_union_fits(catalog, obligated_resources, &guarded.plan, limits)? =>
+            {
+                selected = guarded;
+            }
+            Ok(None) => return Ok(None),
+            Ok(Some(_)) => {}
+            Err(error) if plane_guard_attempt_should_retry_exact(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Some(selected))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_cross_section_panel_attempt(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    panel: PanelId,
+    presentation: PresentationViewport,
+    viewport: RenderExtent,
+    limits: DatasetDemandPlanLimits,
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+    selected_layer_scales: Option<&BTreeMap<LogicalLayerKey, ScaleLevel>>,
+    guarded: bool,
+    cancelled: &mut impl FnMut() -> bool,
 ) -> anyhow::Result<Option<DatasetDemandPlanning>> {
     if cancelled() {
         return Ok(None);
@@ -1273,8 +2796,32 @@ pub(crate) fn plan_cross_section_panel_cancellable(
         PanelId::Yz => CrossSectionPlane::Yz,
         PanelId::ThreeD => anyhow::bail!("the 3D panel is not a cross-section demand target"),
     };
-    let active_level =
-        select_cross_section_level(active, *view.cross_section(), panel, presentation, viewport)?;
+    let active_level = selected_layer_scales
+        .and_then(|scales| scales.get(&view.active_layer()).copied())
+        .map_or_else(
+            || {
+                select_cross_section_level(
+                    active,
+                    *view.cross_section(),
+                    panel,
+                    presentation,
+                    viewport,
+                )
+            },
+            |level| {
+                active
+                    .scale(level)
+                    .is_some()
+                    .then_some(level)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "transient cross-section LOD s{} is absent from active layer {}",
+                            level.get(),
+                            view.active_layer().ordinal()
+                        )
+                    })
+            },
+        )?;
     let mut plan = PlanAccumulator::default();
     for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
         let key = view_layer.layer_key();
@@ -1284,38 +2831,83 @@ pub(crate) fn plan_cross_section_panel_cancellable(
                 key.ordinal()
             )
         })?;
-        let level = select_cross_section_level(
-            layer,
-            *view.cross_section(),
-            panel,
-            presentation,
-            viewport,
-        )?;
+        let level = selected_layer_scales
+            .and_then(|scales| scales.get(&key).copied())
+            .map_or_else(
+                || {
+                    select_cross_section_level(
+                        layer,
+                        *view.cross_section(),
+                        panel,
+                        presentation,
+                        viewport,
+                    )
+                },
+                |level| {
+                    layer
+                        .scale(level)
+                        .is_some()
+                        .then_some(level)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "transient cross-section LOD s{} is absent from layer {}",
+                                level.get(),
+                                key.ordinal()
+                            )
+                        })
+                },
+            )?;
         let scale = layer
             .scale(level)
             .expect("the projected LOD selector returns a catalog scale");
         if cancelled() {
             return Ok(None);
         }
-        let region_plan = plan_cross_section_resource_regions_cancellable(
-            *view.cross_section(),
-            semantic_panel,
-            presentation,
-            SemanticRegionGridSpec {
-                volume_shape: scale.shape(),
-                resource_shape: semantic_resource_shape(scale.shape()),
-                grid_to_world: scale.grid_to_world(),
-            },
-            sampling_footprint_class(*view_layer.render_state()).halo_voxels(),
-            semantic_limits(limits, plan.resources.len()),
-            scratch_ledger,
-            &mut cancelled,
-        )
+        let spec = SemanticRegionGridSpec {
+            volume_shape: scale.shape(),
+            resource_shape: semantic_resource_shape(scale.shape()),
+            grid_to_world: scale.grid_to_world(),
+        };
+        let halo = sampling_footprint_class(*view_layer.render_state()).halo_voxels();
+        let semantic_limits = semantic_limits(limits, plan.resources.len());
+        let region_plan = if guarded {
+            plan_guarded_cross_section_resource_regions_cancellable(
+                *view.cross_section(),
+                semantic_panel,
+                presentation,
+                viewport,
+                spec,
+                halo,
+                semantic_limits,
+                scratch_ledger,
+                &mut *cancelled,
+            )
+        } else {
+            plan_cross_section_resource_regions_cancellable(
+                *view.cross_section(),
+                semantic_panel,
+                presentation,
+                viewport,
+                spec,
+                halo,
+                semantic_limits,
+                scratch_ledger,
+                &mut *cancelled,
+            )
+        }
         .map_err(plan_attempt_from_semantic_error);
         let region_plan = match region_plan {
             Ok(region_plan) => region_plan,
-            Err(PlanAttemptError::Capacity) => {
-                return Err(DatasetDemandPlanCapacityError::new(limits).into());
+            Err(PlanAttemptError::Capacity(excess)) => {
+                return Err(
+                    DatasetDemandPlanCapacityError::at_selected_scale_with_excess(
+                        limits,
+                        panel_capacity_target(panel),
+                        active_level,
+                        excess,
+                    )
+                    .into(),
+                );
             }
             Err(PlanAttemptError::Cancelled) => return Ok(None),
             Err(PlanAttemptError::Other(error)) => return Err(error),
@@ -1325,6 +2917,13 @@ pub(crate) fn plan_cross_section_panel_cancellable(
             .saturating_add(region_plan.work.candidates_visited);
         let candidate_charge = region_plan.scratch_charge;
         let primary_regions = region_plan.primary_regions;
+        if guarded {
+            if let Some(guard) = region_plan.plane_reuse_guard {
+                plan.plane_reuse_guards.push(guard);
+            } else {
+                plan.guard_retained = false;
+            }
+        }
         let regions = region_plan.regions;
         let result_charge = reserve_key_scratch(scratch_ledger, regions.len())?;
         match append_layer_resources(
@@ -1336,11 +2935,19 @@ pub(crate) fn plan_cross_section_panel_cancellable(
             primary_regions,
             &mut plan,
             limits,
-            &mut cancelled,
+            &mut *cancelled,
         ) {
             Ok(()) => {}
-            Err(PlanAttemptError::Capacity) => {
-                return Err(DatasetDemandPlanCapacityError::new(limits).into());
+            Err(PlanAttemptError::Capacity(excess)) => {
+                return Err(
+                    DatasetDemandPlanCapacityError::at_selected_scale_with_excess(
+                        limits,
+                        panel_capacity_target(panel),
+                        active_level,
+                        excess,
+                    )
+                    .into(),
+                );
             }
             Err(PlanAttemptError::Cancelled) => return Ok(None),
             Err(PlanAttemptError::Other(error)) => return Err(error),
@@ -1353,7 +2960,7 @@ pub(crate) fn plan_cross_section_panel_cancellable(
     if cancelled() {
         return Ok(None);
     }
-    let covers_full_volume = accumulator_covers_full_volume(catalog, view, &plan);
+    let mut covers_full_volume = accumulator_covers_full_volume(catalog, view, &plan);
     if let Some(charge) = reserve_interleave_scratch(scratch_ledger, plan.resources.len())? {
         plan.scratch_charges.push(charge);
     }
@@ -1364,9 +2971,22 @@ pub(crate) fn plan_cross_section_panel_cancellable(
         .sum();
     plan.resources =
         interleave_visible_layers(view, plan.resources, &plan.primary_resource_counts_by_layer);
+    if !guarded || !plan.guard_retained {
+        plan.resources.truncate(primary_resource_count);
+        plan.payload_bytes = plan.primary_payload_bytes;
+        covers_full_volume = accumulator_primary_covers_full_volume(catalog, view, &plan);
+        plan.plane_reuse_guards.clear();
+    }
     if cancelled() {
         return Ok(None);
     }
+    let plane_reuse_guards = std::mem::take(&mut plan.plane_reuse_guards);
+    let plane_reuse_envelope = SemanticPlaneReuseEnvelope::new(
+        plane_reuse_guards,
+        covers_full_volume,
+        plan.candidates_visited,
+    );
+    let playback_resource_count = plan.resources.len();
     Ok(Some(DatasetDemandPlanning {
         candidates_visited: plan.candidates_visited,
         plan: DatasetDemandPlan {
@@ -1377,8 +2997,10 @@ pub(crate) fn plan_cross_section_panel_cancellable(
             playback_downshifted: false,
             covers_full_volume,
             primary_resource_count,
+            playback_resource_count,
         },
-        guard_retained: false,
+        guard_retained: guarded && plan.guard_retained,
+        plane_reuse_envelope,
         scratch_charges: plan.scratch_charges,
     }))
 }
@@ -1446,13 +3068,6 @@ fn plan_level(
         let candidate_charge = region_plan.scratch_charge;
         let primary_regions = region_plan.primary_regions;
         let regions = region_plan.regions;
-        if priority_camera.is_some() {
-            let guard_regions = regions.len().saturating_sub(primary_regions);
-            let maximum_guard_regions = primary_regions / 4 + usize::from(primary_regions != 0) * 2;
-            if guard_regions > maximum_guard_regions {
-                plan.guard_retained = false;
-            }
-        }
         let result_charge =
             reserve_key_scratch(scratch_ledger, regions.len()).map_err(PlanAttemptError::Other)?;
         append_layer_resources(
@@ -1474,6 +3089,7 @@ fn plan_level(
     if cancelled() {
         return Err(PlanAttemptError::Cancelled);
     }
+    let playback_resource_count = plan.resources.len();
     let mut covers_full_volume = accumulator_covers_full_volume(catalog, view, &plan);
     if let Some(charge) = reserve_interleave_scratch(scratch_ledger, plan.resources.len())
         .map_err(PlanAttemptError::Other)?
@@ -1505,8 +3121,10 @@ fn plan_level(
             playback_downshifted,
             covers_full_volume,
             primary_resource_count,
+            playback_resource_count,
         },
         guard_retained: plan.guard_retained,
+        plane_reuse_envelope: None,
         scratch_charges: plan.scratch_charges,
     })
 }
@@ -1553,9 +3171,15 @@ fn append_layer_resources(
             return Err(PlanAttemptError::Cancelled);
         }
         if plan.resources.len() == limits.max_resources {
-            return Err(PlanAttemptError::Capacity);
+            return Err(PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+                dimension: DatasetDemandCapacityDimension::Resources,
+                required: u64::try_from(plan.resources.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1),
+                available: u64::try_from(limits.max_resources).unwrap_or(u64::MAX),
+            }));
         }
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             catalog.resource_identity(),
             layer,
             view.timepoint(),
@@ -1567,21 +3191,33 @@ fn append_layer_resources(
             .map_err(|error| PlanAttemptError::Other(error.into()))?;
         let allocation_bytes = mirante4d_render_wgpu::payload_allocation_bytes(descriptor)
             .map_err(|error| PlanAttemptError::Other(error.into()))?;
-        let next_payload_bytes = plan
-            .payload_bytes
-            .checked_add(allocation_bytes)
-            .ok_or(PlanAttemptError::Capacity)?;
+        let next_payload_bytes =
+            plan.payload_bytes
+                .checked_add(allocation_bytes)
+                .ok_or(PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+                    dimension: DatasetDemandCapacityDimension::GpuPayloadBytes,
+                    required: u64::MAX,
+                    available: limits.max_gpu_payload_bytes,
+                }))?;
         if next_payload_bytes > limits.max_gpu_payload_bytes {
-            return Err(PlanAttemptError::Capacity);
+            return Err(PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+                dimension: DatasetDemandCapacityDimension::GpuPayloadBytes,
+                required: next_payload_bytes,
+                available: limits.max_gpu_payload_bytes,
+            }));
         }
         plan.payload_bytes = next_payload_bytes;
         plan.resources.push(key);
         *plan.resource_counts_by_layer.entry(layer).or_default() += 1;
         if offset < primary_regions {
-            plan.primary_payload_bytes = plan
-                .primary_payload_bytes
-                .checked_add(allocation_bytes)
-                .ok_or(PlanAttemptError::Capacity)?;
+            plan.primary_payload_bytes =
+                plan.primary_payload_bytes
+                    .checked_add(allocation_bytes)
+                    .ok_or(PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+                        dimension: DatasetDemandCapacityDimension::GpuPayloadBytes,
+                        required: u64::MAX,
+                        available: limits.max_gpu_payload_bytes,
+                    }))?;
             *plan
                 .primary_resource_counts_by_layer
                 .entry(layer)
@@ -1657,11 +3293,11 @@ fn accumulator_primary_covers_full_volume(
 /// any coverage. Per-layer order comes directly from semantic planning.
 fn interleave_visible_layers(
     view: &ViewState,
-    resources: Vec<DatasetResourceKey>,
+    resources: Vec<BrickKey>,
     primary_counts: &BTreeMap<LogicalLayerKey, usize>,
-) -> Vec<DatasetResourceKey> {
-    let mut primary_by_layer = BTreeMap::<LogicalLayerKey, VecDeque<DatasetResourceKey>>::new();
-    let mut guard_by_layer = BTreeMap::<LogicalLayerKey, VecDeque<DatasetResourceKey>>::new();
+) -> Vec<BrickKey> {
+    let mut primary_by_layer = BTreeMap::<LogicalLayerKey, VecDeque<BrickKey>>::new();
+    let mut guard_by_layer = BTreeMap::<LogicalLayerKey, VecDeque<BrickKey>>::new();
     let mut seen_by_layer = BTreeMap::<LogicalLayerKey, usize>::new();
     for resource in resources {
         let layer = resource.layer();
@@ -1713,26 +3349,43 @@ fn semantic_limits(
 }
 
 fn plan_attempt_from_semantic_error(error: SemanticPlanError) -> PlanAttemptError {
-    if error.is_capacity() {
-        PlanAttemptError::Capacity
-    } else if matches!(error, SemanticPlanError::Cancelled) {
-        PlanAttemptError::Cancelled
-    } else {
-        PlanAttemptError::Other(error.into())
+    match error {
+        SemanticPlanError::Capacity { kind, maximum } => {
+            let dimension = if kind.contains("candidate") {
+                DatasetDemandCapacityDimension::Candidates
+            } else if kind.contains("scratch") {
+                DatasetDemandCapacityDimension::ScratchBytes
+            } else {
+                DatasetDemandCapacityDimension::Resources
+            };
+            PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+                dimension,
+                required: u64::try_from(maximum).unwrap_or(u64::MAX).saturating_add(1),
+                available: u64::try_from(maximum).unwrap_or(u64::MAX),
+            })
+        }
+        SemanticPlanError::ScratchCapacity(CpuLedgerError::CapacityExceeded {
+            requested_bytes,
+            available_bytes,
+            ..
+        }) => PlanAttemptError::Capacity(DatasetDemandCapacityExcess {
+            dimension: DatasetDemandCapacityDimension::ScratchBytes,
+            required: requested_bytes,
+            available: available_bytes,
+        }),
+        SemanticPlanError::Cancelled => PlanAttemptError::Cancelled,
+        error => PlanAttemptError::Other(error.into()),
     }
 }
 
 pub(crate) fn semantic_resource_shape(volume: Shape3D) -> Shape3D {
-    Shape3D::new(
-        volume.z().min(SEMANTIC_TILE_SIDE),
-        volume.y().min(SEMANTIC_TILE_SIDE),
-        volume.x().min(SEMANTIC_TILE_SIDE),
-    )
-    .expect("a semantic resource clipped to a non-empty volume is non-empty")
+    mirante4d_render_api::default_logical_brick_shape(volume)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use mirante4d_dataset::{
         DatasetLayer, DatasetScale, DatasetSourceId, ResourceValidity, ScientificIdentityStatus,
     };
@@ -1744,6 +3397,94 @@ mod tests {
     use mirante4d_project_model::LayerViewState;
 
     use super::*;
+
+    struct BoundedScratchLedger {
+        live: Arc<AtomicU64>,
+        peak: Arc<AtomicU64>,
+        capacity: u64,
+    }
+
+    struct BoundedScratchLease {
+        category: CpuLedgerCategory,
+        bytes: u64,
+        live: Arc<AtomicU64>,
+    }
+
+    impl CpuByteLease for BoundedScratchLease {
+        fn category(&self) -> CpuLedgerCategory {
+            self.category
+        }
+
+        fn reserved_bytes(&self) -> u64 {
+            self.bytes
+        }
+    }
+
+    impl Drop for BoundedScratchLease {
+        fn drop(&mut self) {
+            self.live.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
+
+    impl BoundedScratchLedger {
+        fn new(capacity: u64) -> Self {
+            Self {
+                live: Arc::new(AtomicU64::new(0)),
+                peak: Arc::new(AtomicU64::new(0)),
+                capacity,
+            }
+        }
+
+        fn peak(&self) -> u64 {
+            self.peak.load(Ordering::Acquire)
+        }
+    }
+
+    impl CpuByteLedger for BoundedScratchLedger {
+        fn try_acquire(
+            &self,
+            category: CpuLedgerCategory,
+            bytes: u64,
+        ) -> Result<Box<dyn CpuByteLease>, CpuLedgerError> {
+            if bytes == 0 {
+                return Err(CpuLedgerError::ZeroByteReservation);
+            }
+            let mut live = self.live.load(Ordering::Acquire);
+            loop {
+                let Some(next) = live.checked_add(bytes) else {
+                    return Err(CpuLedgerError::CapacityExceeded {
+                        category,
+                        requested_bytes: bytes,
+                        available_bytes: self.capacity.saturating_sub(live),
+                    });
+                };
+                if next > self.capacity {
+                    return Err(CpuLedgerError::CapacityExceeded {
+                        category,
+                        requested_bytes: bytes,
+                        available_bytes: self.capacity.saturating_sub(live),
+                    });
+                }
+                match self.live.compare_exchange_weak(
+                    live,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        self.peak.fetch_max(next, Ordering::AcqRel);
+                        break;
+                    }
+                    Err(current) => live = current,
+                }
+            }
+            Ok(Box::new(BoundedScratchLease {
+                category,
+                bytes,
+                live: Arc::clone(&self.live),
+            }))
+        }
+    }
 
     #[test]
     fn semantic_resource_shape_clips_small_axes() {
@@ -1865,7 +3606,7 @@ mod tests {
     }
 
     #[test]
-    fn no_scale_plan_returns_stable_capacity_error_instead_of_over_budget_plan() {
+    fn minimum_navigation_plan_returns_truthful_global_capacity_error() {
         let (catalog, view) = two_layer_catalog_and_view();
         let error = plan_current_3d(
             &catalog,
@@ -1880,12 +3621,12 @@ mod tests {
         assert!(error.is::<DatasetDemandPlanCapacityError>());
         assert_eq!(
             error.to_string(),
-            "screen-selected scale s2 dataset demand cannot fit within 64 resources, 0 decoded bytes, and 4096 candidates per visible layer; fidelity was not silently reduced"
+            "3D minimum navigation scale s2 requires 65536 GPU payload bytes, but the renderer-global capacity provides 0"
         );
     }
 
     #[test]
-    fn screen_selected_scale_reports_capacity_instead_of_silently_coarsening() {
+    fn screen_ideal_uses_the_finest_catalog_configuration_that_fits() {
         let (catalog, view) = two_layer_catalog_and_view();
         let camera = CameraView::new(
             Projection::Orthographic,
@@ -1907,7 +3648,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = plan_current_3d(
+        let plan = plan_current_3d(
             &catalog,
             &view,
             PresentationViewport::new(64.0, 64.0).unwrap(),
@@ -1915,16 +3656,195 @@ mod tests {
             DatasetDemandPlanLimits::new(4_096, 2, 64 * 1_048_576),
             false,
         )
-        .unwrap_err();
-        let capacity = error
-            .downcast_ref::<DatasetDemandPlanCapacityError>()
-            .expect("the screen-selected scale must fail with typed capacity");
+        .unwrap();
 
-        assert_eq!(capacity.selected_scale(), Some(ScaleLevel::BASE));
+        assert_eq!(plan.scale, ScaleLevel::new(2));
+        assert_eq!(
+            plan.layer_scales,
+            BTreeMap::from([
+                (LogicalLayerKey::new(0), ScaleLevel::new(2)),
+                (LogicalLayerKey::new(1), ScaleLevel::new(7)),
+            ])
+        );
+        assert_eq!(plan.resources.len(), 2);
         assert!(
-            error
-                .to_string()
-                .contains("fidelity was not silently reduced")
+            plan.resources
+                .iter()
+                .all(|key| key.scale() != ScaleLevel::BASE),
+            "capacity selection must use only declared coarser catalog levels"
+        );
+    }
+
+    #[test]
+    fn finer_candidate_over_each_scalar_bound_selects_the_truthful_catalog_floor() {
+        let (catalog, view) = two_layer_catalog_and_view();
+        let camera = CameraView::new(
+            Projection::Orthographic,
+            view.camera().target(),
+            view.camera().orientation(),
+            0.5,
+            view.camera().perspective_focal_length_screen_points(),
+            view.camera().perspective_view_distance_world(),
+        )
+        .unwrap();
+        let view = ViewState::new(
+            view.layers().to_vec(),
+            view.active_layer(),
+            view.timepoint(),
+            camera,
+            view.layout(),
+            *view.cross_section(),
+            *view.iso_light(),
+        )
+        .unwrap();
+        let presentation = PresentationViewport::new(64.0, 64.0).unwrap();
+        let extent = RenderExtent::new(64, 64).unwrap();
+        let floor = plan_progressive_current_3d(
+            &catalog,
+            &view,
+            presentation,
+            extent,
+            DatasetDemandPlanLimits::new(4_096, 2, u64::MAX),
+            false,
+        )
+        .unwrap()
+        .target;
+        let expected_scales = BTreeMap::from([
+            (LogicalLayerKey::new(0), ScaleLevel::new(2)),
+            (LogicalLayerKey::new(1), ScaleLevel::new(7)),
+        ]);
+        assert_eq!(floor.layer_scales, expected_scales);
+
+        for (name, limits) in [
+            (
+                "candidate traversal",
+                DatasetDemandPlanLimits::new(1, 64, u64::MAX),
+            ),
+            (
+                "resource directory",
+                DatasetDemandPlanLimits::new(4_096, 2, u64::MAX),
+            ),
+            (
+                "GPU payload",
+                DatasetDemandPlanLimits::new(4_096, 64, floor.payload_bytes),
+            ),
+        ] {
+            let selected =
+                plan_progressive_current_3d(&catalog, &view, presentation, extent, limits, false)
+                    .unwrap();
+            assert_eq!(
+                selected.ideal_scale,
+                ScaleLevel::BASE,
+                "{name} fixture must request the fine screen ideal"
+            );
+            assert_eq!(
+                selected.target.layer_scales, expected_scales,
+                "{name} must fall back to the declared coarsest levels"
+            );
+            assert!(
+                selected
+                    .target
+                    .resources
+                    .iter()
+                    .all(|resource| resource.scale() != ScaleLevel::BASE),
+                "{name} must not label a coarse body as the rejected fine ideal"
+            );
+        }
+    }
+
+    #[test]
+    fn finer_candidate_over_scratch_capacity_selects_the_truthful_catalog_floor() {
+        let (catalog, view) = two_layer_catalog_and_view();
+        let camera = CameraView::new(
+            Projection::Orthographic,
+            view.camera().target(),
+            view.camera().orientation(),
+            0.5,
+            view.camera().perspective_focal_length_screen_points(),
+            view.camera().perspective_view_distance_world(),
+        )
+        .unwrap();
+        let view = ViewState::new(
+            view.layers().to_vec(),
+            view.active_layer(),
+            view.timepoint(),
+            camera,
+            view.layout(),
+            *view.cross_section(),
+            *view.iso_light(),
+        )
+        .unwrap();
+        let presentation = PresentationViewport::new(64.0, 64.0).unwrap();
+        let extent = RenderExtent::new(64, 64).unwrap();
+        let limits = DatasetDemandPlanLimits::new(4_096, 64, u64::MAX);
+        let ideal =
+            select_current_3d_levels(&catalog, &view, presentation, extent, limits, false).unwrap();
+        let floor_scales = coarsest_visible_layer_scales(&catalog, &view).unwrap();
+
+        let floor_measure = BoundedScratchLedger::new(u64::MAX);
+        let floor = plan_current_3d_configuration(
+            &catalog,
+            &view,
+            ideal.camera,
+            None,
+            extent,
+            &floor_scales,
+            limits,
+            false,
+            Some(&floor_measure),
+            &mut || false,
+        )
+        .unwrap_or_else(|_| panic!("the unbounded floor scratch measurement must plan"));
+        let floor_peak = floor_measure.peak();
+        drop(floor);
+        assert!(floor_peak > 0);
+
+        let fine_measure = BoundedScratchLedger::new(u64::MAX);
+        let fine = plan_current_3d_configuration(
+            &catalog,
+            &view,
+            ideal.camera,
+            None,
+            extent,
+            &ideal.layer_scales,
+            limits,
+            false,
+            Some(&fine_measure),
+            &mut || false,
+        )
+        .unwrap_or_else(|_| panic!("the unbounded fine scratch measurement must plan"));
+        let fine_peak = fine_measure.peak();
+        drop(fine);
+        assert!(
+            fine_peak > floor_peak,
+            "the fine fixture must require more live planner scratch"
+        );
+
+        let scratch_capacity = floor_peak.saturating_mul(2);
+        assert!(floor_peak.saturating_add(fine_peak) > scratch_capacity);
+        let bounded = BoundedScratchLedger::new(scratch_capacity);
+        let selected = plan_progressive_current_3d_cancellable(
+            &catalog,
+            &view,
+            presentation,
+            extent,
+            limits,
+            false,
+            Some(&bounded),
+            || false,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(selected.plan.ideal_scale, ScaleLevel::BASE);
+        assert_eq!(selected.plan.target.layer_scales, floor_scales);
+        assert!(
+            selected
+                .plan
+                .target
+                .resources
+                .iter()
+                .all(|resource| resource.scale() != ScaleLevel::BASE)
         );
     }
 
@@ -2075,12 +3995,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(progressive.target.layer_scales, plan.layer_scales);
+        assert!(
+            progressive.target.covers_full_volume,
+            "the independently selected per-layer target may cover the full volume"
+        );
+        let floor = progressive
+            .coarse
+            .expect("a finer target retains a distinct terminal navigation floor");
         assert_eq!(
-            progressive
-                .coarse
-                .expect("the independently coarser sheared layer fits")
-                .layer_scales,
-            BTreeMap::from([(active, ScaleLevel::new(1)), (sheared, ScaleLevel::new(1)),])
+            floor.layer_scales,
+            coarsest_visible_layer_scales(&catalog, &view).unwrap()
         );
     }
 
@@ -2125,7 +4049,7 @@ mod tests {
     }
 
     #[test]
-    fn progressive_plan_keeps_target_fidelity_and_uses_only_leftover_for_coarse_coverage() {
+    fn progressive_plan_keeps_terminal_floor_when_finer_full_volume_fits() {
         let (catalog, view) = two_layer_catalog_and_view();
         let camera = CameraView::new(
             Projection::Orthographic,
@@ -2147,21 +4071,225 @@ mod tests {
         )
         .unwrap();
 
+        let limits = DatasetDemandPlanLimits::new(4_096, 128, 64 * 1_048_576);
         let plan = plan_progressive_current_3d(
             &catalog,
             &view,
             PresentationViewport::new(64.0, 64.0).unwrap(),
             RenderExtent::new(64, 64).unwrap(),
-            DatasetDemandPlanLimits::new(4_096, 128, 64 * 1_048_576),
+            limits,
             false,
         )
         .unwrap();
 
         assert_eq!(plan.target.scale, ScaleLevel::BASE);
-        let coarse = plan.coarse.expect("the bounded coarse cohort fits");
-        assert_eq!(coarse.scale, ScaleLevel::new(2));
-        assert!(plan.target.resources.len() + coarse.resources.len() <= 128);
-        assert!(plan.target.payload_bytes + coarse.payload_bytes <= 64 * 1_048_576);
+        assert!(plan.target.covers_full_volume);
+        assert_eq!(
+            plan.navigation_candidates.len(),
+            2,
+            "the terminal and complete finer configuration both fit this fixture"
+        );
+        let terminal = &plan.navigation_candidates[0];
+        assert_eq!(
+            terminal.layer_scales,
+            coarsest_visible_layer_scales(&catalog, &view).unwrap()
+        );
+        assert_eq!(
+            terminal.resources.len(),
+            terminal.primary_resource_count,
+            "each candidate body is exact rather than an aggregate tail"
+        );
+        let floor = plan
+            .coarse
+            .expect("a byte-placeable fine volume must not replace the terminal safety floor");
+        assert_eq!(
+            floor.layer_scales,
+            coarsest_visible_layer_scales(&catalog, &view).unwrap()
+        );
+        assert_eq!(floor.primary_resource_count, terminal.resources.len());
+        assert!(
+            floor.resources.len() > floor.primary_resource_count,
+            "the installed scope keeps the terminal first-useful prefix followed by the finer rung"
+        );
+        let (resource_ceiling, payload_ceiling) = navigation_tail_limits(limits, terminal);
+        assert_eq!(
+            resource_ceiling,
+            terminal
+                .resources
+                .len()
+                .saturating_add(limits.max_resources / NAVIGATION_TAIL_RESOURCE_DIVISOR)
+        );
+        assert_eq!(
+            payload_ceiling,
+            terminal.payload_bytes.saturating_add(
+                (limits.max_gpu_payload_bytes / NAVIGATION_TAIL_PAYLOAD_DIVISOR)
+                    .min(NAVIGATION_TAIL_MAX_PAYLOAD_BYTES)
+            )
+        );
+        assert!(plan.target.resources.len() <= 128);
+        assert!(plan.target.payload_bytes <= 64 * 1_048_576);
+    }
+
+    #[test]
+    fn installed_ladder_requires_terminal_first_and_reuses_adjacent_rungs() {
+        let layer_key = LogicalLayerKey::new(0);
+        let catalog = DatasetCatalog::new(
+            "installed-navigation-floor",
+            ScientificIdentityStatus::Unverified(DatasetSourceId::new(73)),
+            vec![
+                DatasetLayer::new_multiscale(
+                    layer_key,
+                    "volume",
+                    1,
+                    IntensityDType::Uint16,
+                    vec![
+                        DatasetScale::new(
+                            ScaleLevel::BASE,
+                            Shape3D::new(256, 256, 256).unwrap(),
+                            GridToWorld::identity(),
+                            ResourceValidity::AllValid,
+                        ),
+                        DatasetScale::new(
+                            ScaleLevel::new(3),
+                            Shape3D::new(128, 128, 128).unwrap(),
+                            GridToWorld::scale(2.0, 2.0, 2.0).unwrap(),
+                            ResourceValidity::AllValid,
+                        ),
+                        DatasetScale::new(
+                            ScaleLevel::new(6),
+                            Shape3D::new(64, 64, 64).unwrap(),
+                            GridToWorld::scale(4.0, 4.0, 4.0).unwrap(),
+                            ResourceValidity::AllValid,
+                        ),
+                    ],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let view = ViewState::new(
+            vec![view_layer(layer_key)],
+            layer_key,
+            TimeIndex::new(0),
+            CameraView::new(
+                Projection::Orthographic,
+                WorldPoint3::new(128.0, 128.0, 128.0).unwrap(),
+                UnitQuaternion::identity(),
+                0.25,
+                320.0,
+                200.0,
+            )
+            .unwrap(),
+            ViewerLayout::Single3d,
+            CrossSectionView::new(
+                WorldPoint3::new(128.0, 128.0, 128.0).unwrap(),
+                UnitQuaternion::identity(),
+                1.0,
+                1.0,
+            )
+            .unwrap(),
+            IsoLightState::attached_camera(),
+        )
+        .unwrap();
+        let limits = DatasetDemandPlanLimits::new(4_096, 64, u64::MAX);
+        let nonterminal_scales = BTreeMap::from([(layer_key, ScaleLevel::new(3))]);
+        let nonterminal = plan_full_volume_navigation_floor(
+            &catalog,
+            &view,
+            &nonterminal_scales,
+            limits,
+            false,
+            None,
+            &mut || false,
+        )
+        .unwrap_or_else(|_| panic!("the S3 fixture is a complete full-volume body"));
+        let mut canonical = nonterminal.plan.resources.clone();
+        canonical.sort_unstable();
+        let nonterminal_baseline = NavigationCandidateBaseline::new(
+            PreparedResourceBody::new(
+                canonical.into(),
+                nonterminal.plan.resources.clone().into(),
+                None,
+            )
+            .unwrap(),
+            Arc::new(nonterminal_scales),
+            nonterminal.plan.payload_bytes,
+        );
+        assert!(
+            adopt_navigation_candidate_baseline(
+                &catalog,
+                &view,
+                &nonterminal_baseline,
+                limits,
+                false,
+                true,
+                None,
+            )
+            .unwrap_or_else(|_| panic!("nonterminal baseline validation must be bounded"))
+            .is_none(),
+            "a formerly accepted finer full-volume body is target residency, not the terminal floor"
+        );
+
+        let terminal_scales = BTreeMap::from([(layer_key, ScaleLevel::new(6))]);
+        let terminal = plan_full_volume_navigation_floor(
+            &catalog,
+            &view,
+            &terminal_scales,
+            limits,
+            false,
+            None,
+            &mut || false,
+        )
+        .unwrap_or_else(|_| panic!("the S6 fixture is the terminal full-volume body"));
+        let mut canonical = terminal.plan.resources.clone();
+        canonical.sort_unstable();
+        let terminal_baseline = NavigationCandidateBaseline::new(
+            PreparedResourceBody::new(
+                canonical.into(),
+                terminal.plan.resources.clone().into(),
+                None,
+            )
+            .unwrap(),
+            Arc::new(terminal_scales),
+            terminal.plan.payload_bytes,
+        );
+        assert!(
+            adopt_navigation_candidate_baseline(
+                &catalog,
+                &view,
+                &terminal_baseline,
+                limits,
+                false,
+                true,
+                None,
+            )
+            .unwrap_or_else(|_| panic!("terminal baseline validation must be bounded"))
+            .is_some(),
+            "the exact terminal body is reusable as the stable navigation floor"
+        );
+
+        let baseline = NavigationLadderBaseline::new(vec![terminal_baseline, nonterminal_baseline]);
+        let (aggregate, candidates) = adopt_navigation_ladder_baseline(
+            &catalog,
+            &view,
+            &baseline,
+            limits,
+            false,
+            None,
+            &[],
+            None,
+        )
+        .unwrap_or_else(|_| panic!("the installed adjacent ladder must revalidate"))
+        .expect("the installed adjacent ladder remains current");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].scale, ScaleLevel::new(6));
+        assert_eq!(candidates[1].scale, ScaleLevel::new(3));
+        assert_eq!(aggregate.plan.primary_resource_count, 1);
+        assert_eq!(aggregate.plan.resources.len(), 9);
+        assert_eq!(
+            aggregate.candidates_visited, 0,
+            "baseline adoption must not traverse semantic candidates again"
+        );
     }
 
     #[test]
@@ -2172,7 +4300,7 @@ mod tests {
         let layer0 = LogicalLayerKey::new(0);
         let layer1 = LogicalLayerKey::new(1);
         let key = |layer, x| {
-            DatasetResourceKey::new(
+            BrickKey::new(
                 identity,
                 layer,
                 TimeIndex::new(0),
@@ -2206,7 +4334,7 @@ mod tests {
         let identity = catalog.resource_identity();
         let layer = LogicalLayerKey::new(0);
         let key = |x| {
-            DatasetResourceKey::new(
+            BrickKey::new(
                 identity,
                 layer,
                 TimeIndex::new(0),
@@ -2235,22 +4363,7 @@ mod tests {
         assert!(prepared.canonical().is_sorted());
         assert!(
             prepared.host_allocation_bytes()
-                >= (2 * prepared.canonical().len() * std::mem::size_of::<DatasetResourceKey>())
-                    as u64
-        );
-
-        let mut previous = vec![first, retired];
-        previous.sort_unstable();
-        let delta = prepared.bounded_delta_from(&previous, 3).unwrap();
-        assert_eq!(
-            delta.additions().as_ref(),
-            &[admitted, highest_new_priority]
-        );
-        assert_eq!(delta.removals().as_ref(), &[retired]);
-        assert!(prepared.bounded_delta_from(&previous, 2).is_none());
-        assert_eq!(
-            bounded_requirement_delta_scratch_bytes(32).unwrap(),
-            key_array_bytes(104).unwrap()
+                >= (2 * prepared.canonical().len() * std::mem::size_of::<BrickKey>()) as u64
         );
 
         let mut guarded =
@@ -2343,7 +4456,7 @@ mod tests {
     }
 
     #[test]
-    fn large_grid_contained_pan_and_orbit_reuse_guard_without_lod_or_budget_tradeoff() {
+    fn large_full_volume_navigation_floor_reuses_pan_and_orbit_without_a_guard() {
         let layer_key = LogicalLayerKey::new(0);
         let shape = Shape3D::new(64, 16_384, 16_384).unwrap();
         let catalog = DatasetCatalog::new(
@@ -2414,25 +4527,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(guarded.plan.target.scale, exact.plan.target.scale);
+        assert_eq!(guarded.plan.target, exact.plan.target);
+        assert!(guarded.plan.target.covers_full_volume);
         assert_eq!(
             guarded.plan.target.primary_resource_count,
-            exact.plan.target.resources.len()
+            guarded.plan.target.resources.len(),
+            "a single-scale navigation floor is complete primary coverage, not a speculative guard"
         );
-        assert_eq!(
-            &guarded.plan.target.resources[..guarded.plan.target.primary_resource_count],
-            exact.plan.target.resources.as_slice(),
-            "the exact view must be the complete first I/O tier"
-        );
-        let guard_count = guarded
-            .plan
-            .target
-            .resources
-            .len()
-            .saturating_sub(guarded.plan.target.primary_resource_count);
-        assert!(guard_count > 0);
         assert!(
-            guard_count <= guarded.plan.target.primary_resource_count / 4 + 2,
-            "the fixed guard must remain a bounded thin frontier"
+            guarded.plan.target.resources.len() <= limits.max_resources,
+            "the full-volume navigation floor must remain inside the explicit resource ceiling"
         );
 
         let angle = 0.001_f64;
@@ -2445,19 +4549,9 @@ mod tests {
             camera.perspective_view_distance_world(),
         )
         .unwrap();
-        let envelope = guarded
-            .reuse_envelope
-            .as_ref()
-            .expect("the bounded guard should be retained");
-        assert!(envelope.reusable_candidates() > 40_000);
         assert!(
-            envelope
-                .contains(
-                    CameraFrame::new(moved_camera, presentation).unwrap(),
-                    extent
-                )
-                .unwrap(),
-            "a thin pan/orbit frontier should reuse the immutable large plan"
+            guarded.reuse_envelope.is_none(),
+            "full-volume coverage needs no camera-specific containment envelope"
         );
 
         let moved_view = ViewState::new(
@@ -2482,16 +4576,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let mut guard_canonical = guarded.plan.target.resources.clone();
-        guard_canonical.sort_unstable();
-        assert!(
-            moved_exact
-                .plan
-                .target
-                .resources
-                .iter()
-                .all(|resource| { guard_canonical.binary_search(resource).is_ok() })
-        );
+        assert_eq!(moved_exact.plan.target, guarded.plan.target);
 
         let exact_only_limit = DatasetDemandPlanLimits::new(
             131_072,
@@ -2512,6 +4597,120 @@ mod tests {
         .unwrap();
         assert!(budget_fallback.reuse_envelope.is_none());
         assert_eq!(budget_fallback.plan.target, exact.plan.target);
+    }
+
+    #[test]
+    fn plane_guard_capacity_falls_back_to_the_exact_current_plane() {
+        let layer_key = LogicalLayerKey::new(0);
+        let catalog = DatasetCatalog::new(
+            "plane-guard-capacity-fallback",
+            ScientificIdentityStatus::Unverified(DatasetSourceId::new(45)),
+            vec![
+                DatasetLayer::new_multiscale(
+                    layer_key,
+                    "large",
+                    1,
+                    IntensityDType::Uint16,
+                    vec![DatasetScale::new(
+                        ScaleLevel::BASE,
+                        Shape3D::new(512, 512, 512).unwrap(),
+                        GridToWorld::identity(),
+                        ResourceValidity::AllValid,
+                    )],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let rotation = glam::DQuat::from_rotation_x(0.31) * glam::DQuat::from_rotation_y(-0.27);
+        let [x, y, z, w] = rotation.to_array();
+        let cross_section = CrossSectionView::new(
+            WorldPoint3::new(250.0, 250.0, 250.0).unwrap(),
+            UnitQuaternion::new_xyzw(x, y, z, w).unwrap(),
+            1.25,
+            1.0,
+        )
+        .unwrap();
+        let view = ViewState::new(
+            vec![view_layer(layer_key)],
+            layer_key,
+            TimeIndex::new(0),
+            CameraView::new(
+                Projection::Orthographic,
+                WorldPoint3::new(256.0, 256.0, 256.0).unwrap(),
+                UnitQuaternion::identity(),
+                1.25,
+                320.0,
+                200.0,
+            )
+            .unwrap(),
+            ViewerLayout::FourPanel,
+            cross_section,
+            IsoLightState::attached_camera(),
+        )
+        .unwrap();
+        let presentation = PresentationViewport::new(64.0, 64.0).unwrap();
+        let extent = RenderExtent::new(64, 64).unwrap();
+        let broad_limits = DatasetDemandPlanLimits::new(4_096, 4_096, u64::MAX);
+        let exact = plan_cross_section_panel_attempt(
+            &catalog,
+            &view,
+            PanelId::Xy,
+            presentation,
+            extent,
+            broad_limits,
+            None,
+            None,
+            false,
+            &mut || false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!exact.plan.resources.is_empty());
+        let guarded = plan_cross_section_panel_attempt(
+            &catalog,
+            &view,
+            PanelId::Xy,
+            presentation,
+            extent,
+            broad_limits,
+            None,
+            None,
+            true,
+            &mut || false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            guarded.plan.resources.len() > exact.plan.resources.len(),
+            "the fixture must exercise a real dormant guard suffix: exact={}, guarded={}, envelope={:?}",
+            exact.plan.resources.len(),
+            guarded.plan.resources.len(),
+            guarded.plane_reuse_envelope
+        );
+        let exact_only_limits = DatasetDemandPlanLimits::new(
+            4_096,
+            exact.plan.resources.len(),
+            exact.plan.payload_bytes,
+        );
+        let fallback = plan_cross_section_panel_cancellable(
+            &catalog,
+            &view,
+            PanelId::Xy,
+            presentation,
+            extent,
+            exact_only_limits,
+            None,
+            || false,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(fallback.plan, exact.plan);
+        assert!(
+            fallback.plane_reuse_envelope.is_none(),
+            "capacity fallback must not retain a containment claim for a discarded guard"
+        );
     }
 
     fn two_layer_catalog_and_view() -> (DatasetCatalog, ViewState) {

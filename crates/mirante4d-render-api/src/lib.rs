@@ -11,18 +11,20 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use mirante4d_dataset::{CpuByteLease, DatasetResourceIdentity, DatasetResourceKey};
+use mirante4d_dataset::{BrickKey, CpuByteLease, DatasetCatalog, DatasetResourceIdentity};
 use mirante4d_domain::{
-    CameraView, CrossSectionView, IsoLightState, LayerTransfer, RenderState, UnitQuaternion,
+    CameraView, CrossSectionView, GridToWorld, IsoLightState, LayerTransfer, RenderState, Shape3D,
+    UnitQuaternion,
 };
 pub use mirante4d_domain::{
-    IsoShadingPolicy, LogicalLayerKey, Projection, SamplingPolicy, TimeIndex, WorldPoint3,
+    IsoShadingPolicy, LogicalLayerKey, Projection, SamplingPolicy, ScaleLevel, TimeIndex,
+    WorldPoint3,
 };
 use thiserror::Error;
 
 pub const MAX_RENDER_LAYERS: usize = 64;
 pub const MAX_RENDER_REQUIREMENTS: usize = 65_536;
-pub const MAX_PRESENTATION_TARGETS: usize = 64;
+pub const DEFAULT_LOGICAL_BRICK_SIDE: u64 = 64;
 pub const DEFAULT_PRESENTATION_VIEWPORT: PresentationViewport =
     PresentationViewport::new_unchecked(512.0, 512.0);
 
@@ -60,6 +62,10 @@ pub enum RenderApiError {
     TooManyRenderRequirements { actual: usize, maximum: usize },
     #[error("one dataset resource occurs more than once in a render requirement set")]
     DuplicateRenderRequirement,
+    #[error("render resource-grid metadata is duplicated, missing, or incompatible with its keys")]
+    InvalidRenderResourceGrid,
+    #[error("render layer scale chains are missing, duplicated, unordered, or incompatible")]
+    InvalidRenderScaleChain,
     #[error("requirement layer {ordinal} is absent from the render intent")]
     RequirementLayerNotInIntent { ordinal: u32 },
     #[error("requirement timepoint {actual} differs from render-intent timepoint {expected}")]
@@ -82,8 +88,82 @@ pub enum RenderApiError {
     CoveredResourceNotRequired,
     #[error("frame completeness, coverage, and limitation are inconsistent")]
     InvalidFrameProgress,
-    #[error("presentation tokens must be nonzero")]
-    InvalidPresentationToken,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum ShaderControlAffineError {
+    #[error("grid-to-world transform cannot be inverted for shader controls")]
+    NonInvertible,
+    #[error("world-to-grid transform cannot be represented by finite binary32 shader controls")]
+    NotRepresentable,
+}
+
+/// Derives the canonical binary32 world-to-grid rows consumed by render
+/// shaders from one validated affine grid-to-world transform.
+pub fn shader_control_world_to_grid_rows(
+    transform: GridToWorld,
+) -> Result<[[f32; 4]; 3], ShaderControlAffineError> {
+    let matrix = transform.row_major();
+    let a = matrix[0];
+    let b = matrix[1];
+    let c = matrix[2];
+    let d = matrix[4];
+    let e = matrix[5];
+    let f = matrix[6];
+    let g = matrix[8];
+    let h = matrix[9];
+    let i = matrix[10];
+    let determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+        return Err(ShaderControlAffineError::NonInvertible);
+    }
+    let inverse_determinant = determinant.recip();
+    let linear = [
+        (e * i - f * h) * inverse_determinant,
+        (c * h - b * i) * inverse_determinant,
+        (b * f - c * e) * inverse_determinant,
+        (f * g - d * i) * inverse_determinant,
+        (a * i - c * g) * inverse_determinant,
+        (c * d - a * f) * inverse_determinant,
+        (d * h - e * g) * inverse_determinant,
+        (b * g - a * h) * inverse_determinant,
+        (a * e - b * d) * inverse_determinant,
+    ];
+    if !linear.iter().all(|value| value.is_finite()) {
+        return Err(ShaderControlAffineError::NonInvertible);
+    }
+    let translation = [matrix[3], matrix[7], matrix[11]];
+    let rows = [
+        [
+            linear[0],
+            linear[1],
+            linear[2],
+            -(linear[0] * translation[0] + linear[1] * translation[1] + linear[2] * translation[2]),
+        ],
+        [
+            linear[3],
+            linear[4],
+            linear[5],
+            -(linear[3] * translation[0] + linear[4] * translation[1] + linear[5] * translation[2]),
+        ],
+        [
+            linear[6],
+            linear[7],
+            linear[8],
+            -(linear[6] * translation[0] + linear[7] * translation[1] + linear[8] * translation[2]),
+        ],
+    ];
+    let mut quantized = [[0.0; 4]; 3];
+    for row in 0..3 {
+        for column in 0..4 {
+            let converted = rows[row][column] as f32;
+            if !converted.is_finite() {
+                return Err(ShaderControlAffineError::NotRepresentable);
+            }
+            quantized[row][column] = if converted == 0.0 { 0.0 } else { converted };
+        }
+    }
+    Ok(quantized)
 }
 
 /// A monotonically assigned identity used to suppress stale render results.
@@ -94,12 +174,46 @@ pub enum RenderApiError {
 pub struct FrameIdentity(u64);
 
 impl FrameIdentity {
+    pub const fn initial() -> Self {
+        Self(0)
+    }
+
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
     pub const fn get(self) -> u64 {
         self.0
+    }
+}
+
+/// One of the viewer's four fixed logical presentation targets.
+///
+/// This identity is stable application intent shared with renderer frame
+/// coordination. Dynamic backend presentation handles remain a separate,
+/// opaque lifecycle concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PresentationTarget {
+    ThreeD,
+    Xy,
+    Xz,
+    Yz,
+}
+
+impl PresentationTarget {
+    pub const ALL: [Self; 4] = [Self::ThreeD, Self::Xy, Self::Xz, Self::Yz];
+
+    pub const fn is_cross_section(self) -> bool {
+        !matches!(self, Self::ThreeD)
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::ThreeD => 0,
+            Self::Xy => 1,
+            Self::Xz => 2,
+            Self::Yz => 3,
+        }
     }
 }
 
@@ -327,16 +441,248 @@ pub enum RenderRequirementRole {
 /// One semantic dataset resource needed by a render intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RenderRequirement {
-    key: DatasetResourceKey,
+    key: BrickKey,
     role: RenderRequirementRole,
 }
 
+/// Ordered target-to-coarser catalog levels available to one rendered layer.
+///
+/// The first entry is the selected target. Later entries are strictly coarser
+/// fallback candidates. A volume requirement uses exactly one entry; a Plane
+/// requirement may include catalog levels that are not demanded by this frame
+/// so already-resident intermediate data can be reused without serializing
+/// target loading through it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderLayerScaleChain {
+    layer: LogicalLayerKey,
+    scales: Box<[ScaleLevel]>,
+}
+
+impl RenderLayerScaleChain {
+    pub fn new(
+        layer: LogicalLayerKey,
+        scales: impl Into<Box<[ScaleLevel]>>,
+    ) -> Result<Self, RenderApiError> {
+        let scales = scales.into();
+        if scales.is_empty()
+            || scales.len() > mirante4d_dataset::MAX_SCALES_PER_LAYER
+            || scales.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(RenderApiError::InvalidRenderScaleChain);
+        }
+        Ok(Self { layer, scales })
+    }
+
+    pub const fn layer(&self) -> LogicalLayerKey {
+        self.layer
+    }
+
+    pub fn scales(&self) -> &[ScaleLevel] {
+        &self.scales
+    }
+
+    pub fn target(&self) -> ScaleLevel {
+        self.scales[0]
+    }
+
+    pub fn fallback(&self) -> Option<ScaleLevel> {
+        self.scales
+            .last()
+            .copied()
+            .filter(|_| self.scales.len() > 1)
+    }
+
+    /// Finest catalog level eligible after the target. Together with
+    /// `fallback()`, this bounds what a progressive Plane may show when
+    /// already-resident intermediate levels are reused.
+    pub fn finest_fallback(&self) -> Option<ScaleLevel> {
+        self.scales.get(1).copied()
+    }
+}
+
+/// Canonical regular logical-brick grid for one rendered layer and scale.
+///
+/// This is semantic demand metadata, not a physical package-chunk shape. It
+/// belongs to the dataset generation so every backend can project a
+/// `BrickKey` into its own residency representation without inferring geometry
+/// from whichever resources happen to be required by one presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RenderResourceGrid {
+    layer: LogicalLayerKey,
+    scale: ScaleLevel,
+    volume_shape: Shape3D,
+    cell_shape: Shape3D,
+}
+
+impl RenderResourceGrid {
+    pub const fn new(
+        layer: LogicalLayerKey,
+        scale: ScaleLevel,
+        volume_shape: Shape3D,
+        cell_shape: Shape3D,
+    ) -> Self {
+        Self {
+            layer,
+            scale,
+            volume_shape,
+            cell_shape,
+        }
+    }
+
+    pub const fn layer(self) -> LogicalLayerKey {
+        self.layer
+    }
+
+    pub const fn scale(self) -> ScaleLevel {
+        self.scale
+    }
+
+    pub const fn volume_shape(self) -> Shape3D {
+        self.volume_shape
+    }
+
+    pub const fn cell_shape(self) -> Shape3D {
+        self.cell_shape
+    }
+}
+
+pub fn default_logical_brick_shape(volume: Shape3D) -> Shape3D {
+    Shape3D::new(
+        volume.z().min(DEFAULT_LOGICAL_BRICK_SIDE),
+        volume.y().min(DEFAULT_LOGICAL_BRICK_SIDE),
+        volume.x().min(DEFAULT_LOGICAL_BRICK_SIDE),
+    )
+    .expect("a logical brick clipped to a non-empty volume is non-empty")
+}
+
+/// Dataset-generation-scoped canonical logical resource grids.
+///
+/// This is installed once into the GPU residency owner. Camera or
+/// presentation bodies select entries but never infer or redefine them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderResourceGridCatalog {
+    resource_identity: DatasetResourceIdentity,
+    grids: Box<[RenderResourceGrid]>,
+}
+
+impl RenderResourceGridCatalog {
+    pub fn new(
+        catalog: &DatasetCatalog,
+        mut grids: Vec<RenderResourceGrid>,
+    ) -> Result<Self, RenderApiError> {
+        grids.sort_unstable_by_key(|grid| (grid.layer(), grid.scale()));
+        let expected_len = catalog
+            .layers()
+            .map(|layer| layer.scales().len())
+            .sum::<usize>();
+        if grids.len() != expected_len {
+            return Err(RenderApiError::InvalidRenderResourceGrid);
+        }
+        for pair in grids.windows(2) {
+            if (pair[0].layer(), pair[0].scale()) == (pair[1].layer(), pair[1].scale()) {
+                return Err(RenderApiError::InvalidRenderResourceGrid);
+            }
+        }
+        for grid in &grids {
+            let Some(scale) = catalog
+                .layer(grid.layer())
+                .and_then(|layer| layer.scale(grid.scale()))
+            else {
+                return Err(RenderApiError::InvalidRenderResourceGrid);
+            };
+            let volume = grid.volume_shape().dimensions();
+            let cell = grid.cell_shape().dimensions();
+            if scale.shape() != grid.volume_shape() || (0..3).any(|axis| cell[axis] > volume[axis])
+            {
+                return Err(RenderApiError::InvalidRenderResourceGrid);
+            }
+        }
+        for layer in catalog.layers() {
+            for scale in layer.scales() {
+                if grids
+                    .binary_search_by_key(&(layer.key(), scale.level()), |grid| {
+                        (grid.layer(), grid.scale())
+                    })
+                    .is_err()
+                {
+                    return Err(RenderApiError::InvalidRenderResourceGrid);
+                }
+            }
+        }
+        Ok(Self {
+            resource_identity: catalog.resource_identity(),
+            grids: grids.into(),
+        })
+    }
+
+    pub fn current(catalog: &DatasetCatalog) -> Self {
+        let grids = catalog
+            .layers()
+            .flat_map(|layer| {
+                layer.scales().map(move |scale| {
+                    RenderResourceGrid::new(
+                        layer.key(),
+                        scale.level(),
+                        scale.shape(),
+                        default_logical_brick_shape(scale.shape()),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        Self::new(catalog, grids)
+            .expect("the current logical-brick policy covers every non-empty dataset scale")
+    }
+
+    pub const fn resource_identity(&self) -> DatasetResourceIdentity {
+        self.resource_identity
+    }
+
+    pub fn grids(&self) -> &[RenderResourceGrid] {
+        &self.grids
+    }
+
+    pub fn validate_catalog(&self, catalog: &DatasetCatalog) -> Result<(), RenderApiError> {
+        if self.resource_identity != catalog.resource_identity() {
+            return Err(RenderApiError::RequirementIdentityMismatch);
+        }
+        Self::new(catalog, self.grids.to_vec()).map(|_| ())
+    }
+
+    pub fn grid(&self, layer: LogicalLayerKey, scale: ScaleLevel) -> Option<RenderResourceGrid> {
+        self.grids
+            .binary_search_by_key(&(layer, scale), |grid| (grid.layer(), grid.scale()))
+            .ok()
+            .map(|index| self.grids[index])
+    }
+
+    pub fn validate_key(&self, key: BrickKey) -> Result<RenderResourceGrid, RenderApiError> {
+        if key.identity() != self.resource_identity {
+            return Err(RenderApiError::RequirementIdentityMismatch);
+        }
+        let grid = self
+            .grid(key.layer(), key.scale())
+            .ok_or(RenderApiError::InvalidRenderResourceGrid)?;
+        let origin = key.region().origin();
+        let actual_shape = key.region().shape().dimensions();
+        let volume = grid.volume_shape().dimensions();
+        let cell = grid.cell_shape().dimensions();
+        let valid = (0..3).all(|axis| {
+            origin[axis].is_multiple_of(cell[axis])
+                && origin[axis] < volume[axis]
+                && actual_shape[axis] == cell[axis].min(volume[axis] - origin[axis])
+        });
+        valid
+            .then_some(grid)
+            .ok_or(RenderApiError::InvalidRenderResourceGrid)
+    }
+}
+
 impl RenderRequirement {
-    pub const fn new(key: DatasetResourceKey, role: RenderRequirementRole) -> Self {
+    pub const fn new(key: BrickKey, role: RenderRequirementRole) -> Self {
         Self { key, role }
     }
 
-    pub const fn key(self) -> DatasetResourceKey {
+    pub const fn key(self) -> BrickKey {
         self.key
     }
 
@@ -350,8 +696,8 @@ impl RenderRequirement {
 /// Input order is preserved so a planner can emit a deterministic traversal;
 /// runtime request priority remains owned by the dataset runtime.
 struct PreparedResourceBodyData {
-    canonical: Arc<[DatasetResourceKey]>,
-    ranked: Arc<[DatasetResourceKey]>,
+    canonical: Arc<[BrickKey]>,
+    ranked: Arc<[BrickKey]>,
     charge: OnceLock<Arc<dyn CpuByteLease>>,
     host_allocation_bytes: u64,
 }
@@ -388,8 +734,8 @@ impl Eq for PreparedResourceBody {}
 
 impl PreparedResourceBody {
     pub fn new(
-        canonical: Arc<[DatasetResourceKey]>,
-        ranked: Arc<[DatasetResourceKey]>,
+        canonical: Arc<[BrickKey]>,
+        ranked: Arc<[BrickKey]>,
         charge: Option<Arc<dyn CpuByteLease>>,
     ) -> Result<Self, RenderApiError> {
         if canonical.len() > MAX_RENDER_REQUIREMENTS {
@@ -425,11 +771,11 @@ impl PreparedResourceBody {
         Ok(prepared)
     }
 
-    pub fn canonical(&self) -> &Arc<[DatasetResourceKey]> {
+    pub fn canonical(&self) -> &Arc<[BrickKey]> {
         &self.body.canonical
     }
 
-    pub fn ranked(&self) -> &Arc<[DatasetResourceKey]> {
+    pub fn ranked(&self) -> &Arc<[BrickKey]> {
         &self.body.ranked
     }
 
@@ -465,7 +811,7 @@ impl PreparedResourceBody {
         Arc::ptr_eq(&self.body, &other.body)
     }
 
-    pub fn resource_index(&self, key: DatasetResourceKey) -> Option<usize> {
+    pub fn resource_index(&self, key: BrickKey) -> Option<usize> {
         self.body.canonical.binary_search(&key).ok()
     }
 
@@ -477,7 +823,7 @@ impl PreparedResourceBody {
             .checked_add(ranked_len)
             .ok_or(RenderApiError::PreparedRequirementHostAllocationOverflow)?;
         let keys = key_count
-            .checked_mul(std::mem::size_of::<DatasetResourceKey>())
+            .checked_mul(std::mem::size_of::<BrickKey>())
             .ok_or(RenderApiError::PreparedRequirementHostAllocationOverflow)?;
         let bytes = keys
             .checked_add(std::mem::size_of::<PreparedResourceBodyData>())
@@ -491,11 +837,13 @@ struct RenderRequirementResources {
     resource_identity: DatasetResourceIdentity,
     timepoint: TimeIndex,
     layers: Box<[LogicalLayerKey]>,
+    scale_chains: Box<[RenderLayerScaleChain]>,
     body: PreparedResourceBody,
     first_useful_words: Arc<[u64]>,
     required_words: Arc<[u64]>,
     total_first_useful: u64,
     total_required: u64,
+    dormant_residency_suffix: bool,
 }
 
 impl RenderRequirementResources {
@@ -563,8 +911,9 @@ impl PreparedRenderRequirements {
     }
 
     /// Prepares one body whose ranked suffix is a resident-navigation guard.
-    /// Guard resources share the canonical body and backend page layout, but
-    /// do not affect current-frame completeness until O(1) promotion.
+    /// Guard resources share the canonical body and renderer-global resource
+    /// grid, but do not affect current-frame completeness until O(1)
+    /// promotion.
     pub fn new_with_required_prefix(
         resource_identity: DatasetResourceIdentity,
         timepoint: TimeIndex,
@@ -572,6 +921,115 @@ impl PreparedRenderRequirements {
         body: PreparedResourceBody,
         first_useful_prefix_len: usize,
         required_prefix_len: usize,
+    ) -> Result<Self, RenderApiError> {
+        let layer_set = layers.iter().copied().collect::<HashSet<_>>();
+        for key in body.canonical().iter().copied() {
+            if key.identity() != resource_identity {
+                return Err(RenderApiError::RequirementIdentityMismatch);
+            }
+            if key.timepoint() != timepoint {
+                return Err(RenderApiError::RequirementTimepointMismatch {
+                    expected: timepoint.get(),
+                    actual: key.timepoint().get(),
+                });
+            }
+            if !layer_set.contains(&key.layer()) {
+                return Err(RenderApiError::RequirementLayerNotInIntent {
+                    ordinal: key.layer().ordinal(),
+                });
+            }
+        }
+        let mut scales_by_layer = BTreeMap::<LogicalLayerKey, Vec<ScaleLevel>>::new();
+        for key in body.canonical().iter().copied() {
+            let scales = scales_by_layer.entry(key.layer()).or_default();
+            if !scales.contains(&key.scale()) {
+                scales.push(key.scale());
+            }
+        }
+        let scale_chains = layers
+            .iter()
+            .copied()
+            .map(|layer| {
+                let mut scales = scales_by_layer
+                    .remove(&layer)
+                    .ok_or(RenderApiError::InvalidRenderScaleChain)?;
+                scales.sort_unstable();
+                RenderLayerScaleChain::new(layer, scales)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new_with_required_prefix_and_scale_chains(
+            resource_identity,
+            timepoint,
+            layers,
+            scale_chains,
+            body,
+            first_useful_prefix_len,
+            required_prefix_len,
+        )
+    }
+
+    /// Prepares one immutable body with explicit target-to-coarser scale
+    /// chains. Plane rendering uses every chain entry for resident fallback;
+    /// volume rendering supplies one target entry and remains uniform-scale.
+    pub fn new_with_required_prefix_and_scale_chains(
+        resource_identity: DatasetResourceIdentity,
+        timepoint: TimeIndex,
+        layers: Vec<LogicalLayerKey>,
+        scale_chains: Vec<RenderLayerScaleChain>,
+        body: PreparedResourceBody,
+        first_useful_prefix_len: usize,
+        required_prefix_len: usize,
+    ) -> Result<Self, RenderApiError> {
+        Self::new_with_scale_chains_and_suffix_policy(
+            resource_identity,
+            timepoint,
+            layers,
+            scale_chains,
+            body,
+            first_useful_prefix_len,
+            required_prefix_len,
+            false,
+        )
+    }
+
+    /// Prepares a uniform presentation body whose suffix is GPU-residency
+    /// prefetch for other immutable presentation wrappers.
+    ///
+    /// Required keys still have to belong to this wrapper's explicit
+    /// target-to-coarser chains. Suffix keys may name other scales, remain
+    /// permanently dormant for this wrapper, and are never promoted into its
+    /// coverage or pixels.
+    pub fn new_with_dormant_residency_suffix_and_scale_chains(
+        resource_identity: DatasetResourceIdentity,
+        timepoint: TimeIndex,
+        layers: Vec<LogicalLayerKey>,
+        scale_chains: Vec<RenderLayerScaleChain>,
+        body: PreparedResourceBody,
+        first_useful_prefix_len: usize,
+        required_prefix_len: usize,
+    ) -> Result<Self, RenderApiError> {
+        Self::new_with_scale_chains_and_suffix_policy(
+            resource_identity,
+            timepoint,
+            layers,
+            scale_chains,
+            body,
+            first_useful_prefix_len,
+            required_prefix_len,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_scale_chains_and_suffix_policy(
+        resource_identity: DatasetResourceIdentity,
+        timepoint: TimeIndex,
+        layers: Vec<LogicalLayerKey>,
+        mut scale_chains: Vec<RenderLayerScaleChain>,
+        body: PreparedResourceBody,
+        first_useful_prefix_len: usize,
+        required_prefix_len: usize,
+        dormant_residency_suffix: bool,
     ) -> Result<Self, RenderApiError> {
         if first_useful_prefix_len == 0
             || first_useful_prefix_len > required_prefix_len
@@ -588,7 +1046,11 @@ impl PreparedRenderRequirements {
                 maximum: MAX_RENDER_LAYERS,
             });
         }
-        Self::preflight_host_allocation_bytes(layers.len(), body.canonical().len())?;
+        Self::preflight_host_allocation_bytes_with_scale_count(
+            layers.len(),
+            scale_chains.iter().map(|chain| chain.scales().len()).sum(),
+            body.canonical().len(),
+        )?;
         let layer_set = layers.iter().copied().collect::<HashSet<_>>();
         if layer_set.len() != layers.len() {
             let duplicate = layers
@@ -622,6 +1084,32 @@ impl PreparedRenderRequirements {
                 });
             }
         }
+        scale_chains.sort_unstable_by_key(RenderLayerScaleChain::layer);
+        if scale_chains.len() != layers.len()
+            || scale_chains
+                .windows(2)
+                .any(|pair| pair[0].layer() == pair[1].layer())
+            || layers.iter().any(|layer| {
+                scale_chains
+                    .binary_search_by_key(layer, |chain| chain.layer())
+                    .is_err()
+            })
+        {
+            return Err(RenderApiError::InvalidRenderScaleChain);
+        }
+        let validated_keys = if dormant_residency_suffix {
+            &body.ranked()[..required_prefix_len]
+        } else {
+            body.canonical().as_ref()
+        };
+        for key in validated_keys.iter().copied() {
+            let chain = &scale_chains[scale_chains
+                .binary_search_by_key(&key.layer(), |chain| chain.layer())
+                .expect("every validated requirement layer owns one scale chain")];
+            if chain.scales().binary_search(&key.scale()).is_err() {
+                return Err(RenderApiError::InvalidRenderScaleChain);
+            }
+        }
         let mut first_useful_words = vec![0_u64; body.canonical().len().div_ceil(64)];
         for key in body.ranked()[..first_useful_prefix_len].iter().copied() {
             let index = body
@@ -641,11 +1129,13 @@ impl PreparedRenderRequirements {
                 resource_identity,
                 timepoint,
                 layers: layers.into(),
+                scale_chains: scale_chains.into(),
                 body,
                 first_useful_words: first_useful_words.into(),
                 required_words: required_words.into(),
                 total_first_useful: first_useful_prefix_len as u64,
                 total_required: required_prefix_len as u64,
+                dormant_residency_suffix,
             }),
             prefetch_promoted: false,
         })
@@ -668,7 +1158,7 @@ impl PreparedRenderRequirements {
     pub fn promote_prefetch(&self) -> Self {
         Self {
             resources: Arc::clone(&self.resources),
-            prefetch_promoted: true,
+            prefetch_promoted: !self.resources.dormant_residency_suffix,
         }
     }
 
@@ -677,7 +1167,7 @@ impl PreparedRenderRequirements {
     }
 
     pub fn required_prefix_len(&self) -> usize {
-        if self.prefetch_promoted {
+        if self.prefetch_promoted && !self.resources.dormant_residency_suffix {
             self.resources.body.ranked().len()
         } else {
             self.resources.total_required as usize
@@ -696,6 +1186,12 @@ impl PreparedRenderRequirements {
         &self.resources.body
     }
 
+    /// True when this prepared handle and a frame-bound handle share the
+    /// exact validated ordered resource body. This comparison is O(1).
+    pub fn shares_resources_with(&self, bound: &RenderRequirements) -> bool {
+        Arc::ptr_eq(&self.resources, &bound.set.resources)
+    }
+
     pub fn resource_identity(&self) -> DatasetResourceIdentity {
         self.resources.resource_identity
     }
@@ -708,6 +1204,10 @@ impl PreparedRenderRequirements {
         &self.resources.layers
     }
 
+    pub fn scale_chains(&self) -> &[RenderLayerScaleChain] {
+        &self.resources.scale_chains
+    }
+
     pub fn first_useful_prefix_len(&self) -> usize {
         self.resources.total_first_useful as usize
     }
@@ -715,8 +1215,13 @@ impl PreparedRenderRequirements {
     /// Host allocation owned by this render wrapper, excluding the shared
     /// `PreparedResourceBody` reported separately.
     pub fn host_allocation_bytes(&self) -> u64 {
-        Self::preflight_host_allocation_bytes(
+        Self::preflight_host_allocation_bytes_with_scale_count(
             self.resources.layers.len(),
+            self.resources
+                .scale_chains
+                .iter()
+                .map(|chain| chain.scales().len())
+                .sum(),
             self.resources.body.canonical().len(),
         )
         .expect("a constructed prepared render wrapper has representable host bytes")
@@ -729,8 +1234,28 @@ impl PreparedRenderRequirements {
         layer_count: usize,
         requirement_count: usize,
     ) -> Result<u64, RenderApiError> {
+        Self::preflight_host_allocation_bytes_with_scale_count(
+            layer_count,
+            layer_count,
+            requirement_count,
+        )
+    }
+
+    pub fn preflight_host_allocation_bytes_with_scale_count(
+        layer_count: usize,
+        scale_count: usize,
+        requirement_count: usize,
+    ) -> Result<u64, RenderApiError> {
         let layer_bytes = layer_count
             .checked_mul(std::mem::size_of::<LogicalLayerKey>())
+            .ok_or(RenderApiError::PreparedRequirementHostAllocationOverflow)?;
+        let scale_chain_bytes = layer_count
+            .checked_mul(std::mem::size_of::<RenderLayerScaleChain>())
+            .and_then(|bytes| {
+                scale_count
+                    .checked_mul(std::mem::size_of::<ScaleLevel>())
+                    .and_then(|scale_bytes| bytes.checked_add(scale_bytes))
+            })
             .ok_or(RenderApiError::PreparedRequirementHostAllocationOverflow)?;
         let first_useful_words = requirement_count
             .checked_add(63)
@@ -742,6 +1267,7 @@ impl PreparedRenderRequirements {
             .ok_or(RenderApiError::PreparedRequirementHostAllocationOverflow)?;
         let bytes = std::mem::size_of::<RenderRequirementResources>()
             .checked_add(layer_bytes)
+            .and_then(|bytes| bytes.checked_add(scale_chain_bytes))
             .and_then(|bytes| bytes.checked_add(role_bitmap_bytes))
             .ok_or(RenderApiError::PreparedRequirementHostAllocationOverflow)?;
         u64::try_from(bytes).map_err(|_| RenderApiError::PreparedRequirementHostAllocationOverflow)
@@ -791,6 +1317,14 @@ fn validate_prepared_render_binding(
         return Err(RenderApiError::RequirementLayerNotInIntent {
             ordinal: missing.ordinal(),
         });
+    }
+    if intent.view().pass_kind() == RenderPassKind::Volume
+        && resources
+            .scale_chains
+            .iter()
+            .any(|chain| chain.scales().len() != 1)
+    {
+        return Err(RenderApiError::InvalidRenderScaleChain);
     }
     Ok(())
 }
@@ -886,7 +1420,7 @@ impl RenderRequirements {
         self.set.prefetch_promoted
     }
 
-    pub fn is_required_resource(&self, key: DatasetResourceKey) -> bool {
+    pub fn is_required_resource(&self, key: BrickKey) -> bool {
         self.resource_index(key).is_some_and(|index| {
             self.set
                 .resources
@@ -906,8 +1440,21 @@ impl RenderRequirements {
         }
     }
 
-    pub fn resource_keys(&self) -> &[DatasetResourceKey] {
+    pub fn resource_keys(&self) -> &[BrickKey] {
         self.set.resources.body.canonical().as_ref()
+    }
+
+    pub fn scale_chains(&self) -> &[RenderLayerScaleChain] {
+        &self.set.resources.scale_chains
+    }
+
+    pub fn scale_chain(&self, layer: LogicalLayerKey) -> Option<&RenderLayerScaleChain> {
+        self.set
+            .resources
+            .scale_chains
+            .binary_search_by_key(&layer, |chain| chain.layer())
+            .ok()
+            .map(|index| &self.set.resources.scale_chains[index])
     }
 
     pub fn len(&self) -> usize {
@@ -922,11 +1469,11 @@ impl RenderRequirements {
         &self.set.resources.body
     }
 
-    pub fn contains_resource(&self, key: DatasetResourceKey) -> bool {
+    pub fn contains_resource(&self, key: BrickKey) -> bool {
         self.set.resources.body.resource_index(key).is_some()
     }
 
-    pub fn resource_index(&self, key: DatasetResourceKey) -> Option<usize> {
+    pub fn resource_index(&self, key: BrickKey) -> Option<usize> {
         self.set.resources.body.resource_index(key)
     }
 
@@ -984,16 +1531,156 @@ pub struct FrameCoverage {
     available_prefetch: u64,
     total_prefetch: u64,
     prefetch_promoted: bool,
+    layers: Arc<[FrameLayerCoverageState]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameLayerCoverageState {
+    layer: LogicalLayerKey,
+    target_scale: ScaleLevel,
+    finest_fallback_scale: Option<ScaleLevel>,
+    fallback_scale: Option<ScaleLevel>,
+    available_target_required: u64,
+    total_target_required: u64,
+    available_target_prefetch: u64,
+    total_target_prefetch: u64,
+    available_required: u64,
+    total_required: u64,
+    available_prefetch: u64,
+    total_prefetch: u64,
+}
+
+/// Requirement availability for one layer in an actual frame-coverage
+/// snapshot.
+///
+/// `scale()` is the one truthful scalar scale only for a uniform target or a
+/// single eligible fallback level. It is `None` while target and fallback
+/// regions coexist or when already-resident intermediate fallback levels make
+/// a scalar value unprovable without a pixel readback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameLayerCoverage {
+    layer: LogicalLayerKey,
+    scale: Option<ScaleLevel>,
+    target_scale: ScaleLevel,
+    finest_fallback_scale: Option<ScaleLevel>,
+    fallback_scale: Option<ScaleLevel>,
+    available_target_requirements: u64,
+    total_target_requirements: u64,
+    available_requirements: u64,
+    total_requirements: u64,
+}
+
+impl FrameLayerCoverage {
+    pub const fn layer(self) -> LogicalLayerKey {
+        self.layer
+    }
+
+    pub const fn scale(self) -> Option<ScaleLevel> {
+        self.scale
+    }
+
+    pub const fn target_scale(self) -> ScaleLevel {
+        self.target_scale
+    }
+
+    pub const fn fallback_scale(self) -> Option<ScaleLevel> {
+        self.fallback_scale
+    }
+
+    pub const fn finest_fallback_scale(self) -> Option<ScaleLevel> {
+        self.finest_fallback_scale
+    }
+
+    pub const fn fallback_range(self) -> Option<(ScaleLevel, ScaleLevel)> {
+        match (self.finest_fallback_scale, self.fallback_scale) {
+            (Some(finest), Some(coarsest)) if self.scale.is_none() => Some((finest, coarsest)),
+            _ => None,
+        }
+    }
+
+    pub const fn is_mixed(self) -> bool {
+        self.fallback_scale.is_some()
+            && self.available_target_requirements > 0
+            && self.available_target_requirements < self.total_target_requirements
+    }
+
+    pub const fn available_target_requirements(self) -> u64 {
+        self.available_target_requirements
+    }
+
+    pub const fn total_target_requirements(self) -> u64 {
+        self.total_target_requirements
+    }
+
+    pub const fn available_requirements(self) -> u64 {
+        self.available_requirements
+    }
+
+    pub const fn total_requirements(self) -> u64 {
+        self.total_requirements
+    }
+}
+
+fn initial_frame_layer_coverage(
+    resources: &RenderRequirementResources,
+    available_words: &[u64],
+) -> Arc<[FrameLayerCoverageState]> {
+    let mut layers = BTreeMap::<LogicalLayerKey, FrameLayerCoverageState>::new();
+    for chain in resources.scale_chains.iter() {
+        layers.insert(
+            chain.layer(),
+            FrameLayerCoverageState {
+                layer: chain.layer(),
+                target_scale: chain.target(),
+                finest_fallback_scale: chain.finest_fallback(),
+                fallback_scale: chain.fallback(),
+                available_target_required: 0,
+                total_target_required: 0,
+                available_target_prefetch: 0,
+                total_target_prefetch: 0,
+                available_required: 0,
+                total_required: 0,
+                available_prefetch: 0,
+                total_prefetch: 0,
+            },
+        );
+    }
+    for (index, key) in resources.body.canonical().iter().copied().enumerate() {
+        let available = available_words[index / 64] & (1_u64 << (index % 64)) != 0;
+        let layer = layers
+            .get_mut(&key.layer())
+            .expect("every validated requirement layer owns one scale chain");
+        let target = key.scale() == layer.target_scale;
+        if resources.base_role_at(index) == RenderRequirementRole::Prefetch {
+            layer.total_prefetch += 1;
+            layer.available_prefetch += u64::from(available);
+            if target {
+                layer.total_target_prefetch += 1;
+                layer.available_target_prefetch += u64::from(available);
+            }
+        } else {
+            layer.total_required += 1;
+            layer.available_required += u64::from(available);
+            if target {
+                layer.total_target_required += 1;
+                layer.available_target_required += u64::from(available);
+            }
+        }
+    }
+    layers.into_values().collect::<Vec<_>>().into()
 }
 
 impl FrameCoverage {
     /// Creates an empty bitmap for an already validated requirement body.
     pub fn empty(requirements: &RenderRequirements) -> Self {
         let resources = &requirements.set.resources;
+        let available_words: Arc<[u64]> =
+            vec![0_u64; resources.body.canonical().len().div_ceil(64)].into();
+        let layers = initial_frame_layer_coverage(resources, &available_words);
         Self {
             frame: requirements.frame(),
             requirements: Arc::clone(resources),
-            available_words: vec![0_u64; resources.body.canonical().len().div_ceil(64)].into(),
+            available_words,
             available_first_useful: 0,
             total_first_useful: resources.total_first_useful,
             available_refinement: 0,
@@ -1001,12 +1688,13 @@ impl FrameCoverage {
             available_prefetch: 0,
             total_prefetch: resources.body.canonical().len() as u64 - resources.total_required,
             prefetch_promoted: requirements.set.prefetch_promoted,
+            layers,
         }
     }
 
     pub fn from_available(
         requirements: &RenderRequirements,
-        available: &[DatasetResourceKey],
+        available: &[BrickKey],
     ) -> Result<Self, RenderApiError> {
         if available.len() > requirements.resources().len() {
             return Err(RenderApiError::TooManyCoveredResources {
@@ -1050,6 +1738,7 @@ impl FrameCoverage {
         let total_refinement = requirements.set.resources.total_required - total_first_useful;
         let total_prefetch =
             requirements.resources().len() as u64 - requirements.set.resources.total_required;
+        let layers = initial_frame_layer_coverage(&requirements.set.resources, &available_words);
         Ok(Self {
             frame: requirements.frame(),
             requirements: Arc::clone(&requirements.set.resources),
@@ -1061,6 +1750,7 @@ impl FrameCoverage {
             available_prefetch,
             total_prefetch,
             prefetch_promoted: requirements.set.prefetch_promoted,
+            layers,
         })
     }
 
@@ -1070,15 +1760,19 @@ impl FrameCoverage {
     pub fn with_availability_changes(
         &self,
         requirements: &RenderRequirements,
-        changes: &[(DatasetResourceKey, bool)],
+        changes: &[(BrickKey, bool)],
     ) -> Result<Self, RenderApiError> {
         if !Arc::ptr_eq(&self.requirements, &requirements.set.resources) {
             return Err(RenderApiError::CoveredResourceNotRequired);
+        }
+        if changes.is_empty() {
+            return self.rebind(requirements);
         }
         let mut words = self.available_words.to_vec();
         let mut available_first_useful = self.available_first_useful;
         let mut available_refinement = self.available_refinement;
         let mut available_prefetch = self.available_prefetch;
+        let mut layers = self.layers.to_vec();
         for (key, available) in changes {
             let Some(index) = self.requirements.body.resource_index(*key) else {
                 return Err(RenderApiError::CoveredResourceNotRequired);
@@ -1104,6 +1798,33 @@ impl FrameCoverage {
             } else {
                 *count -= 1;
             }
+            let layer_index = layers
+                .binary_search_by_key(&key.layer(), |layer| layer.layer)
+                .expect("every validated requirement layer has coverage accounting");
+            let layer = &mut layers[layer_index];
+            let prefetch = self.requirements.base_role_at(index) == RenderRequirementRole::Prefetch;
+            let layer_count = if prefetch {
+                &mut layer.available_prefetch
+            } else {
+                &mut layer.available_required
+            };
+            if *available {
+                *layer_count += 1;
+            } else {
+                *layer_count -= 1;
+            }
+            if key.scale() == layer.target_scale {
+                let target_count = if prefetch {
+                    &mut layer.available_target_prefetch
+                } else {
+                    &mut layer.available_target_required
+                };
+                if *available {
+                    *target_count += 1;
+                } else {
+                    *target_count -= 1;
+                }
+            }
         }
         Ok(Self {
             frame: requirements.frame(),
@@ -1116,6 +1837,7 @@ impl FrameCoverage {
             available_prefetch,
             total_prefetch: self.total_prefetch,
             prefetch_promoted: requirements.set.prefetch_promoted,
+            layers: layers.into(),
         })
     }
 
@@ -1181,6 +1903,55 @@ impl FrameCoverage {
         self.prefetch_promoted
     }
 
+    /// Compact per-layer facts for this exact coverage snapshot. Iteration is
+    /// proportional to visible layers, not to the requirement body.
+    pub fn layer_coverages(&self) -> impl ExactSizeIterator<Item = FrameLayerCoverage> + '_ {
+        self.layers.iter().map(|layer| {
+            let available_target = layer.available_target_required
+                + if self.prefetch_promoted {
+                    layer.available_target_prefetch
+                } else {
+                    0
+                };
+            let total_target = layer.total_target_required
+                + if self.prefetch_promoted {
+                    layer.total_target_prefetch
+                } else {
+                    0
+                };
+            let scale = if layer.fallback_scale.is_none()
+                || (total_target != 0 && available_target == total_target)
+            {
+                Some(layer.target_scale)
+            } else if available_target == 0 && layer.finest_fallback_scale == layer.fallback_scale {
+                layer.fallback_scale
+            } else {
+                None
+            };
+            FrameLayerCoverage {
+                layer: layer.layer,
+                scale,
+                target_scale: layer.target_scale,
+                finest_fallback_scale: layer.finest_fallback_scale,
+                fallback_scale: layer.fallback_scale,
+                available_target_requirements: available_target,
+                total_target_requirements: total_target,
+                available_requirements: layer.available_required
+                    + if self.prefetch_promoted {
+                        layer.available_prefetch
+                    } else {
+                        0
+                    },
+                total_requirements: layer.total_required
+                    + if self.prefetch_promoted {
+                        layer.total_prefetch
+                    } else {
+                        0
+                    },
+            }
+        })
+    }
+
     pub const fn is_first_useful(&self) -> bool {
         self.available_first_useful == self.total_first_useful
     }
@@ -1191,17 +1962,6 @@ impl FrameCoverage {
 
     pub fn fraction(&self) -> f64 {
         self.available_requirements() as f64 / self.total_requirements() as f64
-    }
-
-    fn can_replace(&self, current: &Self) -> bool {
-        self.frame == current.frame
-            && Arc::ptr_eq(&self.requirements, &current.requirements)
-            && self.prefetch_promoted == current.prefetch_promoted
-            && self
-                .available_words
-                .iter()
-                .zip(current.available_words.iter())
-                .all(|(next, previous)| next & previous == *previous)
     }
 
     pub fn rebind(&self, requirements: &RenderRequirements) -> Result<Self, RenderApiError> {
@@ -1219,6 +1979,7 @@ impl FrameCoverage {
             available_prefetch: self.available_prefetch,
             total_prefetch: self.total_prefetch,
             prefetch_promoted: requirements.set.prefetch_promoted,
+            layers: Arc::clone(&self.layers),
         })
     }
 }
@@ -1292,19 +2053,6 @@ impl FrameProgress {
             self.limitation,
         )
     }
-
-    fn can_replace(&self, current: &Self) -> bool {
-        self.coverage.can_replace(&current.coverage)
-            && completeness_rank(self.completeness) >= completeness_rank(current.completeness)
-    }
-}
-
-const fn completeness_rank(completeness: FrameCompleteness) -> u8 {
-    match completeness {
-        FrameCompleteness::Progressive => 0,
-        FrameCompleteness::Complete => 1,
-        FrameCompleteness::Exact => 2,
-    }
 }
 
 /// The sole categories to which large production GPU allocations are charged.
@@ -1313,51 +2061,34 @@ pub enum GpuLedgerCategory {
     PayloadResidency,
     TransferStaging,
     DisplayTarget,
-    PageTable,
+    ControlAndResidencyMetadata,
     Scratch,
 }
 
-/// A framework-neutral identifier for a renderer-owned presentation resource.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PresentationToken(u64);
-
-impl PresentationToken {
-    pub fn new(value: u64) -> Result<Self, RenderApiError> {
-        if value == 0 {
-            return Err(RenderApiError::InvalidPresentationToken);
-        }
-        Ok(Self(value))
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
 /// The current renderer-owned frame facts safe to carry in an application
-/// snapshot. The token never transfers ownership of the backend resource.
+/// snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresentedFrame {
-    token: PresentationToken,
+    target: PresentationTarget,
     extent: RenderExtent,
     progress: FrameProgress,
 }
 
 impl PresentedFrame {
     pub const fn new(
-        token: PresentationToken,
+        target: PresentationTarget,
         extent: RenderExtent,
         progress: FrameProgress,
     ) -> Self {
         Self {
-            token,
+            target,
             extent,
             progress,
         }
     }
 
-    pub const fn token(&self) -> PresentationToken {
-        self.token
+    pub const fn target(&self) -> PresentationTarget {
+        self.target
     }
 
     pub fn frame(&self) -> FrameIdentity {
@@ -1415,14 +2146,14 @@ pub enum VolumePickValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct VolumePickTicket {
     sequence: u64,
-    presentation: PresentationToken,
+    target: PresentationTarget,
     frame: FrameIdentity,
 }
 
 impl VolumePickTicket {
     pub fn new(
         sequence: u64,
-        presentation: PresentationToken,
+        target: PresentationTarget,
         frame: FrameIdentity,
     ) -> Result<Self, RenderApiError> {
         if sequence == 0 {
@@ -1430,7 +2161,7 @@ impl VolumePickTicket {
         }
         Ok(Self {
             sequence,
-            presentation,
+            target,
             frame,
         })
     }
@@ -1439,8 +2170,8 @@ impl VolumePickTicket {
         self.sequence
     }
 
-    pub const fn presentation(self) -> PresentationToken {
-        self.presentation
+    pub const fn target(self) -> PresentationTarget {
+        self.target
     }
 
     pub const fn frame(self) -> FrameIdentity {
@@ -1452,7 +2183,7 @@ impl VolumePickTicket {
 /// timepoint, and active layer from which it was requested.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VolumePickQuery {
-    token: PresentationToken,
+    target: PresentationTarget,
     frame: FrameIdentity,
     extent: RenderExtent,
     timepoint: TimeIndex,
@@ -1481,7 +2212,7 @@ impl VolumePickQuery {
             return Err(RenderApiError::PickPixelOutsideExtent);
         }
         Ok(Self {
-            token: presented.token(),
+            target: presented.target(),
             frame: presented.frame(),
             extent,
             timepoint,
@@ -1491,8 +2222,8 @@ impl VolumePickQuery {
         })
     }
 
-    pub const fn token(self) -> PresentationToken {
-        self.token
+    pub const fn target(self) -> PresentationTarget {
+        self.target
     }
 
     pub const fn frame(self) -> FrameIdentity {
@@ -1628,181 +2359,24 @@ impl VolumePickResult {
     }
 }
 
-/// Registers one opaque presentation resource retained by the renderer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PresentationRegistration {
-    token: PresentationToken,
-    extent: RenderExtent,
-}
-
-impl PresentationRegistration {
-    pub const fn new(token: PresentationToken, extent: RenderExtent) -> Self {
-        Self { token, extent }
-    }
-
-    pub const fn token(self) -> PresentationToken {
-        self.token
-    }
-
-    pub const fn extent(self) -> RenderExtent {
-        self.extent
-    }
-}
-
-/// Publishes a current frame for an already registered presentation token.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PresentationUpdate(PresentedFrame);
-
-impl PresentationUpdate {
-    pub const fn new(frame: PresentedFrame) -> Self {
-        Self(frame)
-    }
-
-    pub const fn frame(&self) -> &PresentedFrame {
-        &self.0
-    }
-
-    pub const fn token(&self) -> PresentationToken {
-        self.0.token()
-    }
-
-    fn into_frame(self) -> PresentedFrame {
-        self.0
-    }
-}
-
-/// Retires the renderer-owned resource associated with an opaque token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PresentationRetirement(PresentationToken);
-
-impl PresentationRetirement {
-    pub const fn new(token: PresentationToken) -> Self {
-        Self(token)
-    }
-
-    pub const fn token(self) -> PresentationToken {
-        self.0
-    }
-}
-
-/// A UI-originated request to paint a registered token in logical points.
+/// A UI-originated request to paint one fixed target in logical points.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PresentationPaintRequest {
-    token: PresentationToken,
+    target: PresentationTarget,
     viewport: PresentationViewport,
 }
 
 impl PresentationPaintRequest {
-    pub const fn new(token: PresentationToken, viewport: PresentationViewport) -> Self {
-        Self { token, viewport }
+    pub const fn new(target: PresentationTarget, viewport: PresentationViewport) -> Self {
+        Self { target, viewport }
     }
 
-    pub const fn token(self) -> PresentationToken {
-        self.token
+    pub const fn target(self) -> PresentationTarget {
+        self.target
     }
 
     pub const fn viewport(self) -> PresentationViewport {
         self.viewport
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RegisteredPresentation {
-    extent: RenderExtent,
-    frame: Option<PresentedFrame>,
-}
-
-/// Backend-neutral lifecycle authority for opaque presentation tokens.
-///
-/// This registry retains only validated scalar metadata. A render backend
-/// remains the sole owner of textures and other presentation resources and
-/// applies the same accepted register/update/retire operations to them.
-#[derive(Debug, Default)]
-pub struct PresentationRegistry {
-    entries: BTreeMap<PresentationToken, RegisteredPresentation>,
-}
-
-impl PresentationRegistry {
-    pub const fn new() -> Self {
-        Self {
-            entries: BTreeMap::new(),
-        }
-    }
-
-    pub fn register(&mut self, registration: PresentationRegistration) -> Result<(), RenderFault> {
-        if self.entries.contains_key(&registration.token()) {
-            return Err(RenderFault::PresentationAlreadyRegistered {
-                token: registration.token(),
-            });
-        }
-        if self.entries.len() >= MAX_PRESENTATION_TARGETS {
-            return Err(RenderFault::PresentationCapacityExceeded {
-                maximum: MAX_PRESENTATION_TARGETS,
-            });
-        }
-        self.entries.insert(
-            registration.token(),
-            RegisteredPresentation {
-                extent: registration.extent(),
-                frame: None,
-            },
-        );
-        Ok(())
-    }
-
-    pub fn update(&mut self, update: PresentationUpdate) -> Result<(), RenderFault> {
-        let token = update.token();
-        let entry = self
-            .entries
-            .get_mut(&token)
-            .ok_or(RenderFault::PresentationNotRegistered { token })?;
-        let next = update.into_frame();
-        if let Some(current) = entry.frame.as_ref() {
-            if next.frame() < current.frame() {
-                return Err(RenderFault::StaleFrame {
-                    actual: next.frame(),
-                    current: current.frame(),
-                });
-            }
-            if next.frame() == current.frame() && !next.progress().can_replace(current.progress()) {
-                return Err(RenderFault::FrameProgressRegressed {
-                    frame: next.frame(),
-                });
-            }
-        }
-        entry.extent = next.extent();
-        entry.frame = Some(next);
-        Ok(())
-    }
-
-    pub fn retire(&mut self, retirement: PresentationRetirement) -> Result<(), RenderFault> {
-        let token = retirement.token();
-        self.entries
-            .remove(&token)
-            .map(|_| ())
-            .ok_or(RenderFault::PresentationNotRegistered { token })
-    }
-
-    /// Resolves the current metadata for a paint request without exposing or
-    /// transferring the renderer-owned presentation resource.
-    pub fn resolve_paint(
-        &self,
-        request: PresentationPaintRequest,
-    ) -> Result<Option<PresentedFrame>, RenderFault> {
-        self.entries
-            .get(&request.token())
-            .map(|entry| entry.frame.clone())
-            .ok_or(RenderFault::PresentationNotRegistered {
-                token: request.token(),
-            })
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 }
 
@@ -1822,20 +2396,7 @@ pub enum RenderFault {
         available_bytes: u64,
     },
     #[error("a required semantic dataset resource is unavailable")]
-    ResourceUnavailable { key: DatasetResourceKey },
-    #[error("presentation token {token:?} is already registered")]
-    PresentationAlreadyRegistered { token: PresentationToken },
-    #[error("presentation registry reached its limit of {maximum} targets")]
-    PresentationCapacityExceeded { maximum: usize },
-    #[error("presentation token {token:?} is not registered")]
-    PresentationNotRegistered { token: PresentationToken },
-    #[error("render result {actual:?} is stale; the current frame is {current:?}")]
-    StaleFrame {
-        actual: FrameIdentity,
-        current: FrameIdentity,
-    },
-    #[error("progress for current frame {frame:?} regressed")]
-    FrameProgressRegressed { frame: FrameIdentity },
+    ResourceUnavailable { key: BrickKey },
     #[error("the render runtime is shutting down")]
     ShuttingDown,
 }
@@ -2243,6 +2804,70 @@ mod tests {
 
     const EPSILON: f64 = 1.0e-12;
 
+    #[test]
+    fn canonical_frame_and_presentation_identities_have_fixed_initial_projection() {
+        assert_eq!(FrameIdentity::initial(), FrameIdentity::new(0));
+        assert_eq!(
+            PresentationTarget::ALL.map(PresentationTarget::index),
+            [0, 1, 2, 3]
+        );
+        assert!(!PresentationTarget::ThreeD.is_cross_section());
+        assert!(
+            [
+                PresentationTarget::Xy,
+                PresentationTarget::Xz,
+                PresentationTarget::Yz
+            ]
+            .into_iter()
+            .all(PresentationTarget::is_cross_section)
+        );
+    }
+
+    #[test]
+    fn shader_control_affine_rows_have_exact_values_and_typed_failures() {
+        let transform = GridToWorld::from_row_major([
+            1.0, 2.0, 0.0, 5.0, 0.0, 1.0, 0.0, 6.0, 0.0, 0.0, 2.0, 8.0, 0.0, 0.0, 0.0, 1.0,
+        ])
+        .unwrap();
+        let rows = shader_control_world_to_grid_rows(transform).unwrap();
+        assert_eq!(
+            rows.map(|row| row.map(f32::to_bits)),
+            [
+                [1.0_f32, -2.0, 0.0, 7.0].map(f32::to_bits),
+                [0.0_f32, 1.0, 0.0, -6.0].map(f32::to_bits),
+                [0.0_f32, 0.0, 0.5, -4.0].map(f32::to_bits),
+            ]
+        );
+
+        assert_eq!(
+            shader_control_world_to_grid_rows(GridToWorld::scale(1.0, 0.0, 1.0).unwrap()),
+            Err(ShaderControlAffineError::NonInvertible)
+        );
+        let unrepresentable = GridToWorld::from_row_major([
+            1.0,
+            0.0,
+            0.0,
+            f64::MAX,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ])
+        .unwrap();
+        assert_eq!(
+            shader_control_world_to_grid_rows(unrepresentable),
+            Err(ShaderControlAffineError::NotRepresentable)
+        );
+    }
+
     struct TestCharge(u64);
 
     impl CpuByteLease for TestCharge {
@@ -2324,7 +2949,7 @@ mod tests {
         )
     }
 
-    fn resource_key(x: u64) -> DatasetResourceKey {
+    fn resource_key(x: u64) -> BrickKey {
         resource_key_at(3, 5, x)
     }
 
@@ -2336,12 +2961,16 @@ mod tests {
         )
     }
 
-    fn resource_key_at(layer: u32, timepoint: u64, x: u64) -> DatasetResourceKey {
-        DatasetResourceKey::new(
+    fn resource_key_at(layer: u32, timepoint: u64, x: u64) -> BrickKey {
+        resource_key_at_scale(layer, timepoint, ScaleLevel::new(1), x)
+    }
+
+    fn resource_key_at_scale(layer: u32, timepoint: u64, scale: ScaleLevel, x: u64) -> BrickKey {
+        BrickKey::new(
             resource_identity(),
             LogicalLayerKey::new(layer),
             TimeIndex::new(timepoint),
-            ScaleLevel::new(1),
+            scale,
             ResourceRegion::new([0, 0, x], Shape3D::new(1, 1, 1).unwrap()).unwrap(),
         )
     }
@@ -2354,6 +2983,22 @@ mod tests {
             RenderViewIntent::volume(
                 camera(Projection::Orthographic).view(),
                 IsoLightState::attached_camera(),
+            ),
+            PresentationViewport::new(800.0, 600.0).unwrap(),
+            RenderExtent::new(1600, 1200).unwrap(),
+            vec![layer(3)],
+        )
+        .unwrap()
+    }
+
+    fn plane_requirements_intent(frame: u64) -> RenderIntent {
+        RenderIntent::new(
+            FrameIdentity::new(frame),
+            resource_identity(),
+            TimeIndex::new(5),
+            RenderViewIntent::cross_section(
+                CrossSectionView::new(WorldPoint3::origin(), UnitQuaternion::identity(), 1.0, 1.0)
+                    .unwrap(),
             ),
             PresentationViewport::new(800.0, 600.0).unwrap(),
             RenderExtent::new(1600, 1200).unwrap(),
@@ -2375,7 +3020,7 @@ mod tests {
         .unwrap();
         let coverage = FrameCoverage::from_available(&requirements, &[key]).unwrap();
         let progress = FrameProgress::new(coverage, FrameCompleteness::Exact, None).unwrap();
-        PresentedFrame::new(PresentationToken::new(9).unwrap(), extent, progress)
+        PresentedFrame::new(PresentationTarget::ThreeD, extent, progress)
     }
 
     #[test]
@@ -2436,7 +3081,7 @@ mod tests {
             VolumePickPolicy::MipArgmax,
         )
         .unwrap();
-        assert_eq!(query.token(), presented.token());
+        assert_eq!(query.target(), presented.target());
         assert_eq!(query.frame(), FrameIdentity::new(17));
         assert_eq!(query.extent(), RenderExtent::new(640, 360).unwrap());
         assert_eq!(query.timepoint(), TimeIndex::new(5));
@@ -2547,7 +3192,7 @@ mod tests {
             RenderRequirements::new(
                 &intent,
                 vec![RenderRequirement::new(
-                    DatasetResourceKey::new(
+                    BrickKey::new(
                         DatasetResourceIdentity::Unverified(DatasetSourceId::new(99)),
                         LogicalLayerKey::new(3),
                         TimeIndex::new(5),
@@ -2602,8 +3247,8 @@ mod tests {
 
     #[test]
     fn prepared_requirement_authority_shares_exact_bodies_and_has_linear_host_bound() {
-        let canonical: Arc<[DatasetResourceKey]> = Arc::from([resource_key(0), resource_key(1)]);
-        let ranked: Arc<[DatasetResourceKey]> = Arc::from([resource_key(1), resource_key(0)]);
+        let canonical: Arc<[BrickKey]> = Arc::from([resource_key(0), resource_key(1)]);
+        let ranked: Arc<[BrickKey]> = Arc::from([resource_key(1), resource_key(0)]);
         let body =
             PreparedResourceBody::new(Arc::clone(&canonical), Arc::clone(&ranked), None).unwrap();
         assert!(Arc::ptr_eq(body.canonical(), &canonical));
@@ -2612,10 +3257,9 @@ mod tests {
         assert_eq!(body.resource_index(resource_key(0)), Some(0));
         assert_eq!(body.resource_index(resource_key(1)), Some(1));
 
-        let key_bytes = u64::try_from(
-            (canonical.len() + ranked.len()) * std::mem::size_of::<DatasetResourceKey>(),
-        )
-        .unwrap();
+        let key_bytes =
+            u64::try_from((canonical.len() + ranked.len()) * std::mem::size_of::<BrickKey>())
+                .unwrap();
         assert!(body.host_allocation_bytes() >= key_bytes);
         assert!(
             body.host_allocation_bytes()
@@ -2639,6 +3283,7 @@ mod tests {
         )
         .unwrap();
         let bound = prepared.bind(&requirements_intent(12)).unwrap();
+        assert!(prepared.shares_resources_with(&bound));
         assert!(bound.prepared_body().shares_storage_with(&body));
         let requirements = bound.resources().collect::<Vec<_>>();
         assert_eq!(requirements[0].key(), resource_key(0));
@@ -2684,6 +3329,11 @@ mod tests {
         assert_eq!(current_coverage.fraction(), 1.0);
         assert_eq!(current_coverage.available_prefetch(), 0);
         assert_eq!(current_coverage.total_prefetch(), 1);
+        let current_layer = current_coverage.layer_coverages().next().unwrap();
+        assert_eq!(current_layer.layer(), LogicalLayerKey::new(3));
+        assert_eq!(current_layer.scale(), Some(ScaleLevel::new(1)));
+        assert_eq!(current_layer.available_requirements(), 2);
+        assert_eq!(current_layer.total_requirements(), 2);
 
         let promoted_prepared = prepared.promote_prefetch();
         assert_eq!(promoted_prepared.required_prefix_len(), 3);
@@ -2697,12 +3347,212 @@ mod tests {
         assert!(!promoted_coverage.is_full());
         assert_eq!(promoted_coverage.available_requirements(), 2);
         assert_eq!(promoted_coverage.total_requirements(), 3);
+        let promoted_layer = promoted_coverage.layer_coverages().next().unwrap();
+        assert_eq!(promoted_layer.available_requirements(), 2);
+        assert_eq!(promoted_layer.total_requirements(), 3);
 
         let full = promoted_coverage
             .with_availability_changes(&promoted, &[(guard, true)])
             .unwrap();
         assert!(full.is_full());
         assert_eq!(full.fraction(), 1.0);
+        assert_eq!(
+            full.layer_coverages()
+                .next()
+                .unwrap()
+                .available_requirements(),
+            3
+        );
+    }
+
+    #[test]
+    fn dormant_multiscale_residency_suffix_never_changes_uniform_volume_coverage() {
+        let layer = LogicalLayerKey::new(3);
+        let terminal = resource_key_at_scale(3, 5, ScaleLevel::new(3), 0);
+        let finer = resource_key_at_scale(3, 5, ScaleLevel::new(2), 0);
+        let body = PreparedResourceBody::new(
+            Arc::from([finer, terminal]),
+            Arc::from([terminal, finer]),
+            None,
+        )
+        .unwrap();
+        let chain = RenderLayerScaleChain::new(layer, vec![ScaleLevel::new(3)]).unwrap();
+        assert_eq!(
+            PreparedRenderRequirements::new_with_required_prefix_and_scale_chains(
+                resource_identity(),
+                TimeIndex::new(5),
+                vec![layer],
+                vec![chain.clone()],
+                body.clone(),
+                1,
+                1,
+            ),
+            Err(RenderApiError::InvalidRenderScaleChain),
+            "ordinary promotable prefetch must remain inside its render chain"
+        );
+
+        let prepared =
+            PreparedRenderRequirements::new_with_dormant_residency_suffix_and_scale_chains(
+                resource_identity(),
+                TimeIndex::new(5),
+                vec![layer],
+                vec![chain],
+                body,
+                1,
+                1,
+            )
+            .unwrap();
+        let bound = prepared.bind(&requirements_intent(31)).unwrap();
+        assert_eq!(
+            bound.scale_chain(layer).unwrap().target(),
+            ScaleLevel::new(3)
+        );
+        assert_eq!(
+            bound
+                .requirement(bound.resource_index(finer).unwrap())
+                .unwrap()
+                .role(),
+            RenderRequirementRole::Prefetch
+        );
+        let coverage = FrameCoverage::from_available(&bound, &[terminal]).unwrap();
+        assert!(coverage.is_full());
+        assert_eq!(
+            coverage.layer_coverages().next().unwrap().scale(),
+            Some(ScaleLevel::new(3))
+        );
+
+        let promoted = prepared.promote_prefetch();
+        assert!(!promoted.prefetch_promoted());
+        assert_eq!(promoted.required_prefix_len(), 1);
+        let rebound = promoted.bind(&requirements_intent(32)).unwrap();
+        assert_eq!(
+            rebound
+                .requirement(rebound.resource_index(finer).unwrap())
+                .unwrap()
+                .role(),
+            RenderRequirementRole::Prefetch
+        );
+    }
+
+    #[test]
+    fn multiscale_layer_coverage_distinguishes_fallback_mixed_and_target() {
+        let layer = LogicalLayerKey::new(3);
+        let target_a = resource_key_at_scale(3, 5, ScaleLevel::new(1), 0);
+        let target_b = resource_key_at_scale(3, 5, ScaleLevel::new(1), 1);
+        let floor = resource_key_at_scale(3, 5, ScaleLevel::new(3), 0);
+        let body = PreparedResourceBody::new(
+            Arc::from([target_a, target_b, floor]),
+            Arc::from([floor, target_a, target_b]),
+            None,
+        )
+        .unwrap();
+        let prepared = PreparedRenderRequirements::new_with_required_prefix_and_scale_chains(
+            resource_identity(),
+            TimeIndex::new(5),
+            vec![layer],
+            vec![
+                RenderLayerScaleChain::new(
+                    layer,
+                    vec![ScaleLevel::new(1), ScaleLevel::new(2), ScaleLevel::new(3)],
+                )
+                .unwrap(),
+            ],
+            body.clone(),
+            1,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.bind(&requirements_intent(22)),
+            Err(RenderApiError::InvalidRenderScaleChain)
+        );
+        let requirements = prepared.bind(&plane_requirements_intent(22)).unwrap();
+
+        let fallback = FrameCoverage::from_available(&requirements, &[floor]).unwrap();
+        let fallback_layer = fallback.layer_coverages().next().unwrap();
+        assert_eq!(fallback_layer.target_scale(), ScaleLevel::new(1));
+        assert_eq!(
+            fallback_layer.finest_fallback_scale(),
+            Some(ScaleLevel::new(2))
+        );
+        assert_eq!(fallback_layer.fallback_scale(), Some(ScaleLevel::new(3)));
+        assert_eq!(fallback_layer.scale(), None);
+        assert_eq!(
+            fallback_layer.fallback_range(),
+            Some((ScaleLevel::new(2), ScaleLevel::new(3)))
+        );
+        assert!(!fallback_layer.is_mixed());
+        assert_eq!(fallback_layer.available_target_requirements(), 0);
+        assert_eq!(fallback_layer.total_target_requirements(), 2);
+        assert!(fallback.is_first_useful());
+        assert!(!fallback.is_full());
+
+        let mixed = fallback
+            .with_availability_changes(&requirements, &[(target_a, true)])
+            .unwrap();
+        let mixed_layer = mixed.layer_coverages().next().unwrap();
+        assert_eq!(mixed_layer.scale(), None);
+        assert!(mixed_layer.is_mixed());
+        assert_eq!(mixed_layer.available_target_requirements(), 1);
+        assert_eq!(mixed_layer.total_target_requirements(), 2);
+
+        let target = mixed
+            .with_availability_changes(&requirements, &[(target_b, true)])
+            .unwrap();
+        let target_layer = target.layer_coverages().next().unwrap();
+        assert_eq!(target_layer.scale(), Some(ScaleLevel::new(1)));
+        assert!(!target_layer.is_mixed());
+        assert_eq!(target_layer.available_target_requirements(), 2);
+        assert!(target.is_full());
+
+        let single_fallback =
+            PreparedRenderRequirements::new_with_required_prefix_and_scale_chains(
+                resource_identity(),
+                TimeIndex::new(5),
+                vec![layer],
+                vec![
+                    RenderLayerScaleChain::new(layer, vec![ScaleLevel::new(1), ScaleLevel::new(3)])
+                        .unwrap(),
+                ],
+                body,
+                1,
+                3,
+            )
+            .unwrap()
+            .bind(&plane_requirements_intent(23))
+            .unwrap();
+        let uniform_floor = FrameCoverage::from_available(&single_fallback, &[floor]).unwrap();
+        let uniform_floor_layer = uniform_floor.layer_coverages().next().unwrap();
+        assert_eq!(uniform_floor_layer.scale(), Some(ScaleLevel::new(3)));
+        assert_eq!(uniform_floor_layer.fallback_range(), None);
+    }
+
+    #[test]
+    fn scale_chains_are_target_first_strict_and_cover_every_layer() {
+        let layer = LogicalLayerKey::new(3);
+        assert_eq!(
+            RenderLayerScaleChain::new(layer, vec![ScaleLevel::new(1), ScaleLevel::new(1)]),
+            Err(RenderApiError::InvalidRenderScaleChain)
+        );
+        assert_eq!(
+            RenderLayerScaleChain::new(layer, vec![ScaleLevel::new(2), ScaleLevel::new(1)]),
+            Err(RenderApiError::InvalidRenderScaleChain)
+        );
+
+        let key = resource_key_at_scale(3, 5, ScaleLevel::new(1), 0);
+        let body = PreparedResourceBody::new(Arc::from([key]), Arc::from([key]), None).unwrap();
+        assert_eq!(
+            PreparedRenderRequirements::new_with_required_prefix_and_scale_chains(
+                resource_identity(),
+                TimeIndex::new(5),
+                vec![layer],
+                Vec::new(),
+                body,
+                1,
+                1,
+            ),
+            Err(RenderApiError::InvalidRenderScaleChain)
+        );
     }
 
     #[test]
@@ -2794,189 +3644,22 @@ mod tests {
     }
 
     #[test]
-    fn presentation_lifecycle_carries_only_opaque_identity_and_frame_facts() {
-        assert_eq!(
-            PresentationToken::new(0),
-            Err(RenderApiError::InvalidPresentationToken)
-        );
-        let token = PresentationToken::new(17).unwrap();
-        let extent = RenderExtent::new(640, 480).unwrap();
-        let registration = PresentationRegistration::new(token, extent);
-        let viewport = PresentationViewport::new(320.0, 240.0).unwrap();
-        let paint = PresentationPaintRequest::new(token, viewport);
-
-        let first = resource_key(0);
-        let refinement_a = resource_key(1);
-        let refinement_b = resource_key(2);
-        let alternate_a = resource_key(3);
-        let alternate_b = resource_key(4);
-        let requirements = |frame, refinements: [DatasetResourceKey; 2]| {
-            let intent = requirements_intent(frame);
-            RenderRequirements::new(
-                &intent,
-                vec![
-                    RenderRequirement::new(first, RenderRequirementRole::FirstUsefulFrame),
-                    RenderRequirement::new(refinements[0], RenderRequirementRole::Refinement),
-                    RenderRequirement::new(refinements[1], RenderRequirementRole::Refinement),
-                ],
-            )
-            .unwrap()
-        };
-        let current_requirements = requirements(8, [refinement_a, refinement_b]);
-        let alternate_requirements = requirements(8, [alternate_a, alternate_b]);
-        let stale_requirements = requirements(7, [refinement_a, refinement_b]);
-        let progress =
-            |requirements: &RenderRequirements, available: &[DatasetResourceKey], completeness| {
-                FrameProgress::new(
-                    FrameCoverage::from_available(requirements, available).unwrap(),
-                    completeness,
-                    None,
-                )
-                .unwrap()
-            };
-
-        let mut registry = PresentationRegistry::new();
-        assert!(registry.is_empty());
-        registry.register(registration).unwrap();
-        assert_eq!(registry.len(), 1);
-        assert_eq!(registry.resolve_paint(paint).unwrap(), None);
-        assert_eq!(
-            registry.register(registration),
-            Err(RenderFault::PresentationAlreadyRegistered { token })
-        );
-
-        let mut bounded = PresentationRegistry::new();
-        for value in 1..=MAX_PRESENTATION_TARGETS {
-            bounded
-                .register(PresentationRegistration::new(
-                    PresentationToken::new(u64::try_from(value).unwrap()).unwrap(),
-                    extent,
-                ))
-                .unwrap();
-        }
-        assert_eq!(
-            bounded.register(PresentationRegistration::new(
-                PresentationToken::new(u64::try_from(MAX_PRESENTATION_TARGETS + 1).unwrap())
-                    .unwrap(),
-                extent,
-            )),
-            Err(RenderFault::PresentationCapacityExceeded {
-                maximum: MAX_PRESENTATION_TARGETS,
-            })
-        );
-
-        let partial_frame = PresentedFrame::new(
-            token,
-            extent,
-            progress(
-                &current_requirements,
-                &[first, refinement_a],
-                FrameCompleteness::Progressive,
-            ),
-        );
-        registry
-            .update(PresentationUpdate::new(partial_frame.clone()))
-            .unwrap();
-        assert_eq!(
-            registry.resolve_paint(paint).unwrap(),
-            Some(partial_frame.clone())
-        );
-
-        let swapped_same_set = PresentedFrame::new(
-            token,
-            extent,
-            progress(
-                &current_requirements,
-                &[first, refinement_b],
-                FrameCompleteness::Progressive,
-            ),
-        );
-        assert_eq!(
-            registry.update(PresentationUpdate::new(swapped_same_set)),
-            Err(RenderFault::FrameProgressRegressed {
-                frame: FrameIdentity::new(8)
-            })
-        );
-
-        let crossed_requirement_set = PresentedFrame::new(
-            token,
-            extent,
-            progress(
-                &alternate_requirements,
-                &[first, alternate_a],
-                FrameCompleteness::Progressive,
-            ),
-        );
-        assert_eq!(
-            registry.update(PresentationUpdate::new(crossed_requirement_set)),
-            Err(RenderFault::FrameProgressRegressed {
-                frame: FrameIdentity::new(8)
-            })
-        );
-
-        let exact_frame = PresentedFrame::new(
-            token,
-            extent,
-            progress(
-                &current_requirements,
-                &[first, refinement_a, refinement_b],
-                FrameCompleteness::Exact,
-            ),
-        );
-        registry
-            .update(PresentationUpdate::new(exact_frame.clone()))
-            .unwrap();
-        assert_eq!(registry.resolve_paint(paint).unwrap(), Some(exact_frame));
-        assert_eq!(
-            registry.update(PresentationUpdate::new(partial_frame)),
-            Err(RenderFault::FrameProgressRegressed {
-                frame: FrameIdentity::new(8)
-            })
-        );
-
-        let stale = PresentedFrame::new(
-            token,
-            extent,
-            progress(
-                &stale_requirements,
-                &[first, refinement_a, refinement_b],
-                FrameCompleteness::Exact,
-            ),
-        );
-        assert_eq!(
-            registry.update(PresentationUpdate::new(stale)),
-            Err(RenderFault::StaleFrame {
-                actual: FrameIdentity::new(7),
-                current: FrameIdentity::new(8),
-            })
-        );
-
-        registry.retire(PresentationRetirement::new(token)).unwrap();
-        assert!(registry.is_empty());
-        assert_eq!(
-            registry.resolve_paint(paint),
-            Err(RenderFault::PresentationNotRegistered { token })
-        );
-    }
-
-    #[test]
     fn volume_pick_ticket_rejects_zero_and_preserves_frame_identity() {
-        let presentation = PresentationToken::new(17).unwrap();
+        let target = PresentationTarget::ThreeD;
         let frame = FrameIdentity::new(23);
         assert_eq!(
-            VolumePickTicket::new(0, presentation, frame),
+            VolumePickTicket::new(0, target, frame),
             Err(RenderApiError::InvalidVolumePickTicket)
         );
 
-        let ticket = VolumePickTicket::new(41, presentation, frame).unwrap();
+        let ticket = VolumePickTicket::new(41, target, frame).unwrap();
         assert_eq!(ticket.sequence(), 41);
-        assert_eq!(ticket.presentation(), presentation);
+        assert_eq!(ticket.target(), target);
         assert_eq!(ticket.frame(), frame);
     }
 
     #[test]
     fn render_faults_are_typed_and_backend_neutral() {
-        let token = PresentationToken::new(2).unwrap();
         assert!(matches!(
             RenderFault::CapacityExceeded {
                 category: GpuLedgerCategory::PayloadResidency,
@@ -2989,10 +3672,6 @@ mod tests {
                 available_bytes: 4,
             }
         ));
-        assert_eq!(
-            RenderFault::PresentationNotRegistered { token },
-            RenderFault::PresentationNotRegistered { token }
-        );
         assert_eq!(
             RenderFault::ResourceUnavailable {
                 key: resource_key(9)

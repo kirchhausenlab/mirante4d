@@ -5,51 +5,455 @@
 
 #![forbid(unsafe_code)]
 
+mod global_residency;
 mod runtime;
-
-pub use runtime::{
-    MAX_INCREMENTAL_STATIC_KEY_CHANGES, PreparedStaticPresentationLayout,
-    StaticPresentationLayoutPreflight, preflight_static_presentation_layout,
-    preflight_static_presentation_layout_update, prepare_static_presentation_layout,
-    prepare_static_presentation_layout_update,
-};
 
 use std::sync::Arc;
 
-use mirante4d_dataset::{
-    DatasetCatalog, DatasetResourceKey, ResourceLease, ResourcePayloadDescriptor,
-};
+use mirante4d_dataset::{BrickKey, DatasetCatalog, ResourceLease, ResourcePayloadDescriptor};
+#[cfg(test)]
+use mirante4d_render_api::RenderResourceGridCatalog;
 use mirante4d_render_api::{
-    FrameIdentity, FrameProgress, GpuLedgerCategory, PresentationRegistration,
-    PresentationRetirement, PresentationToken, PresentedFrame, RenderExtent, RenderExtentEnvelope,
-    RenderIntent, RenderPassKind, RenderRequirements, VolumePickQuery, VolumePickResult,
-    VolumePickTicket,
+    FrameIdentity, FrameProgress, GpuLedgerCategory, PreparedRenderRequirements,
+    PresentationTarget, RenderExtent, RenderExtentEnvelope, RenderIntent, RenderPassKind,
+    RenderRequirements, VolumePickQuery, VolumePickResult, VolumePickTicket,
 };
 use thiserror::Error;
 
-const MAX_VISITS: usize = mirante4d_render_api::MAX_RENDER_REQUIREMENTS;
 // 512 x 16-KiB tiles saturate the 8-MiB byte envelope in one submission.
 // A count guard remains to avoid pathological command-buffer fan-out for
 // tiny payloads without throttling normal 2D brick streams to 128 KiB/frame.
 const MAX_UPLOADS: usize = 512;
 const MAX_PAYLOAD_UPLOAD_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CONTROL_UPLOAD_BYTES: u64 = 8 * 1024 * 1024;
-const UNKNOWN_GPU_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
-
 pub const MAX_RENDER_WIDTH_PIXELS: u32 = 1_920;
 pub const MAX_RENDER_HEIGHT_PIXELS: u32 = 1_080;
 
 /// Controls when retained residency progress produces a volume pass.
 ///
-/// Both policies use the same upload arena, page-table authority, and frame
-/// transaction. `ExactFrameOnly` is for hidden atomic refinement: incomplete
-/// cohorts become resident without raymarching pixels that cannot be shown,
-/// and the cohort that completes exact coverage renders once in the same GPU
-/// submission.
+/// Both policies use the same upload arena, global residency/control metadata,
+/// and frame transaction. `ExactFrameOnly` is for hidden atomic refinement:
+/// incomplete cohorts become resident without raymarching pixels that cannot
+/// be shown, and the cohort that completes exact coverage renders once in the
+/// same GPU submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetainedFrameRenderPolicy {
     EveryUsefulFrame,
     ExactFrameOnly,
+}
+
+/// Scheduling policy for one coordinated 3D color request.
+///
+/// `InteractivePreview` renders a complete provisional volume at the physical
+/// `output_extent`. Reduced internal preview extents are not supported.
+/// `AtomicRefinement` renders the exact native-size private candidate in
+/// bounded horizontal strips; partial strips never become visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeColorSchedule {
+    Direct,
+    InteractivePreview,
+    AtomicRefinement { strip_height_pixels: u32 },
+}
+
+/// Hidden exact-volume construction progress for one coordinated cutoff.
+///
+/// The historically named fields now carry completed and total screen rows,
+/// not dataset resources or visible presentation frames. A report with
+/// `completed_strips < total_strips` must also report `presented == false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeRefinementProgress {
+    completed_strips: u32,
+    total_strips: u32,
+}
+
+impl VolumeRefinementProgress {
+    const fn new(completed_strips: u32, total_strips: u32) -> Self {
+        Self {
+            completed_strips,
+            total_strips,
+        }
+    }
+
+    pub const fn completed_strips(self) -> u32 {
+        self.completed_strips
+    }
+
+    pub const fn total_strips(self) -> u32 {
+        self.total_strips
+    }
+
+    pub const fn is_complete(self) -> bool {
+        self.completed_strips == self.total_strips
+    }
+}
+
+/// Monotone identity of one renderer-owned logical target texture allocation.
+///
+/// The value changes only when the renderer replaces the allocation backing a
+/// fixed coordinated target. Presentation code can therefore refresh its
+/// borrowed texture registration without owning allocation policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TargetTextureRevision(u64);
+
+impl TargetTextureRevision {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Generation of the renderer-owned WGPU device authority.
+///
+/// Mirante4D does not recover a failed device in place. A generation is
+/// therefore stable for one runtime and changes only with construction of a
+/// replacement renderer root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RendererDeviceGeneration(u64);
+
+impl RendererDeviceGeneration {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Desired physical allocation for one fixed logical presentation target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordinatedTargetLayout {
+    target: PresentationTarget,
+    extent: RenderExtent,
+}
+
+impl CoordinatedTargetLayout {
+    pub const fn new(target: PresentationTarget, extent: RenderExtent) -> Self {
+        Self { target, extent }
+    }
+
+    pub const fn target(self) -> PresentationTarget {
+        self.target
+    }
+
+    pub const fn extent(self) -> RenderExtent {
+        self.extent
+    }
+}
+
+/// Current renderer-owned allocation for one desired logical target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordinatedTargetLayoutState {
+    target: PresentationTarget,
+    extent: RenderExtent,
+    device_generation: RendererDeviceGeneration,
+    texture_revision: TargetTextureRevision,
+}
+
+impl CoordinatedTargetLayoutState {
+    pub const fn target(self) -> PresentationTarget {
+        self.target
+    }
+
+    pub const fn extent(self) -> RenderExtent {
+        self.extent
+    }
+
+    pub const fn device_generation(self) -> RendererDeviceGeneration {
+        self.device_generation
+    }
+
+    pub const fn texture_revision(self) -> TargetTextureRevision {
+        self.texture_revision
+    }
+}
+
+/// Exact fixed-target result of one desired-layout request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatedLayoutReport {
+    targets: Box<[CoordinatedTargetLayoutState]>,
+}
+
+impl CoordinatedLayoutReport {
+    pub fn targets(&self) -> &[CoordinatedTargetLayoutState] {
+        &self.targets
+    }
+
+    pub fn target(&self, target: PresentationTarget) -> Option<CoordinatedTargetLayoutState> {
+        self.targets
+            .iter()
+            .copied()
+            .find(|state| state.target == target)
+    }
+}
+
+/// Borrowed scientific request for one fixed target in a coordinated cutoff.
+#[derive(Debug, Clone, Copy)]
+pub struct CoordinatedTargetRequest<'a> {
+    target: PresentationTarget,
+    intent: &'a RenderIntent,
+    requirements: &'a RenderRequirements,
+    display_generation: u64,
+    render_policy: RetainedFrameRenderPolicy,
+    output_extent: RenderExtent,
+    volume_schedule: VolumeColorSchedule,
+    measure_gpu_timing: bool,
+    hidden_promotion_authorized: bool,
+}
+
+impl<'a> CoordinatedTargetRequest<'a> {
+    pub const fn new(
+        target: PresentationTarget,
+        intent: &'a RenderIntent,
+        requirements: &'a RenderRequirements,
+        display_generation: u64,
+        render_policy: RetainedFrameRenderPolicy,
+    ) -> Self {
+        Self {
+            target,
+            intent,
+            requirements,
+            display_generation,
+            render_policy,
+            output_extent: intent.extent(),
+            volume_schedule: VolumeColorSchedule::Direct,
+            measure_gpu_timing: false,
+            hidden_promotion_authorized: true,
+        }
+    }
+
+    /// Configures the one 3D presentation schedule for this request.
+    ///
+    /// The renderer validates that previews and strips are used only for the
+    /// 3D volume target. Native previews require `intent.extent()` and
+    /// `output_extent` to be the same physical panel extent.
+    pub const fn with_volume_schedule(
+        mut self,
+        output_extent: RenderExtent,
+        schedule: VolumeColorSchedule,
+        measure_gpu_timing: bool,
+    ) -> Self {
+        self.output_extent = output_extent;
+        self.volume_schedule = schedule;
+        self.measure_gpu_timing = measure_gpu_timing;
+        self
+    }
+
+    /// Controls whether a complete private exact-volume candidate may replace
+    /// the visible preview during this cutoff.
+    ///
+    /// Product staging uses this as the final transaction boundary: GPU work
+    /// may complete at any time, but publication waits until the application
+    /// has preflighted the matching dataset/residency promotion.
+    pub const fn with_hidden_promotion_authorized(mut self, authorized: bool) -> Self {
+        self.hidden_promotion_authorized = authorized;
+        self
+    }
+
+    pub const fn target(self) -> PresentationTarget {
+        self.target
+    }
+
+    pub const fn intent(self) -> &'a RenderIntent {
+        self.intent
+    }
+
+    pub const fn requirements(self) -> &'a RenderRequirements {
+        self.requirements
+    }
+
+    pub const fn display_generation(self) -> u64 {
+        self.display_generation
+    }
+
+    pub const fn render_policy(self) -> RetainedFrameRenderPolicy {
+        self.render_policy
+    }
+
+    pub const fn output_extent(self) -> RenderExtent {
+        self.output_extent
+    }
+
+    pub const fn volume_schedule(self) -> VolumeColorSchedule {
+        self.volume_schedule
+    }
+
+    pub const fn measure_gpu_timing(self) -> bool {
+        self.measure_gpu_timing
+    }
+
+    pub const fn hidden_promotion_authorized(self) -> bool {
+        self.hidden_promotion_authorized
+    }
+}
+
+/// Consequences for one logical target in a coordinated cutoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatedTargetExecutionReport {
+    target: PresentationTarget,
+    device_generation: RendererDeviceGeneration,
+    texture_revision: TargetTextureRevision,
+    frame: FrameIdentity,
+    progress: Option<FrameProgress>,
+    presented: bool,
+    visited_resources: usize,
+    uploaded_resources: usize,
+    payload_upload_bytes: u64,
+    control_upload_bytes: u64,
+    residency_command_buffers: u32,
+    residency_queue_submissions: u32,
+    deferred_by_backpressure: bool,
+    volume_refinement: Option<VolumeRefinementProgress>,
+    validation_capture: Option<CoordinatedValidationCaptureTicket>,
+    newly_resident_keys: Box<[BrickKey]>,
+    evicted_keys: Box<[BrickKey]>,
+}
+
+impl CoordinatedTargetExecutionReport {
+    pub const fn target(&self) -> PresentationTarget {
+        self.target
+    }
+
+    pub const fn texture_revision(&self) -> TargetTextureRevision {
+        self.texture_revision
+    }
+
+    pub const fn device_generation(&self) -> RendererDeviceGeneration {
+        self.device_generation
+    }
+
+    pub const fn frame(&self) -> FrameIdentity {
+        self.frame
+    }
+
+    pub const fn progress(&self) -> Option<&FrameProgress> {
+        self.progress.as_ref()
+    }
+
+    pub const fn presented(&self) -> bool {
+        self.presented
+    }
+
+    pub const fn visited_resources(&self) -> usize {
+        self.visited_resources
+    }
+
+    pub const fn uploaded_resources(&self) -> usize {
+        self.uploaded_resources
+    }
+
+    pub const fn payload_upload_bytes(&self) -> u64 {
+        self.payload_upload_bytes
+    }
+
+    pub const fn control_upload_bytes(&self) -> u64 {
+        self.control_upload_bytes
+    }
+
+    pub const fn residency_command_buffers(&self) -> u32 {
+        self.residency_command_buffers
+    }
+
+    pub const fn residency_queue_submissions(&self) -> u32 {
+        self.residency_queue_submissions
+    }
+
+    pub const fn deferred_by_backpressure(&self) -> bool {
+        self.deferred_by_backpressure
+    }
+
+    pub const fn volume_refinement(&self) -> Option<VolumeRefinementProgress> {
+        self.volume_refinement
+    }
+
+    pub const fn validation_capture(&self) -> Option<CoordinatedValidationCaptureTicket> {
+        self.validation_capture
+    }
+
+    pub fn newly_resident_keys(&self) -> &[BrickKey] {
+        &self.newly_resident_keys
+    }
+
+    pub fn evicted_keys(&self) -> &[BrickKey] {
+        &self.evicted_keys
+    }
+}
+
+/// Opaque capture identity for one fixed coordinated target.
+///
+/// Private allocation and dataset-generation facts remain renderer-internal
+/// while the fixed target/revision facts are the public identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CoordinatedValidationCaptureTicket {
+    target: PresentationTarget,
+    device_generation: RendererDeviceGeneration,
+    texture_revision: TargetTextureRevision,
+    residency_generation: u64,
+    inner: ValidationCaptureTicket,
+}
+
+impl CoordinatedValidationCaptureTicket {
+    pub const fn target(self) -> PresentationTarget {
+        self.target
+    }
+
+    pub const fn device_generation(self) -> RendererDeviceGeneration {
+        self.device_generation
+    }
+
+    pub const fn texture_revision(self) -> TargetTextureRevision {
+        self.texture_revision
+    }
+
+    pub const fn frame(self) -> FrameIdentity {
+        self.inner.frame()
+    }
+
+    pub const fn extent(self) -> RenderExtent {
+        self.inner.extent()
+    }
+}
+
+/// One renderer cutoff over the fixed four-target layout.
+///
+/// `recorded_targets` is the exact color-pass order. Residency-only transfer
+/// submissions, when present, remain separately accounted by the per-target
+/// execution reports and never inflate `color_queue_submissions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatedFrameExecutionReport {
+    targets: Box<[CoordinatedTargetExecutionReport]>,
+    recorded_targets: Box<[PresentationTarget]>,
+    residency_queue_submissions: u32,
+    color_queue_submissions: u32,
+    cpu_timing: Option<CpuFrameTiming>,
+    gpu_timing: Option<GpuTimingTicket>,
+}
+
+impl CoordinatedFrameExecutionReport {
+    pub fn targets(&self) -> &[CoordinatedTargetExecutionReport] {
+        &self.targets
+    }
+
+    pub fn target(&self, target: PresentationTarget) -> Option<&CoordinatedTargetExecutionReport> {
+        self.targets.iter().find(|report| report.target == target)
+    }
+
+    pub fn recorded_targets(&self) -> &[PresentationTarget] {
+        &self.recorded_targets
+    }
+
+    pub const fn residency_queue_submissions(&self) -> u32 {
+        self.residency_queue_submissions
+    }
+
+    pub const fn color_queue_submissions(&self) -> u32 {
+        self.color_queue_submissions
+    }
+
+    pub const fn cpu_timing(&self) -> Option<CpuFrameTiming> {
+        self.cpu_timing
+    }
+
+    /// Timestamp ticket for the active target's color pass when timing is
+    /// enabled and a coordinated color cutoff was submitted.
+    pub const fn gpu_timing(&self) -> Option<GpuTimingTicket> {
+        self.gpu_timing
+    }
 }
 
 /// Exact persistent-arena reservation for one decoded payload, including the
@@ -89,27 +493,28 @@ pub struct FrameBudget {
     queue_submissions: u32,
 }
 
-/// Monotonic identity for the exact global GPU payload-residency set.
-/// Applications cache readiness against this value and only rescan semantic
-/// keys after an upload or eviction changes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct GpuResidencyEpoch(u64);
-
-impl GpuResidencyEpoch {
-    pub const fn get(self) -> u64 {
-        self.0
-    }
+/// One exact destructive change in renderer-global GPU residency.
+///
+/// Events remain queryable until acknowledged, superseded by a later
+/// re-eviction of the same key, or cancelled by that key becoming resident
+/// again. Sequence numbers are renderer-local and monotonically increasing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuResidencyEvictionEvent {
+    key: BrickKey,
+    sequence: u64,
 }
 
-/// Monotonic epoch for destructive residency changes only. Additions do not
-/// advance it, so an application can retain a large satisfied-key set across
-/// progressive upload batches and rescan only after eviction/removal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct GpuResidencyInvalidationEpoch(u64);
+impl GpuResidencyEvictionEvent {
+    const fn new(key: BrickKey, sequence: u64) -> Self {
+        Self { key, sequence }
+    }
 
-impl GpuResidencyInvalidationEpoch {
-    pub const fn get(self) -> u64 {
-        self.0
+    pub const fn key(self) -> BrickKey {
+        self.key
+    }
+
+    pub const fn sequence(self) -> u64 {
+        self.sequence
     }
 }
 
@@ -117,7 +522,7 @@ impl FrameBudget {
     /// Returns the fixed interactive budget. It is not caller-expandable.
     pub const fn interactive() -> Self {
         Self {
-            resident_resources_visited: MAX_VISITS,
+            resident_resources_visited: MAX_UPLOADS,
             new_resources_uploaded: MAX_UPLOADS,
             payload_upload_bytes: MAX_PAYLOAD_UPLOAD_BYTES,
             control_upload_bytes: MAX_CONTROL_UPLOAD_BYTES,
@@ -171,14 +576,6 @@ impl WgpuRenderRuntimeConfig {
         })
     }
 
-    pub const fn unknown_capacity() -> Self {
-        Self {
-            gpu_budget_bytes: UNKNOWN_GPU_BUDGET_BYTES,
-            validation_capture: false,
-            gpu_timing: false,
-        }
-    }
-
     pub const fn with_validation_capture(mut self, enabled: bool) -> Self {
         self.validation_capture = enabled;
         self
@@ -204,6 +601,37 @@ impl WgpuRenderRuntimeConfig {
     }
 }
 
+/// Product pipeline capability compiled by the renderer's bounded startup
+/// worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineCapability {
+    /// All color pipelines required by the current renderer.
+    InitialRender,
+    /// Asynchronous volume picking.
+    Pick,
+}
+
+/// Observable readiness of the product renderer's fixed pipeline set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineReadiness {
+    /// The initial color pipelines are still compiling.
+    CompilingInitial,
+    /// Color rendering is available while the pick pipeline compiles.
+    InitialRenderReady,
+    /// Color rendering and picking are both available.
+    Ready,
+}
+
+/// Stable classification of a pipeline-worker failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineCompilationFailureCause {
+    Validation,
+    DeviceOutOfMemory,
+    BackendInternal,
+    WorkerPanicked,
+    WorkerStopped,
+}
+
 /// Stable counters and sanitized adapter facts for the product runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WgpuRenderRuntimeDiagnostics {
@@ -225,8 +653,21 @@ pub struct WgpuRenderRuntimeDiagnostics {
     transfer_capacity_bytes: u64,
     other_capacity_bytes: u64,
     payload_arena_allocated_bytes: u64,
+    payload_committed_capacity_bytes: u64,
+    payload_uncommitted_capacity_bytes: u64,
+    payload_segment_committed_capacity_bytes: [u64; 4],
+    payload_growths: u64,
+    payload_growth_copy_bytes: u64,
     resident_payload_used_bytes: u64,
     peak_resident_payload_used_bytes: u64,
+    payload_free_bytes: u64,
+    payload_largest_contiguous_bytes: u64,
+    payload_segment_free_bytes: [u64; 4],
+    payload_segment_largest_contiguous_bytes: [u64; 4],
+    payload_placeability_failures: u64,
+    payload_compactions: u64,
+    payload_compaction_resources_moved: u64,
+    payload_compaction_bytes_moved: u64,
     empty_resident_metadata_capacity_records: usize,
     empty_resident_metadata_bytes_per_record: u64,
     empty_resident_metadata_records: usize,
@@ -234,12 +675,13 @@ pub struct WgpuRenderRuntimeDiagnostics {
     peak_empty_resident_metadata_bytes: u64,
     peak_transfer_bytes: u64,
     peak_display_target_bytes: u64,
-    peak_page_table_bytes: u64,
+    peak_control_and_residency_metadata_bytes: u64,
     peak_scratch_bytes: u64,
     frames_executed: u64,
     queue_submissions: u64,
     current_in_flight_submissions: usize,
     peak_in_flight_submissions: usize,
+    peak_in_flight_color_cutoffs: usize,
     backpressure_deferrals: u64,
     residency_hits: u64,
     residency_misses: u64,
@@ -249,47 +691,45 @@ pub struct WgpuRenderRuntimeDiagnostics {
     uploaded_payload_bytes: u64,
     upload_staging_padding_zero_bytes: u64,
     render_thread_payload_fact_scan_bytes: u64,
-    control_static_rebuilds: u64,
-    control_static_rebuild_bytes: u64,
-    page_layout_constructions: u64,
-    control_dynamic_updates: u64,
-    control_dynamic_upload_bytes: u64,
-    control_publication_writes: u64,
-    peak_control_publication_writes_per_frame: usize,
-    control_dense_fallbacks: u64,
-    control_body_delta_updates: u64,
-    control_body_delta_keys: u64,
-    control_body_delta_page_entries: u64,
-    body_delta_pin_lru_keys: u64,
+    directory_publications: u64,
+    directory_mutations: u64,
+    directory_rebuilds: u64,
+    directory_slot_writes: u64,
+    page_record_writes: u64,
+    target_control_updates: u64,
+    target_control_upload_bytes: u64,
     control_buffer_allocations: u64,
     control_buffer_allocation_bytes: u64,
     bind_group_creations: u64,
-    pipeline_creations: u64,
+    usable_pipeline_handles: u64,
     explicit_staging_allocations: u64,
     explicit_staging_bytes: u64,
     peak_explicit_staging_bytes: u64,
     allocator_plans: u64,
     retained_navigation_frames: u64,
     cold_coverage_membership_checks: u64,
+    cold_coverage_resident_matches: u64,
     gpu_timestamps_supported: bool,
     gpu_timing_enabled: bool,
-    gpu_payload_copy_timestamps_supported: bool,
-    gpu_timing_prelude_submissions: u64,
+    gpu_encoder_timestamps_supported: bool,
     completed_gpu_timings: u64,
     gpu_timing_failures: u64,
     last_gpu_batch_envelope_ns: Option<u64>,
-    last_gpu_payload_copy_ns: Option<u64>,
     last_gpu_render_pass_ns: Option<u64>,
     completed_cpu_timings: u64,
     last_cpu_timing_frame: Option<u64>,
     last_cpu_planning_ns: Option<u64>,
-    last_cpu_control_publication_ns: Option<u64>,
-    last_cpu_payload_staging_ns: Option<u64>,
     last_cpu_queue_submit_ns: Option<u64>,
     total_cpu_planning_ns: u64,
-    total_cpu_control_publication_ns: u64,
-    total_cpu_payload_staging_ns: u64,
     total_cpu_queue_submit_ns: u64,
+    hidden_refinement_jobs_started: u64,
+    hidden_refinement_jobs_completed: u64,
+    hidden_refinement_jobs_cancelled: u64,
+    hidden_refinement_jobs_failed: u64,
+    hidden_refinement_batches: u64,
+    hidden_refinement_rows: u64,
+    hidden_refinement_elapsed_ns: u64,
+    hidden_refinement_last_batch_rows: Option<u32>,
     pick_submissions: u64,
     completed_picks: u64,
     pick_backpressure_deferrals: u64,
@@ -353,8 +793,9 @@ impl WgpuRenderRuntimeDiagnostics {
         self.payload_segment_count
     }
 
-    /// Fixed shader-visible payload bindings in priority/fill order. Entries
-    /// after [`Self::payload_segment_count`] are zero-capacity dummy bindings.
+    /// Logical payload segment maxima in deterministic allocation order.
+    /// Entries after [`Self::payload_segment_count`] have zero logical
+    /// capacity; their required shader bindings alias the first valid segment.
     pub const fn payload_segment_capacity_bytes(&self) -> &[u64; 4] {
         &self.payload_segment_capacity_bytes
     }
@@ -371,12 +812,68 @@ impl WgpuRenderRuntimeDiagnostics {
         self.payload_arena_allocated_bytes
     }
 
+    /// Usable payload bytes currently backed by physical buffers.
+    pub const fn payload_committed_capacity_bytes(&self) -> u64 {
+        self.payload_committed_capacity_bytes
+    }
+
+    /// Logical payload capacity not yet physically committed.
+    pub const fn payload_uncommitted_capacity_bytes(&self) -> u64 {
+        self.payload_uncommitted_capacity_bytes
+    }
+
+    pub const fn payload_segment_committed_capacity_bytes(&self) -> &[u64; 4] {
+        &self.payload_segment_committed_capacity_bytes
+    }
+
+    pub const fn payload_growths(&self) -> u64 {
+        self.payload_growths
+    }
+
+    pub const fn payload_growth_copy_bytes(&self) -> u64 {
+        self.payload_growth_copy_bytes
+    }
+
     pub const fn resident_payload_bytes(&self) -> u64 {
         self.resident_payload_used_bytes
     }
 
     pub const fn peak_resident_payload_bytes(&self) -> u64 {
         self.peak_resident_payload_used_bytes
+    }
+
+    /// Aggregate free payload bytes. This is not itself one allocatable range.
+    pub const fn payload_free_bytes(&self) -> u64 {
+        self.payload_free_bytes
+    }
+
+    /// Largest currently allocatable contiguous range in any payload segment.
+    pub const fn payload_largest_contiguous_bytes(&self) -> u64 {
+        self.payload_largest_contiguous_bytes
+    }
+
+    pub const fn payload_segment_free_bytes(&self) -> &[u64; 4] {
+        &self.payload_segment_free_bytes
+    }
+
+    pub const fn payload_segment_largest_contiguous_bytes(&self) -> &[u64; 4] {
+        &self.payload_segment_largest_contiguous_bytes
+    }
+
+    pub const fn payload_placeability_failures(&self) -> u64 {
+        self.payload_placeability_failures
+    }
+
+    pub const fn payload_compactions(&self) -> u64 {
+        self.payload_compactions
+    }
+
+    pub const fn payload_compaction_resources_moved(&self) -> u64 {
+        self.payload_compaction_resources_moved
+    }
+
+    pub const fn payload_compaction_bytes_moved(&self) -> u64 {
+        self.payload_compaction_bytes_moved
     }
 
     /// Maximum number of metadata-only empty page records retained by the
@@ -412,8 +909,8 @@ impl WgpuRenderRuntimeDiagnostics {
         self.peak_display_target_bytes
     }
 
-    pub const fn peak_page_table_bytes(&self) -> u64 {
-        self.peak_page_table_bytes
+    pub const fn peak_control_and_residency_metadata_bytes(&self) -> u64 {
+        self.peak_control_and_residency_metadata_bytes
     }
 
     pub const fn peak_scratch_bytes(&self) -> u64 {
@@ -434,6 +931,12 @@ impl WgpuRenderRuntimeDiagnostics {
 
     pub const fn peak_in_flight_submissions(&self) -> usize {
         self.peak_in_flight_submissions
+    }
+
+    /// Maximum coordinated color cutoffs simultaneously owned by the GPU.
+    /// Residency-transfer, pick, capture, and timing-only work do not count.
+    pub const fn peak_in_flight_color_cutoffs(&self) -> usize {
+        self.peak_in_flight_color_cutoffs
     }
 
     pub const fn backpressure_deferrals(&self) -> u64 {
@@ -476,61 +979,41 @@ impl WgpuRenderRuntimeDiagnostics {
         self.render_thread_payload_fact_scan_bytes
     }
 
-    pub const fn control_static_rebuilds(&self) -> u64 {
-        self.control_static_rebuilds
+    /// Committed batches that changed the renderer-global residency directory.
+    pub const fn directory_publications(&self) -> u64 {
+        self.directory_publications
     }
 
-    pub const fn control_static_rebuild_bytes(&self) -> u64 {
-        self.control_static_rebuild_bytes
+    /// Exact compact-cell insertions and removals across committed directory
+    /// batches.
+    pub const fn directory_mutations(&self) -> u64 {
+        self.directory_mutations
     }
 
-    /// Number of per-layer sparse page layouts constructed for committed
-    /// static requirement bodies. One new body constructs each layer once.
-    pub const fn page_layout_constructions(&self) -> u64 {
-        self.page_layout_constructions
+    /// Bounded full-directory compactions among committed publications.
+    pub const fn directory_rebuilds(&self) -> u64 {
+        self.directory_rebuilds
     }
 
-    pub const fn control_dynamic_updates(&self) -> u64 {
-        self.control_dynamic_updates
+    /// Shader-visible directory slots copied to the GPU. Incremental batches
+    /// count their touched slots; a rebuild counts its complete fixed image.
+    pub const fn directory_slot_writes(&self) -> u64 {
+        self.directory_slot_writes
     }
 
-    pub const fn control_dynamic_upload_bytes(&self) -> u64 {
-        self.control_dynamic_upload_bytes
+    /// Shader-visible page records written or cleared after successful
+    /// residency publication.
+    pub const fn page_record_writes(&self) -> u64 {
+        self.page_record_writes
     }
 
-    /// Total `Queue::write_buffer` operations used to publish render-control
-    /// data. The per-frame peak is hard-capped before any writes are issued.
-    pub const fn control_publication_writes(&self) -> u64 {
-        self.control_publication_writes
+    /// Target-local frame-control blocks published before color work.
+    pub const fn target_control_updates(&self) -> u64 {
+        self.target_control_updates
     }
 
-    pub const fn peak_control_publication_writes_per_frame(&self) -> usize {
-        self.peak_control_publication_writes_per_frame
-    }
-
-    /// Fragmented incremental updates replaced by one dense record-slab write.
-    pub const fn control_dense_fallbacks(&self) -> u64 {
-        self.control_dense_fallbacks
-    }
-
-    /// Exact predecessor-bound body replacements applied through stable
-    /// record slots and sparse page-entry patches.
-    pub const fn control_body_delta_updates(&self) -> u64 {
-        self.control_body_delta_updates
-    }
-
-    pub const fn control_body_delta_keys(&self) -> u64 {
-        self.control_body_delta_keys
-    }
-
-    pub const fn control_body_delta_page_entries(&self) -> u64 {
-        self.control_body_delta_page_entries
-    }
-
-    /// Exact added/removed keys visited to reconcile payload pin and age
-    /// indexes after a predecessor-bound body replacement.
-    pub const fn body_delta_pin_lru_keys(&self) -> u64 {
-        self.body_delta_pin_lru_keys
+    pub const fn target_control_upload_bytes(&self) -> u64 {
+        self.target_control_upload_bytes
     }
 
     /// Presentation control buffers allocated since runtime creation,
@@ -550,11 +1033,11 @@ impl WgpuRenderRuntimeDiagnostics {
         self.bind_group_creations
     }
 
-    /// Product render and compute pipelines created since this runtime was
-    /// constructed. The fixed initial set is the general render pipeline, the
-    /// dedicated MIP pipeline, and the asynchronous pick pipeline.
-    pub const fn pipeline_creations(&self) -> u64 {
-        self.pipeline_creations
+    /// Successfully adopted product pipeline handles that are usable by this
+    /// runtime. Buffered worker results and failed or cancelled creation
+    /// attempts are deliberately not counted.
+    pub const fn usable_pipeline_handles(&self) -> u64 {
+        self.usable_pipeline_handles
     }
 
     /// Explicit mapped staging buffers allocated by the runtime. Camera-only
@@ -585,6 +1068,10 @@ impl WgpuRenderRuntimeDiagnostics {
         self.cold_coverage_membership_checks
     }
 
+    pub const fn cold_coverage_resident_matches(&self) -> u64 {
+        self.cold_coverage_resident_matches
+    }
+
     pub const fn gpu_timestamps_supported(&self) -> bool {
         self.gpu_timestamps_supported
     }
@@ -593,14 +1080,8 @@ impl WgpuRenderRuntimeDiagnostics {
         self.gpu_timing_enabled
     }
 
-    pub const fn gpu_payload_copy_timestamps_supported(&self) -> bool {
-        self.gpu_payload_copy_timestamps_supported
-    }
-
-    /// Qualification-only timestamp prelude submissions used to place the
-    /// batch-envelope start before queue-write control publication.
-    pub const fn gpu_timing_prelude_submissions(&self) -> u64 {
-        self.gpu_timing_prelude_submissions
+    pub const fn gpu_encoder_timestamps_supported(&self) -> bool {
+        self.gpu_encoder_timestamps_supported
     }
 
     pub const fn completed_gpu_timings(&self) -> u64 {
@@ -616,10 +1097,6 @@ impl WgpuRenderRuntimeDiagnostics {
 
     pub const fn last_gpu_batch_envelope_ns(&self) -> Option<u64> {
         self.last_gpu_batch_envelope_ns
-    }
-
-    pub const fn last_gpu_payload_copy_ns(&self) -> Option<u64> {
-        self.last_gpu_payload_copy_ns
     }
 
     pub const fn last_gpu_render_pass_ns(&self) -> Option<u64> {
@@ -642,19 +1119,6 @@ impl WgpuRenderRuntimeDiagnostics {
         self.last_cpu_planning_ns
     }
 
-    /// Host time spent in queue-write control publication. This is not a GPU
-    /// transfer duration; queue-visible interference remains outside the
-    /// encoder-bracketed payload-copy interval.
-    pub const fn last_cpu_control_publication_ns(&self) -> Option<u64> {
-        self.last_cpu_control_publication_ns
-    }
-
-    /// Host time spent copying decoded payloads into mapped staging storage.
-    /// Encoder command construction and GPU copy execution are outside it.
-    pub const fn last_cpu_payload_staging_ns(&self) -> Option<u64> {
-        self.last_cpu_payload_staging_ns
-    }
-
     pub const fn last_cpu_queue_submit_ns(&self) -> Option<u64> {
         self.last_cpu_queue_submit_ns
     }
@@ -663,16 +1127,40 @@ impl WgpuRenderRuntimeDiagnostics {
         self.total_cpu_planning_ns
     }
 
-    pub const fn total_cpu_control_publication_ns(&self) -> u64 {
-        self.total_cpu_control_publication_ns
-    }
-
-    pub const fn total_cpu_payload_staging_ns(&self) -> u64 {
-        self.total_cpu_payload_staging_ns
-    }
-
     pub const fn total_cpu_queue_submit_ns(&self) -> u64 {
         self.total_cpu_queue_submit_ns
+    }
+
+    pub const fn hidden_refinement_jobs_started(&self) -> u64 {
+        self.hidden_refinement_jobs_started
+    }
+
+    pub const fn hidden_refinement_jobs_completed(&self) -> u64 {
+        self.hidden_refinement_jobs_completed
+    }
+
+    pub const fn hidden_refinement_jobs_cancelled(&self) -> u64 {
+        self.hidden_refinement_jobs_cancelled
+    }
+
+    pub const fn hidden_refinement_jobs_failed(&self) -> u64 {
+        self.hidden_refinement_jobs_failed
+    }
+
+    pub const fn hidden_refinement_batches(&self) -> u64 {
+        self.hidden_refinement_batches
+    }
+
+    pub const fn hidden_refinement_rows(&self) -> u64 {
+        self.hidden_refinement_rows
+    }
+
+    pub const fn hidden_refinement_elapsed_ns(&self) -> u64 {
+        self.hidden_refinement_elapsed_ns
+    }
+
+    pub const fn hidden_refinement_last_batch_rows(&self) -> Option<u32> {
+        self.hidden_refinement_last_batch_rows
     }
 
     pub const fn pick_submissions(&self) -> u64 {
@@ -696,7 +1184,7 @@ impl WgpuRenderRuntimeDiagnostics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GpuTimingTicket {
     id: u64,
-    target: PresentationToken,
+    target: PresentationTarget,
     generation: FrameIdentity,
     display_generation: u64,
     pass_kind: RenderPassKind,
@@ -710,7 +1198,7 @@ impl GpuTimingTicket {
         self.id
     }
 
-    pub const fn target(self) -> PresentationToken {
+    pub const fn target(self) -> PresentationTarget {
         self.target
     }
 
@@ -732,60 +1220,38 @@ impl GpuTimingTicket {
 
 /// GPU-domain elapsed times from timestamp queries.
 ///
-/// Payload-copy time is available only when copy commands were encoded and the
-/// adapter supports timestamp writes inside command encoders. Render-pass time
-/// is available only when this execution encoded the target's pass. Queue
-/// writes and CPU staging are deliberately excluded from both intervals. The
-/// batch GPU envelope spans an explicitly counted diagnostic prelude through
-/// the end of the render/copy commands; it includes queue-write interference
-/// but is not a claimed control-copy duration.
+/// Render-pass time is available when this execution encoded the active
+/// target's pass. When encoder timestamps are supported, the batch envelope
+/// spans the coordinated color encoder's first timestamp through its final
+/// timestamp. Queue writes and CPU staging are deliberately excluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuFrameTiming {
     ticket: GpuTimingTicket,
     batch_gpu_envelope_ns: Option<u64>,
-    payload_copy_ns: Option<u64>,
     render_pass_ns: Option<u64>,
 }
 
 /// CPU-domain work for one exact renderer execution.
 ///
-/// Planning includes the retained-cohort preflight, validation, residency and
-/// control preparation, and command encoding. The synchronous
-/// `Queue::submit` call is measured separately. Collection is opt-in with the
-/// qualification timing switch and never performs a GPU wait or readback.
+/// Planning covers coordinated color-control preparation and command encoding.
+/// The synchronous `Queue::submit` call is measured separately. Collection is
+/// opt-in and never performs a GPU wait or readback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuFrameTiming {
     planning_ns: u64,
-    control_publication_ns: Option<u64>,
-    payload_staging_ns: Option<u64>,
     queue_submit_ns: u64,
 }
 
 impl CpuFrameTiming {
-    pub const fn new(
-        planning_ns: u64,
-        control_publication_ns: Option<u64>,
-        payload_staging_ns: Option<u64>,
-        queue_submit_ns: u64,
-    ) -> Self {
+    pub const fn new(planning_ns: u64, queue_submit_ns: u64) -> Self {
         Self {
             planning_ns,
-            control_publication_ns,
-            payload_staging_ns,
             queue_submit_ns,
         }
     }
 
     pub const fn planning_ns(self) -> u64 {
         self.planning_ns
-    }
-
-    pub const fn control_publication_ns(self) -> Option<u64> {
-        self.control_publication_ns
-    }
-
-    pub const fn payload_staging_ns(self) -> Option<u64> {
-        self.payload_staging_ns
     }
 
     pub const fn queue_submit_ns(self) -> u64 {
@@ -798,7 +1264,7 @@ impl GpuFrameTiming {
         self.ticket
     }
 
-    pub const fn target(self) -> PresentationToken {
+    pub const fn target(self) -> PresentationTarget {
         self.ticket.target()
     }
 
@@ -814,29 +1280,21 @@ impl GpuFrameTiming {
         self.batch_gpu_envelope_ns
     }
 
-    pub const fn payload_copy_ns(self) -> Option<u64> {
-        self.payload_copy_ns
-    }
-
     pub const fn render_pass_ns(self) -> Option<u64> {
         self.render_pass_ns
     }
 }
 
-/// Opaque identity for one asynchronous validation readback.
+/// Private identity embedded in a coordinated validation-capture ticket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ValidationCaptureTicket {
+struct ValidationCaptureTicket {
     id: u64,
-    presentation: PresentationToken,
+    private_presentation: u64,
     frame: FrameIdentity,
     extent: RenderExtent,
 }
 
 impl ValidationCaptureTicket {
-    pub const fn presentation(self) -> PresentationToken {
-        self.presentation
-    }
-
     pub const fn frame(self) -> FrameIdentity {
         self.frame
     }
@@ -878,114 +1336,11 @@ impl ValidationCapture {
     }
 }
 
-/// One bounded execution result. No report implies more coverage than its
-/// `FrameProgress` proves.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FrameExecutionReport {
-    presentation: Option<PresentedFrame>,
-    frame: FrameIdentity,
-    progress: Option<FrameProgress>,
-    visited_resources: usize,
-    uploaded_resources: usize,
-    payload_upload_bytes: u64,
-    control_upload_bytes: u64,
-    command_buffers: u32,
-    queue_submissions: u32,
-    deferred_by_backpressure: bool,
-    retained_updates_accepted: bool,
-    cpu_timing: Option<CpuFrameTiming>,
-    gpu_timing: Option<GpuTimingTicket>,
-    validation_capture: Option<ValidationCaptureTicket>,
-    newly_resident_keys: Box<[DatasetResourceKey]>,
-    evicted_keys: Box<[DatasetResourceKey]>,
-}
-
-impl FrameExecutionReport {
-    pub const fn presentation(&self) -> Option<&PresentedFrame> {
-        self.presentation.as_ref()
-    }
-
-    pub const fn frame(&self) -> FrameIdentity {
-        self.frame
-    }
-
-    pub const fn progress(&self) -> Option<&FrameProgress> {
-        self.progress.as_ref()
-    }
-
-    pub const fn visited_resources(&self) -> usize {
-        self.visited_resources
-    }
-
-    pub const fn uploaded_resources(&self) -> usize {
-        self.uploaded_resources
-    }
-
-    pub const fn payload_upload_bytes(&self) -> u64 {
-        self.payload_upload_bytes
-    }
-
-    pub const fn control_upload_bytes(&self) -> u64 {
-        self.control_upload_bytes
-    }
-
-    pub const fn command_buffers(&self) -> u32 {
-        self.command_buffers
-    }
-
-    pub const fn queue_submissions(&self) -> u32 {
-        self.queue_submissions
-    }
-
-    pub const fn deferred_by_backpressure(&self) -> bool {
-        self.deferred_by_backpressure
-    }
-
-    /// Whether every lease update supplied to `execute_retained_frame` was
-    /// either already known/resident or retained in exact caller order. When
-    /// false, the caller must retry the same ranked cohort before advancing.
-    /// Direct `execute_frame` reports always return true.
-    pub const fn retained_updates_accepted(&self) -> bool {
-        self.retained_updates_accepted
-    }
-
-    /// CPU planning and queue-submission durations bound to this report's
-    /// exact frame. `None` means timing was disabled or no submission occurred.
-    pub const fn cpu_timing(&self) -> Option<CpuFrameTiming> {
-        self.cpu_timing
-    }
-
-    /// Returns a ticket only when this execution submitted at least one
-    /// timestamped payload-copy or render-pass interval. Each interval remains
-    /// independently optional in the asynchronous result; `None` here is an
-    /// explicit unavailable/not-submitted state for the whole execution.
-    pub const fn gpu_timing(&self) -> Option<GpuTimingTicket> {
-        self.gpu_timing
-    }
-
-    pub const fn validation_capture(&self) -> Option<ValidationCaptureTicket> {
-        self.validation_capture
-    }
-
-    /// Exact bounded residency additions committed by this execution,
-    /// including metadata-only empty resources drained from retained leases.
-    pub fn newly_resident_keys(&self) -> &[DatasetResourceKey] {
-        &self.newly_resident_keys
-    }
-
-    /// Exact payload/metadata removals committed by this execution.
-    pub fn evicted_keys(&self) -> &[DatasetResourceKey] {
-        &self.evicted_keys
-    }
-}
-
 /// Typed, backend-neutral failures from the product GPU runtime.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum WgpuRenderRuntimeError {
     #[error("the WGPU runtime configuration is invalid")]
     InvalidConfiguration,
-    #[error("no qualifying Vulkan GPU adapter is available")]
-    DeviceUnavailable,
     #[error("a CPU or software adapter cannot run the interactive renderer")]
     SoftwareAdapter,
     #[error("the interactive renderer requires a Vulkan adapter")]
@@ -994,8 +1349,21 @@ pub enum WgpuRenderRuntimeError {
     AdapterLimitsInsufficient,
     #[error("the existing WGPU device was created below the renderer limits")]
     DeviceLimitsInsufficient,
-    #[error("the GPU device could not be created")]
-    DeviceCreationFailed,
+    #[error("the bounded GPU pipeline compiler worker could not be started")]
+    PipelineCompilerSpawnFailed,
+    #[error("the bounded hidden-refinement worker could not be started")]
+    HiddenRefinementWorkerSpawnFailed,
+    #[error("the renderer exhausted its hidden-refinement job identity space")]
+    HiddenRefinementIdentityExhausted,
+    #[error("hidden exact refinement failed before atomic promotion")]
+    HiddenRefinementFailed,
+    #[error("{capability:?} GPU pipeline compilation failed with first cause {cause:?}")]
+    PipelineCompilationFailed {
+        capability: PipelineCapability,
+        cause: PipelineCompilationFailureCause,
+    },
+    #[error("{capability:?} GPU pipelines are not ready")]
+    PipelineNotReady { capability: PipelineCapability },
     #[error("the active GPU device was lost")]
     DeviceLost,
     #[error("the GPU backend exhausted device memory")]
@@ -1013,26 +1381,46 @@ pub enum WgpuRenderRuntimeError {
     },
     #[error("the requirement set changed within one frame generation")]
     RequirementSetChanged,
-    #[error("the prepared static presentation layout does not match the render body/layers")]
-    PreparedStaticLayoutMismatch,
+    #[error("the dataset generation's logical render-resource grid is invalid")]
+    InvalidResourceGridCatalog,
     #[error(
         "the render requirement set contains {actual} resources, exceeding the renderer limit of {maximum}"
     )]
     RequirementCapacityExceeded { actual: usize, maximum: usize },
     #[error("the renderer reached its limit of {maximum} presentation targets")]
     PresentationCapacityExceeded { maximum: usize },
-    #[error("presentation token {token:?} is not registered in this renderer")]
-    PresentationNotRegistered { token: PresentationToken },
-    #[error("the renderer exhausted its presentation token space")]
-    PresentationTokenExhausted,
+    #[error("the requested private renderer target is not allocated")]
+    PresentationNotRegistered,
+    #[error("the renderer exhausted its private target-slot identity space")]
+    PrivatePresentationIdExhausted,
+    #[error("the renderer exhausted its monotone target texture revision space")]
+    TextureRevisionExhausted,
+    #[error("the process exhausted its monotone renderer-device generation space")]
+    RendererDeviceGenerationExhausted,
+    #[error("coordinated target {target:?} occurs more than once in one request")]
+    DuplicateCoordinatedTarget { target: PresentationTarget },
+    #[error("coordinated target {target:?} has no desired renderer allocation")]
+    CoordinatedTargetNotConfigured { target: PresentationTarget },
+    #[error("coordinated target {target:?} received a mismatched view family")]
+    CoordinatedTargetViewMismatch { target: PresentationTarget },
+    #[error("coordinated target {target:?} received an invalid 3D color schedule")]
+    InvalidVolumeColorSchedule { target: PresentationTarget },
+    #[error(
+        "coordinated target {target:?} requested extent {requested:?}, but its desired layout is {desired:?}"
+    )]
+    CoordinatedTargetExtentMismatch {
+        target: PresentationTarget,
+        requested: RenderExtent,
+        desired: RenderExtent,
+    },
     #[error(
         "the supplied lease set contains {actual} resources, exceeding the renderer limit of {maximum}"
     )]
     LeaseCapacityExceeded { actual: usize, maximum: usize },
-    #[error("one render layer requests more than one semantic scale in the same frame")]
-    MixedScaleRequirements,
-    #[error("same-layer resources overlap at one semantic scale")]
-    OverlappingResources,
+    #[error(
+        "unacknowledged residency evictions would require {actual} events, exceeding the renderer limit of {maximum}"
+    )]
+    ResidencyEvictionEventCapacityExceeded { actual: usize, maximum: usize },
     #[error("one semantic resource lease occurs more than once")]
     DuplicateLease,
     #[error("a supplied lease is absent from the frame requirements")]
@@ -1053,6 +1441,18 @@ pub enum WgpuRenderRuntimeError {
         requested_bytes: u64,
         available_bytes: u64,
     },
+    #[error(
+        "GPU payload placement cannot fit one {requested_bytes}-byte allocation: \
+         {total_free_bytes} bytes are free in aggregate, but the largest contiguous \
+         range is {largest_contiguous_bytes} bytes"
+    )]
+    PayloadPlacementUnavailable {
+        requested_bytes: u64,
+        total_free_bytes: u64,
+        largest_contiguous_bytes: u64,
+    },
+    #[error("GPU payload fragmentation recovery is deferred by bounded in-flight work")]
+    PayloadRecoveryDeferred,
     #[error(
         "empty-page host metadata requires {requested_records} records/{requested_bytes} bytes, exceeding the bounded {maximum_records} records/{available_bytes} bytes"
     )]
@@ -1105,8 +1505,8 @@ pub fn qualify_adapter(adapter: &wgpu::Adapter) -> Result<(), WgpuRenderRuntimeE
 
 /// Builds the device request used by the interactive product renderer.
 ///
-/// The requested features and limits are the same fixed set used by
-/// [`WgpuRenderRuntime::new`].
+/// The requested features and limits are the fixed set required by
+/// [`WgpuRenderRuntime::from_existing_device`].
 pub fn renderer_device_descriptor(
     adapter: &wgpu::Adapter,
     label: &'static str,
@@ -1120,20 +1520,43 @@ pub struct WgpuRenderRuntime {
 }
 
 impl WgpuRenderRuntime {
-    /// Creates a real Vulkan device and the offscreen rendering pipeline.
-    pub async fn new(config: WgpuRenderRuntimeConfig) -> Result<Self, WgpuRenderRuntimeError> {
-        Ok(Self {
-            inner: runtime::Runtime::new(config).await?,
-        })
-    }
-
     #[cfg(test)]
-    async fn new_with_payload_segment_limit(
+    fn from_existing_device_with_payload_segment_limit(
+        adapter: &wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
         config: WgpuRenderRuntimeConfig,
         segment_limit: u64,
     ) -> Result<Self, WgpuRenderRuntimeError> {
         Ok(Self {
-            inner: runtime::Runtime::new_with_payload_segment_limit(config, segment_limit).await?,
+            inner: runtime::Runtime::from_existing_device_with_payload_segment_limit(
+                adapter,
+                device,
+                queue,
+                config,
+                segment_limit,
+            )?,
+        })
+    }
+
+    #[cfg(test)]
+    fn from_existing_device_with_payload_test_limits(
+        adapter: &wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        config: WgpuRenderRuntimeConfig,
+        segment_limit: u64,
+        initial_commitment: u64,
+    ) -> Result<Self, WgpuRenderRuntimeError> {
+        Ok(Self {
+            inner: runtime::Runtime::from_existing_device_with_payload_test_limits(
+                adapter,
+                device,
+                queue,
+                config,
+                segment_limit,
+                initial_commitment,
+            )?,
         })
     }
 
@@ -1171,38 +1594,138 @@ impl WgpuRenderRuntime {
         self.inner.diagnostics()
     }
 
-    /// Creates one renderer-owned target and returns only its opaque identity
-    /// and scalar extent to the composition layer.
-    pub fn register_presentation(
-        &mut self,
-        extent: RenderExtent,
-    ) -> Result<PresentationRegistration, WgpuRenderRuntimeError> {
-        self.inner.register_presentation(extent)
+    /// Installs the native event-loop wake used only when hidden exact work
+    /// reaches a terminal handoff. Hidden batches never use this callback as
+    /// their scheduling clock.
+    pub fn set_hidden_refinement_wake(&mut self, wake: Arc<dyn Fn() + Send + Sync + 'static>) {
+        self.inner.set_hidden_refinement_wake(wake);
     }
 
-    /// Borrows the color view for the sole native composition bridge. The
-    /// token is checked by the renderer and the texture remains renderer-owned.
-    pub fn presentation_texture_view(
+    /// Returns the last readiness state observed by the runtime, or the first
+    /// pipeline-compilation failure once one has been observed.
+    pub fn pipeline_readiness(&self) -> Result<PipelineReadiness, WgpuRenderRuntimeError> {
+        self.inner.pipeline_readiness()
+    }
+
+    /// Consumes at most one ordered event from the bounded compiler channel.
+    ///
+    /// The native application calls this once per UI turn. A cold runtime
+    /// therefore exposes `InitialRenderReady` before `Ready` even when both
+    /// events were produced between UI turns.
+    pub fn poll_pipeline_readiness(&mut self) -> Result<PipelineReadiness, WgpuRenderRuntimeError> {
+        self.inner.poll_pipeline_readiness()
+    }
+
+    /// Reports whether one capability is currently usable. A latched compiler
+    /// failure is returned rather than hidden behind `false`.
+    pub fn pipeline_capability_is_ready(
         &self,
-        token: PresentationToken,
+        capability: PipelineCapability,
+    ) -> Result<bool, WgpuRenderRuntimeError> {
+        self.inner.pipeline_capability_is_ready(capability)
+    }
+
+    /// Applies the complete desired subset of the fixed four-target layout.
+    ///
+    /// Allocations are created lazily and replaced only when their physical
+    /// extent changes. Omitted targets retain no active frame authority.
+    pub fn request_coordinated_layout(
+        &mut self,
+        desired: &[CoordinatedTargetLayout],
+    ) -> Result<CoordinatedLayoutReport, WgpuRenderRuntimeError> {
+        self.inner.request_coordinated_layout(desired)
+    }
+
+    /// Borrows the current front color view for one fixed logical target.
+    pub fn coordinated_target_texture_view(
+        &self,
+        target: PresentationTarget,
     ) -> Result<&wgpu::TextureView, WgpuRenderRuntimeError> {
-        self.inner.presentation_texture_view(token)
+        self.inner.coordinated_target_texture_view(target)
     }
 
-    pub fn retire_presentation(
-        &mut self,
-        token: PresentationToken,
-    ) -> Result<PresentationRetirement, WgpuRenderRuntimeError> {
-        self.inner.retire_presentation(token)
+    /// Reports whether either private allocation for one desired logical
+    /// target has actionable residency or freshness work.
+    pub fn coordinated_target_requires_execution(
+        &self,
+        target: PresentationTarget,
+    ) -> Result<bool, WgpuRenderRuntimeError> {
+        self.inner.coordinated_target_requires_execution(target)
     }
 
-    /// Clears a target's retained frame, streaming backlog, and residency
-    /// pins while preserving its registered texture/token for later reuse.
-    pub fn deactivate_presentation(
+    /// Collects completed renderer-owned hidden work and reports whether the
+    /// exact private candidate matching this request is ready for application
+    /// preflight and atomic publication.
+    pub fn poll_coordinated_hidden_refinement_ready(
         &mut self,
-        token: PresentationToken,
-    ) -> Result<(), WgpuRenderRuntimeError> {
-        self.inner.deactivate_presentation(token)
+        request: CoordinatedTargetRequest<'_>,
+    ) -> Result<bool, WgpuRenderRuntimeError> {
+        self.inner.poll_coordinated_hidden_refinement_ready(request)
+    }
+
+    /// Reports whether a fixed target needs work for one exact prepared
+    /// presentation identity.
+    ///
+    /// The ordinary target-level query can only observe the body already
+    /// installed in the renderer. This request-aware form also detects an
+    /// application-prepared successor body under the same semantic frame, so
+    /// asynchronous planning cannot wait for another input revision to make
+    /// the replacement visible.
+    pub fn coordinated_target_requires_prepared_presentation(
+        &self,
+        target: PresentationTarget,
+        frame: FrameIdentity,
+        extent: RenderExtent,
+        requirements: &PreparedRenderRequirements,
+    ) -> Result<bool, WgpuRenderRuntimeError> {
+        self.inner
+            .coordinated_target_requires_prepared_presentation(target, frame, extent, requirements)
+    }
+
+    /// Request-bound counterpart of
+    /// [`Self::coordinated_target_requires_prepared_presentation`].
+    ///
+    /// This is used at retained-presentation adoption boundaries, where frame
+    /// and immutable body identity must both match before existing pixels can
+    /// satisfy a new request. The volume schedule is also authoritative:
+    /// provisional preview pixels, including a full-size preview, cannot
+    /// satisfy a direct or atomic exact request. Work owned by the private 3D
+    /// candidate does not invalidate an otherwise matching visible front.
+    pub fn coordinated_target_requires_render_presentation(
+        &self,
+        target: PresentationTarget,
+        extent: RenderExtent,
+        requirements: &RenderRequirements,
+        volume_schedule: VolumeColorSchedule,
+    ) -> Result<bool, WgpuRenderRuntimeError> {
+        self.inner.coordinated_target_requires_render_presentation(
+            target,
+            extent,
+            requirements,
+            volume_schedule,
+        )
+    }
+
+    /// Executes one ordered cutoff over the desired fixed-target layout.
+    ///
+    /// Eligible resident color passes are recorded active-first into one
+    /// command encoder and use exactly one uninstrumented color submission.
+    pub fn execute_coordinated_frame(
+        &mut self,
+        catalog: &DatasetCatalog,
+        active_target: PresentationTarget,
+        targets: &[CoordinatedTargetRequest<'_>],
+    ) -> Result<CoordinatedFrameExecutionReport, WgpuRenderRuntimeError> {
+        self.inner
+            .execute_coordinated_frame(catalog, active_target, targets)
+    }
+
+    /// Polls one target/revision-bound coordinated validation capture.
+    pub fn poll_coordinated_validation_capture(
+        &mut self,
+        ticket: CoordinatedValidationCaptureTicket,
+    ) -> Result<Option<ValidationCapture>, WgpuRenderRuntimeError> {
+        self.inner.poll_coordinated_validation_capture(ticket)
     }
 
     /// Retires all dataset-generation-scoped residency, controls, and
@@ -1212,139 +1735,80 @@ impl WgpuRenderRuntime {
         self.inner.retire_dataset_generation();
     }
 
-    /// Read-only half of an application-level multi-owner transaction.
-    pub fn preflight_deactivate_presentation(
-        &self,
-        token: PresentationToken,
+    /// Installs the one canonical logical resource grid for an opened dataset
+    /// generation. Presentation bodies may select its layer/scales but never
+    /// infer or redefine GPU brick coordinates.
+    pub fn activate_dataset_generation(
+        &mut self,
+        catalog: &DatasetCatalog,
     ) -> Result<(), WgpuRenderRuntimeError> {
-        self.inner.preflight_deactivate_presentation(token)
+        self.inner.activate_dataset_generation(catalog)
     }
 
-    /// Infallible commit after `preflight_deactivate_presentation`. Renderer
-    /// ownership is UI-thread confined, so no registration can change between
-    /// the adjacent preflight and commit boundaries.
-    pub fn commit_preflighted_deactivate_presentation(&mut self, token: PresentationToken) {
+    #[cfg(test)]
+    fn activate_dataset_generation_with_resource_grids(
+        &mut self,
+        catalog: &DatasetCatalog,
+        grids: &RenderResourceGridCatalog,
+    ) -> Result<(), WgpuRenderRuntimeError> {
         self.inner
-            .deactivate_presentation(token)
-            .expect("a preflighted presentation remains registered until UI commit");
+            .activate_dataset_generation_with_resource_grids(catalog, grids)
     }
 
-    pub fn execute_frame(
+    /// Offers decoded payload leases to the renderer-global residency inbox.
+    ///
+    /// The batch is atomic and idempotent. Resident, already-pending, and
+    /// duplicate keys are no-ops; newly admitted leases retain caller order
+    /// until a relevant presentation drains them under the fixed per-execution
+    /// transfer bounds.
+    pub fn offer_residency_leases(
         &mut self,
-        presentation: PresentationToken,
-        catalog: &DatasetCatalog,
-        intent: &RenderIntent,
-        requirements: &RenderRequirements,
-        leases: &[&dyn ResourceLease],
-    ) -> Result<FrameExecutionReport, WgpuRenderRuntimeError> {
-        self.inner
-            .execute_frame(presentation, catalog, intent, requirements, leases)
+        leases: &[Arc<dyn ResourceLease>],
+    ) -> Result<(), WgpuRenderRuntimeError> {
+        self.inner.offer_residency_leases(leases)
     }
 
-    /// Executes a frame using a worker-prepared static sparse layout. The UI
-    /// path performs only bounded layer-prefix work plus actual residency
-    /// deltas; it never constructs or clones the up-to-65,536-entry layout.
-    pub fn execute_prepared_frame(
-        &mut self,
-        presentation: PresentationToken,
-        catalog: &DatasetCatalog,
-        intent: &RenderIntent,
-        requirements: &RenderRequirements,
-        layout: &PreparedStaticPresentationLayout,
-        leases: &[&dyn ResourceLease],
-    ) -> Result<FrameExecutionReport, WgpuRenderRuntimeError> {
-        self.inner.execute_prepared_frame(
-            presentation,
-            catalog,
-            intent,
-            requirements,
-            layout,
-            leases,
-        )
+    /// Retires pending CPU lease offers removed from the global retained
+    /// resource union. This is idempotent and never evicts an already-resident
+    /// GPU page.
+    pub fn retire_residency_offers(&mut self, keys: &[BrickKey]) {
+        self.inner.retire_residency_offers(keys);
     }
 
-    /// Executes from presentation-retained requirement/control/lease state.
-    /// Callers supply only newly available CPU leases; leases not consumed by
-    /// this frame's byte budget remain retained for subsequent submissions.
-    pub fn execute_retained_frame(
-        &mut self,
-        presentation: PresentationToken,
-        catalog: &DatasetCatalog,
-        intent: &RenderIntent,
-        requirements: &RenderRequirements,
-        lease_updates: &[Arc<dyn ResourceLease>],
-    ) -> Result<FrameExecutionReport, WgpuRenderRuntimeError> {
-        self.inner.execute_retained_frame(
-            presentation,
-            catalog,
-            intent,
-            requirements,
-            lease_updates,
-        )
+    /// Returns whether any active target has actionable offered residency
+    /// work. Offers for a future or unrelated target remain retained without
+    /// forcing idle repaint polling.
+    pub fn has_pending_residency_work(&self) -> bool {
+        self.inner.has_pending_residency_work()
     }
 
-    /// Retained-lease variant of [`Self::execute_prepared_frame`].
-    pub fn execute_prepared_retained_frame(
-        &mut self,
-        presentation: PresentationToken,
-        catalog: &DatasetCatalog,
-        intent: &RenderIntent,
-        requirements: &RenderRequirements,
-        layout: &PreparedStaticPresentationLayout,
-        lease_updates: &[Arc<dyn ResourceLease>],
-    ) -> Result<FrameExecutionReport, WgpuRenderRuntimeError> {
-        self.inner.execute_prepared_retained_frame(
-            presentation,
-            catalog,
-            intent,
-            requirements,
-            layout,
-            lease_updates,
-        )
+    /// Returns up to `maximum` unacknowledged destructive residency changes
+    /// in eviction order. Repeated calls return the same events until they are
+    /// acknowledged, superseded by a later eviction of the same key, or
+    /// cancelled by that key becoming resident again.
+    pub fn pending_residency_evictions(&self, maximum: usize) -> Box<[GpuResidencyEvictionEvent]> {
+        self.inner.pending_residency_evictions(maximum)
     }
 
-    /// Retained-lease execution with an explicit presentation cadence policy.
-    /// Upload/residency progress is never delayed by the policy.
-    #[allow(clippy::too_many_arguments)]
-    pub fn execute_prepared_retained_frame_with_policy(
-        &mut self,
-        presentation: PresentationToken,
-        catalog: &DatasetCatalog,
-        intent: &RenderIntent,
-        requirements: &RenderRequirements,
-        layout: &PreparedStaticPresentationLayout,
-        lease_updates: &[Arc<dyn ResourceLease>],
-        display_generation: u64,
-        render_policy: RetainedFrameRenderPolicy,
-    ) -> Result<FrameExecutionReport, WgpuRenderRuntimeError> {
-        self.inner.execute_prepared_retained_frame_with_policy(
-            presentation,
-            catalog,
-            intent,
-            requirements,
-            layout,
-            lease_updates,
-            display_generation,
-            render_policy,
-        )
+    pub fn has_pending_residency_evictions(&self) -> bool {
+        self.inner.has_pending_residency_evictions()
     }
 
-    pub const fn residency_epoch(&self) -> GpuResidencyEpoch {
-        GpuResidencyEpoch(self.inner.residency_epoch())
-    }
-
-    pub const fn residency_invalidation_epoch(&self) -> GpuResidencyInvalidationEpoch {
-        GpuResidencyInvalidationEpoch(self.inner.residency_invalidation_epoch())
+    /// Acknowledges every still-current eviction event through the supplied
+    /// sequence. A later re-eviction of the same key is a distinct event and
+    /// is never removed by acknowledging an older sequence.
+    pub fn acknowledge_residency_evictions(&mut self, through_sequence: u64) {
+        self.inner.acknowledge_residency_evictions(through_sequence);
     }
 
     /// Effective usable payload arena after device binding limits and the
     /// configured ledger are both applied.
     pub const fn payload_capacity_bytes(&self) -> u64 {
-        self.inner.diagnostics().payload_capacity_bytes()
+        self.inner.payload_capacity_bytes()
     }
 
     pub const fn resident_payload_bytes(&self) -> u64 {
-        self.inner.diagnostics().resident_payload_bytes()
+        self.inner.resident_payload_bytes()
     }
 
     pub const fn available_payload_bytes(&self) -> u64 {
@@ -1352,18 +1816,30 @@ impl WgpuRenderRuntime {
             .saturating_sub(self.resident_payload_bytes())
     }
 
-    /// Exact read-only membership query for the current residency epoch.
-    pub fn resource_is_resident(&self, key: DatasetResourceKey) -> bool {
-        self.inner.resource_is_resident(key)
+    /// Ensures that one exact aggregate visible/replacement union is physically
+    /// placeable in the renderer's sole segmented arena and current frame pins.
+    ///
+    /// A fragmented arena is compacted once inside the residency owner before
+    /// the exact transactional preflight is retried. Logical residency, pins,
+    /// and requirement identity never leave the renderer.
+    pub fn ensure_global_requirement_union(
+        &mut self,
+        catalog: &DatasetCatalog,
+        requirements: &[BrickKey],
+    ) -> Result<(), WgpuRenderRuntimeError> {
+        self.inner
+            .ensure_global_requirement_union(catalog, requirements)
     }
 
-    /// Polls once without waiting. `None` means the GPU/map callback has not
-    /// completed yet and the caller should poll on a later event-loop turn.
-    pub fn poll_validation_capture(
-        &mut self,
-        ticket: ValidationCaptureTicket,
-    ) -> Result<Option<ValidationCapture>, WgpuRenderRuntimeError> {
-        self.inner.poll_validation_capture(ticket)
+    /// Attempts one physical-only compaction after a transfer-time placement
+    /// refusal. Returns whether any payload moved.
+    pub fn recover_payload_fragmentation(&mut self) -> Result<bool, WgpuRenderRuntimeError> {
+        self.inner.recover_payload_fragmentation()
+    }
+
+    /// Exact read-only membership query for the current residency epoch.
+    pub fn resource_is_resident(&self, key: BrickKey) -> bool {
+        self.inner.resource_is_resident(key)
     }
 
     /// Polls one asynchronous GPU-domain timing without waiting for the GPU.
@@ -1374,18 +1850,20 @@ impl WgpuRenderRuntime {
         self.inner.poll_gpu_timing(ticket)
     }
 
-    /// Submits one bounded compute pick over the exact page/payload snapshot
-    /// associated with `query`. No framebuffer or synchronous readback is used.
-    pub fn request_pick(
+    /// Submits one pick against the exact visible 3D front allocation.
+    ///
+    /// An incomplete private refinement candidate is never resolved by this
+    /// entrypoint and therefore cannot become accidental pick authority.
+    pub fn request_coordinated_pick(
         &mut self,
-        presentation: PresentationToken,
+        target: PresentationTarget,
         query: VolumePickQuery,
     ) -> Result<VolumePickTicket, WgpuRenderRuntimeError> {
-        self.inner.request_pick(presentation, query)
+        self.inner.request_coordinated_pick(target, query)
     }
 
     /// Polls once without waiting. A completed result preserves the exact
-    /// query supplied to [`Self::request_pick`].
+    /// query supplied to [`Self::request_coordinated_pick`].
     pub fn poll_pick(
         &mut self,
         ticket: VolumePickTicket,
@@ -1401,10 +1879,7 @@ mod tests {
     #[test]
     fn accepted_frame_budget_is_exact() {
         let budget = FrameBudget::interactive();
-        assert_eq!(
-            budget.resident_resources_visited(),
-            mirante4d_render_api::MAX_RENDER_REQUIREMENTS
-        );
+        assert_eq!(budget.resident_resources_visited(), 512);
         assert_eq!(budget.new_resources_uploaded(), 512);
         assert_eq!(budget.payload_upload_bytes(), 8 * 1024 * 1024);
         assert_eq!(budget.control_upload_bytes(), 8 * 1024 * 1024);

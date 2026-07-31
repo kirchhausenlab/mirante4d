@@ -62,10 +62,7 @@ impl DatasetSource for FixtureSource {
     }
 }
 
-fn sink_fault(
-    key: mirante4d_dataset::DatasetResourceKey,
-    reason: DecodeSinkError,
-) -> DatasetSourceFault {
+fn sink_fault(key: mirante4d_dataset::BrickKey, reason: DecodeSinkError) -> DatasetSourceFault {
     DatasetSourceFault::SinkRejected {
         key,
         reason: Box::new(reason),

@@ -11,6 +11,7 @@ mod histogram;
 pub mod import_workflow;
 mod project_store_service;
 pub mod render_coordination;
+pub mod render_intent_mailbox;
 pub mod viewer_tools;
 pub mod viewport_interaction;
 
@@ -23,18 +24,25 @@ pub use histogram::{
     auto_signal_window_from_histogram, histogram_can_auto_window,
 };
 pub use mirante4d_analysis_core::{AnalysisPlot, AnalysisTable, IntensityStatistics};
+pub use mirante4d_render_api::PresentationTarget as PresentationSlot;
 pub use project_store_service::{
     MonotonicClock, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,
     ProjectStoreLifecycle, ProjectStoreServiceError, ProjectStoreServiceEvent,
     ProjectStoreServiceStatus, SystemMonotonicClock,
 };
 pub use render_coordination::{
+    CoordinatedPresentationGroup, CoordinatedPublicationDiagnostics,
     CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
     CrossSectionPanelScheduleStatus, DISPLAY_TIMING_SAMPLE_CAPACITY, DisplayGenerationStatus,
     DisplayRefreshPath, DisplayRefreshTiming, DisplayTimingSamples, DisplayedFrameFreshness,
     FrameCompleteness, FrameFailureKind, FrameFidelityStatus, LayerPresentationOverflow,
     LayerPresentationStatus, LodDecisionReason, RenderBackend, RenderCoordinationState,
     RenderSurfaceState, ResidentRenderFailureStatus,
+};
+pub use render_intent_mailbox::{
+    CompletedRenderIntent, RenderGestureId, RenderGestureKind, RenderIntentBase,
+    RenderIntentFamily, RenderIntentMailbox, RenderIntentMailboxError, RenderIntentMailboxSnapshot,
+    RenderIntentPayload, RenderIntentRevision, RenderIntentSample, RenderIntentTarget,
 };
 
 use std::{
@@ -3279,32 +3287,6 @@ pub enum WorkspaceSnapshot {
     },
 }
 
-/// One of the viewer's fixed presentation surfaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum PresentationSlot {
-    ThreeD,
-    Xy,
-    Xz,
-    Yz,
-}
-
-impl PresentationSlot {
-    pub const ALL: [Self; 4] = [Self::ThreeD, Self::Xy, Self::Xz, Self::Yz];
-
-    pub const fn is_cross_section(self) -> bool {
-        !matches!(self, Self::ThreeD)
-    }
-
-    const fn index(self) -> usize {
-        match self {
-            Self::ThreeD => 0,
-            Self::Xy => 1,
-            Self::Xz => 2,
-            Self::Yz => 3,
-        }
-    }
-}
-
 /// Backend-neutral facts needed to paint one viewer surface.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PresentationSurface {
@@ -3357,7 +3339,7 @@ impl PresentationSurface {
     pub fn paint_request(&self) -> Option<PresentationPaintRequest> {
         self.frame
             .as_ref()
-            .map(|frame| PresentationPaintRequest::new(frame.token(), self.viewport))
+            .map(|frame| PresentationPaintRequest::new(frame.target(), self.viewport))
     }
 }
 

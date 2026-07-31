@@ -1,6 +1,4 @@
-use mirante4d_dataset::{
-    DatasetCatalog, DatasetResourceIdentity, DatasetResourceKey, ResourceRegion,
-};
+use mirante4d_dataset::{BrickKey, DatasetCatalog, DatasetResourceIdentity, ResourceRegion};
 use mirante4d_domain::{IntensityDType, LogicalLayerKey, ScaleLevel, Shape3D, TimeIndex};
 use mirante4d_identity::ScientificContentId;
 
@@ -171,7 +169,7 @@ impl AnalysisDefinition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnalysisBlock {
     ordinal: u64,
-    resource: DatasetResourceKey,
+    resource: BrickKey,
 }
 
 impl AnalysisBlock {
@@ -179,7 +177,7 @@ impl AnalysisBlock {
         self.ordinal
     }
 
-    pub const fn resource(self) -> DatasetResourceKey {
+    pub const fn resource(self) -> BrickKey {
         self.resource
     }
 }
@@ -253,7 +251,7 @@ impl AnalysisPlan {
                 .expect("a clipped analysis block is nonempty"),
         )
         .expect("a planned region is bounded by a validated dataset shape");
-        let resource = DatasetResourceKey::new(
+        let resource = BrickKey::new(
             self.definition.resource_identity(),
             self.definition.layer(),
             TimeIndex::new(self.definition.time_start() + time_offset),

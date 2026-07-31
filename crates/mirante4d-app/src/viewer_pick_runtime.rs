@@ -7,18 +7,18 @@ use mirante4d_application::{
         ViewerToolEvent,
     },
 };
-use mirante4d_render_api::{FrameIdentity, PresentationToken, RenderExtent, VolumePickResult};
+use mirante4d_render_api::{FrameIdentity, PresentationTarget, RenderExtent, VolumePickResult};
 use mirante4d_ui_egui::{
     ViewerPickPurpose, ViewerPickRequest, ViewportHover, ViewportIntensity, ViewportSampleKind,
 };
 
-use crate::{MiranteWorkbenchApp, application_view};
+use crate::{BACKGROUND_WORK_REPAINT_INTERVAL, MiranteWorkbenchApp, application_view};
 
 const PICK_POLL_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PresentedPickIdentity {
-    token: PresentationToken,
+    target: PresentationTarget,
     frame: FrameIdentity,
     extent: RenderExtent,
 }
@@ -40,7 +40,7 @@ impl ViewerPickCurrentness {
             .get(PresentationSlot::ThreeD)
             .and_then(|surface| surface.current_frame())
             .map(|frame| PresentedPickIdentity {
-                token: frame.token(),
+                target: frame.target(),
                 frame: frame.frame(),
                 extent: frame.extent(),
             });
@@ -60,7 +60,7 @@ impl ViewerPickCurrentness {
         request.context() == self.context
             && request.tool() == self.tool
             && self.presented.is_some_and(|presented| {
-                query.token() == presented.token
+                query.target() == presented.target
                     && query.frame() == presented.frame
                     && query.extent() == presented.extent
             })
@@ -341,6 +341,22 @@ impl MiranteWorkbenchApp {
         let snapshot = self.application_snapshot_for_ui();
         let currentness = ViewerPickCurrentness::from_snapshot(&snapshot);
         self.viewer_pick_queue.retain_current(currentness);
+        match self.native_presentation.pick_pipeline_is_ready() {
+            Ok(true) => {}
+            Ok(false) => {
+                // Keep the latest current request queued while the renderer's
+                // one bounded compiler worker finishes the pick capability.
+                // Compiler polling owns the slower cadence; do not turn this
+                // into the 8-ms mapped-result poll loop.
+                context.request_repaint_after(BACKGROUND_WORK_REPAINT_INTERVAL);
+                return;
+            }
+            Err(error) => {
+                self.viewer_pick_queue.clear_unsubmitted();
+                tracing::warn!(%error, "viewer picking stopped after renderer initialization failed");
+                return;
+            }
+        }
 
         let completion = self
             .viewer_pick_queue
@@ -401,10 +417,10 @@ impl MiranteWorkbenchApp {
                 .as_mut()
                 .expect("the renderer availability was checked above")
                 .renderer
-                .request_pick(query.token(), query);
+                .request_coordinated_pick(query.target(), query);
             match submission {
                 Ok(ticket) => {
-                    if ticket.presentation() != query.token() || ticket.frame() != query.frame() {
+                    if ticket.target() != query.target() || ticket.frame() != query.frame() {
                         tracing::error!(
                             ?ticket,
                             ?query,
@@ -534,10 +550,10 @@ mod tests {
         SourceSessionGeneration,
         viewer_tools::{ScreenPosition, ViewerToolContext},
     };
-    use mirante4d_dataset::{DatasetResourceIdentity, DatasetResourceKey, ResourceRegion};
+    use mirante4d_dataset::{BrickKey, DatasetResourceIdentity, ResourceRegion};
     use mirante4d_domain::{LogicalLayerKey, ScaleLevel, Shape3D, TimeIndex, WorldPoint3};
     use mirante4d_render_api::{
-        FrameCompleteness, FrameCoverage, FrameProgress, PresentationToken, PresentedFrame,
+        FrameCompleteness, FrameCoverage, FrameProgress, PresentationTarget, PresentedFrame,
         RenderRequirement, RenderRequirementRole, RenderRequirements, VolumePickCompleteness,
         VolumePickPolicy, VolumePickQuery, VolumePickValue,
     };
@@ -585,7 +601,7 @@ mod tests {
             vec![layer],
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
+        let key = BrickKey::new(
             identity(),
             LogicalLayerKey::new(3),
             TimeIndex::new(5),
@@ -602,7 +618,7 @@ mod tests {
         .unwrap();
         let coverage = FrameCoverage::from_available(&requirements, &[key]).unwrap();
         PresentedFrame::new(
-            PresentationToken::new(11).unwrap(),
+            PresentationTarget::ThreeD,
             RenderExtent::new(64, 32).unwrap(),
             FrameProgress::new(coverage, FrameCompleteness::Exact, None).unwrap(),
         )
@@ -638,7 +654,7 @@ mod tests {
             context: request.context(),
             tool: request.tool(),
             presented: Some(PresentedPickIdentity {
-                token: query.token(),
+                target: query.target(),
                 frame: query.frame(),
                 extent: query.extent(),
             }),
