@@ -74,3 +74,12 @@ within ten seconds. Fallback termination, a missing recovery, a panic marker,
 source mutation, or a nonzero clean-close exit fails the check. It does not
 create a supported-release or crash-durability claim beyond those exact
 steps.
+
+The current local pre-alpha checkpoint passed both commands against its
+unpacked packaged executable. The lifecycle run used exactly three mapped
+launches and zero retries; all source comparisons were byte-identical, all
+bounded stderr logs were panic-free, recovery opened dirty through the normal
+actor route, and the clean native close exited successfully without fallback
+cleanup. The generated contents and product-validation reports, rather than
+this prose, remain authoritative for the exact commit, tree, binary path,
+artifact digests, and observations.

@@ -4,17 +4,17 @@ Last updated: 2026-07-31
 
 ## Current Status
 
-The
+No implementation package is currently active. The
 [pre-alpha reliability and packaging plan](../plans/active/PRE_ALPHA_RELIABILITY_AND_PACKAGING.md)
-is the active closeout package. The clean native-shutdown hard cut and
-proactive unsaved-autosave recovery exposure are implemented. One bounded
-real-display source-tree run passed the exact three-launch reliability
-scenario: external SIGKILL after a durable provisional autosave, explicit
-dirty recovery on the next launch, and successful mapped clean X11 close,
-with zero retries, panic-free stderr, and byte-identical source data. The
-remaining active work is the exact clean-commit Linux x86_64 package build,
-packaged render/reliability validation, final branch push, and draft pull
-request. The owner requested and authorized the full package on 2026-07-31.
+is complete: the rendering checkpoint is preserved on its publication
+branch, native clean shutdown has one exit-time owner, unsaved provisional
+autosaves are proactively exposed for explicit actor-validated recovery, and
+the clean Linux x86_64 release directory, AppImage, and tarball passed their
+package checks. The unpacked packaged executable also passed the mapped
+render-mode matrix and the exact three-launch crash/recovery/native-close
+scenario with zero retries, panic-free stderr, and byte-identical source
+data. This remains a local pre-alpha handoff, not a supported public release.
+The next implementation package requires a new owner decision.
 
 The viewer performance refactor is closed as of 2026-07-31. The owner
 exercised the normal application after the final resident-navigation-ladder

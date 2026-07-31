@@ -26,10 +26,11 @@ exceptions have one separate tool-owned
 
 The
 [pre-alpha reliability and packaging plan](plans/active/PRE_ALPHA_RELIABILITY_AND_PACKAGING.md)
-is the active checkpoint for publishing the completed rendering work, making
+is the completed handoff for publishing the rendering checkpoint, making
 native clean shutdown single-owner, exposing earlier-launch provisional
-autosaves in the packaged application, and building one validated local Linux
-x86_64 pre-alpha package.
+autosaves for explicit recovery, and building one validated local Linux
+x86_64 pre-alpha package. The unpacked package passed the mapped render-mode
+and fixed three-launch crash/recovery/native-close checks.
 
 The
 [resident 3D navigation ladder plan](plans/active/VIEWER_RESIDENT_3D_NAVIGATION_LADDER.md)

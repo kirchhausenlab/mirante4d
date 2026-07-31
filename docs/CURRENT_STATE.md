@@ -478,6 +478,16 @@ directly under its hardware, timeout, and clean-revision guards. Ordinary test
 source is no longer treated as a hash-bound fixture, and no separate WP-09A
 receipt parser can override the native test result.
 
+The current local Linux x86_64 pre-alpha package passed dependency policy,
+AppStream validation, release-directory/AppImage/tarball construction, and
+all three package smoke checks from a clean committed tree. Its unpacked
+executable passed the mapped promoted-fixture MIP/DVR/ISO matrix and the
+fixed three-launch reliability scenario: durable provisional autosave before
+external SIGKILL, explicit startup-exposed dirty recovery, and successful
+clean native X11 close without cleanup fallback. The generated contents and
+product-validation reports retain the exact revision, binary, source
+nonmutation, process, and artifact evidence.
+
 See [testing](TESTING.md) for commands and claim language.
 
 ## Viewer Performance And Development Recovery Status

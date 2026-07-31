@@ -1,6 +1,6 @@
 # Pre-Alpha Reliability And Packaging Plan
 
-- Status: IMPLEMENTED; PRE-PACKAGE PRODUCT VALIDATED; PACKAGE/PR PENDING
+- Status: IMPLEMENTED AND VERIFIED
 - Planning requested by owner: 2026-07-31
 - Implementation authorized by owner: 2026-07-31
 - Last reviewed: 2026-07-31
@@ -312,6 +312,47 @@ mirante4d-0.1.0-linux-x86_64-release/mirante4d-app \
 MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
   cargo xtask product-validate pre_alpha_reliability
 ```
+
+## Implementation And Verification Result
+
+The planned hard cut is complete:
+
+- the completed rendering checkpoint is preserved on
+  `origin/agent/pre-alpha-reliability`;
+- clean native close is accepted immediately and `on_exit` is the sole
+  exit-time close/join owner;
+- dirty Save, Discard, and Cancel retain their explicit decision route;
+- bounded earlier-launch locator discovery proactively exposes unsaved
+  provisional recovery after startup;
+- recovery waits for source verification, follows the normal application
+  service and actor route, and opens the selected provisional branch dirty;
+- automation script schema 8 adds only the recovery exposure and selection
+  vocabulary needed by the product boundary; and
+- `pre_alpha_reliability` implements the fixed three-launch mapped scenario
+  with no retries or timeout-as-success behavior.
+
+The full pull-request gate passed before packaging: policy, formatting/lint,
+documentation, dependencies, fixtures, workflows, and 1,306 tests passed,
+with 33 explicitly skipped and no failures. The clean Linux x86_64 package
+command then passed dependency policy, release compilation, AppStream
+validation, release-directory/AppImage/tarball construction, and all three
+package smoke checks.
+
+Both mapped product checks passed against the unpacked packaged executable.
+`target_fixture_render_modes` exercised the promoted fixture and MIP/DVR/ISO
+matrix. `pre_alpha_reliability` completed all three required launches with
+zero retries: external SIGKILL only after the durable provisional-autosave
+checkpoint, explicit dirty recovery on the next launch with a nonblank GPU
+capture and successful actor close/join, and a real clean X11 window-manager
+close that exited successfully without fallback cleanup. All three source
+closures were byte-identical and all bounded stderr logs were panic-free.
+
+The generated contents report under `target/mirante4d/dist/` is the authority
+for the exact package commit, tree, artifact digests, dependency result, and
+smoke results. The mapped product reports under
+`target/mirante4d/product-validation/` are the authority for their exact
+binary path and observations. These generated local artifacts are not
+committed and do not create a public release.
 
 ## Acceptance Criteria
 
