@@ -386,7 +386,7 @@ impl eframe::App for MiranteWorkbenchApp {
                 .project_store
                 .as_ref()
                 .is_some_and(ProjectStoreApplicationService::can_save_as);
-        let project_recovery_ui = self.project_recovery_ui();
+        let project_recovery_ui = self.project_recovery_ui(project_actions_available);
         let project_recovery_available = can_inspect_project_recovery
             || project_recovery_ui.has_candidates()
             || project_recovery_ui.has_locators();

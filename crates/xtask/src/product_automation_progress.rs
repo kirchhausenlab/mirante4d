@@ -201,6 +201,7 @@ fn known_command_kind(kind: &str) -> Option<&'static str> {
         "initial_save_with_edit" => "initial_save_with_edit",
         "open_project" => "open_project",
         "recover_automatic_autosave" => "recover_automatic_autosave",
+        "recover_exposed_unsaved_autosave" => "recover_exposed_unsaved_autosave",
         "save_project_as" => "save_project_as",
         "close_project_store" => "close_project_store",
         "write_external_kill_checkpoint" => "write_external_kill_checkpoint",

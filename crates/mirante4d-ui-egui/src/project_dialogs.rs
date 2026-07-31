@@ -72,6 +72,7 @@ pub struct ProjectRecoveryView {
     candidates: Vec<ProjectRecoveryCandidateView>,
     locators: Vec<ProjectId>,
     can_open_locator: bool,
+    source_verified: bool,
 }
 
 impl ProjectRecoveryView {
@@ -81,6 +82,7 @@ impl ProjectRecoveryView {
         candidates: Vec<ProjectRecoveryCandidateView>,
         locators: Vec<ProjectId>,
         can_open_locator: bool,
+        source_verified: bool,
     ) -> Self {
         Self {
             review_generation,
@@ -88,6 +90,7 @@ impl ProjectRecoveryView {
             candidates,
             locators,
             can_open_locator,
+            source_verified,
         }
     }
 
@@ -193,6 +196,17 @@ pub(crate) fn show_project_recovery_ui(
             ui.separator();
             if !input.locators.is_empty() {
                 ui.heading("Unsaved projects from earlier launches");
+                if !input.source_verified {
+                    muted_label(
+                        ui,
+                        "Waiting for the current dataset's scientific verification before recovery can open.",
+                    );
+                } else if !input.can_open_locator {
+                    muted_label(
+                        ui,
+                        "Recovery will become available when the current project operation finishes.",
+                    );
+                }
                 for project_id in &input.locators {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!("Project {project_id}"));
@@ -316,6 +330,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     false,
+                    false,
                 ),
                 actions: Vec::new(),
             },
@@ -353,6 +368,7 @@ mod tests {
                     vec![candidate],
                     vec![project_id],
                     true,
+                    true,
                 ),
                 actions: Vec::new(),
             },
@@ -373,6 +389,35 @@ mod tests {
                 candidate_generation
             )]
         );
+    }
+
+    #[test]
+    fn earlier_launch_recovery_waits_visibly_for_source_verification() {
+        let project_id = ProjectId::from_bytes([9; 16]);
+        let mut harness = Harness::builder().build_ui_state(
+            |ui, state: &mut ProjectRecoveryHarnessState| {
+                state.actions.clear();
+                show_project_recovery_ui(ui.ctx(), &state.input, &mut state.actions);
+            },
+            ProjectRecoveryHarnessState {
+                input: ProjectRecoveryView::new(
+                    None,
+                    true,
+                    Vec::new(),
+                    vec![project_id],
+                    false,
+                    false,
+                ),
+                actions: Vec::new(),
+            },
+        );
+
+        harness.get_by_label(
+            "Waiting for the current dataset's scientific verification before recovery can open.",
+        );
+        harness.get_by_label("Inspect and Recover").click();
+        harness.step();
+        assert!(harness.state().actions.is_empty());
     }
 
     fn generation_id(byte: u8) -> ProjectGenerationId {

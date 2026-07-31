@@ -4,6 +4,18 @@ Last updated: 2026-07-31
 
 ## Current Status
 
+The
+[pre-alpha reliability and packaging plan](../plans/active/PRE_ALPHA_RELIABILITY_AND_PACKAGING.md)
+is the active closeout package. The clean native-shutdown hard cut and
+proactive unsaved-autosave recovery exposure are implemented. One bounded
+real-display source-tree run passed the exact three-launch reliability
+scenario: external SIGKILL after a durable provisional autosave, explicit
+dirty recovery on the next launch, and successful mapped clean X11 close,
+with zero retries, panic-free stderr, and byte-identical source data. The
+remaining active work is the exact clean-commit Linux x86_64 package build,
+packaged render/reliability validation, final branch push, and draft pull
+request. The owner requested and authorized the full package on 2026-07-31.
+
 The viewer performance refactor is closed as of 2026-07-31. The owner
 exercised the normal application after the final resident-navigation-ladder
 cut and reported that four-panel and 3D behavior works as expected. No

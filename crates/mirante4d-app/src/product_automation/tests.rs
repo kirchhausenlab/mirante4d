@@ -77,7 +77,7 @@ fn runtime_idle_wait_includes_async_camera_demand_planning_and_install() {
 }
 
 #[test]
-fn schema_v6_requires_exact_hard_safety_limits_without_legacy_alias() {
+fn schema_v8_requires_exact_hard_safety_limits_without_legacy_alias() {
     let script_without_limits = json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
@@ -787,7 +787,7 @@ fn automation_alone_does_not_enable_validation_capture() {
     let navigation: ProductAutomationScript = serde_json::from_str(
         r#"{
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 7,
+          "schema_version": 8,
           "hard_safety_limits": {},
           "scenario": "performance_navigation",
           "commands": [
@@ -813,7 +813,7 @@ fn automation_alone_does_not_enable_validation_capture() {
         let raw = format!(
             r#"{{
               "schema": "mirante4d-product-automation-script",
-              "schema_version": 7,
+              "schema_version": 8,
               "hard_safety_limits": {{}},
               "scenario": "render_correctness",
               "commands": [{pixel_command}]
@@ -826,7 +826,7 @@ fn automation_alone_does_not_enable_validation_capture() {
 }
 
 #[test]
-fn automation_v7_rejects_implicit_capture_and_legacy_nonblank_frame() {
+fn automation_v8_rejects_implicit_capture_and_legacy_nonblank_frame() {
     let implicit_capture = serde_json::from_value::<ProductAutomationScript>(json!({
         "schema": AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": AUTOMATION_SCHEMA_VERSION,
@@ -935,7 +935,7 @@ fn automation_script_parses_the_b4_project_store_contract() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 7,
+          "schema_version": 8,
           "hard_safety_limits": {},
           "scenario": "b4_project_store",
           "commands": [
@@ -1007,6 +1007,55 @@ fn automation_script_parses_the_b4_project_store_contract() {
 }
 
 #[test]
+fn automation_script_parses_exposed_provisional_autosave_recovery() {
+    let raw = r#"
+        {
+          "schema": "mirante4d-product-automation-script",
+          "schema_version": 8,
+          "hard_safety_limits": {},
+          "scenario": "pre_alpha_recovery",
+          "commands": [
+            { "command": "wait_for", "condition": "unsaved_autosave_recovery_exposed", "timeout_ms": 1000 },
+            { "command": "recover_exposed_unsaved_autosave" },
+            { "command": "assert", "condition": { "project_state": {
+              "bound": true,
+              "dirty": true,
+              "lifecycle": "provisional",
+              "can_save": true,
+              "can_save_as": false,
+              "manual": false,
+              "autosave": true
+            } } },
+            { "command": "quit" }
+          ]
+        }"#;
+
+    let script: ProductAutomationScript = serde_json::from_str(raw).unwrap();
+    script.validate().unwrap();
+    assert_eq!(
+        script.commands[1].name(),
+        "recover_exposed_unsaved_autosave"
+    );
+    let ProductAutomationCommand::WaitFor { condition, .. } = script.commands[0] else {
+        panic!("expected recovery-exposure wait");
+    };
+    assert!(matches!(
+        condition,
+        ProductAutomationWaitCondition::UnsavedAutosaveRecoveryExposed
+    ));
+    let ProductAutomationCommand::Assert {
+        condition: ProductAutomationAssertCondition::ProjectState { lifecycle, .. },
+    } = script.commands[2]
+    else {
+        panic!("expected provisional project-state assertion");
+    };
+    assert_eq!(
+        lifecycle,
+        ProductAutomationProjectStoreLifecycle::Provisional
+    );
+}
+
+#[test]
 fn b4_project_evidence_helpers_keep_exact_typed_facts() {
     let project_id = mirante4d_project_model::ProjectId::from_bytes([7; 16]);
     let revision = ProjectRevisionId::new(project_id, 42);
@@ -1017,6 +1066,10 @@ fn b4_project_evidence_helpers_keep_exact_typed_facts() {
     assert_eq!(project_revision_json(Some(revision))["sequence"], 42);
     assert_eq!(project_revision_json(None), Value::Null);
 
+    assert_eq!(
+        project_store_lifecycle(ProductAutomationProjectStoreLifecycle::Provisional),
+        ProjectStoreLifecycle::Provisional
+    );
     assert_eq!(
         project_store_lifecycle(ProductAutomationProjectStoreLifecycle::RecoverySelected),
         ProjectStoreLifecycle::RecoverySelected
@@ -1067,7 +1120,7 @@ fn automation_script_parses_semantic_camera_commands() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 7,
+          "schema_version": 8,
           "hard_safety_limits": {
             "max_cpu_total_bytes": 1024,
             "max_runtime_queued_requests": 128
@@ -1195,7 +1248,7 @@ fn automation_script_parses_source_verification_evidence_workflow() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 7,
+          "schema_version": 8,
           "hard_safety_limits": {},
           "scenario": "b3_source_verification",
           "commands": [
@@ -1251,7 +1304,7 @@ fn automation_script_parses_normal_import_cancel_resume_workflow() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 7,
+          "schema_version": 8,
           "hard_safety_limits": {},
           "scenario": "import_preprocessing",
           "commands": [
@@ -1294,7 +1347,7 @@ fn automation_script_parses_retained_four_panel_assertions() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 7,
+          "schema_version": 8,
           "hard_safety_limits": {},
           "scenario": "unit_four_panel",
           "commands": [

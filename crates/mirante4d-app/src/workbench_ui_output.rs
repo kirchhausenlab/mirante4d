@@ -262,7 +262,8 @@ impl MiranteWorkbenchApp {
                                 Some(format!("Dataset open could not begin: {error}"));
                         }
                     } else {
-                        self.request_project_store_close_for_exit();
+                        self.egui_ui.allow_close_without_prompt = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
                 WorkbenchUiAction::CancelDirtyProjectClose => {

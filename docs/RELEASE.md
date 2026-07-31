@@ -54,3 +54,23 @@ MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
 This exercises MIP, DVR, ISO, linked panels, 1280x720, and a short
 1920x1080 resize with the promoted small fixture. It is a local product check,
 not a supported-release claim.
+
+Then run the bounded packaged lifecycle check against that same executable:
+
+```bash
+MIRANTE4D_PRODUCT_VALIDATE_APP_BINARY=target/mirante4d/dist/\
+mirante4d-0.1.0-linux-x86_64-release/mirante4d-app \
+MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
+  cargo xtask product-validate pre_alpha_reliability
+```
+
+`pre_alpha_reliability` uses the promoted small fixture, isolated state homes,
+1280x720 mapped clients, no automatic retries, and three release-process
+launches. It creates a real scheduled provisional autosave and applies
+external SIGKILL only after a synced checkpoint; proves that the next launch
+visibly exposes and explicitly recovers the dirty branch; then sends a real
+window-manager close to a clean mapped client and requires successful exit
+within ten seconds. Fallback termination, a missing recovery, a panic marker,
+source mutation, or a nonzero clean-close exit fails the check. It does not
+create a supported-release or crash-durability claim beyond those exact
+steps.

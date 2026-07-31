@@ -6,7 +6,7 @@ use crate::product_validate::{is_product_validation_scenario_name, product_valid
 use crate::workflow_audit::workflow_audit;
 
 const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [target-package] \
-     [target_fixture_camera_smoke|target_fixture_render_modes|representative_native_navigation|target_source_verification|import_preprocessing|b4_project_persistence]";
+     [target_fixture_camera_smoke|target_fixture_render_modes|representative_native_navigation|target_source_verification|import_preprocessing|b4_project_persistence|pre_alpha_reliability]";
 
 mod arch;
 #[cfg(test)]
@@ -159,7 +159,10 @@ input, exact settlement, and return to standalone 3D. The import scenario
 generates a bounded public TIFF fixture, cancels and resumes preprocessing,
 waits for verified publication, then renders the imported package. The
 retained b4_project_persistence scenario checks project save, recovery, and
-reopen behavior across three application launches.
+reopen behavior across three application launches. The pre_alpha_reliability
+scenario uses isolated state homes to prove provisional-autosave exposure and
+recovery across a crash, then proves clean exit from a mapped native X11
+window close.
 
 Useful controls:
   MIRANTE4D_PRODUCT_VALIDATE_TIMEOUT_SECS=<seconds>
@@ -239,6 +242,13 @@ mod tests {
             ProductValidateArgs::Run {
                 package: None,
                 scenario: Some("import_preprocessing".to_owned())
+            }
+        );
+        assert_eq!(
+            product_validate_args(args(&["pre_alpha_reliability"])).unwrap(),
+            ProductValidateArgs::Run {
+                package: None,
+                scenario: Some("pre_alpha_reliability".to_owned())
             }
         );
     }

@@ -19,9 +19,9 @@ fn x11_automation_helpers_have_short_silence_absolute_and_output_bounds() {
 }
 
 fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_resources: u64) {
-    assert_eq!(SCRIPT_SCHEMA_VERSION, 7);
+    assert_eq!(SCRIPT_SCHEMA_VERSION, 8);
     assert_eq!(REPORT_SCHEMA_VERSION, 8);
-    assert_eq!(script["schema_version"], 7);
+    assert_eq!(script["schema_version"], 8);
     assert_eq!(
         script["hard_safety_limits"]["max_cpu_total_bytes"],
         total_bytes
@@ -962,6 +962,170 @@ fn b4_scripts_lock_the_fixed_three_launch_cutover() {
 }
 
 #[test]
+fn pre_alpha_reliability_scripts_lock_recovery_exposure_and_native_close() {
+    let package = Path::new("/tmp/source.m4d");
+    let provisional_checkpoint = Path::new("/tmp/provisional-checkpoint.json");
+    let native_close_checkpoint = Path::new("/tmp/native-close-checkpoint.json");
+    let first = pre_alpha_provisional_launch_script(package, provisional_checkpoint);
+    let second = pre_alpha_recovery_launch_script(package);
+    let third = pre_alpha_native_close_launch_script(package, native_close_checkpoint);
+    for script in [&first, &second, &third] {
+        validate_product_automation_script(script).unwrap();
+        let commands = script["commands"].as_array().unwrap();
+        assert!(commands.iter().any(|command| {
+            command["command"] == "set_mapped_client_pixels"
+                && command["width"] == B4_PRIMARY_CLIENT_WIDTH
+                && command["height"] == B4_PRIMARY_CLIENT_HEIGHT
+        }));
+    }
+
+    let first_commands = first["commands"].as_array().unwrap();
+    let autosave = first_commands
+        .iter()
+        .position(|command| {
+            command["command"] == "wait_for" && command["condition"] == "project_autosaved"
+        })
+        .unwrap();
+    let checkpoint = first_commands
+        .iter()
+        .position(|command| command["command"] == "write_external_kill_checkpoint")
+        .unwrap();
+    assert!(autosave < checkpoint);
+    assert_eq!(first_commands[autosave]["timeout_ms"], 45_000);
+    assert_eq!(
+        first_commands[checkpoint]["stage"],
+        PRE_ALPHA_PROVISIONAL_CHECKPOINT_STAGE
+    );
+    assert_eq!(
+        first_commands.last().unwrap()["command"],
+        "hold_for_external_kill"
+    );
+
+    let second_commands = second["commands"].as_array().unwrap();
+    let exposed = second_commands
+        .iter()
+        .position(|command| {
+            command["command"] == "wait_for"
+                && command["condition"] == "unsaved_autosave_recovery_exposed"
+        })
+        .unwrap();
+    let recovered = second_commands
+        .iter()
+        .position(|command| command["command"] == "recover_exposed_unsaved_autosave")
+        .unwrap();
+    assert!(exposed < recovered);
+    validate_pre_alpha_recovery_script(&second).unwrap();
+    assert_eq!(second_commands.last().unwrap()["command"], "quit");
+
+    let third_commands = third["commands"].as_array().unwrap();
+    let checkpoint = third_commands
+        .iter()
+        .find(|command| command["command"] == "write_external_kill_checkpoint")
+        .unwrap();
+    assert_eq!(checkpoint["stage"], PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE);
+    assert_eq!(
+        third_commands.last().unwrap()["command"],
+        "hold_for_external_kill"
+    );
+}
+
+#[test]
+fn pre_alpha_recovery_and_stderr_evidence_are_bounded_and_strict() {
+    let state_home = tempfile::tempdir().unwrap();
+    let recovery_root = state_home.path().join("mirante4d").join("recovery");
+    fs::create_dir_all(recovery_root.join("12345678-1234-1234-1234-123456789abc.m4dproj")).unwrap();
+    let evidence = pre_alpha_recovery_store_evidence(state_home.path()).unwrap();
+    assert_eq!(evidence["entries"], 1);
+    assert_eq!(evidence["canonical_store_directories"], 1);
+    assert!(is_canonical_project_store_directory_name(
+        "12345678-1234-1234-1234-123456789abc.m4dproj"
+    ));
+    assert!(!is_canonical_project_store_directory_name(
+        "12345678-1234-1234-1234-123456789ABC.m4dproj"
+    ));
+
+    let stderr = state_home.path().join("stderr.log");
+    fs::write(&stderr, "normal diagnostic\n").unwrap();
+    assert_eq!(
+        pre_alpha_stderr_evidence(&stderr).unwrap()["panic_free"],
+        true
+    );
+    fs::write(&stderr, "thread 'main' panicked at source.rs:1\n").unwrap();
+    assert_eq!(
+        pre_alpha_stderr_evidence(&stderr).unwrap()["panic_free"],
+        false
+    );
+}
+
+#[test]
+fn pre_alpha_checkpoints_require_provisional_autosave_and_clean_unbound_close() {
+    let provisional = json!({
+        "schema": B4_CHECKPOINT_SCHEMA,
+        "schema_version": 1,
+        "stage": PRE_ALPHA_PROVISIONAL_CHECKPOINT_STAGE,
+        "viewport_evidence": {
+            "requested_mapped_client_pixels": {
+                "width": B4_PRIMARY_CLIENT_WIDTH,
+                "height": B4_PRIMARY_CLIENT_HEIGHT,
+            }
+        },
+        "project_state": {
+            "bound": true,
+            "dirty": true,
+            "current_revision": {"project_id": "project", "sequence": 2},
+            "saved_revision": null,
+            "lifecycle": "provisional",
+            "can_save": true,
+            "can_save_as": false,
+            "manual": false,
+            "autosave": true,
+            "current_manual": null,
+            "current_autosave": "autosave-generation",
+        },
+        "project_evidence": {
+            "latest_autosave_captured_revision": {
+                "project_id": "project",
+                "sequence": 2,
+            }
+        }
+    });
+    validate_pre_alpha_checkpoint(&provisional, PRE_ALPHA_PROVISIONAL_CHECKPOINT_STAGE, 1).unwrap();
+
+    let clean = json!({
+        "schema": B4_CHECKPOINT_SCHEMA,
+        "schema_version": 1,
+        "stage": PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE,
+        "viewport_evidence": {
+            "requested_mapped_client_pixels": {
+                "width": B4_PRIMARY_CLIENT_WIDTH,
+                "height": B4_PRIMARY_CLIENT_HEIGHT,
+            }
+        },
+        "project_state": {
+            "bound": false,
+            "dirty": false,
+            "current_revision": null,
+            "saved_revision": null,
+            "lifecycle": "unbound",
+            "can_save": true,
+            "can_save_as": false,
+            "manual": false,
+            "autosave": false,
+            "current_manual": null,
+            "current_autosave": null,
+        }
+    });
+    validate_pre_alpha_checkpoint(&clean, PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE, 3).unwrap();
+
+    let mut unsafe_clean = clean;
+    unsafe_clean["project_state"]["dirty"] = json!(true);
+    assert!(
+        validate_pre_alpha_checkpoint(&unsafe_clean, PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE, 3)
+            .is_err()
+    );
+}
+
+#[test]
 fn b4_checkpoint_requires_real_passive_autosave_and_revision_order() {
     let checkpoint = b4_valid_checkpoint();
     validate_b4_checkpoint(&checkpoint, B4_CHECKPOINT_STAGE).unwrap();
@@ -1105,6 +1269,10 @@ fn product_validation_scenario_resolution_is_strict() {
             B4_PROJECT_PERSISTENCE_SCENARIO,
             ProductValidationScenario::B4ProjectPersistence,
         ),
+        (
+            PRE_ALPHA_RELIABILITY_SCENARIO,
+            ProductValidationScenario::PreAlphaReliability,
+        ),
     ] {
         assert_eq!(
             ProductValidationScenario::resolve(Some(name), None).unwrap(),
@@ -1155,6 +1323,10 @@ fn product_validation_output_dirs_are_scenario_scoped() {
         product_validation_output_dir(&ProductValidationScenario::B4ProjectPersistence),
         Path::new(OUTPUT_DIR).join(B4_PROJECT_PERSISTENCE_SCENARIO)
     );
+    assert_eq!(
+        product_validation_output_dir(&ProductValidationScenario::PreAlphaReliability),
+        Path::new(OUTPUT_DIR).join(PRE_ALPHA_RELIABILITY_SCENARIO)
+    );
 }
 
 #[test]
@@ -1188,12 +1360,12 @@ fn fixed_product_automation_script_validation_rejects_wrong_schema() {
         validate_product_automation_script(&predecessor_version)
             .unwrap_err()
             .to_string()
-            .contains("schema_version must be 7")
+            .contains("schema_version must be 8")
     );
 }
 
 #[test]
-fn product_automation_v7_rejects_implicit_capture_and_nonblank_targets() {
+fn product_automation_v8_rejects_implicit_capture_and_nonblank_targets() {
     let implicit_capture = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": SCRIPT_SCHEMA_VERSION,
@@ -1356,7 +1528,7 @@ fn product_automation_script_shape_rejects_legacy_and_unknown_top_level_fields()
 }
 
 #[test]
-fn product_automation_report_contract_requires_v7_with_a_v6_script_binding() {
+fn product_automation_report_contract_requires_v8_script_and_report_binding() {
     let report = json!({
         "status": "passed",
         "artifacts": []
@@ -1365,7 +1537,7 @@ fn product_automation_report_contract_requires_v7_with_a_v6_script_binding() {
     validate_product_automation_report_contract(&report, &script, &script_path).unwrap();
 
     let mut old_schema = report.clone();
-    old_schema["schema_version"] = json!(SCRIPT_SCHEMA_VERSION);
+    old_schema["schema_version"] = json!(REPORT_SCHEMA_VERSION - 1);
     assert!(
         validate_product_automation_report_contract(&old_schema, &script, &script_path).is_err()
     );

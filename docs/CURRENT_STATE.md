@@ -35,9 +35,21 @@ application-problem presentation, and transient UI drafts and interaction
 state. `mirante4d-render-wgpu` is the sole product renderer. The unpublished
 `mirante4d-render-reference` CPU oracle is test-only.
 
-Native SIGINT/SIGTERM handling sets one monotonic latch, wakes egui, and issues
-one prompt-free close request. Existing `on_exit` ownership performs the normal
-cancellation and joins; there is no guardian or competing shutdown path.
+Native clean window-manager close is accepted on its first close event.
+Dirty close alone is cancelled for an explicit Save, Discard, or Cancel
+decision; successful Save or Discard authorizes one later close. Native
+SIGINT/SIGTERM handling sets one monotonic latch, wakes egui, and issues one
+prompt-free close request. `on_exit` is the sole exit-time shutdown owner and
+performs normal cancellation and joins; there is no frame-loop project-store
+join, second synthetic close, guardian, or competing shutdown path.
+
+Earlier-launch provisional autosaves are discovered only as bounded canonical
+project-store locators. When any exist, startup opens the normal recovery
+panel and visibly reports that unsaved work is available. Recovery remains an
+explicit user choice, waits for current-source scientific verification, and
+uses the application reducer and project-store actor to validate the selected
+store. A recovered provisional branch opens dirty and still requires Save or
+Save As; startup never silently opens, repairs, advances, or deletes it.
 
 The importer now indexes the reviewed TIFF inventory once, traverses admitted
 native strips/tiles in source order, decodes each admitted native chunk once
@@ -891,10 +903,6 @@ historical T5 performance claim.
   artifacts.
 - Linux release candidates are local x86_64 artifacts, not a supported public
   release.
-- Packaged runtime does not expose unsaved-autosave recovery.
-- Direct X11 close of a clean project can hit an inherited Winit shutdown
-  panic; the dirty-project save/discard/cancel route and native
-  SIGINT/SIGTERM close request exit cleanly.
 - Terminal GPU loss, out-of-memory, backend-internal, and validation failures
   are typed and latched, but there is no device-recovery path or CPU fallback.
   Actual hardware loss/OOM fault injection remains unperformed.

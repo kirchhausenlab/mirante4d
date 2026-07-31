@@ -234,6 +234,30 @@ fn noninteractive_project_paths_are_consumed_once() {
 }
 
 #[test]
+fn native_close_policy_accepts_clean_or_explicitly_authorized_exit_without_cancellation() {
+    assert_eq!(
+        native_close_decision(true, false, false),
+        NativeCloseDecision::Accept
+    );
+    assert_eq!(
+        native_close_decision(true, true, true),
+        NativeCloseDecision::Accept
+    );
+}
+
+#[test]
+fn native_close_policy_cancels_only_an_unauthorized_dirty_exit() {
+    assert_eq!(
+        native_close_decision(true, false, true),
+        NativeCloseDecision::CancelForDirtyPrompt
+    );
+    assert_eq!(
+        native_close_decision(false, false, true),
+        NativeCloseDecision::NoRequest
+    );
+}
+
+#[test]
 fn recovery_locator_discovery_is_canonical_bounded_and_content_blind() {
     let root = tempfile::tempdir().unwrap();
     let current = ProjectId::from_bytes([1; 16]);
@@ -258,6 +282,24 @@ fn recovery_locator_discovery_is_canonical_bounded_and_content_blind() {
             .collect::<Vec<_>>(),
         vec![older_a, older_b]
     );
+}
+
+#[test]
+fn project_store_startup_reports_earlier_launch_recovery_locators() {
+    let root = tempfile::tempdir().unwrap();
+    let current = ProjectId::from_bytes([1; 16]);
+    let earlier = ProjectId::from_bytes([2; 16]);
+    fs::create_dir(root.path().join(format!("{earlier}.m4dproj"))).unwrap();
+
+    let (service, warning) = start_project_store_service(Some(root.path()), current).unwrap();
+
+    assert!(warning.is_none());
+    assert!(earlier_launch_recovery_available(&service));
+    assert_eq!(
+        service.recovery_store_project_ids().collect::<Vec<_>>(),
+        vec![earlier]
+    );
+    service.join().unwrap();
 }
 
 #[test]
@@ -458,9 +500,8 @@ pub(crate) fn test_workbench_app_without_background_runtime(
         dataset_open_project_close: DatasetOpenProjectCloseState::NotRequested,
         project_status_message: None,
         close_after_project_save: false,
-        exit_after_project_close: false,
+        native_exit_requested: false,
         restart_project_store_after_close: false,
-        pending_viewport_close: false,
         pending_source_install: None,
         settings_connection,
         selected_adapter_memory: gpu_memory::SelectedAdapterMemoryFacts::unavailable_for_tests(),

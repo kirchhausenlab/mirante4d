@@ -30,7 +30,7 @@ use crate::{
 const PRODUCT_VALIDATION_SCHEMA: &str = "mirante4d-product-validation-report";
 pub(crate) const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 pub(crate) const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-pub(crate) const SCRIPT_SCHEMA_VERSION: u32 = 7;
+pub(crate) const SCRIPT_SCHEMA_VERSION: u32 = 8;
 pub(crate) const REPORT_SCHEMA_VERSION: u32 = 8;
 pub(crate) const IMPORT_OPEN_READY_COMPLETE_STATUS: &str = "open_ready_complete";
 pub(crate) const PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS: [&str; 12] = [
@@ -64,11 +64,16 @@ const REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO: &str = "representative_native_n
 const B3_SOURCE_VERIFICATION_SCENARIO: &str = "target_source_verification";
 const IMPORT_PREPROCESSING_SCENARIO: &str = "import_preprocessing";
 const B4_PROJECT_PERSISTENCE_SCENARIO: &str = "b4_project_persistence";
+const PRE_ALPHA_RELIABILITY_SCENARIO: &str = "pre_alpha_reliability";
 const B4_TRUSTED_REPORT_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_PROJECT_STORE_LIFECYCLE_REPORT";
 const B4_CHECKPOINT_SCHEMA: &str = "mirante4d-product-external-kill-checkpoint";
 const B4_CHECKPOINT_STAGE: &str = "after_real_autosave_before_external_kill";
+const PRE_ALPHA_PROVISIONAL_CHECKPOINT_STAGE: &str =
+    "after_provisional_autosave_before_external_kill";
+const PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE: &str = "mapped_clean_window_ready_for_native_close";
 const B4_AUTOSAVE_MIN_ELAPSED_MS: u64 = 30_000;
 const B4_PHASE_TIMEOUT_SECS: u64 = 90;
+const NATIVE_CLOSE_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const B3_SCENARIO_TIMEOUT_SECS: u64 = 180;
 const IMPORT_SCENARIO_TIMEOUT_SECS: u64 = 600;
 const B4_PRIMARY_CLIENT_WIDTH: u32 = 1280;
@@ -97,6 +102,8 @@ const MIB: u64 = 1024 * 1024;
 const PREFLIGHT_ONLY_DISPLAY_SOURCE: &str = "preflight_only";
 const SOURCE_CLOSURE_EVIDENCE_ENTRY_MAX: usize = 131_072;
 const SOURCE_CLOSURE_EVIDENCE_BYTES_MAX: u64 = 256 * MIB;
+const PRE_ALPHA_RECOVERY_ROOT_ENTRIES_MAX: usize = 64;
+const PRE_ALPHA_STDERR_BYTES_MAX: u64 = 4 * MIB;
 const X11_AUTOMATION_OUTPUT_POLICY: BoundedOutputPolicy = BoundedOutputPolicy {
     scope: "x11_automation",
     inactivity_timeout: Duration::from_secs(2),
@@ -306,6 +313,9 @@ fn product_validate_report_inner(
 ) -> anyhow::Result<ProductValidationOutcome> {
     if matches!(scenario, ProductValidationScenario::B4ProjectPersistence) {
         return product_validate_b4_project_persistence(package, scenario);
+    }
+    if matches!(scenario, ProductValidationScenario::PreAlphaReliability) {
+        return product_validate_pre_alpha_reliability(package, scenario);
     }
     let started_at = Instant::now();
     let started_at_epoch_ms = epoch_ms();
@@ -611,6 +621,7 @@ enum ProductValidationScenario {
     B3SourceVerification,
     ImportPreprocessing,
     B4ProjectPersistence,
+    PreAlphaReliability,
 }
 
 impl ProductValidationScenario {
@@ -622,6 +633,7 @@ impl ProductValidationScenario {
             Self::B3SourceVerification => B3_SOURCE_VERIFICATION_SCENARIO,
             Self::ImportPreprocessing => IMPORT_PREPROCESSING_SCENARIO,
             Self::B4ProjectPersistence => B4_PROJECT_PERSISTENCE_SCENARIO,
+            Self::PreAlphaReliability => PRE_ALPHA_RELIABILITY_SCENARIO,
         }
     }
 
@@ -634,12 +646,13 @@ impl ProductValidationScenario {
             B3_SOURCE_VERIFICATION_SCENARIO => Ok(Self::B3SourceVerification),
             IMPORT_PREPROCESSING_SCENARIO => Ok(Self::ImportPreprocessing),
             B4_PROJECT_PERSISTENCE_SCENARIO => Ok(Self::B4ProjectPersistence),
+            PRE_ALPHA_RELIABILITY_SCENARIO => Ok(Self::PreAlphaReliability),
             other => bail!(
                 "unknown product validation scenario {other:?}; expected \
                  {GENERATED_FIXTURE_SCENARIO}, {GENERATED_RENDER_MODES_SCENARIO}, \
                  {REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO}, \
                  {B3_SOURCE_VERIFICATION_SCENARIO}, {IMPORT_PREPROCESSING_SCENARIO}, or \
-                 {B4_PROJECT_PERSISTENCE_SCENARIO}"
+                 {B4_PROJECT_PERSISTENCE_SCENARIO}, or {PRE_ALPHA_RELIABILITY_SCENARIO}"
             ),
         }
     }
@@ -653,6 +666,7 @@ impl ProductValidationScenario {
                 | B3_SOURCE_VERIFICATION_SCENARIO
                 | IMPORT_PREPROCESSING_SCENARIO
                 | B4_PROJECT_PERSISTENCE_SCENARIO
+                | PRE_ALPHA_RELIABILITY_SCENARIO
         )
     }
 
@@ -663,6 +677,7 @@ impl ProductValidationScenario {
             Self::B3SourceVerification => B3_SCENARIO_TIMEOUT_SECS,
             Self::ImportPreprocessing => IMPORT_SCENARIO_TIMEOUT_SECS,
             Self::B4ProjectPersistence => B4_PHASE_TIMEOUT_SECS * 3,
+            Self::PreAlphaReliability => B4_PHASE_TIMEOUT_SECS * 3,
         }
     }
 }
@@ -965,6 +980,308 @@ fn product_validate_b4_project_persistence(
         report_path,
         status,
     })
+}
+
+struct PreAlphaReliabilityReport<'a> {
+    path: &'a Path,
+    binary: &'a Path,
+    status: ProductValidationStatus,
+    failure_reason: Option<String>,
+    started_at_epoch_ms: u128,
+    started_at: Instant,
+    package: &'a Path,
+    run_dir: &'a Path,
+    recovery_state_home: &'a Path,
+    clean_close_state_home: &'a Path,
+    scripts: &'a [Value],
+    attempts: &'a [Value],
+    display: DisplayClassification,
+    preflight_only: bool,
+}
+
+fn product_validate_pre_alpha_reliability(
+    package: Option<&Path>,
+    scenario: &ProductValidationScenario,
+) -> anyhow::Result<ProductValidationOutcome> {
+    let started_at = Instant::now();
+    let started_at_epoch_ms = epoch_ms();
+    let binary = ProductValidationAppBinary::from_environment()?;
+    let output_dir = product_validation_output_dir(scenario);
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    let run_dir = output_dir.join(format!("run-{}-{}", epoch_ms(), std::process::id()));
+    fs::create_dir(&run_dir).with_context(|| {
+        format!(
+            "failed to create unique pre-alpha reliability directory {}",
+            run_dir.display()
+        )
+    })?;
+    let work_dir = run_dir.join("work");
+    let recovery_state_home = work_dir.join("recovery-xdg-state-home");
+    let clean_close_state_home = work_dir.join("clean-close-xdg-state-home");
+    fs::create_dir_all(&recovery_state_home)
+        .with_context(|| format!("failed to create {}", recovery_state_home.display()))?;
+    fs::create_dir_all(&clean_close_state_home)
+        .with_context(|| format!("failed to create {}", clean_close_state_home.display()))?;
+    let package = match package {
+        Some(package) => package.to_path_buf(),
+        None => default_target_fixture()?,
+    };
+    let provisional_checkpoint = run_dir
+        .join("launch-1-provisional")
+        .join("external-process-checkpoint.json");
+    let native_close_checkpoint = run_dir
+        .join("launch-3-native-close")
+        .join("external-process-checkpoint.json");
+    let scripts = [
+        pre_alpha_provisional_launch_script(&package, &provisional_checkpoint),
+        pre_alpha_recovery_launch_script(&package),
+        pre_alpha_native_close_launch_script(&package, &native_close_checkpoint),
+    ];
+    let phase_names = [
+        "launch-1-provisional",
+        "launch-2-recovery",
+        "launch-3-native-close",
+    ];
+    let mut script_records = Vec::with_capacity(scripts.len());
+    for (phase, script) in phase_names.iter().zip(&scripts) {
+        validate_product_automation_script(script)
+            .with_context(|| format!("invalid pre-alpha reliability script for {phase}"))?;
+        let phase_dir = run_dir.join(phase);
+        fs::create_dir_all(&phase_dir)
+            .with_context(|| format!("failed to create {}", phase_dir.display()))?;
+        let path = phase_dir.join("product-automation-script.json");
+        write_json_file(&path, script)?;
+        script_records.push(json!({
+            "phase": phase,
+            "path": path,
+            "scenario": script.get("scenario").and_then(Value::as_str),
+        }));
+    }
+
+    let report_path = run_dir.join("product-validation-report.json");
+    let display = display_status();
+    let preflight_only = env_flag(PREFLIGHT_ONLY_ENV);
+    let mut attempts = Vec::new();
+    if preflight_only {
+        write_pre_alpha_reliability_report(PreAlphaReliabilityReport {
+            path: &report_path,
+            binary: binary.path(),
+            status: ProductValidationStatus::Unsupported,
+            failure_reason: Some(
+                "pre-alpha reliability preflight generated all three scripts without launching the app"
+                    .to_owned(),
+            ),
+            started_at_epoch_ms,
+            started_at,
+            package: &package,
+            run_dir: &run_dir,
+            recovery_state_home: &recovery_state_home,
+            clean_close_state_home: &clean_close_state_home,
+            scripts: &script_records,
+            attempts: &attempts,
+            display: DisplayClassification {
+                class: DisplayClass::Unsupported,
+                source: PREFLIGHT_ONLY_DISPLAY_SOURCE,
+            },
+            preflight_only,
+        })?;
+        return Ok(ProductValidationOutcome {
+            report_path,
+            status: ProductValidationStatus::Unsupported,
+        });
+    }
+
+    let setup = (|| -> anyhow::Result<()> {
+        if display.class != DisplayClass::RealDisplay || env::var_os("DISPLAY").is_none() {
+            bail!("pre-alpha reliability validation requires a real X11 display");
+        }
+        require_b4_x11_tools()?;
+        if binary.should_build_default_release() {
+            run_cargo(["build", "--release", "-p", "mirante4d-app"])?;
+        }
+        binary.validate_for_launch()
+    })();
+    if let Err(err) = setup {
+        write_pre_alpha_reliability_report(PreAlphaReliabilityReport {
+            path: &report_path,
+            binary: binary.path(),
+            status: ProductValidationStatus::Failed,
+            failure_reason: Some(err.to_string()),
+            started_at_epoch_ms,
+            started_at,
+            package: &package,
+            run_dir: &run_dir,
+            recovery_state_home: &recovery_state_home,
+            clean_close_state_home: &clean_close_state_home,
+            scripts: &script_records,
+            attempts: &attempts,
+            display,
+            preflight_only,
+        })?;
+        return Ok(ProductValidationOutcome {
+            report_path,
+            status: ProductValidationStatus::Failed,
+        });
+    }
+
+    let specs = [
+        PreAlphaAttemptSpec {
+            number: 1,
+            phase: phase_names[0],
+            script: &script_records[0]["path"],
+            state_home: &recovery_state_home,
+            termination: B4Termination::ExternalSigkill {
+                checkpoint: &provisional_checkpoint,
+                expected_stage: PRE_ALPHA_PROVISIONAL_CHECKPOINT_STAGE,
+            },
+        },
+        PreAlphaAttemptSpec {
+            number: 2,
+            phase: phase_names[1],
+            script: &script_records[1]["path"],
+            state_home: &recovery_state_home,
+            termination: B4Termination::Normal,
+        },
+        PreAlphaAttemptSpec {
+            number: 3,
+            phase: phase_names[2],
+            script: &script_records[2]["path"],
+            state_home: &clean_close_state_home,
+            termination: B4Termination::ExternalNativeClose {
+                checkpoint: &native_close_checkpoint,
+                expected_stage: PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE,
+            },
+        },
+    ];
+
+    for spec in specs {
+        let attempt = run_pre_alpha_attempt(binary.path(), &package, &run_dir, spec);
+        let passed = attempt.get("status").and_then(Value::as_str) == Some("passed");
+        attempts.push(attempt);
+        let failure_reason = (!passed).then(|| {
+            attempts
+                .last()
+                .and_then(|attempt| attempt.get("failure_reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("pre-alpha reliability phase failed")
+                .to_owned()
+        });
+        write_pre_alpha_reliability_report(PreAlphaReliabilityReport {
+            path: &report_path,
+            binary: binary.path(),
+            status: ProductValidationStatus::Failed,
+            failure_reason: failure_reason
+                .or_else(|| Some("pre-alpha reliability scenario is incomplete".to_owned())),
+            started_at_epoch_ms,
+            started_at,
+            package: &package,
+            run_dir: &run_dir,
+            recovery_state_home: &recovery_state_home,
+            clean_close_state_home: &clean_close_state_home,
+            scripts: &script_records,
+            attempts: &attempts,
+            display: display.clone(),
+            preflight_only,
+        })?;
+        if !passed {
+            return Ok(ProductValidationOutcome {
+                report_path,
+                status: ProductValidationStatus::Failed,
+            });
+        }
+    }
+
+    let (status, failure_reason) = match validate_pre_alpha_attempts(&attempts) {
+        Ok(()) => (ProductValidationStatus::Passed, None),
+        Err(err) => (ProductValidationStatus::Failed, Some(err.to_string())),
+    };
+    write_pre_alpha_reliability_report(PreAlphaReliabilityReport {
+        path: &report_path,
+        binary: binary.path(),
+        status,
+        failure_reason,
+        started_at_epoch_ms,
+        started_at,
+        package: &package,
+        run_dir: &run_dir,
+        recovery_state_home: &recovery_state_home,
+        clean_close_state_home: &clean_close_state_home,
+        scripts: &script_records,
+        attempts: &attempts,
+        display,
+        preflight_only,
+    })?;
+    Ok(ProductValidationOutcome {
+        report_path,
+        status,
+    })
+}
+
+fn write_pre_alpha_reliability_report(report: PreAlphaReliabilityReport<'_>) -> anyhow::Result<()> {
+    let all_source_byte_identical = report.attempts.len() == 3
+        && report.attempts.iter().all(|attempt| {
+            attempt
+                .pointer("/source_closure_evidence/byte_identical")
+                .and_then(Value::as_bool)
+                == Some(true)
+        });
+    let value = json!({
+        "schema": PRODUCT_VALIDATION_SCHEMA,
+        "schema_version": PRODUCT_VALIDATION_SCHEMA_VERSION,
+        "command": "product-validate",
+        "status": report.status.name(),
+        "failure_reason": report.failure_reason,
+        "started_at_epoch_ms": report.started_at_epoch_ms,
+        "started_at_utc": unix_epoch_ms_to_utc_rfc3339(report.started_at_epoch_ms),
+        "finished_at_epoch_ms": epoch_ms(),
+        "duration_ms": duration_ms(report.started_at.elapsed()),
+        "host": benchmark_host_context(),
+        "build_profile": "release",
+        "binary": report.binary,
+        "dataset": dataset_context_json(report.package),
+        "scenario": {
+            "name": PRE_ALPHA_RELIABILITY_SCENARIO,
+            "kind": "fixed_three_launch_packaged_recovery_and_native_close",
+            "required_launches": 3,
+            "scripts": report.scripts,
+            "mapped_client_pixels": {
+                "width": B4_PRIMARY_CLIENT_WIDTH,
+                "height": B4_PRIMARY_CLIENT_HEIGHT,
+            },
+            "native_close_exit_deadline_seconds": NATIVE_CLOSE_EXIT_TIMEOUT.as_secs(),
+        },
+        "claim_boundary": {
+            "evidence_type": "normal_release_multi_launch_with_external_sigkill_and_mapped_x11_close",
+            "real_display_required": true,
+            "provisional_autosave_recovery": true,
+            "native_window_manager_close": true,
+            "public_release_claim": false,
+        },
+        "environment": {
+            "display_class": report.display.class.name(),
+            "display_class_source": report.display.source,
+            "display_env_present": env::var_os("DISPLAY").is_some(),
+            "isolated_recovery_xdg_state_home": report.recovery_state_home,
+            "isolated_clean_close_xdg_state_home": report.clean_close_state_home,
+            "preflight_only": report.preflight_only,
+        },
+        "retry_policy": {
+            "automatic_retries": 0,
+            "attempts_per_phase_max": 1,
+            "observed_retries": 0,
+        },
+        "source_nonmutation": {
+            "required_per_launch": true,
+            "all_three_launches_byte_identical": all_source_byte_identical,
+        },
+        "attempts": report.attempts,
+        "artifacts": {
+            "run_directory": report.run_dir,
+            "retention": "all_phase_scripts_logs_reports_checkpoints_and_capture",
+        },
+    });
+    write_json_file(report.path, &value)
 }
 
 fn write_b4_aggregate_report(report: B4AggregateReport<'_>) -> anyhow::Result<()> {
@@ -1633,6 +1950,15 @@ fn product_validation_package_and_script(
             let script = b4_launch_one_script(&package, placeholder, checkpoint);
             Ok((package, script, None))
         }
+        ProductValidationScenario::PreAlphaReliability => {
+            let package = match package {
+                Some(package) => package.to_path_buf(),
+                None => default_target_fixture()?,
+            };
+            let checkpoint = Path::new("target/pre-alpha-reliability-checkpoint.json");
+            let script = pre_alpha_provisional_launch_script(&package, checkpoint);
+            Ok((package, script, None))
+        }
     }
 }
 
@@ -2169,6 +2495,93 @@ fn import_preprocessing_script(
     })
 }
 
+fn pre_alpha_provisional_launch_script(package: &Path, checkpoint: &Path) -> Value {
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": "pre_alpha_reliability_provisional_autosave",
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
+        "commands": [
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5_000 },
+            { "command": "set_mapped_client_pixels", "width": B4_PRIMARY_CLIENT_WIDTH, "height": B4_PRIMARY_CLIENT_HEIGHT },
+            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30_000 },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30_000 },
+            { "command": "new_project" },
+            { "command": "camera_pan", "x_points": 8.0, "y_points": -4.0 },
+            { "command": "wait_for", "condition": "project_autosaved", "timeout_ms": 45_000 },
+            { "command": "wait_for", "condition": "project_store_idle", "timeout_ms": 30_000 },
+            { "command": "assert", "condition": { "project_state": {
+                "bound": true,
+                "dirty": true,
+                "lifecycle": "provisional",
+                "can_save": true,
+                "can_save_as": false,
+                "manual": false,
+                "autosave": true
+            } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "write_external_kill_checkpoint", "path": checkpoint, "stage": PRE_ALPHA_PROVISIONAL_CHECKPOINT_STAGE },
+            { "command": "hold_for_external_kill" }
+        ]
+    })
+}
+
+fn pre_alpha_recovery_launch_script(package: &Path) -> Value {
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": "pre_alpha_reliability_recover_unsaved_autosave",
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
+        "commands": [
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5_000 },
+            { "command": "set_mapped_client_pixels", "width": B4_PRIMARY_CLIENT_WIDTH, "height": B4_PRIMARY_CLIENT_HEIGHT },
+            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30_000 },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30_000 },
+            { "command": "wait_for", "condition": "unsaved_autosave_recovery_exposed", "timeout_ms": 30_000 },
+            { "command": "recover_exposed_unsaved_autosave" },
+            { "command": "wait_for", "condition": "project_store_idle", "timeout_ms": 30_000 },
+            { "command": "assert", "condition": { "project_state": {
+                "bound": true,
+                "dirty": true,
+                "lifecycle": "recovery_selected",
+                "can_save": false,
+                "can_save_as": true,
+                "manual": false,
+                "autosave": true
+            } } },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30_000 },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "pre-alpha-recovered-unsaved-autosave" },
+            { "command": "close_project_store" },
+            { "command": "wait_for", "condition": "project_store_closed", "timeout_ms": 30_000 },
+            { "command": "quit" }
+        ]
+    })
+}
+
+fn pre_alpha_native_close_launch_script(package: &Path, checkpoint: &Path) -> Value {
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": "pre_alpha_reliability_native_close",
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
+        "commands": [
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5_000 },
+            { "command": "set_mapped_client_pixels", "width": B4_PRIMARY_CLIENT_WIDTH, "height": B4_PRIMARY_CLIENT_HEIGHT },
+            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30_000 },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30_000 },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "write_external_kill_checkpoint", "path": checkpoint, "stage": PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE },
+            { "command": "hold_for_external_kill" }
+        ]
+    })
+}
+
 fn b4_launch_one_script(package: &Path, project: &Path, checkpoint: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
@@ -2492,6 +2905,10 @@ enum B4Termination<'a> {
         checkpoint: &'a Path,
         expected_stage: &'a str,
     },
+    ExternalNativeClose {
+        checkpoint: &'a Path,
+        expected_stage: &'a str,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2505,6 +2922,15 @@ struct B4AttemptSpec<'a> {
     termination: B4Termination<'a>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreAlphaAttemptSpec<'a> {
+    number: u64,
+    phase: &'a str,
+    script: &'a Value,
+    state_home: &'a Path,
+    termination: B4Termination<'a>,
+}
+
 #[derive(Debug)]
 struct B4ProcessStatus {
     timed_out: bool,
@@ -2512,6 +2938,18 @@ struct B4ProcessStatus {
     exit_success: Option<bool>,
     signal: Option<i32>,
     external_sigkill_sent: bool,
+    external_native_close_sent: bool,
+    checkpoint: Option<Value>,
+    observed_client_area_pixels: Option<Value>,
+    fullscreen_action: Option<Value>,
+    control_failure: Option<String>,
+}
+
+struct B4FinishedProcessStatus {
+    exit_status: std::process::ExitStatus,
+    timed_out: bool,
+    external_sigkill_sent: bool,
+    external_native_close_sent: bool,
     checkpoint: Option<Value>,
     observed_client_area_pixels: Option<Value>,
     fullscreen_action: Option<Value>,
@@ -2593,6 +3031,7 @@ fn run_b4_attempt(
             "exit_success": Value::Null,
             "signal": Value::Null,
             "external_sigkill_sent": false,
+            "external_native_close_sent": false,
             "checkpoint": Value::Null,
             "observed_client_area_pixels": Value::Null,
             "fullscreen_action": Value::Null,
@@ -2635,6 +3074,224 @@ fn run_b4_attempt(
     attempt
 }
 
+fn run_pre_alpha_attempt(
+    binary: &Path,
+    package: &Path,
+    run_dir: &Path,
+    spec: PreAlphaAttemptSpec<'_>,
+) -> Value {
+    let phase_dir = run_dir.join(spec.phase);
+    let automation_report_path = phase_dir.join("product-automation-report.json");
+    let stdout_path = phase_dir.join("mirante4d-app.stdout.log");
+    let stderr_path = phase_dir.join("mirante4d-app.stderr.log");
+    let script_path = spec
+        .script
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| phase_dir.join("invalid-script-path"));
+    let source_before = SourceClosureSnapshot::capture(package);
+    let started_at_epoch_ms = epoch_ms();
+    let started_at = Instant::now();
+    let progress = read_json_file(&script_path).and_then(|script| {
+        let progress_plan = ProductAutomationProgressPlan::from_script(&script)?;
+        let phase_root = fs::canonicalize(&phase_dir).context(
+            "pre-alpha reliability phase directory is unavailable for progress monitoring",
+        )?;
+        let progress_launch = ProductAutomationProgressLaunch::new_replacing_stale(&phase_root)?;
+        Ok((progress_plan, progress_launch))
+    });
+    let process_result = match (&source_before, progress) {
+        (Ok(_), Ok((progress_plan, progress_launch))) => run_b4_product_process(B4ProductRun {
+            binary,
+            package,
+            script: &script_path,
+            automation_report: &automation_report_path,
+            stdout_path: &stdout_path,
+            stderr_path: &stderr_path,
+            state_home: spec.state_home,
+            timeout: Duration::from_secs(B4_PHASE_TIMEOUT_SECS),
+            expected_client_width: B4_PRIMARY_CLIENT_WIDTH,
+            expected_client_height: B4_PRIMARY_CLIENT_HEIGHT,
+            termination: spec.termination,
+            phase: spec.phase,
+            progress_plan,
+            progress_launch,
+        }),
+        (Err(err), _) => Err(anyhow::anyhow!(err.to_string())),
+        (_, Err(err)) => Err(err),
+    };
+    let source_closure_evidence = source_before
+        .as_ref()
+        .map_err(|err| anyhow::anyhow!(err.to_string()))
+        .and_then(|before| before.compare_json(package))
+        .unwrap_or_else(|err| {
+            json!({
+                "required": true,
+                "byte_identical": Value::Null,
+                "error": err.to_string(),
+            })
+        });
+    let automation_report = if automation_report_path.exists() {
+        read_json_file(&automation_report_path).unwrap_or_else(|err| {
+            json!({
+                "status": "invalid_report",
+                "failure_reason": err.to_string(),
+            })
+        })
+    } else {
+        Value::Null
+    };
+    let process = match process_result {
+        Ok(process) => b4_process_status_json(process),
+        Err(err) => json!({
+            "timed_out": false,
+            "exit_status": Value::Null,
+            "exit_success": Value::Null,
+            "signal": Value::Null,
+            "external_sigkill_sent": false,
+            "external_native_close_sent": false,
+            "checkpoint": Value::Null,
+            "observed_client_area_pixels": Value::Null,
+            "fullscreen_action": Value::Null,
+            "control_failure": format!("pre-alpha reliability process runner failed: {err}"),
+        }),
+    };
+    let stderr_evidence = pre_alpha_stderr_evidence(&stderr_path).unwrap_or_else(|err| {
+        json!({
+            "checked": false,
+            "panic_free": Value::Null,
+            "error": err.to_string(),
+        })
+    });
+    let recovery_store_evidence = pre_alpha_recovery_store_evidence(spec.state_home)
+        .unwrap_or_else(|err| {
+            json!({
+                "checked": false,
+                "error": err.to_string(),
+            })
+        });
+    let mut attempt = json!({
+        "attempt": spec.number,
+        "phase": spec.phase,
+        "retry_index": 0,
+        "status": "pending",
+        "failure_reason": Value::Null,
+        "started_at_epoch_ms": started_at_epoch_ms,
+        "finished_at_epoch_ms": epoch_ms(),
+        "duration_ms": duration_ms(started_at.elapsed()),
+        "script": script_path,
+        "automation_report_path": automation_report_path,
+        "stdout": stdout_path,
+        "stderr": stderr_path,
+        "state_home": spec.state_home,
+        "requested_client_area_pixels": {
+            "width": B4_PRIMARY_CLIENT_WIDTH,
+            "height": B4_PRIMARY_CLIENT_HEIGHT,
+        },
+        "process": process,
+        "automation_report": automation_report,
+        "source_closure_evidence": source_closure_evidence,
+        "stderr_evidence": stderr_evidence,
+        "recovery_store_evidence": recovery_store_evidence,
+    });
+    match validate_pre_alpha_attempt(&attempt, spec.number) {
+        Ok(()) => attempt["status"] = Value::String("passed".to_owned()),
+        Err(err) => {
+            attempt["status"] = Value::String("failed".to_owned());
+            attempt["failure_reason"] = Value::String(err.to_string());
+        }
+    }
+    attempt
+}
+
+fn pre_alpha_stderr_evidence(path: &Path) -> anyhow::Result<Value> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("pre-alpha stderr evidence is not a regular file");
+    }
+    if metadata.len() > PRE_ALPHA_STDERR_BYTES_MAX {
+        bail!(
+            "pre-alpha stderr exceeded its {}-byte evidence bound",
+            PRE_ALPHA_STDERR_BYTES_MAX
+        );
+    }
+    let stderr =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let lowercase = stderr.to_ascii_lowercase();
+    let panic_free = !lowercase.contains("panicked at")
+        && !lowercase.contains("thread 'main' panicked")
+        && !lowercase.contains("thread \"main\" panicked");
+    Ok(json!({
+        "checked": true,
+        "bytes": metadata.len(),
+        "maximum_bytes": PRE_ALPHA_STDERR_BYTES_MAX,
+        "panic_free": panic_free,
+        "matching_policy": "bounded_complete_utf8_log_has_no_rust_panic_marker",
+    }))
+}
+
+fn pre_alpha_recovery_store_evidence(state_home: &Path) -> anyhow::Result<Value> {
+    let recovery_root = state_home.join("mirante4d").join("recovery");
+    let metadata = fs::symlink_metadata(&recovery_root)
+        .with_context(|| format!("failed to inspect {}", recovery_root.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!("pre-alpha recovery root is not a real directory");
+    }
+    let mut entries = 0_usize;
+    let mut canonical_store_directories = 0_usize;
+    for entry in fs::read_dir(&recovery_root)
+        .with_context(|| format!("failed to enumerate {}", recovery_root.display()))?
+    {
+        if entries >= PRE_ALPHA_RECOVERY_ROOT_ENTRIES_MAX {
+            bail!(
+                "pre-alpha recovery root exceeded its {}-entry evidence bound",
+                PRE_ALPHA_RECOVERY_ROOT_ENTRIES_MAX
+            );
+        }
+        let entry = entry.context("failed to read a pre-alpha recovery-root entry")?;
+        entries += 1;
+        let file_type = entry
+            .file_type()
+            .context("failed to inspect a pre-alpha recovery-root entry")?;
+        let name = entry.file_name();
+        let canonical_name = name
+            .to_str()
+            .is_some_and(is_canonical_project_store_directory_name);
+        if file_type.is_dir() && canonical_name {
+            canonical_store_directories += 1;
+        } else {
+            bail!(
+                "isolated pre-alpha recovery root contains a noncanonical or non-directory entry"
+            );
+        }
+    }
+    Ok(json!({
+        "checked": true,
+        "root": recovery_root,
+        "entries": entries,
+        "canonical_store_directories": canonical_store_directories,
+        "maximum_entries": PRE_ALPHA_RECOVERY_ROOT_ENTRIES_MAX,
+        "all_entries_canonical_directories": true,
+    }))
+}
+
+fn is_canonical_project_store_directory_name(name: &str) -> bool {
+    let Some(project_id) = name.strip_suffix(".m4dproj") else {
+        return false;
+    };
+    if project_id.len() != 36 {
+        return false;
+    }
+    project_id.bytes().enumerate().all(|(index, byte)| {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+        }
+    })
+}
+
 fn b4_process_status_json(status: B4ProcessStatus) -> Value {
     json!({
         "timed_out": status.timed_out,
@@ -2642,6 +3299,7 @@ fn b4_process_status_json(status: B4ProcessStatus) -> Value {
         "exit_success": status.exit_success,
         "signal": status.signal,
         "external_sigkill_sent": status.external_sigkill_sent,
+        "external_native_close_sent": status.external_native_close_sent,
         "checkpoint": status.checkpoint,
         "observed_client_area_pixels": status.observed_client_area_pixels,
         "fullscreen_action": status.fullscreen_action,
@@ -2696,6 +3354,8 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
     let mut observed_client_area_pixels = None;
     let mut fullscreen_action = None;
     let mut checkpoint = None;
+    let mut external_native_close_sent = false;
+    let mut external_native_close_sent_at = None;
     loop {
         if observed_client_area_pixels.is_none() {
             match probe_b4_x11_client_geometry(
@@ -2713,48 +3373,60 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
                         let progress_failure = progress_monitor
                             .finalize_at_exit(Instant::now())
                             .map(|failure| failure.reason_code());
-                        return Ok(b4_finished_process_status(
+                        return Ok(b4_finished_process_status(B4FinishedProcessStatus {
                             exit_status,
-                            false,
-                            false,
+                            timed_out: false,
+                            external_sigkill_sent: false,
+                            external_native_close_sent: false,
                             checkpoint,
                             observed_client_area_pixels,
                             fullscreen_action,
-                            Some(progress_failure.map_or_else(
+                            control_failure: Some(progress_failure.map_or_else(
                                 || format!("external X11 geometry observation failed: {err}"),
                                 |failure| format!("automation progress protocol failed: {failure}"),
                             )),
-                        ));
+                        }));
                     }
                 }
             }
         }
 
-        if let B4Termination::ExternalSigkill {
-            checkpoint: checkpoint_path,
-            expected_stage,
-        } = run.termination
+        let checkpoint_request = match run.termination {
+            B4Termination::ExternalSigkill {
+                checkpoint,
+                expected_stage,
+            }
+            | B4Termination::ExternalNativeClose {
+                checkpoint,
+                expected_stage,
+            } => Some((checkpoint, expected_stage)),
+            B4Termination::Normal => None,
+        };
+        if let Some((checkpoint_path, expected_stage)) = checkpoint_request
             && checkpoint.is_none()
             && checkpoint_path.exists()
         {
-            match read_json_file(checkpoint_path)
-                .and_then(|value| validate_b4_checkpoint(&value, expected_stage).map(|()| value))
-            {
+            match read_json_file(checkpoint_path).and_then(|value| {
+                validate_external_checkpoint_identity(&value, expected_stage).map(|()| value)
+            }) {
                 Ok(value) => checkpoint = Some(value),
                 Err(err) => {
                     terminate_process_tree(&mut child);
                     let exit_status = child
                         .wait()
                         .context("failed to reap B4 child after invalid checkpoint")?;
-                    return Ok(b4_finished_process_status(
+                    return Ok(b4_finished_process_status(B4FinishedProcessStatus {
                         exit_status,
-                        false,
-                        true,
-                        None,
+                        timed_out: false,
+                        external_sigkill_sent: true,
+                        external_native_close_sent: false,
+                        checkpoint: None,
                         observed_client_area_pixels,
                         fullscreen_action,
-                        Some(format!("external kill checkpoint failed validation: {err}")),
-                    ));
+                        control_failure: Some(format!(
+                            "external kill checkpoint failed validation: {err}"
+                        )),
+                    }));
                 }
             }
         }
@@ -2767,43 +3439,103 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
             let exit_status = child
                 .wait()
                 .context("failed to reap externally killed B4 product child")?;
-            return Ok(b4_finished_process_status(
+            return Ok(b4_finished_process_status(B4FinishedProcessStatus {
                 exit_status,
-                false,
-                true,
+                timed_out: false,
+                external_sigkill_sent: true,
+                external_native_close_sent: false,
                 checkpoint,
                 observed_client_area_pixels,
                 fullscreen_action,
-                None,
-            ));
+                control_failure: None,
+            }));
+        }
+
+        if matches!(run.termination, B4Termination::ExternalNativeClose { .. })
+            && checkpoint.is_some()
+            && !external_native_close_sent
+            && let Some(observed_client) = observed_client_area_pixels.as_ref()
+        {
+            if let Err(err) = request_b4_native_x11_close(observed_client) {
+                terminate_process_tree(&mut child);
+                let exit_status = child
+                    .wait()
+                    .context("failed to reap product child after native-close request failure")?;
+                return Ok(b4_finished_process_status(B4FinishedProcessStatus {
+                    exit_status,
+                    timed_out: false,
+                    external_sigkill_sent: false,
+                    external_native_close_sent: false,
+                    checkpoint,
+                    observed_client_area_pixels,
+                    fullscreen_action,
+                    control_failure: Some(format!(
+                        "external native X11 close request failed: {err}"
+                    )),
+                }));
+            }
+            external_native_close_sent = true;
+            external_native_close_sent_at = Some(Instant::now());
         }
 
         if let Some(exit_status) = child
             .try_wait()
             .context("failed to poll B4 product validation child")?
         {
-            let early_exit = matches!(run.termination, B4Termination::ExternalSigkill { .. });
-            let progress_failure = progress_monitor
-                .finalize_at_exit(Instant::now())
-                .map(|failure| failure.reason_code());
-            return Ok(b4_finished_process_status(
+            let external_native_close_completed =
+                matches!(run.termination, B4Termination::ExternalNativeClose { .. })
+                    && external_native_close_sent;
+            let early_exit = matches!(
+                run.termination,
+                B4Termination::ExternalSigkill { .. } | B4Termination::ExternalNativeClose { .. }
+            ) && !external_native_close_completed;
+            let progress_failure = (!external_native_close_completed)
+                .then(|| {
+                    progress_monitor
+                        .finalize_at_exit(Instant::now())
+                        .map(|failure| failure.reason_code())
+                })
+                .flatten();
+            return Ok(b4_finished_process_status(B4FinishedProcessStatus {
                 exit_status,
-                false,
-                false,
+                timed_out: false,
+                external_sigkill_sent: false,
+                external_native_close_sent,
                 checkpoint,
                 observed_client_area_pixels,
                 fullscreen_action,
-                progress_failure
+                control_failure: progress_failure
                     .map(|failure| format!("automation progress protocol failed: {failure}"))
                     .or_else(|| {
                         early_exit.then(|| {
-                            "native app exited before the synced checkpoint and external SIGKILL"
+                            "native app exited before its synced checkpoint and external lifecycle action"
                                 .to_owned()
                         })
                     }),
-            ));
+            }));
         }
         let now = Instant::now();
+        if external_native_close_sent_at
+            .is_some_and(|sent_at| now.duration_since(sent_at) >= NATIVE_CLOSE_EXIT_TIMEOUT)
+        {
+            terminate_process_tree(&mut child);
+            let exit_status = child
+                .wait()
+                .context("failed to reap product child after native-close exit deadline")?;
+            return Ok(b4_finished_process_status(B4FinishedProcessStatus {
+                exit_status,
+                timed_out: false,
+                external_sigkill_sent: false,
+                external_native_close_sent: true,
+                checkpoint,
+                observed_client_area_pixels,
+                fullscreen_action,
+                control_failure: Some(format!(
+                    "mapped native X11 close did not exit within {} seconds; fallback termination was failure cleanup",
+                    NATIVE_CLOSE_EXIT_TIMEOUT.as_secs()
+                )),
+            }));
+        }
         if now >= next_progress_poll {
             match progress_monitor.poll_at(now) {
                 ProgressMonitorAction::Continue => {}
@@ -2817,18 +3549,19 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
                     let exit_status = child
                         .wait()
                         .context("failed to reap B4 child after progress failure")?;
-                    return Ok(b4_finished_process_status(
+                    return Ok(b4_finished_process_status(B4FinishedProcessStatus {
                         exit_status,
-                        false,
-                        false,
+                        timed_out: false,
+                        external_sigkill_sent: false,
+                        external_native_close_sent,
                         checkpoint,
                         observed_client_area_pixels,
                         fullscreen_action,
-                        Some(format!(
+                        control_failure: Some(format!(
                             "automation progress protocol failed: {}",
                             failure.reason_code()
                         )),
-                    ));
+                    }));
                 }
             }
             next_progress_poll = now + FILE_POLL_INTERVAL;
@@ -2838,42 +3571,36 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
             let exit_status = child
                 .wait()
                 .context("failed to reap timed-out B4 product child")?;
-            return Ok(b4_finished_process_status(
+            return Ok(b4_finished_process_status(B4FinishedProcessStatus {
                 exit_status,
-                true,
-                false,
+                timed_out: true,
+                external_sigkill_sent: false,
+                external_native_close_sent,
                 checkpoint,
                 observed_client_area_pixels,
                 fullscreen_action,
-                Some(format!(
+                control_failure: Some(format!(
                     "B4 product phase exceeded its {}-second timeout",
                     run.timeout.as_secs()
                 )),
-            ));
+            }));
         }
         thread::sleep(Duration::from_millis(100));
     }
 }
 
-fn b4_finished_process_status(
-    exit_status: std::process::ExitStatus,
-    timed_out: bool,
-    external_sigkill_sent: bool,
-    checkpoint: Option<Value>,
-    observed_client_area_pixels: Option<Value>,
-    fullscreen_action: Option<Value>,
-    control_failure: Option<String>,
-) -> B4ProcessStatus {
+fn b4_finished_process_status(finished: B4FinishedProcessStatus) -> B4ProcessStatus {
     B4ProcessStatus {
-        timed_out,
-        exit_status: Some(exit_status.to_string()),
-        exit_success: Some(exit_status.success()),
-        signal: exit_status.signal(),
-        external_sigkill_sent,
-        checkpoint,
-        observed_client_area_pixels,
-        fullscreen_action,
-        control_failure,
+        timed_out: finished.timed_out,
+        exit_status: Some(finished.exit_status.to_string()),
+        exit_success: Some(finished.exit_status.success()),
+        signal: finished.exit_status.signal(),
+        external_sigkill_sent: finished.external_sigkill_sent,
+        external_native_close_sent: finished.external_native_close_sent,
+        checkpoint: finished.checkpoint,
+        observed_client_area_pixels: finished.observed_client_area_pixels,
+        fullscreen_action: finished.fullscreen_action,
+        control_failure: finished.control_failure,
     }
 }
 
@@ -2942,6 +3669,25 @@ fn probe_b4_x11_client_geometry(
     Ok(None)
 }
 
+fn request_b4_native_x11_close(observed_client: &Value) -> anyhow::Result<()> {
+    if observed_client.get("map_state").and_then(Value::as_str) != Some("is_viewable") {
+        bail!("native close requires an externally observed mapped X11 client");
+    }
+    let window_id = observed_client
+        .get("window_id")
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("0x") && value.len() > 2)
+        .context("mapped X11 client observation lacks its window ID")?;
+    let mut close = Command::new("wmctrl");
+    close.args(["-i", "-c", window_id]);
+    let output = run_command_with_bounded_output(&mut close, X11_AUTOMATION_OUTPUT_POLICY)
+        .context("failed to request mapped X11 client close through wmctrl")?;
+    if !output.status.success() {
+        bail!("wmctrl native close failed with status {}", output.status);
+    }
+    Ok(())
+}
+
 fn parse_xwininfo_client_geometry(output: &str) -> Option<(u32, u32, bool)> {
     let width = output
         .lines()
@@ -2964,13 +3710,21 @@ fn parse_xwininfo_client_geometry(output: &str) -> Option<(u32, u32, bool)> {
     Some((width, height, is_viewable))
 }
 
-fn validate_b4_checkpoint(checkpoint: &Value, expected_stage: &str) -> anyhow::Result<()> {
+fn validate_external_checkpoint_identity(
+    checkpoint: &Value,
+    expected_stage: &str,
+) -> anyhow::Result<()> {
     if checkpoint.get("schema").and_then(Value::as_str) != Some(B4_CHECKPOINT_SCHEMA)
         || checkpoint.get("schema_version").and_then(Value::as_u64) != Some(1)
         || checkpoint.get("stage").and_then(Value::as_str) != Some(expected_stage)
     {
-        bail!("B4 external-kill checkpoint identity or stage drifted");
+        bail!("external process checkpoint identity or stage drifted");
     }
+    Ok(())
+}
+
+fn validate_b4_checkpoint(checkpoint: &Value, expected_stage: &str) -> anyhow::Result<()> {
+    validate_external_checkpoint_identity(checkpoint, expected_stage)?;
     let requested_pixels = checkpoint
         .pointer("/viewport_evidence/requested_mapped_client_pixels")
         .context("B4 checkpoint lacks requested mapped-client pixels")?;
@@ -3181,6 +3935,368 @@ fn validate_b4_aggregate_attempts(attempts: &[Value]) -> anyhow::Result<()> {
         .any(|attempt| attempt.get("retry_index").and_then(Value::as_u64) != Some(0))
     {
         bail!("B4 aggregate observed a retry");
+    }
+    Ok(())
+}
+
+fn validate_pre_alpha_checkpoint(
+    checkpoint: &Value,
+    expected_stage: &str,
+    expected_number: u64,
+) -> anyhow::Result<()> {
+    validate_external_checkpoint_identity(checkpoint, expected_stage)?;
+    let requested_pixels = checkpoint
+        .pointer("/viewport_evidence/requested_mapped_client_pixels")
+        .context("pre-alpha checkpoint lacks requested mapped-client pixels")?;
+    if requested_pixels.get("width").and_then(Value::as_u64)
+        != Some(u64::from(B4_PRIMARY_CLIENT_WIDTH))
+        || requested_pixels.get("height").and_then(Value::as_u64)
+            != Some(u64::from(B4_PRIMARY_CLIENT_HEIGHT))
+    {
+        bail!("pre-alpha checkpoint mapped-client request is not exact 1280x720");
+    }
+    let state = checkpoint
+        .get("project_state")
+        .context("pre-alpha checkpoint lacks project state")?;
+    match expected_number {
+        1 => {
+            for (field, expected) in [
+                ("bound", true),
+                ("dirty", true),
+                ("can_save", true),
+                ("can_save_as", false),
+                ("manual", false),
+                ("autosave", true),
+            ] {
+                if state.get(field).and_then(Value::as_bool) != Some(expected) {
+                    bail!("pre-alpha provisional checkpoint project_state.{field} drifted");
+                }
+            }
+            if state.get("lifecycle").and_then(Value::as_str) != Some("provisional")
+                || !state.get("current_manual").is_some_and(Value::is_null)
+                || state.get("current_autosave").is_none_or(Value::is_null)
+            {
+                bail!(
+                    "pre-alpha provisional checkpoint does not retain provisional autosave-only state"
+                );
+            }
+            let current = b4_revision_fact(state.get("current_revision"), "current revision")?;
+            let autosave = b4_revision_fact(
+                checkpoint.pointer("/project_evidence/latest_autosave_captured_revision"),
+                "latest autosave captured revision",
+            )?;
+            if current != autosave {
+                bail!(
+                    "pre-alpha provisional checkpoint autosave does not capture the current revision"
+                );
+            }
+        }
+        3 => {
+            for field in ["bound", "dirty", "can_save_as", "manual", "autosave"] {
+                if state.get(field).and_then(Value::as_bool) != Some(false) {
+                    bail!("pre-alpha clean-close checkpoint project_state.{field} drifted");
+                }
+            }
+            if state.get("can_save").and_then(Value::as_bool) != Some(true) {
+                bail!("pre-alpha clean-close checkpoint project_state.can_save drifted");
+            }
+            for field in [
+                "current_revision",
+                "saved_revision",
+                "current_manual",
+                "current_autosave",
+            ] {
+                if !state.get(field).is_some_and(Value::is_null) {
+                    bail!("pre-alpha clean-close checkpoint project_state.{field} is not unbound");
+                }
+            }
+            if state.get("lifecycle").and_then(Value::as_str) != Some("unbound") {
+                bail!("pre-alpha clean-close checkpoint lifecycle is not unbound");
+            }
+        }
+        _ => bail!("pre-alpha checkpoint validation was requested for an invalid launch"),
+    }
+    Ok(())
+}
+
+fn validate_pre_alpha_attempt(attempt: &Value, expected_number: u64) -> anyhow::Result<()> {
+    if attempt.get("attempt").and_then(Value::as_u64) != Some(expected_number)
+        || attempt.get("retry_index").and_then(Value::as_u64) != Some(0)
+    {
+        bail!("pre-alpha reliability attempt identity or retry index drifted");
+    }
+    if attempt
+        .pointer("/source_closure_evidence/byte_identical")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        bail!("pre-alpha launch {expected_number} changed or failed to compare the source closure");
+    }
+    if attempt
+        .pointer("/process/timed_out")
+        .and_then(Value::as_bool)
+        != Some(false)
+        || !attempt
+            .pointer("/process/control_failure")
+            .is_some_and(Value::is_null)
+    {
+        bail!("pre-alpha launch {expected_number} process control failed");
+    }
+    if attempt
+        .pointer("/stderr_evidence/checked")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || attempt
+            .pointer("/stderr_evidence/panic_free")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        bail!("pre-alpha launch {expected_number} did not retain panic-free bounded stderr");
+    }
+    if attempt
+        .pointer("/recovery_store_evidence/checked")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || attempt
+            .pointer("/recovery_store_evidence/all_entries_canonical_directories")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        bail!("pre-alpha launch {expected_number} recovery-root evidence is invalid");
+    }
+    let requested = attempt
+        .get("requested_client_area_pixels")
+        .context("pre-alpha attempt lacks requested client pixels")?;
+    let observed = attempt
+        .pointer("/process/observed_client_area_pixels")
+        .context("pre-alpha attempt lacks externally observed client pixels")?;
+    if observed.get("width") != requested.get("width")
+        || observed.get("height") != requested.get("height")
+        || observed.get("map_state").and_then(Value::as_str) != Some("is_viewable")
+        || observed.get("observation").and_then(Value::as_str)
+            != Some("xdotool_pid_search_plus_xwininfo_client_geometry")
+    {
+        bail!("pre-alpha launch {expected_number} mapped client geometry was not externally exact");
+    }
+    let recovery_store_count = attempt
+        .pointer("/recovery_store_evidence/canonical_store_directories")
+        .and_then(Value::as_u64)
+        .context("pre-alpha attempt lacks its recovery-store count")?;
+
+    match expected_number {
+        1 => {
+            if attempt
+                .pointer("/process/external_sigkill_sent")
+                .and_then(Value::as_bool)
+                != Some(true)
+                || attempt
+                    .pointer("/process/external_native_close_sent")
+                    .and_then(Value::as_bool)
+                    != Some(false)
+                || attempt.pointer("/process/signal").and_then(Value::as_i64) != Some(9)
+                || attempt
+                    .pointer("/process/exit_success")
+                    .and_then(Value::as_bool)
+                    != Some(false)
+            {
+                bail!(
+                    "pre-alpha launch 1 was not terminated by the parent's external SIGKILL signal 9"
+                );
+            }
+            let checkpoint = attempt
+                .pointer("/process/checkpoint")
+                .context("pre-alpha launch 1 lacks its synced provisional checkpoint")?;
+            validate_pre_alpha_checkpoint(
+                checkpoint,
+                PRE_ALPHA_PROVISIONAL_CHECKPOINT_STAGE,
+                expected_number,
+            )?;
+            if recovery_store_count != 1 {
+                bail!(
+                    "pre-alpha launch 1 did not leave exactly one canonical provisional recovery store"
+                );
+            }
+        }
+        2 => {
+            if attempt
+                .pointer("/process/external_sigkill_sent")
+                .and_then(Value::as_bool)
+                != Some(false)
+                || attempt
+                    .pointer("/process/external_native_close_sent")
+                    .and_then(Value::as_bool)
+                    != Some(false)
+                || attempt
+                    .pointer("/process/exit_success")
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                || !attempt
+                    .pointer("/process/signal")
+                    .is_some_and(Value::is_null)
+            {
+                bail!("pre-alpha recovery launch did not exit normally");
+            }
+            let automation = attempt
+                .get("automation_report")
+                .context("pre-alpha recovery launch lacks its automation report")?;
+            let script_path = attempt
+                .get("script")
+                .and_then(Value::as_str)
+                .map(Path::new)
+                .context("pre-alpha recovery launch lacks its exact automation script path")?;
+            let script = read_json_file(script_path)
+                .context("pre-alpha recovery automation script could not be read")?;
+            validate_product_automation_report_contract(automation, &script, script_path)
+                .context("pre-alpha recovery automation report contract is invalid")?;
+            validate_pre_alpha_recovery_script(&script)?;
+            validate_pre_alpha_recovery_events(automation)?;
+            qualifying_nonblank_viewport_capture(Some(automation)).map_err(anyhow::Error::msg)?;
+            if automation
+                .pointer("/project_store_evidence/close_result/status")
+                .and_then(Value::as_str)
+                != Some("succeeded")
+                || automation
+                    .pointer("/project_store_evidence/actor_join/status")
+                    .and_then(Value::as_str)
+                    != Some("succeeded")
+            {
+                bail!(
+                    "pre-alpha recovery launch does not prove normal project-store Close and actor join"
+                );
+            }
+            if recovery_store_count != 1 {
+                bail!(
+                    "pre-alpha recovery launch did not retain exactly one unchanged provisional recovery store"
+                );
+            }
+        }
+        3 => {
+            if attempt
+                .pointer("/process/external_sigkill_sent")
+                .and_then(Value::as_bool)
+                != Some(false)
+                || attempt
+                    .pointer("/process/external_native_close_sent")
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                || attempt
+                    .pointer("/process/exit_success")
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                || !attempt
+                    .pointer("/process/signal")
+                    .is_some_and(Value::is_null)
+            {
+                bail!(
+                    "pre-alpha clean-close launch did not exit successfully from the external mapped X11 close"
+                );
+            }
+            let checkpoint = attempt
+                .pointer("/process/checkpoint")
+                .context("pre-alpha clean-close launch lacks its synced checkpoint")?;
+            validate_pre_alpha_checkpoint(
+                checkpoint,
+                PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE,
+                expected_number,
+            )?;
+            if recovery_store_count != 0 {
+                bail!("pre-alpha clean-close launch unexpectedly created a recovery store");
+            }
+        }
+        _ => bail!("pre-alpha reliability requires launch numbers 1 through 3"),
+    }
+    Ok(())
+}
+
+fn validate_pre_alpha_recovery_script(script: &Value) -> anyhow::Result<()> {
+    let commands = script
+        .get("commands")
+        .and_then(Value::as_array)
+        .context("pre-alpha recovery script lacks commands")?;
+    let recovery_assertion = commands
+        .iter()
+        .find_map(|command| command.pointer("/condition/project_state"))
+        .context("pre-alpha recovery script lacks its dirty recovery assertion")?;
+    for (field, expected) in [
+        ("bound", true),
+        ("dirty", true),
+        ("can_save", false),
+        ("can_save_as", true),
+        ("manual", false),
+        ("autosave", true),
+    ] {
+        if recovery_assertion.get(field).and_then(Value::as_bool) != Some(expected) {
+            bail!("pre-alpha recovery script project_state.{field} drifted");
+        }
+    }
+    if recovery_assertion.get("lifecycle").and_then(Value::as_str) != Some("recovery_selected") {
+        bail!("pre-alpha recovery script does not require recovery_selected lifecycle");
+    }
+    Ok(())
+}
+
+fn validate_pre_alpha_recovery_events(report: &Value) -> anyhow::Result<()> {
+    let events = report
+        .get("events")
+        .and_then(Value::as_array)
+        .context("pre-alpha recovery report lacks command events")?;
+    let recovery_exposed = events.iter().any(|event| {
+        event.get("command").and_then(Value::as_str) == Some("wait_for")
+            && event.get("status").and_then(Value::as_str) == Some("passed")
+            && event.pointer("/details/condition").and_then(Value::as_str)
+                == Some("unsaved_autosave_recovery_exposed")
+    });
+    if !recovery_exposed {
+        bail!("pre-alpha recovery report does not prove startup recovery exposure");
+    }
+    let normal_recovery_route = events.iter().any(|event| {
+        event.get("command").and_then(Value::as_str) == Some("recover_exposed_unsaved_autosave")
+            && event.get("status").and_then(Value::as_str) == Some("passed")
+            && event
+                .pointer("/details/startup_panel_was_open")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && event
+                .pointer("/details/normal_reducer_service_path")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && event
+                .pointer("/details/foreground_started_or_completed")
+                .and_then(Value::as_bool)
+                == Some(true)
+    });
+    if !normal_recovery_route {
+        bail!(
+            "pre-alpha recovery report does not prove the exposed locator used the normal application/service route"
+        );
+    }
+    let recovery_state_asserted = events.iter().any(|event| {
+        event.get("command").and_then(Value::as_str) == Some("assert")
+            && event.get("status").and_then(Value::as_str) == Some("passed")
+            && event.pointer("/details/condition").and_then(Value::as_str) == Some("project_state")
+    });
+    if !recovery_state_asserted {
+        bail!("pre-alpha recovery report lacks its passing dirty-state assertion");
+    }
+    Ok(())
+}
+
+fn validate_pre_alpha_attempts(attempts: &[Value]) -> anyhow::Result<()> {
+    if attempts.len() != 3 {
+        bail!("pre-alpha reliability requires exactly three retained launch attempts");
+    }
+    for (index, attempt) in attempts.iter().enumerate() {
+        let expected_number = u64::try_from(index + 1).expect("three attempts fit u64");
+        if attempt.get("status").and_then(Value::as_str) != Some("passed") {
+            bail!("pre-alpha launch {expected_number} is not passed");
+        }
+        validate_pre_alpha_attempt(attempt, expected_number)?;
+    }
+    if attempts
+        .iter()
+        .any(|attempt| attempt.get("retry_index").and_then(Value::as_u64) != Some(0))
+    {
+        bail!("pre-alpha reliability observed an automatic retry");
     }
     Ok(())
 }

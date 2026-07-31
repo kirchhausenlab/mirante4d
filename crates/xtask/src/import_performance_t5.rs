@@ -4854,7 +4854,7 @@ mod tests {
     }
 
     #[test]
-    fn t5_automation_v7_binds_the_exact_canonical_hard_safety_echo() {
+    fn t5_automation_v8_binds_the_exact_canonical_hard_safety_echo() {
         let tempdir = tempfile::tempdir().unwrap();
         let config: T5Config = serde_json::from_value(valid_config_json(tempdir.path())).unwrap();
         let script = automation_script(
@@ -4866,8 +4866,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(script["schema"], PRODUCT_AUTOMATION_SCRIPT_SCHEMA);
-        assert_eq!(SCRIPT_SCHEMA_VERSION, 7);
-        assert_eq!(script["schema_version"], 7);
+        assert_eq!(SCRIPT_SCHEMA_VERSION, 8);
+        assert_eq!(script["schema_version"], 8);
         assert!(script.get("limits").is_none());
         let hard_safety_limits = script["hard_safety_limits"].as_object().unwrap();
         assert_eq!(

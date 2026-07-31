@@ -9,8 +9,9 @@ use std::{
 use eframe::egui;
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationSnapshot, CommandEffect, CrossSectionPanelId,
-    OperationToken, PresentationSlot, ProjectStoreLifecycle, RenderGestureKind, RenderIntentBase,
-    RenderIntentSample, RenderIntentTarget, SourceVerificationSnapshot, WorkspaceSnapshot,
+    OperationToken, PresentationSlot, ProjectStoreApplicationService, ProjectStoreLifecycle,
+    RenderGestureKind, RenderIntentBase, RenderIntentSample, RenderIntentTarget,
+    SourceVerificationSnapshot, WorkspaceSnapshot,
     import_workflow::{
         ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportWorkflowSnapshot,
     },
@@ -209,7 +210,7 @@ fn assertion_capture_panels(condition: &ProductAutomationAssertCondition) -> Vec
 }
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-const AUTOMATION_SCHEMA_VERSION: u32 = 7;
+const AUTOMATION_SCHEMA_VERSION: u32 = 8;
 const AUTOMATION_REPORT_SCHEMA_VERSION: u32 = 8;
 
 fn dispatch_application_command(
@@ -1903,6 +1904,62 @@ impl ProductAutomationController {
                     "foreground_active": true,
                 })))
             }
+            ProductAutomationCommand::RecoverExposedUnsavedAutosave => {
+                if !matches!(
+                    app.application.snapshot().source(),
+                    SourceVerificationSnapshot::Verified(_)
+                ) {
+                    return Err(
+                        "exposed unsaved-autosave recovery requires a verified current dataset"
+                            .to_owned(),
+                    );
+                }
+                if !app.project_recovery_panel_open {
+                    return Err(
+                        "unsaved-autosave recovery was not exposed in the startup recovery panel"
+                            .to_owned(),
+                    );
+                }
+                let project_ids = app
+                    .project_store
+                    .as_ref()
+                    .ok_or_else(|| "project-store service is unavailable".to_owned())?
+                    .recovery_store_project_ids()
+                    .collect::<Vec<_>>();
+                let [project_id] = project_ids.as_slice() else {
+                    return Err(format!(
+                        "packaged recovery check requires exactly one exposed earlier-launch store, found {}",
+                        project_ids.len()
+                    ));
+                };
+                if !app
+                    .project_store
+                    .as_ref()
+                    .is_some_and(ProjectStoreApplicationService::can_open)
+                {
+                    return Err("exposed unsaved-autosave recovery is not ready to open".to_owned());
+                }
+                let project_id = *project_id;
+                app.project_recovery_panel_open = false;
+                app.open_recovery_locator(project_id);
+                let open_started_or_completed = app
+                    .project_store
+                    .as_ref()
+                    .is_some_and(|service| service.status().foreground_active())
+                    || app.application.snapshot().is_bound();
+                if !open_started_or_completed {
+                    return Err(
+                        "exposed unsaved-autosave recovery did not enter the normal project-open route"
+                            .to_owned(),
+                    );
+                }
+                Ok(CommandProgress::Done(json!({
+                    "project_id": project_id.to_string(),
+                    "startup_panel_was_open": true,
+                    "normal_reducer_service_path": true,
+                    "foreground_started_or_completed": true,
+                })))
+            }
             ProductAutomationCommand::SaveProjectAs { path } => {
                 if app.project_store_noninteractive_paths.save_as.is_some() {
                     return Err("a noninteractive Save As path is already pending".to_owned());
@@ -3392,6 +3449,13 @@ impl ProductAutomationController {
                 .is_some(),
             ProductAutomationWaitCondition::RecoveryReviewRequired => {
                 app.project_recovery_review.is_some()
+            }
+            ProductAutomationWaitCondition::UnsavedAutosaveRecoveryExposed => {
+                matches!(snapshot.source(), SourceVerificationSnapshot::Verified(_))
+                    && app.project_recovery_panel_open
+                    && app.project_store.as_ref().is_some_and(|service| {
+                        service.can_open() && service.recovery_store_project_ids().len() == 1
+                    })
             }
             ProductAutomationWaitCondition::ProjectStoreClosed => {
                 app.project_store.is_none()
@@ -5534,6 +5598,7 @@ fn project_store_lifecycle(
     lifecycle: ProductAutomationProjectStoreLifecycle,
 ) -> ProjectStoreLifecycle {
     match lifecycle {
+        ProductAutomationProjectStoreLifecycle::Provisional => ProjectStoreLifecycle::Provisional,
         ProductAutomationProjectStoreLifecycle::Established => ProjectStoreLifecycle::Established,
         ProductAutomationProjectStoreLifecycle::RecoverySelected => {
             ProjectStoreLifecycle::RecoverySelected

@@ -160,6 +160,7 @@ Useful bounded scenarios include:
 ```bash
 cargo xtask product-validate target_source_verification
 cargo xtask product-validate target_fixture_render_modes
+cargo xtask product-validate pre_alpha_reliability
 cargo xtask product-validate \
   /absolute/path/to/dataset.m4d representative_native_navigation
 ```
@@ -168,6 +169,17 @@ cargo xtask product-validate \
 the native-navigation cut in the normal release application across four-panel
 and standalone 3D, linked-only input during 3D refinement, both sampling
 modes, MIP, DVR, ISO, nonblank GPU captures, and exact/current settlement.
+
+`pre_alpha_reliability` is the bounded package/reliability closeout. Against
+one release executable it performs exactly three launches with zero automatic
+retries: durable provisional autosave followed by external SIGKILL; proactive
+startup exposure and explicit actor-validated dirty recovery; and a mapped
+clean X11 window-manager close with a ten-second exit deadline. The scenario
+retains exact external geometry, process status, checkpoint, bounded
+panic-free stderr, canonical recovery-root count, nonblank recovered GPU
+capture, project-store close/join, and source-byte nonmutation evidence.
+Cleanup termination is always failure. It uses only the promoted small
+fixture and is not a rendering stress or linked-S0 workflow.
 
 The obsolete `representative_four_panel_three_sessions` and
 `target_fixture_resident_navigation_no_readback` commands were deleted. Both

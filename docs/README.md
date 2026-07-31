@@ -25,6 +25,13 @@ exceptions have one separate tool-owned
 ## Plans
 
 The
+[pre-alpha reliability and packaging plan](plans/active/PRE_ALPHA_RELIABILITY_AND_PACKAGING.md)
+is the active checkpoint for publishing the completed rendering work, making
+native clean shutdown single-owner, exposing earlier-launch provisional
+autosaves in the packaged application, and building one validated local Linux
+x86_64 pre-alpha package.
+
+The
 [resident 3D navigation ladder plan](plans/active/VIEWER_RESIDENT_3D_NAVIGATION_LADDER.md)
 is implemented, verified, and owner product-validated. It replaces the binary
 selected-target or terminal-volume preview choice with one bounded, globally

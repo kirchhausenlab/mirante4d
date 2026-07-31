@@ -253,6 +253,7 @@ pub(super) enum ProductAutomationCommand {
         path: PathBuf,
     },
     RecoverAutomaticAutosave,
+    RecoverExposedUnsavedAutosave,
     SaveProjectAs {
         path: PathBuf,
     },
@@ -451,6 +452,7 @@ impl ProductAutomationCommand {
             Self::InitialSaveWithEdit { .. } => "initial_save_with_edit",
             Self::OpenProject { .. } => "open_project",
             Self::RecoverAutomaticAutosave => "recover_automatic_autosave",
+            Self::RecoverExposedUnsavedAutosave => "recover_exposed_unsaved_autosave",
             Self::SaveProjectAs { .. } => "save_project_as",
             Self::CloseProjectStore => "close_project_store",
             Self::WriteExternalKillCheckpoint { .. } => "write_external_kill_checkpoint",
@@ -671,6 +673,7 @@ pub(super) enum ProductAutomationWaitCondition {
     ProjectStoreIdle,
     ProjectAutosaved,
     RecoveryReviewRequired,
+    UnsavedAutosaveRecoveryExposed,
     ProjectStoreClosed,
 }
 
@@ -690,6 +693,7 @@ impl ProductAutomationWaitCondition {
             Self::ProjectStoreIdle => "project_store_idle",
             Self::ProjectAutosaved => "project_autosaved",
             Self::RecoveryReviewRequired => "recovery_review_required",
+            Self::UnsavedAutosaveRecoveryExposed => "unsaved_autosave_recovery_exposed",
             Self::ProjectStoreClosed => "project_store_closed",
         }
     }
@@ -700,6 +704,7 @@ impl ProductAutomationWaitCondition {
             Self::ProjectStoreIdle
                 | Self::ProjectAutosaved
                 | Self::RecoveryReviewRequired
+                | Self::UnsavedAutosaveRecoveryExposed
                 | Self::ProjectStoreClosed
         )
     }
@@ -839,6 +844,7 @@ impl ProductAutomationAssertCondition {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ProductAutomationProjectStoreLifecycle {
+    Provisional,
     Established,
     RecoverySelected,
 }
@@ -846,6 +852,7 @@ pub(super) enum ProductAutomationProjectStoreLifecycle {
 impl ProductAutomationProjectStoreLifecycle {
     pub(super) const fn name(self) -> &'static str {
         match self {
+            Self::Provisional => "provisional",
             Self::Established => "established",
             Self::RecoverySelected => "recovery_selected",
         }

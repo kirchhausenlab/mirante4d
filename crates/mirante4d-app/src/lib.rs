@@ -154,6 +154,8 @@ const DVR_DENSITY_SCALE_MAX: f64 = 64.0;
 const CROSS_SECTION_FAST_SLICE_MULTIPLIER: f64 = 10.0;
 const CROSS_SECTION_ROTATE_RADIANS_PER_POINT: f64 = 0.005;
 const PROJECT_RECOVERY_ROOT_ENTRIES_MAX: usize = 64;
+const EARLIER_LAUNCH_RECOVERY_STATUS: &str =
+    "Unsaved work from an earlier launch is available for recovery.";
 
 fn viewer_verification_grace_active(deadline: Option<Instant>, now: Instant) -> bool {
     deadline.is_some_and(|deadline| now < deadline)
@@ -264,6 +266,27 @@ fn project_service_error_fault(
 struct ProjectRecoveryReview {
     token: OperationToken,
     automatic_newer: ProjectGenerationId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeCloseDecision {
+    NoRequest,
+    Accept,
+    CancelForDirtyPrompt,
+}
+
+fn native_close_decision(
+    close_requested: bool,
+    close_authorized: bool,
+    project_dirty: bool,
+) -> NativeCloseDecision {
+    if !close_requested {
+        NativeCloseDecision::NoRequest
+    } else if close_authorized || !project_dirty {
+        NativeCloseDecision::Accept
+    } else {
+        NativeCloseDecision::CancelForDirtyPrompt
+    }
 }
 
 #[derive(Debug)]
@@ -507,6 +530,12 @@ fn start_project_store_service(
     Ok((service, warning))
 }
 
+fn earlier_launch_recovery_available(
+    service: &ProjectStoreApplicationService<SystemMonotonicClock>,
+) -> bool {
+    service.recovery_store_project_ids().len() > 0
+}
+
 pub struct MiranteWorkbenchApp {
     application: ApplicationState,
     startup_diagnostics: StartupDiagnostics,
@@ -577,9 +606,8 @@ pub struct MiranteWorkbenchApp {
     dataset_open_project_close: DatasetOpenProjectCloseState,
     project_status_message: Option<String>,
     close_after_project_save: bool,
-    exit_after_project_close: bool,
+    native_exit_requested: bool,
     restart_project_store_after_close: bool,
-    pending_viewport_close: bool,
     pending_source_install: Option<PendingSourceInstall>,
     settings_connection: current_settings_connection::CurrentSettingsConnection,
     selected_adapter_memory: gpu_memory::SelectedAdapterMemoryFacts,
@@ -726,7 +754,10 @@ impl MiranteWorkbenchApp {
             initialize_project_recovery_root(dataset.selected_path());
         let (project_store, discovery_warning) =
             start_project_store_service(project_recovery_root.as_deref(), provisional_project_id)?;
-        let project_status_message = recovery_root_warning.or(discovery_warning);
+        let earlier_launch_recovery_available = earlier_launch_recovery_available(&project_store);
+        let project_status_message = recovery_root_warning.or(discovery_warning).or_else(|| {
+            earlier_launch_recovery_available.then(|| EARLIER_LAUNCH_RECOVERY_STATUS.to_owned())
+        });
         let project_store = Some(project_store);
         let mut app = Self {
             application,
@@ -784,7 +815,7 @@ impl MiranteWorkbenchApp {
             project_recovery_root,
             project_recovery_candidates: Vec::new(),
             project_recovery_review: None,
-            project_recovery_panel_open: false,
+            project_recovery_panel_open: earlier_launch_recovery_available,
             pending_recovery_selection: None,
             pending_project_open_locator: None,
             pending_analysis_artifact_load: None,
@@ -794,9 +825,8 @@ impl MiranteWorkbenchApp {
             dataset_open_project_close: DatasetOpenProjectCloseState::NotRequested,
             project_status_message,
             close_after_project_save: false,
-            exit_after_project_close: false,
+            native_exit_requested: false,
             restart_project_store_after_close: false,
-            pending_viewport_close: false,
             pending_source_install: None,
             settings_connection,
             selected_adapter_memory,
@@ -1165,7 +1195,7 @@ impl MiranteWorkbenchApp {
                                 Some(format!("Dataset open could not begin: {error}"));
                         }
                     } else {
-                        self.request_project_store_close_for_exit();
+                        self.native_exit_requested = true;
                     }
                 }
             }
@@ -1769,17 +1799,7 @@ impl MiranteWorkbenchApp {
                 };
                 self.project_store_product_evidence.actor_join = Some(actor_join);
                 let imported_preclose_succeeded = close_result_succeeded && actor_join_succeeded;
-                if self.exit_after_project_close {
-                    self.exit_after_project_close = false;
-                    self.restart_project_store_after_close = false;
-                    if let Some(pending) = self.pending_source_install.take() {
-                        if let Err(error) = pending.runtime.dataset.request_shutdown() {
-                            tracing::warn!(%error, "prepared dataset shutdown before exit failed");
-                        }
-                        std::thread::spawn(move || drop(pending.runtime));
-                    }
-                    self.pending_viewport_close = true;
-                } else if self.dataset_open_project_close == DatasetOpenProjectCloseState::Waiting {
+                if self.dataset_open_project_close == DatasetOpenProjectCloseState::Waiting {
                     if imported_preclose_succeeded {
                         self.dataset_open_project_close =
                             DatasetOpenProjectCloseState::ClosedForImportedOpen;
@@ -1849,23 +1869,27 @@ impl MiranteWorkbenchApp {
     }
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
-        if self.pending_viewport_close {
-            self.pending_viewport_close = false;
+        if self.native_exit_requested {
+            self.native_exit_requested = false;
             self.egui_ui.allow_close_without_prompt = true;
+            self.egui_ui.close_prompt_open = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        if !ctx.input(|input| input.viewport().close_requested()) {
-            return;
-        }
-        if self.egui_ui.allow_close_without_prompt {
-            return;
-        }
-        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        if self.project_dirty() {
-            self.egui_ui.close_prompt_open = true;
-        } else {
-            self.request_project_store_close_for_exit();
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        match native_close_decision(
+            close_requested,
+            self.egui_ui.allow_close_without_prompt,
+            close_requested && self.project_dirty(),
+        ) {
+            NativeCloseDecision::NoRequest => {}
+            NativeCloseDecision::Accept => {
+                self.egui_ui.allow_close_without_prompt = true;
+            }
+            NativeCloseDecision::CancelForDirtyPrompt => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.egui_ui.close_prompt_open = true;
+            }
         }
     }
 
@@ -1888,7 +1912,7 @@ impl MiranteWorkbenchApp {
         )
     }
 
-    fn project_recovery_ui(&self) -> ProjectRecoveryView {
+    fn project_recovery_ui(&self, source_verified: bool) -> ProjectRecoveryView {
         ProjectRecoveryView::new(
             self.project_recovery_review
                 .as_ref()
@@ -1914,7 +1938,9 @@ impl MiranteWorkbenchApp {
                 .unwrap_or_default(),
             self.project_store
                 .as_ref()
-                .is_some_and(ProjectStoreApplicationService::can_open),
+                .is_some_and(ProjectStoreApplicationService::can_open)
+                && source_verified,
+            source_verified,
         )
     }
 
@@ -1948,38 +1974,6 @@ impl MiranteWorkbenchApp {
             Err(error) => {
                 self.project_status_message =
                     Some(format!("Recovery inspection could not start: {error:?}"));
-            }
-        }
-    }
-
-    fn request_project_store_close_for_exit(&mut self) {
-        self.exit_after_project_close = true;
-        self.egui_ui.close_prompt_open = false;
-        match self.project_store.as_mut() {
-            Some(service) if service.status().lifecycle() != ProjectStoreLifecycle::Closed => {
-                if let Err(error) = service.close()
-                    && !matches!(
-                        error,
-                        mirante4d_application::ProjectStoreServiceError::Closing
-                    )
-                {
-                    self.exit_after_project_close = false;
-                    self.project_status_message =
-                        Some(format!("Could not close project storage: {error:?}"));
-                }
-            }
-            Some(_) => {
-                if let Some(service) = self.project_store.take()
-                    && let Err(error) = service.join()
-                {
-                    tracing::warn!(?error, "project-store actor join failed");
-                }
-                self.exit_after_project_close = false;
-                self.pending_viewport_close = true;
-            }
-            None => {
-                self.exit_after_project_close = false;
-                self.pending_viewport_close = true;
             }
         }
     }
@@ -2023,9 +2017,14 @@ impl MiranteWorkbenchApp {
             workspace.provisional_project_id(),
         ) {
             Ok((service, warning)) => {
+                let earlier_launch_recovery_available = earlier_launch_recovery_available(&service);
                 self.project_store = Some(service);
-                if warning.is_some() {
-                    self.project_status_message = warning;
+                self.project_recovery_panel_open = earlier_launch_recovery_available;
+                if let Some(status) = warning.or_else(|| {
+                    earlier_launch_recovery_available
+                        .then(|| EARLIER_LAUNCH_RECOVERY_STATUS.to_owned())
+                }) {
+                    self.project_status_message = Some(status);
                 }
             }
             Err(fault) => {
@@ -2621,11 +2620,15 @@ impl MiranteWorkbenchApp {
                 workspace.provisional_project_id(),
             ) {
                 Ok((service, discovery_warning)) => {
+                    let earlier_launch_recovery_available =
+                        earlier_launch_recovery_available(&service);
                     self.project_store = Some(service);
+                    self.project_recovery_panel_open = earlier_launch_recovery_available;
                     let warning = recovery_root_warning.or(discovery_warning);
-                    if warning.is_some() {
-                        self.project_status_message = warning;
-                    }
+                    self.project_status_message = warning.or_else(|| {
+                        earlier_launch_recovery_available
+                            .then(|| EARLIER_LAUNCH_RECOVERY_STATUS.to_owned())
+                    });
                 }
                 Err(fault) => {
                     self.project_status_message =
