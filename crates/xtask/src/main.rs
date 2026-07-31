@@ -6,19 +6,27 @@ use crate::product_validate::{is_product_validation_scenario_name, product_valid
 use crate::workflow_audit::workflow_audit;
 
 const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [target-package] \
-     [target_fixture_camera_smoke|target_fixture_render_modes|target_source_verification|b4_project_persistence]";
+     [target_fixture_camera_smoke|target_fixture_render_modes|representative_native_navigation|target_source_verification|import_preprocessing|b4_project_persistence|pre_alpha_reliability]";
 
 mod arch;
+#[cfg(test)]
+mod build_contract;
 mod deps;
 mod dev;
 mod documentation;
 mod host;
+mod import_performance;
+mod import_performance_t5;
 mod package;
+mod private_evidence;
 mod process;
+mod product_automation_progress;
 mod product_validate;
 mod reports;
+mod t5_sentinel_oracle;
 mod target_fixture;
 mod verification;
+mod viewer_oblique_continuity;
 mod workflow_audit;
 
 fn main() -> anyhow::Result<()> {
@@ -28,7 +36,7 @@ fn main() -> anyhow::Result<()> {
         "verify-leaf" => {
             let leaf = args
                 .next()
-                .context("usage: cargo xtask verify-leaf policy|lint|unit|contract|ui|doctest")?;
+                .context("usage: cargo xtask verify-leaf policy|lint|unit|contract|ui")?;
             if args.next().is_some() {
                 bail!("verify-leaf accepts exactly one leaf");
             }
@@ -74,6 +82,20 @@ fn main() -> anyhow::Result<()> {
             }
         },
         "workflow-audit" => workflow_audit().map(|path| println!("{}", path.display())),
+        "viewer-oblique-continuity" => viewer_oblique_continuity::run(args.collect())
+            .map(|path| println!("{}", path.display())),
+        "import-performance-t2" => {
+            import_performance::run(args.collect()).map(|path| println!("{}", path.display()))
+        }
+        "import-performance-t5" => {
+            import_performance_t5::run(args.collect()).map(|path| println!("{}", path.display()))
+        }
+        "import-performance-t5-publish" => import_performance_t5::publish(args.collect())
+            .map(|path| println!("{}", path.display())),
+        "import-performance-t5-oracle-audit" => {
+            import_performance_t5::run_oracle_audit(args.collect())
+        }
+        "__import-performance-t2-worker" => import_performance::run_worker(args.collect()),
         "docs-check" => documentation::docs_check(),
         "run-dev" => dev::run_dev(),
         "help" | "--help" | "-h" => {
@@ -129,9 +151,18 @@ under target/mirante4d/product-validation/. With no package argument, the
 bounded promoted target U16 fixture is extracted locally.
 
 The ordinary bounded scenarios are target_fixture_camera_smoke,
-target_fixture_render_modes, and target_source_verification. The retained
-b4_project_persistence scenario checks project save, recovery, and reopen
-behavior across three application launches.
+target_fixture_render_modes, representative_native_navigation,
+target_source_verification, and import_preprocessing.
+representative_native_navigation requires an explicit package and exercises
+native 3D navigation, all volume modes, smooth sampling, four-panel linked
+input, exact settlement, and return to standalone 3D. The import scenario
+generates a bounded public TIFF fixture, cancels and resumes preprocessing,
+waits for verified publication, then renders the imported package. The
+retained b4_project_persistence scenario checks project save, recovery, and
+reopen behavior across three application launches. The pre_alpha_reliability
+scenario uses isolated state homes to prove provisional-autosave exposure and
+recovery across a crash, then proves clean exit from a mapped native X11
+window close.
 
 Useful controls:
   MIRANTE4D_PRODUCT_VALIDATE_TIMEOUT_SECS=<seconds>
@@ -147,7 +178,7 @@ fn print_help() {
         "\
 Mirante4D developer tasks
 
-  cargo xtask verify-leaf policy|lint|unit|contract|ui|doctest
+  cargo xtask verify-leaf policy|lint|unit|contract|ui
   cargo xtask verify-pr [policy|rust]
   cargo xtask verify-local <format-lifecycle|project-store-lifecycle|trusted-gpu>
   cargo xtask verification-sync [--check]
@@ -155,8 +186,18 @@ Mirante4D developer tasks
   cargo xtask package-linux-release
   cargo xtask product-validate [target-package] [scenario]
   cargo xtask workflow-audit
+  cargo xtask viewer-oblique-continuity [--workflow oblique|linked-zoom|zoom|combined] [--dataset /absolute/package.m4d] [--duration-secs 30] [--runs 1]
+  cargo run --release -p xtask -- import-performance-t2 [--samples 5] [--qualification-profile PATH]
+  cargo run --release -p xtask -- import-performance-t5 --config /absolute/private/config.json [--performance | --diagnostic]
+  cargo run --release -p xtask -- import-performance-t5-publish --config /absolute/private/config.json --raw-report /absolute/private/raw-private-report.json
+  cargo run --release -p xtask -- import-performance-t5-oracle-audit --config /absolute/private/config.json
   cargo xtask docs-check
   cargo xtask run-dev
+
+T2 and T5 qualification require matching local, non-repository qualification profiles.
+T5 also requires an owner-pinned private configuration; --diagnostic never qualifies.
+The T5 publisher only replays sanitized publication from a finalized private raw report.
+The T5 oracle audit is an explicit offline check of that pinned v2 configuration.
 
 Run cargo xtask product-validate --help for scenario details."
     );
@@ -194,6 +235,20 @@ mod tests {
             ProductValidateArgs::Run {
                 package: None,
                 scenario: Some("b4_project_persistence".to_owned())
+            }
+        );
+        assert_eq!(
+            product_validate_args(args(&["import_preprocessing"])).unwrap(),
+            ProductValidateArgs::Run {
+                package: None,
+                scenario: Some("import_preprocessing".to_owned())
+            }
+        );
+        assert_eq!(
+            product_validate_args(args(&["pre_alpha_reliability"])).unwrap(),
+            ProductValidateArgs::Run {
+                package: None,
+                scenario: Some("pre_alpha_reliability".to_owned())
             }
         );
     }

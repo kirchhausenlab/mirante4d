@@ -11,10 +11,15 @@ may change through explicit hard cutovers.
 - Read [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 - Keep changes narrow and delete replaced paths instead of adding compatibility
   layers.
-- Run `cargo xtask verify-pr` and any additional checks relevant to the change.
+- Use focused checks while developing. Before handing off a substantial
+  change, run `cargo xtask verify-pr` and any affected-boundary checks.
 - Explain what was verified and what remains unverified.
 - Never include credentials, private paths, unpublished results, or microscopy
   data in an issue, pull request, log, screenshot, or test fixture.
+
+New tests, provenance, or verification process should protect a named product,
+scientific, data-safety, security, or release risk. Keep it proportionate to
+this maintainer-led academic project.
 
 Pull requests are reviewed by trusted maintainers. Required checks must pass
 and review conversations must be resolved before merge. While the project has

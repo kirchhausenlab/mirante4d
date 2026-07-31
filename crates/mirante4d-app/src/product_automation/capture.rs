@@ -6,20 +6,28 @@ use std::{
 use eframe::egui;
 use serde_json::{Value, json};
 
-use crate::{MiranteWorkbenchApp, viewer_layout::PanelId};
+use crate::{
+    MiranteWorkbenchApp, native_presentation::texture_revision_is_current, viewer_layout::PanelId,
+};
 
 pub(crate) fn product_target_capture(
     app: &MiranteWorkbenchApp,
     panel: PanelId,
 ) -> Option<&mirante4d_render_wgpu::ValidationCapture> {
-    let target = app
+    let target = panel.presentation_slot();
+    let completed = app
         .native_presentation
         .product_gpu
         .as_ref()?
-        .targets
-        .get(&panel)?;
-    let (presentation, capture) = target.completed_capture.as_ref()?;
-    (target.presented.as_ref() == Some(presentation)).then_some(capture)
+        .completed_validation_capture(target)?;
+    (completed.ticket.target() == target
+        && texture_revision_is_current(
+            app.native_presentation.texture_binding_identity(target),
+            completed.ticket.device_generation().get(),
+            completed.ticket.texture_revision().get(),
+        )
+        && app.render_coordination.surface(target).presented_frame() == Some(&completed.frame))
+    .then_some(&completed.capture)
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +38,9 @@ pub(crate) struct ProductAutomationArtifact {
     pub(crate) width: usize,
     pub(crate) height: usize,
     pub(crate) command_index: usize,
+    pub(crate) target: &'static str,
+    pub(crate) frame_identity: u64,
+    pub(crate) surface_generation: u64,
     pub(crate) capture_source: &'static str,
     pub(crate) pixel_stats: ProductAutomationImageStats,
 }
@@ -43,6 +54,9 @@ impl ProductAutomationArtifact {
             "width": self.width,
             "height": self.height,
             "command_index": self.command_index,
+            "target": self.target,
+            "frame_identity": self.frame_identity,
+            "surface_generation": self.surface_generation,
             "capture_source": self.capture_source,
             "pixel_stats": self.pixel_stats.json(),
         })
@@ -124,8 +138,9 @@ pub(crate) fn sanitize_artifact_label(raw: &str) -> String {
 
 pub(crate) fn capture_color_image(
     app: &mut MiranteWorkbenchApp,
+    panel: PanelId,
 ) -> Result<(&'static str, egui::ColorImage), String> {
-    if let Some(capture) = product_target_capture(app, PanelId::ThreeD) {
+    if let Some(capture) = product_target_capture(app, panel) {
         let width = usize::try_from(capture.extent().width_pixels())
             .map_err(|_| "GPU display frame width does not fit in usize".to_owned())?;
         let height = usize::try_from(capture.extent().height_pixels())
@@ -136,22 +151,27 @@ pub(crate) fn capture_color_image(
         ));
     }
     if app
-        .native_presentation
-        .product_gpu
-        .as_ref()
-        .and_then(|product| product.targets.get(&PanelId::ThreeD))
-        .and_then(|target| target.presented.as_ref())
+        .render_coordination
+        .surface(panel.presentation_slot())
+        .presented_frame()
         .is_some()
     {
-        return Err("current GPU validation capture is still pending".to_owned());
+        return Err(format!(
+            "current {} GPU validation capture is still pending",
+            panel.label()
+        ));
     }
-    Err("no current GPU display frame is available".to_owned())
+    Err(format!(
+        "no current {} GPU display frame is available",
+        panel.label()
+    ))
 }
 
 pub(crate) fn current_display_image_stats(
     app: &MiranteWorkbenchApp,
+    panel: PanelId,
 ) -> Result<(&'static str, ProductAutomationImageStats), String> {
-    if let Some(capture) = product_target_capture(app, PanelId::ThreeD) {
+    if let Some(capture) = product_target_capture(app, panel) {
         let width = usize::try_from(capture.extent().width_pixels())
             .map_err(|_| "GPU display frame width does not fit in usize".to_owned())?;
         let height = usize::try_from(capture.extent().height_pixels())
@@ -163,16 +183,20 @@ pub(crate) fn current_display_image_stats(
         ));
     }
     if app
-        .native_presentation
-        .product_gpu
-        .as_ref()
-        .and_then(|product| product.targets.get(&PanelId::ThreeD))
-        .and_then(|target| target.presented.as_ref())
+        .render_coordination
+        .surface(panel.presentation_slot())
+        .presented_frame()
         .is_some()
     {
-        return Err("current GPU validation capture is still pending".to_owned());
+        return Err(format!(
+            "current {} GPU validation capture is still pending",
+            panel.label()
+        ));
     }
-    Err("no current GPU display frame is available".to_owned())
+    Err(format!(
+        "no current {} GPU display frame is available",
+        panel.label()
+    ))
 }
 
 pub(crate) fn color_image_from_rgba(

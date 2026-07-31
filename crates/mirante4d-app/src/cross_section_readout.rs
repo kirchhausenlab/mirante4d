@@ -4,7 +4,9 @@ use mirante4d_application::{
     viewport_interaction::CrossSectionViewState,
 };
 use mirante4d_dataset::DatasetCatalog;
-use mirante4d_domain::{GridToWorld, LogicalLayerKey, ScaleLevel, Shape3D, ViewerLayout};
+use mirante4d_domain::{
+    CrossSectionView, GridToWorld, LogicalLayerKey, ScaleLevel, Shape3D, ViewerLayout,
+};
 use mirante4d_project_model::ViewState;
 use mirante4d_render_api::PresentationViewport;
 
@@ -16,6 +18,7 @@ use crate::{
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CrossSectionReadoutInput<'a> {
     pub(crate) view: &'a ViewState,
+    pub(crate) cross_section: CrossSectionView,
     pub(crate) catalog: &'a DatasetCatalog,
 }
 
@@ -156,7 +159,7 @@ pub(crate) fn cross_section_hover_readout_for_panel_point(
         }
     };
 
-    let view = CrossSectionViewState::from_canonical(*input.view.cross_section()).view(panel);
+    let view = CrossSectionViewState::from_canonical(input.cross_section).view(panel);
     let world = DVec3::from_array(view.world_point_for_panel_point(
         x_points,
         y_points,
@@ -343,7 +346,7 @@ fn sample_resident_value(
     index: CrossSectionGridIndex,
 ) -> ResidentSample {
     let resident = leases.resident_set(
-        catalog.scientific_identity().resource_identity(),
+        catalog.resource_identity(),
         layer,
         timepoint,
         ScaleLevel::new(scale_level),
@@ -417,6 +420,7 @@ fn schedule_status_for_missing_value(
         CrossSectionPanelScheduleStatus::Empty => CrossSectionHoverStatus::Outside,
         CrossSectionPanelScheduleStatus::Incomplete => CrossSectionHoverStatus::Incomplete,
         CrossSectionPanelScheduleStatus::Coarse
+        | CrossSectionPanelScheduleStatus::Provisional
         | CrossSectionPanelScheduleStatus::Current
         | CrossSectionPanelScheduleStatus::Ready => CrossSectionHoverStatus::Loading,
         CrossSectionPanelScheduleStatus::MissingViewport
@@ -436,6 +440,7 @@ fn missing_resident_label(status: CrossSectionPanelScheduleStatus) -> &'static s
         CrossSectionPanelScheduleStatus::MissingViewport => "unavailable (missing panel viewport)",
         CrossSectionPanelScheduleStatus::Unavailable => "unavailable",
         CrossSectionPanelScheduleStatus::Ready
+        | CrossSectionPanelScheduleStatus::Provisional
         | CrossSectionPanelScheduleStatus::Current
         | CrossSectionPanelScheduleStatus::Coarse => "loading (resident data unavailable)",
     }
@@ -586,8 +591,8 @@ mod tests {
     use std::sync::Arc;
 
     use mirante4d_dataset::{
-        DatasetLayer, DatasetResourceKey, DatasetSourceId, ResourceLease,
-        ResourcePayloadDescriptor, ResourcePayloadView, ResourceRegion, ResourceValidity,
+        BrickKey, DatasetLayer, DatasetSourceId, ResourceLease, ResourcePayloadDescriptor,
+        ResourcePayloadFacts, ResourcePayloadView, ResourceRegion, ResourceValidity,
         ScientificIdentityStatus,
     };
     use mirante4d_domain::{IntensityDType, Shape4D, TimeIndex};
@@ -596,14 +601,14 @@ mod tests {
 
     #[derive(Debug)]
     struct FixtureLease {
-        key: DatasetResourceKey,
+        key: BrickKey,
         descriptor: ResourcePayloadDescriptor,
         values: Box<[u8]>,
         validity: Box<[u8]>,
     }
 
     impl ResourceLease for FixtureLease {
-        fn key(&self) -> DatasetResourceKey {
+        fn key(&self) -> BrickKey {
             self.key
         }
 
@@ -611,6 +616,10 @@ mod tests {
             self.descriptor
                 .view(&self.values, Some(&self.validity))
                 .expect("fixture payload remains valid")
+        }
+
+        fn payload_facts(&self) -> ResourcePayloadFacts {
+            ResourcePayloadFacts::from_payload(self.payload()).expect("fixture facts are valid")
         }
     }
 
@@ -632,8 +641,8 @@ mod tests {
             vec![layer],
         )
         .unwrap();
-        let key = DatasetResourceKey::new(
-            catalog.scientific_identity().resource_identity(),
+        let key = BrickKey::new(
+            catalog.resource_identity(),
             layer_key,
             TimeIndex::new(0),
             ScaleLevel::BASE,

@@ -55,6 +55,12 @@ jobs:
           echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  ${RUNNER_TEMP}/cargo-deny.tar.gz" | sha256sum --check --strict
           tar -xzf "${RUNNER_TEMP}/cargo-deny.tar.gz" -C "${tools_dir}" --strip-components=1 cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny
           echo "${tools_dir}" >> "${GITHUB_PATH}"
+      - name: Install xtask native link library
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 120s sudo apt-get update
+          timeout 120s sudo apt-get install --yes --no-install-recommends libx11-dev
       - name: Fetch locked dependencies without a shared cache
         shell: bash
         run: timeout 120s cargo fetch --locked --target x86_64-unknown-linux-gnu
@@ -65,7 +71,7 @@ jobs:
   rust:
     name: Main / rust
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - name: Check out the protected revision
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -104,10 +110,10 @@ jobs:
         run: |
           set -euo pipefail
           timeout 120s sudo apt-get update
-          timeout 120s sudo apt-get install --yes --no-install-recommends libgtk-3-dev libudev-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+          timeout 120s sudo apt-get install --yes --no-install-recommends libgtk-3-dev libudev-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libx11-dev
       - name: Fetch locked dependencies without a shared cache
         shell: bash
         run: timeout 120s cargo fetch --locked --target x86_64-unknown-linux-gnu
       - name: Run the Rust group
         shell: bash
-        run: timeout 900s cargo xtask verify-pr rust
+        run: timeout 600s cargo xtask verify-pr rust

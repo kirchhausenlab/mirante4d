@@ -6,8 +6,8 @@ use std::{
 };
 
 use mirante4d_app::{
-    AppSmokeOptions, MiranteWorkbenchApp, collect_startup_diagnostics, default_log_path,
-    run_headless_smoke,
+    AppSmokeOptions, MiranteWorkbenchApp, ProcessTerminationLatch, collect_startup_diagnostics,
+    default_log_path, run_headless_smoke,
 };
 use mirante4d_domain::RenderMode;
 use mirante4d_render_wgpu::{qualify_adapter, renderer_device_descriptor};
@@ -128,19 +128,48 @@ fn main() -> anyhow::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Mirante4D")
-            .with_inner_size([1280.0, 800.0])
+            .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([900.0, 600.0]),
+        vsync: true,
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: wgpu_options(),
         ..Default::default()
     };
+    let process_termination = Arc::new(ProcessTerminationLatch::default());
+    install_process_termination_signals(Arc::clone(&process_termination))?;
 
     eframe::run_native(
         "Mirante4D",
         native_options,
-        Box::new(move |cc| Ok(Box::new(MiranteWorkbenchApp::open_dataset(cc, &dataset)?))),
+        Box::new(move |cc| {
+            Ok(Box::new(
+                MiranteWorkbenchApp::open_dataset_with_process_termination(
+                    cc,
+                    &dataset,
+                    process_termination,
+                )?,
+            ))
+        }),
     )
     .map_err(|err| anyhow::anyhow!("failed to launch native window: {err}"))
+}
+
+fn install_process_termination_signals(
+    process_termination: Arc<ProcessTerminationLatch>,
+) -> anyhow::Result<()> {
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ])?;
+    std::thread::Builder::new()
+        .name("mirante4d-process-signals".to_owned())
+        .spawn(move || {
+            for signal in signals.forever() {
+                process_termination.request();
+                tracing::info!(signal, "graceful process termination requested");
+            }
+        })?;
+    Ok(())
 }
 
 fn init_tracing() {
@@ -214,7 +243,11 @@ fn adapter_preference_score(info: &eframe::wgpu::AdapterInfo) -> u8 {
 }
 
 fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
-    let mut options = eframe::egui_wgpu::WgpuConfiguration::default();
+    let mut options = eframe::egui_wgpu::WgpuConfiguration {
+        present_mode: eframe::wgpu::PresentMode::AutoVsync,
+        desired_maximum_frame_latency: Some(1),
+        ..Default::default()
+    };
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut options.wgpu_setup {
         create_new.power_preference = eframe::wgpu::PowerPreference::HighPerformance;
         create_new.native_adapter_selector = Some(Arc::new(|adapters, surface| {
@@ -285,6 +318,13 @@ fn select_window_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn product_surface_contract_bounds_vsynced_presentation_latency() {
+        let options = wgpu_options();
+        assert_eq!(options.present_mode, eframe::wgpu::PresentMode::AutoVsync);
+        assert_eq!(options.desired_maximum_frame_latency, Some(1));
+    }
 
     #[test]
     fn adapter_override_matches_case_insensitive_visible_facts() {

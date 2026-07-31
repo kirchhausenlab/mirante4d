@@ -2,23 +2,27 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, Metadata},
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use mirante4d_identity::{ExactBytesHasher, IdentityHashError, PackageId};
+use rustix::time::{ClockId, clock_gettime};
 use thiserror::Error;
 
-use crate::local_publication::{LocalPublication, LocalPublicationError};
+use crate::local_publication::{LocalPublication, LocalPublicationError, PublicationCheckpoint};
+use crate::package_science::refresh_publication_currentness;
 use crate::range_io::LocalObjectSnapshot;
 use crate::shard::encode_shard_index_tail;
 use crate::{
-    ControlError, DatasetProfileAdmission, DisplayDefaults, LocalPackageCatalog, ManifestRoot,
-    OmeImageGroupMetadata, PackageObjectDescriptor, PackageObjectKind, PackageOpenError,
-    PackagePath, PackageStructureError, PackageValidationError, PortableRecord, ProfileHeader,
-    ProfileKind, RangeReadError, ScienceDescriptor, ScientificPackageValidationError,
-    ShardCodecError, ShardProfileKind, StorageProfileError, ZarrArrayMetadata, ZarrGroupMetadata,
-    ZarrMetadataError, encode_inner_payload, manifest_page_path, pack_manifest_pages,
-    profile_limits,
+    CanonicalEncodedInner, ControlError, DatasetProfileAdmission, DisplayDefaults,
+    LocalPackageCatalog, ManifestRoot, OmeImageGroupMetadata, PackageObjectDescriptor,
+    PackageObjectKind, PackageOpenError, PackagePath, PackageStructureError,
+    PackageValidationError, PortableRecord, ProfileHeader, ProfileKind, RangeReadError,
+    ScienceDescriptor, ScientificPackageValidationError, ScientificPublicationTransferError,
+    ShardCodecError, ShardProfileKind, StorageProfileError, VerifiedScientificPackageCapability,
+    ZarrArrayMetadata, ZarrGroupMetadata, ZarrMetadataError, encode_inner_payload,
+    manifest_page_path, pack_manifest_pages, profile_limits,
 };
 
 const PROFILE_PATH: &str = "m4d/profile.json";
@@ -44,7 +48,7 @@ impl PackageArrayInput {
     }
 }
 
-/// One bounded outer shard supplied as decoded inner chunks in slot order.
+/// One bounded outer shard supplied as validated inner chunks in slot order.
 ///
 /// A caller may generate these values lazily. The writer consumes and drops
 /// each complete outer shard before requesting the next one.
@@ -52,7 +56,13 @@ impl PackageArrayInput {
 pub struct PackageShardInput {
     array_path: PackagePath,
     outer_coordinates: Vec<u64>,
-    decoded_chunks: Vec<Option<Vec<u8>>>,
+    chunks: Vec<Option<PackageInnerChunk>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PackageInnerChunk {
+    Decoded(Vec<u8>),
+    Encoded(CanonicalEncodedInner),
 }
 
 impl PackageShardInput {
@@ -64,7 +74,28 @@ impl PackageShardInput {
         Self {
             array_path,
             outer_coordinates,
-            decoded_chunks,
+            chunks: decoded_chunks
+                .into_iter()
+                .map(|chunk| chunk.map(PackageInnerChunk::Decoded))
+                .collect(),
+        }
+    }
+
+    /// Supplies already-canonical inner payloads. The caller must construct
+    /// fresh values through `CanonicalEncodedInner::encode` and persisted or
+    /// otherwise untrusted values through `CanonicalEncodedInner::validate`.
+    pub fn new_encoded(
+        array_path: PackagePath,
+        outer_coordinates: Vec<u64>,
+        encoded_chunks: Vec<Option<CanonicalEncodedInner>>,
+    ) -> Self {
+        Self {
+            array_path,
+            outer_coordinates,
+            chunks: encoded_chunks
+                .into_iter()
+                .map(|chunk| chunk.map(PackageInnerChunk::Encoded))
+                .collect(),
         }
     }
 
@@ -76,8 +107,8 @@ impl PackageShardInput {
         &self.outer_coordinates
     }
 
-    pub fn decoded_chunks(&self) -> &[Option<Vec<u8>>] {
-        &self.decoded_chunks
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
     }
 }
 
@@ -126,6 +157,36 @@ impl<I> PackageWriteInput<I> {
 pub struct PackageWriteReceipt {
     package_id: PackageId,
     admission: DatasetProfileAdmission,
+    scientific_validation_report: Option<crate::ScientificValidationReport>,
+    validation_read_report: crate::PackageValidationReadReport,
+    codec_report: crate::PackageCodecReport,
+    sync_calls: u64,
+    sync_time_ns: u64,
+}
+
+/// One material stage performed by the create-only package writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackageWriteStage {
+    ShardPublication,
+    StagedStructureValidation,
+    StagedExactValidation,
+    StagedScientificValidation,
+    Commit,
+}
+
+/// Monotonic wall and process-CPU time measured for one completed writer stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackageWriteStageTiming {
+    pub stage: PackageWriteStage,
+    pub wall_time_ns: u64,
+    pub cpu_time_ns: u64,
+}
+
+/// Real-time stage observation from the scientific package writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackageWriteEvent {
+    StageStarted(PackageWriteStage),
+    StageFinished(PackageWriteStageTiming),
 }
 
 impl PackageWriteReceipt {
@@ -135,6 +196,121 @@ impl PackageWriteReceipt {
 
     pub const fn admission(self) -> DatasetProfileAdmission {
         self.admission
+    }
+
+    pub const fn scientific_validation_report(self) -> Option<crate::ScientificValidationReport> {
+        self.scientific_validation_report
+    }
+
+    pub const fn validation_read_report(self) -> crate::PackageValidationReadReport {
+        self.validation_read_report
+    }
+
+    pub const fn codec_report(self) -> crate::PackageCodecReport {
+        self.codec_report
+    }
+
+    /// Successful staged-filesystem and directory durability calls made by the
+    /// package writer. Checkpoint synchronization is accounted by the importer.
+    pub const fn sync_calls(self) -> u64 {
+        self.sync_calls
+    }
+
+    pub const fn sync_time_ns(self) -> u64 {
+        self.sync_time_ns
+    }
+}
+
+/// Linear handoff from a scientifically validated create-only publication to
+/// normal product use.
+///
+/// The transfer owns the exact capability rebound to the published root. It is
+/// deliberately not `Clone`; callers must consume it through the final
+/// metadata-only currentness sandwich before obtaining the capability.
+#[derive(Debug)]
+#[must_use = "a scientific publication must consume its one-shot verified-package transfer"]
+pub struct PublishedScientificPackageTransfer {
+    receipt: PackageWriteReceipt,
+    destination: PathBuf,
+    capability: VerifiedScientificPackageCapability,
+}
+
+impl PublishedScientificPackageTransfer {
+    pub const fn receipt(&self) -> PackageWriteReceipt {
+        self.receipt
+    }
+
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    pub const fn package_id(&self) -> PackageId {
+        self.receipt.package_id
+    }
+
+    pub const fn scientific_content_id(&self) -> mirante4d_identity::ScientificContentId {
+        self.capability.scientific_content_id()
+    }
+
+    /// Consumes the one-shot publication transfer and issues the capability
+    /// only after the published directory passes inventory/snapshot/inventory
+    /// freshness checks. The returned execution evidence is inseparable from
+    /// the consumed capability at this hard-cut boundary.
+    pub fn consume(
+        self,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<
+        (
+            VerifiedScientificPackageCapability,
+            crate::ScientificPublicationTransferEvidence,
+        ),
+        ScientificPublicationTransferError,
+    > {
+        let evidence = refresh_publication_currentness(&self.capability, &mut is_cancelled)?;
+        Ok((self.capability, evidence))
+    }
+}
+
+#[derive(Default)]
+struct PackageSyncCounters {
+    calls: u64,
+    time_ns: u64,
+}
+
+#[derive(Default)]
+struct PackageCodecCounters {
+    encode_calls: u64,
+    encode_time_ns: u64,
+}
+
+impl PackageCodecCounters {
+    fn record_encode(&mut self, elapsed: Duration) -> Result<(), PackageWriteError> {
+        self.encode_calls =
+            self.encode_calls
+                .checked_add(1)
+                .ok_or(PackageWriteError::InvalidInput {
+                    reason: "the package codec encode-call counter overflowed",
+                })?;
+        self.encode_time_ns = self
+            .encode_time_ns
+            .checked_add(u64::try_from(elapsed.as_nanos()).map_err(|_| {
+                PackageWriteError::InvalidInput {
+                    reason: "the package codec encode-time counter overflowed",
+                }
+            })?)
+            .ok_or(PackageWriteError::InvalidInput {
+                reason: "the package codec encode-time counter overflowed",
+            })?;
+        Ok(())
+    }
+}
+
+impl PackageSyncCounters {
+    fn record_publication(&mut self, report: crate::local_publication::PublicationSyncReport) {
+        // Publication has already performed these durability operations. Keep
+        // evidence collection infallible, particularly after atomic rename.
+        self.calls = self.calls.saturating_add(report.calls);
+        self.time_ns = self.time_ns.saturating_add(report.time_ns);
     }
 }
 
@@ -149,6 +325,8 @@ pub enum PackageWriteError {
     DestinationExists,
     #[error("atomic create-only directory publication is unsupported on this filesystem")]
     AtomicPublishUnsupported,
+    #[error("filesystem-wide package durability requires Linux kernel 5.8 or newer")]
+    FilesystemDurabilityUnsupported,
     #[error("package {package_id} became visible, but final directory durability is unknown")]
     CommitIndeterminate {
         package_id: PackageId,
@@ -178,6 +356,8 @@ pub enum PackageWriteError {
     #[error(transparent)]
     ScientificValidation(ScientificPackageValidationError),
     #[error(transparent)]
+    ScientificPublicationTransfer(ScientificPublicationTransferError),
+    #[error(transparent)]
     Range(#[from] RangeReadError),
     #[error(transparent)]
     Profile(#[from] StorageProfileError),
@@ -193,6 +373,11 @@ enum StagedValidation {
     Scientific,
 }
 
+enum PackageWriteOutcome {
+    Structure(Box<PackageWriteReceipt>),
+    Scientific(Box<PublishedScientificPackageTransfer>),
+}
+
 impl LocalPackageWriter {
     /// Writes, validates, and atomically publishes one previously absent
     /// package directory.
@@ -204,12 +389,19 @@ impl LocalPackageWriter {
     where
         I: IntoIterator<Item = PackageShardInput>,
     {
-        Self::write_new_with_validation(
+        let mut observer = |_| {};
+        let mut verified_commit_hook = |_, _| Ok(());
+        match Self::write_new_with_validation(
             destination,
             input,
             &mut is_cancelled,
             StagedValidation::Structure,
-        )
+            &mut observer,
+            &mut verified_commit_hook,
+        )? {
+            PackageWriteOutcome::Structure(receipt) => Ok(*receipt),
+            PackageWriteOutcome::Scientific(_) => unreachable!("structure writer outcome"),
+        }
     }
 
     /// Writes a new package, proves its exact-byte closure and declared
@@ -219,16 +411,48 @@ impl LocalPackageWriter {
         destination: impl AsRef<Path>,
         input: PackageWriteInput<I>,
         mut is_cancelled: impl FnMut() -> bool,
-    ) -> Result<PackageWriteReceipt, PackageWriteError>
+    ) -> Result<PublishedScientificPackageTransfer, PackageWriteError>
     where
         I: IntoIterator<Item = PackageShardInput>,
     {
-        Self::write_new_with_validation(
+        let mut observer = |_| {};
+        let mut verified_commit_hook = |_, _| Ok(());
+        match Self::write_new_with_validation(
             destination,
             input,
             &mut is_cancelled,
             StagedValidation::Scientific,
-        )
+            &mut observer,
+            &mut verified_commit_hook,
+        )? {
+            PackageWriteOutcome::Scientific(transfer) => Ok(*transfer),
+            PackageWriteOutcome::Structure(_) => unreachable!("scientific writer outcome"),
+        }
+    }
+
+    /// Writes and scientifically validates a new package while reporting the
+    /// five material publication stages as they actually execute.
+    pub fn write_new_scientifically_validated_observed<I>(
+        destination: impl AsRef<Path>,
+        input: PackageWriteInput<I>,
+        mut is_cancelled: impl FnMut() -> bool,
+        mut observer: impl FnMut(PackageWriteEvent),
+    ) -> Result<PublishedScientificPackageTransfer, PackageWriteError>
+    where
+        I: IntoIterator<Item = PackageShardInput>,
+    {
+        let mut verified_commit_hook = |_, _| Ok(());
+        match Self::write_new_with_validation(
+            destination,
+            input,
+            &mut is_cancelled,
+            StagedValidation::Scientific,
+            &mut observer,
+            &mut verified_commit_hook,
+        )? {
+            PackageWriteOutcome::Scientific(transfer) => Ok(*transfer),
+            PackageWriteOutcome::Structure(_) => unreachable!("scientific writer outcome"),
+        }
     }
 
     fn write_new_with_validation<I>(
@@ -236,11 +460,15 @@ impl LocalPackageWriter {
         input: PackageWriteInput<I>,
         mut is_cancelled: &mut impl FnMut() -> bool,
         staged_validation: StagedValidation,
-    ) -> Result<PackageWriteReceipt, PackageWriteError>
+        observer: &mut impl FnMut(PackageWriteEvent),
+        verified_commit_hook: &mut impl FnMut(PublicationCheckpoint, PackageId) -> io::Result<()>,
+    ) -> Result<PackageWriteOutcome, PackageWriteError>
     where
         I: IntoIterator<Item = PackageShardInput>,
     {
         check_cancelled(&mut is_cancelled)?;
+        let publication_clock =
+            PackageWriteStageClock::start(PackageWriteStage::ShardPublication, observer);
         let PackageWriteInput {
             profile_kind,
             profile,
@@ -276,6 +504,8 @@ impl LocalPackageWriter {
         let mut descriptors = Vec::new();
         let mut snapshots = Vec::new();
         let mut written_paths = BTreeSet::new();
+        let mut syncs = PackageSyncCounters::default();
+        let mut codecs = PackageCodecCounters::default();
 
         for object in objects {
             check_cancelled(&mut is_cancelled)?;
@@ -320,14 +550,14 @@ impl LocalPackageWriter {
                     reason: "a shard has the wrong outer-coordinate shape",
                 });
             }
-            if shard.decoded_chunks.len() != array.metadata.kind().chunks_per_shard() {
+            if shard.chunks.len() != array.metadata.kind().chunks_per_shard() {
                 return Err(ShardCodecError::ChunkCount {
                     expected: array.metadata.kind().chunks_per_shard(),
-                    actual: shard.decoded_chunks.len(),
+                    actual: shard.chunks.len(),
                 }
                 .into());
             }
-            if shard.decoded_chunks.iter().all(Option::is_none) {
+            if shard.chunks.iter().all(Option::is_none) {
                 if array.shard_kind == PackageObjectKind::PackedIndexShard {
                     return Err(PackageWriteError::InvalidInput {
                         reason: "a packed-index shard cannot contain only missing slots",
@@ -344,8 +574,9 @@ impl LocalPackageWriter {
                 shard_path,
                 array.shard_kind,
                 array.metadata.kind(),
-                shard.decoded_chunks,
+                shard.chunks,
                 &mut is_cancelled,
+                &mut codecs,
             )?;
             descriptors.push(descriptor);
             snapshots.push(snapshot);
@@ -372,11 +603,15 @@ impl LocalPackageWriter {
         snapshots.push(root_snapshot);
         let package_id = root.package_id()?;
 
-        publication
-            .sync_directories(&mut is_cancelled)
+        let stage_syncs = publication
+            .sync_stage(&mut is_cancelled)
             .map_err(map_publication_error_without_commit)?;
+        syncs.record_publication(stage_syncs);
         check_cancelled(&mut is_cancelled)?;
+        publication_clock.finish(observer);
 
+        let structure_clock =
+            PackageWriteStageClock::start(PackageWriteStage::StagedStructureValidation, observer);
         let catalog = LocalPackageCatalog::open(publication.stage_path())?;
         if catalog.declared_package_id() != package_id {
             return Err(PackageWriteError::InvalidInput {
@@ -392,32 +627,183 @@ impl LocalPackageWriter {
         }
         drop(snapshots);
         check_cancelled(&mut is_cancelled)?;
+        structure_clock.finish(observer);
+        let structure_object_reads = catalog.reader().object_open_operations();
 
-        if staged_validation == StagedValidation::Scientific {
+        let mut scientific_validation_report = None;
+        let mut validation_read_report =
+            crate::PackageValidationReadReport::new(structure_object_reads, 0, 0);
+        let mut codec_report = crate::PackageCodecReport::new(
+            codecs.encode_calls,
+            codecs.encode_time_ns,
+            catalog.reader().codec_decode_operations(),
+            catalog.reader().codec_decode_time_ns(),
+        );
+        let verified = if staged_validation == StagedValidation::Scientific {
+            let exact_clock =
+                PackageWriteStageClock::start(PackageWriteStage::StagedExactValidation, observer);
             let exact = catalog
                 .validate_exact_package(profile_kind, &mut is_cancelled)
                 .map_err(map_exact_validation_error)?;
             if exact.package_id() != package_id || exact.admission() != admission {
                 return invalid_input("staged exact validation disagrees with writer admission");
             }
-            exact
+            let exact_finished = exact.catalog().reader().object_open_operations();
+            let exact_object_reads = exact_finished.checked_sub(structure_object_reads).ok_or(
+                PackageWriteError::InvalidInput {
+                    reason: "staged exact object-read counter regressed",
+                },
+            )?;
+            exact_clock.finish(observer);
+            let scientific_clock = PackageWriteStageClock::start(
+                PackageWriteStage::StagedScientificValidation,
+                observer,
+            );
+            let verified = exact
                 .validate_scientific_content(&mut is_cancelled)
                 .map_err(map_scientific_validation_error)?;
+            scientific_validation_report = Some(verified.validation_report());
+            let scientific_finished = verified.catalog().reader().object_open_operations();
+            let scientific_object_reads = scientific_finished.checked_sub(exact_finished).ok_or(
+                PackageWriteError::InvalidInput {
+                    reason: "staged scientific object-read counter regressed",
+                },
+            )?;
+            validation_read_report = crate::PackageValidationReadReport::new(
+                structure_object_reads,
+                exact_object_reads,
+                scientific_object_reads,
+            );
+            codec_report = crate::PackageCodecReport::new(
+                codecs.encode_calls,
+                codecs.encode_time_ns,
+                verified.catalog().reader().codec_decode_operations(),
+                verified.catalog().reader().codec_decode_time_ns(),
+            );
             check_cancelled(&mut is_cancelled)?;
-        }
+            scientific_clock.finish(observer);
+            Some(verified)
+        } else {
+            None
+        };
 
         // Some lazy producers retain the final bounded-memory lease in their
         // iterator. Keep that lease alive through staged validation.
         drop(shards);
 
-        publication
-            .commit(package_id)
-            .map_err(|error| map_publication_error(error, package_id))?;
-        Ok(PackageWriteReceipt {
-            package_id,
-            admission,
-        })
+        let commit_clock = PackageWriteStageClock::start(PackageWriteStage::Commit, observer);
+        match verified {
+            Some(verified) => {
+                let publication_currentness_started =
+                    verified.catalog().reader().object_open_operations();
+                let prepared = verified
+                    .prepare_atomic_publication(publication.stage_path(), &mut is_cancelled)
+                    .map_err(map_scientific_publication_transfer_error)?;
+                let publication_currentness_reads = prepared
+                    .object_open_operations()
+                    .checked_sub(publication_currentness_started)
+                    .ok_or(PackageWriteError::InvalidInput {
+                        reason: "prepublication object-read counter regressed",
+                    })?;
+                let scientific_object_reads = validation_read_report
+                    .scientific_object_reads()
+                    .checked_add(publication_currentness_reads)
+                    .ok_or(PackageWriteError::InvalidInput {
+                        reason: "staged scientific object-read counter overflowed",
+                    })?;
+                validation_read_report = crate::PackageValidationReadReport::new(
+                    validation_read_report.structure_object_reads(),
+                    validation_read_report.exact_object_reads(),
+                    scientific_object_reads,
+                );
+                let (commit_syncs, capability) = publication
+                    .commit_verified(
+                        package_id,
+                        prepared,
+                        &mut is_cancelled,
+                        verified_commit_hook,
+                    )
+                    .map_err(|error| map_publication_error(error, package_id))?;
+                syncs.record_publication(commit_syncs);
+                commit_clock.finish(observer);
+                let receipt = PackageWriteReceipt {
+                    package_id,
+                    admission,
+                    scientific_validation_report,
+                    validation_read_report,
+                    codec_report,
+                    sync_calls: syncs.calls,
+                    sync_time_ns: syncs.time_ns,
+                };
+                let destination = capability.root_path().to_path_buf();
+                Ok(PackageWriteOutcome::Scientific(Box::new(
+                    PublishedScientificPackageTransfer {
+                        receipt,
+                        destination,
+                        capability,
+                    },
+                )))
+            }
+            None => {
+                let commit_syncs = publication
+                    .commit(package_id)
+                    .map_err(|error| map_publication_error(error, package_id))?;
+                syncs.record_publication(commit_syncs);
+                commit_clock.finish(observer);
+                Ok(PackageWriteOutcome::Structure(Box::new(
+                    PackageWriteReceipt {
+                        package_id,
+                        admission,
+                        scientific_validation_report,
+                        validation_read_report,
+                        codec_report,
+                        sync_calls: syncs.calls,
+                        sync_time_ns: syncs.time_ns,
+                    },
+                )))
+            }
+        }
     }
+}
+
+struct PackageWriteStageClock {
+    stage: PackageWriteStage,
+    wall_started: Instant,
+    cpu_started_ns: u64,
+}
+
+impl PackageWriteStageClock {
+    fn start(stage: PackageWriteStage, observer: &mut impl FnMut(PackageWriteEvent)) -> Self {
+        let clock = Self {
+            stage,
+            wall_started: Instant::now(),
+            cpu_started_ns: process_cpu_time_ns(),
+        };
+        observer(PackageWriteEvent::StageStarted(stage));
+        clock
+    }
+
+    fn finish(self, observer: &mut impl FnMut(PackageWriteEvent)) {
+        observer(PackageWriteEvent::StageFinished(PackageWriteStageTiming {
+            stage: self.stage,
+            wall_time_ns: duration_ns(self.wall_started.elapsed()),
+            cpu_time_ns: process_cpu_time_ns().saturating_sub(self.cpu_started_ns),
+        }));
+    }
+}
+
+fn process_cpu_time_ns() -> u64 {
+    let time = clock_gettime(ClockId::ProcessCPUTime);
+    let seconds = u64::try_from(time.tv_sec).expect("process CPU time cannot be negative");
+    let nanoseconds = u64::try_from(time.tv_nsec).expect("clock nanoseconds cannot be negative");
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanoseconds))
+        .expect("process CPU time fits in u64 nanoseconds")
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).expect("writer stage duration fits in u64 nanoseconds")
 }
 
 struct PreparedObject {
@@ -697,24 +1083,39 @@ fn write_authority_bytes(
     .map(|(_facts, snapshot)| snapshot)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_shard(
     publication: &mut LocalPublication,
     path: PackagePath,
     object_kind: PackageObjectKind,
     codec_kind: ShardProfileKind,
-    decoded_chunks: Vec<Option<Vec<u8>>>,
+    chunks: Vec<Option<PackageInnerChunk>>,
     is_cancelled: &mut impl FnMut() -> bool,
+    codecs: &mut PackageCodecCounters,
 ) -> Result<(PackageObjectDescriptor, LocalObjectSnapshot), PackageWriteError> {
     let (facts, snapshot) = write_hashed_file(publication, path.clone(), |file, hasher| {
         let mut lengths = Vec::with_capacity(codec_kind.chunks_per_shard());
-        for decoded in decoded_chunks {
+        for chunk in chunks {
             check_cancelled(is_cancelled)?;
-            match decoded {
-                Some(decoded) => {
+            match chunk {
+                Some(PackageInnerChunk::Decoded(decoded)) => {
+                    let encode_started = Instant::now();
                     let encoded = encode_inner_payload(codec_kind, &decoded)?;
+                    codecs.record_encode(encode_started.elapsed())?;
                     let encoded_length = u64::try_from(encoded.len())
                         .map_err(|_| ShardCodecError::LengthOverflow)?;
                     write_hashed(file, hasher, &encoded)?;
+                    lengths.push(Some(encoded_length));
+                }
+                Some(PackageInnerChunk::Encoded(encoded)) => {
+                    if encoded.kind() != codec_kind {
+                        return Err(PackageWriteError::InvalidInput {
+                            reason: "an encoded inner payload uses the wrong storage kind",
+                        });
+                    }
+                    let encoded_length = u64::try_from(encoded.bytes().len())
+                        .map_err(|_| ShardCodecError::LengthOverflow)?;
+                    write_hashed(file, hasher, encoded.bytes())?;
                     lengths.push(Some(encoded_length));
                 }
                 None => lengths.push(None),
@@ -738,14 +1139,11 @@ fn write_hashed_file(
         .map_err(map_publication_error_without_commit)?;
     let mut hasher = ExactBytesHasher::new();
     write_body(&mut file, &mut hasher)?;
-    file.sync_all().map_err(|source| PackageWriteError::Io {
-        operation: "sync staged package object",
-        source,
-    })?;
     let metadata = file.metadata().map_err(|source| PackageWriteError::Io {
         operation: "inspect staged package object",
         source,
     })?;
+    drop(file);
     let facts = hasher.finalize()?;
     if facts.byte_length() != metadata.len() {
         return invalid_input("the staged object length changed while it was written");
@@ -805,6 +1203,9 @@ fn map_publication_error_without_commit(error: LocalPublicationError) -> Package
         LocalPublicationError::AtomicPublishUnsupported { .. } => {
             PackageWriteError::AtomicPublishUnsupported
         }
+        LocalPublicationError::FilesystemDurabilityUnsupported => {
+            PackageWriteError::FilesystemDurabilityUnsupported
+        }
         LocalPublicationError::CommitIndeterminate { source } => PackageWriteError::Io {
             operation: "unexpected precommit durability state",
             source,
@@ -851,6 +1252,16 @@ fn map_scientific_validation_error(error: ScientificPackageValidationError) -> P
         PackageWriteError::Cancelled
     } else {
         PackageWriteError::ScientificValidation(error)
+    }
+}
+
+fn map_scientific_publication_transfer_error(
+    error: ScientificPublicationTransferError,
+) -> PackageWriteError {
+    if matches!(error, ScientificPublicationTransferError::Cancelled) {
+        PackageWriteError::Cancelled
+    } else {
+        PackageWriteError::ScientificPublicationTransfer(error)
     }
 }
 
@@ -929,7 +1340,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(first_receipt, second_receipt);
+        assert_eq!(first_receipt.package_id(), second_receipt.package_id());
+        assert_eq!(first_receipt.admission(), second_receipt.admission());
+        assert_eq!(
+            first_receipt.validation_read_report(),
+            second_receipt.validation_read_report()
+        );
+        assert_eq!(first_receipt.sync_calls(), second_receipt.sync_calls());
         assert_eq!(tree_bytes(&first), tree_bytes(&second));
         let capability = LocalPackageCatalog::open(&first)
             .unwrap()
@@ -943,6 +1360,59 @@ mod tests {
         assert_eq!(brick.logical_extent_zyx(), [1, 2, 3]);
         assert!(brick.pixel_payload().is_some());
         assert!(brick.validity_payload().is_none());
+    }
+
+    #[test]
+    fn package_write_route_has_one_prevalidation_stage_barrier_and_no_object_sync() {
+        let source = include_str!("package_write.rs");
+        let route_start = source
+            .find("    fn write_new_with_validation<I>(")
+            .expect("package-write route must exist");
+        let route_tail = &source[route_start..];
+        let route_end = route_tail
+            .find("\nstruct PackageWriteStageClock")
+            .expect("stage clock must follow the package-write route");
+        let route = &route_tail[..route_end];
+        let helper_start = source
+            .find("fn write_object_bytes(")
+            .expect("object writer helpers must exist");
+        let helper_tail = &source[helper_start..];
+        let helper_end = helper_tail
+            .find("\nfn check_cancelled(")
+            .expect("cancellation helper must follow object writer helpers");
+        let object_writers = &helper_tail[..helper_end];
+
+        assert_eq!(route.matches(".sync_stage(").count(), 1);
+        let barrier = route
+            .find(".sync_stage(")
+            .expect("the package route must synchronize its complete stage");
+        let validation = route
+            .find("PackageWriteStage::StagedStructureValidation")
+            .expect("staged structure validation must remain explicit");
+        assert!(barrier < validation);
+        for forbidden in [
+            ".sync_all(",
+            ".sync_data(",
+            "fdatasync(",
+            "fsync(",
+            "syncfs(",
+        ] {
+            assert!(
+                !route.contains(forbidden) && !object_writers.contains(forbidden),
+                "package construction contains a forbidden per-object durability route {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_filesystem_durability_remains_a_typed_writer_capability() {
+        let error = map_publication_error_without_commit(
+            LocalPublicationError::FilesystemDurabilityUnsupported,
+        );
+        assert!(matches!(
+            error,
+            PackageWriteError::FilesystemDurabilityUnsupported
+        ));
     }
 
     #[test]
@@ -1057,18 +1527,36 @@ mod tests {
         assert!(!mismatch.exists());
 
         let validated = root.0.join("validated.m4d");
-        let receipt = LocalPackageWriter::write_new_scientifically_validated(
+        let transfer = LocalPackageWriter::write_new_scientifically_validated(
             &validated,
             fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
             || false,
         )
         .unwrap();
-        let capability = LocalPackageCatalog::open(&validated)
-            .unwrap()
-            .validate_exact_package(ProfileKind::Ds0, || false)
-            .unwrap()
-            .validate_scientific_content(|| false)
-            .unwrap();
+        let receipt = transfer.receipt();
+        assert_eq!(transfer.destination(), validated.canonicalize().unwrap());
+        let (capability, currentness) = transfer.consume(|| false).unwrap();
+        assert_eq!(
+            currentness.contract_id(),
+            crate::SCIENTIFIC_PUBLICATION_CURRENTNESS_CONTRACT_ID
+        );
+        assert!(currentness.expected_snapshot_object_reads() > 0);
+        assert_eq!(
+            currentness.observed_snapshot_object_reads(),
+            currentness.expected_snapshot_object_reads()
+        );
+        assert_eq!(
+            currentness.first_inventory_object_reads(),
+            currentness.second_inventory_object_reads()
+        );
+        assert_eq!(
+            currentness.observed_total_object_reads(),
+            currentness.first_inventory_object_reads()
+                + currentness.observed_snapshot_object_reads()
+                + currentness.second_inventory_object_reads()
+        );
+        assert_eq!(currentness.observed_codec_decode_calls(), 0);
+        assert_eq!(capability.root_path(), validated.canonicalize().unwrap());
         assert_eq!(capability.package_id(), receipt.package_id());
         assert_eq!(capability.scientific_content_id(), computed);
 
@@ -1088,6 +1576,333 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".mirante4d-stage-")
         }));
+    }
+
+    #[test]
+    fn scientific_publication_transfer_rejects_precommit_inventory_and_root_substitution() {
+        let root = TestDirectory::new("scientific-transfer-precommit-drift");
+        let computed = computed_fixture_scientific_id(&root.0, "identity");
+
+        let unlisted_destination = root.0.join("unlisted.m4d");
+        let error = LocalPackageWriter::write_new_scientifically_validated_observed(
+            &unlisted_destination,
+            fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
+            || false,
+            |event| {
+                if event == PackageWriteEvent::StageStarted(PackageWriteStage::Commit) {
+                    fs::write(
+                        only_publication_stage(&root.0).join("unlisted.bin"),
+                        b"foreign",
+                    )
+                    .unwrap();
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PackageWriteError::ScientificPublicationTransfer(
+                ScientificPublicationTransferError::Inventory(
+                    crate::DirectoryInventoryError::UnexpectedFile { .. }
+                )
+            )
+        ));
+        assert!(!unlisted_destination.exists());
+
+        let replaced_destination = root.0.join("replaced-root.m4d");
+        let moved_stage = root.0.join("moved-validated-stage");
+        let error = LocalPackageWriter::write_new_scientifically_validated_observed(
+            &replaced_destination,
+            fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
+            || false,
+            |event| {
+                if event == PackageWriteEvent::StageStarted(PackageWriteStage::Commit) {
+                    let stage = only_publication_stage(&root.0);
+                    fs::rename(&stage, &moved_stage).unwrap();
+                    fs::create_dir(&stage).unwrap();
+                    fs::write(stage.join("replacement-marker"), b"keep").unwrap();
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PackageWriteError::ScientificPublicationTransfer(
+                ScientificPublicationTransferError::Inventory(
+                    crate::DirectoryInventoryError::Range(RangeReadError::RootChanged)
+                )
+            )
+        ));
+        assert!(!replaced_destination.exists());
+        assert_eq!(
+            fs::read(only_publication_stage(&root.0).join("replacement-marker")).unwrap(),
+            b"keep"
+        );
+        assert!(moved_stage.is_dir());
+        assert!(!moved_stage.join("m4d/profile.json").exists());
+    }
+
+    #[test]
+    fn scientific_publication_transfer_consume_rejects_postpublication_drift() {
+        let root = TestDirectory::new("scientific-transfer-consume-drift");
+        let computed = computed_fixture_scientific_id(&root.0, "identity");
+
+        let cancelled = root.0.join("cancelled-transfer.m4d");
+        let transfer = LocalPackageWriter::write_new_scientifically_validated(
+            &cancelled,
+            fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
+            || false,
+        )
+        .unwrap();
+        assert!(matches!(
+            transfer.consume(|| true),
+            Err(ScientificPublicationTransferError::Cancelled)
+        ));
+        assert!(cancelled.join("m4d/profile.json").is_file());
+
+        let unlisted_file = root.0.join("unlisted-file.m4d");
+        let transfer = LocalPackageWriter::write_new_scientifically_validated(
+            &unlisted_file,
+            fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
+            || false,
+        )
+        .unwrap();
+        fs::write(unlisted_file.join("foreign.bin"), b"foreign").unwrap();
+        assert!(matches!(
+            transfer.consume(|| false),
+            Err(ScientificPublicationTransferError::Inventory(
+                crate::DirectoryInventoryError::UnexpectedFile { .. }
+            ))
+        ));
+
+        let unlisted_directory = root.0.join("unlisted-directory.m4d");
+        let transfer = LocalPackageWriter::write_new_scientifically_validated(
+            &unlisted_directory,
+            fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
+            || false,
+        )
+        .unwrap();
+        fs::create_dir(unlisted_directory.join("foreign-directory")).unwrap();
+        assert!(matches!(
+            transfer.consume(|| false),
+            Err(ScientificPublicationTransferError::Inventory(
+                crate::DirectoryInventoryError::UnexpectedDirectory { .. }
+            ))
+        ));
+
+        let replaced_object = root.0.join("replaced-object.m4d");
+        let transfer = LocalPackageWriter::write_new_scientifically_validated(
+            &replaced_object,
+            fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
+            || false,
+        )
+        .unwrap();
+        let display = replaced_object.join("m4d/display.json");
+        let replacement = root.0.join("replacement-display.json");
+        fs::write(&replacement, fs::read(&display).unwrap()).unwrap();
+        fs::rename(&replacement, &display).unwrap();
+        assert!(matches!(
+            transfer.consume(|| false),
+            Err(ScientificPublicationTransferError::Snapshot(
+                PackageValidationError::Range(RangeReadError::ObjectChanged { .. })
+            ))
+        ));
+
+        let replaced_root = root.0.join("replaced-published-root.m4d");
+        let moved_root = root.0.join("moved-published-root");
+        let transfer = LocalPackageWriter::write_new_scientifically_validated(
+            &replaced_root,
+            fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
+            || false,
+        )
+        .unwrap();
+        fs::rename(&replaced_root, &moved_root).unwrap();
+        fs::create_dir(&replaced_root).unwrap();
+        assert!(matches!(
+            transfer.consume(|| false),
+            Err(ScientificPublicationTransferError::Inventory(
+                crate::DirectoryInventoryError::Range(RangeReadError::RootChanged)
+            ))
+        ));
+        assert!(moved_root.join("m4d/profile.json").is_file());
+    }
+
+    #[test]
+    fn verified_commit_never_issues_after_a_postrename_root_substitution() {
+        let root = TestDirectory::new("scientific-transfer-postrename-substitution");
+        let computed = computed_fixture_scientific_id(&root.0, "identity");
+        let destination = root.0.join("published.m4d");
+        let moved_validated_root = root.0.join("moved-validated-root");
+
+        let error = write_fixture_with_verified_commit_controls(
+            &destination,
+            fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
+            || false,
+            |checkpoint, _| {
+                if checkpoint == PublicationCheckpoint::AfterRenameBeforeParentSync {
+                    fs::rename(&destination, &moved_validated_root)?;
+                    fs::create_dir(&destination)?;
+                    fs::write(destination.join("replacement-marker"), b"replacement")?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PackageWriteError::CommitIndeterminate { .. }
+        ));
+        assert_eq!(
+            fs::read(destination.join("replacement-marker")).unwrap(),
+            b"replacement"
+        );
+        assert!(moved_validated_root.join("m4d/profile.json").is_file());
+    }
+
+    #[test]
+    fn verified_commit_cancellation_boundary_is_the_atomic_rename() {
+        let root = TestDirectory::new("scientific-transfer-cancellation-boundary");
+        let computed = computed_fixture_scientific_id(&root.0, "identity");
+
+        let cancelled_before_rename = Cell::new(false);
+        let pre_rename_destination = root.0.join("cancelled-before-rename.m4d");
+        let error = write_fixture_with_verified_commit_controls(
+            &pre_rename_destination,
+            fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
+            || cancelled_before_rename.get(),
+            |checkpoint, _| {
+                if checkpoint == PublicationCheckpoint::BeforeRename {
+                    cancelled_before_rename.set(true);
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, PackageWriteError::Cancelled));
+        assert!(!pre_rename_destination.exists());
+
+        let cancelled_after_rename = Cell::new(false);
+        let post_rename_destination = root.0.join("cancelled-after-rename.m4d");
+        let transfer = write_fixture_with_verified_commit_controls(
+            &post_rename_destination,
+            fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
+            || cancelled_after_rename.get(),
+            |checkpoint, _| {
+                if checkpoint == PublicationCheckpoint::AfterRenameBeforeParentSync {
+                    cancelled_after_rename.set(true);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(cancelled_after_rename.get());
+        assert!(post_rename_destination.join("m4d/profile.json").is_file());
+        let (capability, _) = transfer.consume(|| false).unwrap();
+        assert_eq!(capability.scientific_content_id(), computed);
+        assert_eq!(capability.root_path(), post_rename_destination);
+    }
+
+    #[test]
+    fn observed_scientific_writer_reports_ordered_real_stage_timings() {
+        let root = TestDirectory::new("observed-scientific-writer");
+        let mismatch = root.0.join("mismatch.m4d");
+        let computed = match LocalPackageWriter::write_new_scientifically_validated(
+            &mismatch,
+            fixture_input(BrickMode::PixelPresent, false),
+            || false,
+        )
+        .unwrap_err()
+        {
+            PackageWriteError::ScientificValidation(
+                ScientificPackageValidationError::ScientificContentMismatch { computed, .. },
+            ) => computed,
+            other => panic!("unexpected staged-validation error: {other}"),
+        };
+
+        let destination = root.0.join("observed.m4d");
+        let mut events = Vec::new();
+        let transfer = LocalPackageWriter::write_new_scientifically_validated_observed(
+            &destination,
+            fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
+            || false,
+            |event| {
+                if matches!(event, PackageWriteEvent::StageStarted(_)) {
+                    let started = Instant::now();
+                    while started.elapsed() < Duration::from_millis(1) {
+                        std::hint::black_box(());
+                    }
+                }
+                events.push(event);
+            },
+        )
+        .unwrap();
+        let receipt = transfer.receipt();
+
+        let reads = receipt.validation_read_report();
+        assert!(reads.structure_object_reads() > 0);
+        assert!(reads.exact_object_reads() > 0);
+        assert!(reads.scientific_object_reads() > 0);
+        assert_eq!(
+            reads.total_object_reads(),
+            Some(
+                reads.structure_object_reads()
+                    + reads.exact_object_reads()
+                    + reads.scientific_object_reads()
+            )
+        );
+        assert_eq!(
+            reads.total_object_reads(),
+            Some(
+                transfer
+                    .capability
+                    .catalog()
+                    .reader()
+                    .object_open_operations()
+            ),
+            "the receipt must include every strict object open through the pre-rename currentness proof"
+        );
+        let scientific = receipt.scientific_validation_report().unwrap();
+        assert_eq!(scientific.brick_reads(), 1);
+        // The one present brick consumes packed-index and pixel objects. The
+        // exact scan reuses their generation-bound handles/indexes and proves
+        // the complete object set again at the scan boundary.
+        assert_eq!(scientific.object_reads(), 2);
+        let codecs = receipt.codec_report();
+        assert!(codecs.encode_calls() > 0);
+        assert!(codecs.encode_time_ns() > 0);
+        // Structure and exact validation each decode the two shard indexes and
+        // packed-index payload; the scientific brick read decodes both indexes
+        // and both present payloads.
+        assert_eq!(codecs.decode_calls(), 10);
+        assert!(codecs.decode_time_ns() > 0);
+        assert_eq!(
+            receipt.sync_calls(),
+            receipt.admission().counts().directories + 2,
+            "one stage-wide filesystem barrier, every package directory, and the destination parent must be counted exactly"
+        );
+        assert!(receipt.sync_time_ns() > 0);
+
+        let expected = [
+            PackageWriteStage::ShardPublication,
+            PackageWriteStage::StagedStructureValidation,
+            PackageWriteStage::StagedExactValidation,
+            PackageWriteStage::StagedScientificValidation,
+            PackageWriteStage::Commit,
+        ];
+        assert_eq!(events.len(), expected.len() * 2);
+        for (pair, expected_stage) in events.chunks_exact(2).zip(expected) {
+            assert_eq!(pair[0], PackageWriteEvent::StageStarted(expected_stage));
+            let PackageWriteEvent::StageFinished(timing) = pair[1] else {
+                panic!("a writer stage did not finish before the next stage started");
+            };
+            assert_eq!(timing.stage, expected_stage);
+            assert!(timing.wall_time_ns >= 1_000_000);
+            assert!(timing.cpu_time_ns > 0);
+        }
+        assert!(destination.is_dir());
+        let (capability, _) = transfer.consume(|| false).unwrap();
+        drop(capability);
     }
 
     #[test]
@@ -1149,6 +1964,55 @@ mod tests {
 
     fn fixture_input(mode: BrickMode, reverse: bool) -> PackageWriteInput<Vec<PackageShardInput>> {
         fixture_input_with_scientific_id(mode, reverse, scientific_id())
+    }
+
+    fn write_fixture_with_verified_commit_controls(
+        destination: &Path,
+        input: PackageWriteInput<Vec<PackageShardInput>>,
+        mut is_cancelled: impl FnMut() -> bool,
+        mut hook: impl FnMut(PublicationCheckpoint, PackageId) -> io::Result<()>,
+    ) -> Result<PublishedScientificPackageTransfer, PackageWriteError> {
+        let mut observer = |_| {};
+        match LocalPackageWriter::write_new_with_validation(
+            destination,
+            input,
+            &mut is_cancelled,
+            StagedValidation::Scientific,
+            &mut observer,
+            &mut hook,
+        )? {
+            PackageWriteOutcome::Scientific(transfer) => Ok(*transfer),
+            PackageWriteOutcome::Structure(_) => unreachable!("scientific writer outcome"),
+        }
+    }
+
+    fn computed_fixture_scientific_id(parent: &Path, label: &str) -> ScientificContentId {
+        let mismatch = parent.join(format!("{label}-mismatch.m4d"));
+        match LocalPackageWriter::write_new_scientifically_validated(
+            &mismatch,
+            fixture_input(BrickMode::PixelPresent, false),
+            || false,
+        )
+        .unwrap_err()
+        {
+            PackageWriteError::ScientificValidation(
+                ScientificPackageValidationError::ScientificContentMismatch { computed, .. },
+            ) => computed,
+            other => panic!("unexpected staged-validation error: {other}"),
+        }
+    }
+
+    fn only_publication_stage(parent: &Path) -> PathBuf {
+        let stages = fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".mirante4d-stage-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stages.len(), 1, "expected one private publication stage");
+        stages.into_iter().next().unwrap()
     }
 
     fn fixture_input_with_scientific_id(

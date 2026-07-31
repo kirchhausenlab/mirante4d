@@ -81,18 +81,18 @@ pub struct ImportExecutionSnapshot {
     pub destination: String,
     pub progress: ImportProgressSnapshot,
     pub cancellation_requested: bool,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportProgressSnapshot {
     Preparing,
-    Producing {
-        completed_work_units: u64,
-        total_work_units: u64,
+    Stage {
+        name: &'static str,
+        completed_work_units: Option<u64>,
+        total_work_units: Option<u64>,
     },
-    HashingScience,
-    Publishing,
-    Finished,
+    Published,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

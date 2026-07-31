@@ -1,4 +1,4 @@
-use mirante4d_dataset::{DatasetResourceIdentity, DatasetResourceKey, ResourcePayloadView};
+use mirante4d_dataset::{BrickKey, DatasetResourceIdentity, ResourcePayloadView};
 use mirante4d_domain::{IntensityDType, LogicalLayerKey, ScaleLevel, TimeIndex};
 
 use crate::retained_leases::RetainedLeases;
@@ -9,7 +9,7 @@ const LEASE_HISTOGRAM_SAMPLE_LIMIT: u64 = 65_536;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ActiveLayerHistogramInput<'a> {
-    pub(crate) requirements: &'a [DatasetResourceKey],
+    pub(crate) requirements: &'a [BrickKey],
     pub(crate) identity: DatasetResourceIdentity,
     pub(crate) layer: LogicalLayerKey,
     pub(crate) layer_name: &'a str,
@@ -25,10 +25,85 @@ struct LeaseHistogramResource<'a> {
     end: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveLayerHistogramCacheKey {
+    identity: DatasetResourceIdentity,
+    layer: LogicalLayerKey,
+    timepoint: TimeIndex,
+    scale: ScaleLevel,
+    dtype: IntensityDType,
+    requirement_body: usize,
+    requirement_count: usize,
+    generation: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HistogramWorkCounters {
+    pub(crate) computations: u64,
+    pub(crate) requirement_visits: u64,
+    pub(crate) resource_collections: u64,
+    pub(crate) sample_visits: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ActiveLayerHistogramCache {
+    key: Option<ActiveLayerHistogramCacheKey>,
+    summary: Option<LayerHistogramSummary>,
+    work: HistogramWorkCounters,
+}
+
+impl ActiveLayerHistogramCache {
+    pub(crate) fn summary(
+        &mut self,
+        leases: &RetainedLeases,
+        input: ActiveLayerHistogramInput<'_>,
+        generation: u64,
+    ) -> LayerHistogramSummary {
+        let key = ActiveLayerHistogramCacheKey {
+            identity: input.identity,
+            layer: input.layer,
+            timepoint: input.timepoint,
+            scale: input.scale,
+            dtype: input.dtype,
+            requirement_body: input.requirements.as_ptr() as usize,
+            requirement_count: input.requirements.len(),
+            generation,
+        };
+        if self.key.as_ref() == Some(&key) {
+            return self
+                .summary
+                .clone()
+                .expect("a cached histogram key has a cached summary");
+        }
+        self.work.computations = self.work.computations.saturating_add(1);
+        let summary = active_layer_histogram_summary_with_work(leases, input, &mut self.work);
+        self.key = Some(key);
+        self.summary = Some(summary.clone());
+        summary
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn work(&self) -> HistogramWorkCounters {
+        self.work
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn active_layer_histogram_summary(
     leases: &RetainedLeases,
     input: ActiveLayerHistogramInput<'_>,
 ) -> LayerHistogramSummary {
+    active_layer_histogram_summary_with_work(leases, input, &mut HistogramWorkCounters::default())
+}
+
+fn active_layer_histogram_summary_with_work(
+    leases: &RetainedLeases,
+    input: ActiveLayerHistogramInput<'_>,
+    work: &mut HistogramWorkCounters,
+) -> LayerHistogramSummary {
+    work.requirement_visits = work
+        .requirement_visits
+        .saturating_add((input.requirements.len() as u64).saturating_mul(3));
     let cohort = leases.resident_subset(
         input.requirements,
         input.identity,
@@ -40,6 +115,7 @@ pub(crate) fn active_layer_histogram_summary(
     let mut resources = Vec::new();
     let mut total_samples = 0_u64;
     for resource in cohort.resources() {
+        work.resource_collections = work.resource_collections.saturating_add(1);
         let payload = resource.payload();
         if payload.dtype() != input.dtype {
             return unavailable(format!(
@@ -74,14 +150,19 @@ pub(crate) fn active_layer_histogram_summary(
     let selected_samples = total_samples.min(LEASE_HISTOGRAM_SAMPLE_LIMIT);
     let mut min_value = f32::INFINITY;
     let mut max_value = f32::NEG_INFINITY;
-    let valid_samples =
-        match visit_selected_valid_values(&resources, total_samples, selected_samples, |value| {
+    let valid_samples = match visit_selected_valid_values(
+        &resources,
+        total_samples,
+        selected_samples,
+        &mut work.sample_visits,
+        |value| {
             min_value = min_value.min(value);
             max_value = max_value.max(value);
-        }) {
-            Ok(count) => count,
-            Err(reason) => return unavailable(reason.to_owned()),
-        };
+        },
+    ) {
+        Ok(count) => count,
+        Err(reason) => return unavailable(reason.to_owned()),
+    };
 
     if valid_samples == 0 {
         if cohort_status.missing > 0 {
@@ -100,11 +181,16 @@ pub(crate) fn active_layer_histogram_summary(
     }
 
     let mut bins = vec![0_u64; HISTOGRAM_BIN_COUNT];
-    let fill_result =
-        visit_selected_valid_values(&resources, total_samples, selected_samples, |value| {
+    let fill_result = visit_selected_valid_values(
+        &resources,
+        total_samples,
+        selected_samples,
+        &mut work.sample_visits,
+        |value| {
             let index = histogram_bin_index(value, min_value, max_value, HISTOGRAM_BIN_COUNT);
             bins[index] = bins[index].saturating_add(1);
-        });
+        },
+    );
     if let Err(reason) = fill_result {
         return unavailable(reason.to_owned());
     }
@@ -141,6 +227,7 @@ fn visit_selected_valid_values(
     resources: &[LeaseHistogramResource<'_>],
     total_samples: u64,
     selected_samples: u64,
+    sample_visits: &mut u64,
     mut visit: impl FnMut(f32),
 ) -> Result<u64, &'static str> {
     if total_samples == 0 || selected_samples == 0 {
@@ -149,6 +236,7 @@ fn visit_selected_valid_values(
     let mut resource_index = 0_usize;
     let mut valid_samples = 0_u64;
     for ordinal in 0..selected_samples {
+        *sample_visits = sample_visits.saturating_add(1);
         let global_index = u64::try_from(
             (u128::from(ordinal) * u128::from(total_samples)) / u128::from(selected_samples),
         )

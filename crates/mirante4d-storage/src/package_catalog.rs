@@ -194,6 +194,14 @@ impl LocalPackageCatalog {
         &self.descriptors
     }
 
+    pub(crate) fn runtime_read_object_capacity(&self) -> usize {
+        self.descriptors
+            .len()
+            .checked_add(1)
+            .and_then(|count| count.checked_add(self.manifest_root.pages().len()))
+            .expect("admitted manifest object counts fit usize")
+    }
+
     pub fn descriptor(&self, path: &PackagePath) -> Option<&PackageObjectDescriptor> {
         self.descriptors
             .binary_search_by(|entry| entry.path().cmp(path))
@@ -352,11 +360,28 @@ impl LocalPackageCatalog {
         coordinates: crate::PackedIndexCoordinates,
     ) -> Result<crate::LocalBrickRead, crate::PackageReadError> {
         let plan = self.plan_brick_storage(coordinates)?;
-        crate::package_read::read_local_brick(&self.reader, &self.descriptors, plan)
+        crate::package_read::read_local_brick_reusing(&self.reader, &self.descriptors, plan)
     }
 
     pub(crate) const fn reader(&self) -> &LocalPackageReader {
         &self.reader
+    }
+
+    pub(crate) const fn reader_mut(&mut self) -> &mut LocalPackageReader {
+        &mut self.reader
+    }
+
+    pub(crate) fn same_runtime_storage_contract(&self, other: &Self) -> bool {
+        self.reader.same_root_node(&other.reader)
+            && self.declared_package_id == other.declared_package_id
+            && self.manifest_root == other.manifest_root
+            && self.manifest_root_bytes == other.manifest_root_bytes
+            && self.profile == other.profile
+            && self.science == other.science
+            && self.display_defaults == other.display_defaults
+            && self.descriptors == other.descriptors
+            && self.ome_images == other.ome_images
+            && self.zarr_arrays == other.zarr_arrays
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2180,6 +2205,51 @@ mod tests {
     }
 
     #[test]
+    fn warm_exact_brick_currentness_has_one_shard_transaction_and_one_authority_batch() {
+        let coordinates = crate::PackedIndexCoordinates::new(0, 0, 0, 0, 0, 0, 0);
+        let root = fixture(FixtureDrift::None);
+        let capability = LocalPackageCatalog::open(&root.0)
+            .unwrap()
+            .validate_exact_package(crate::ProfileKind::Ds0, || false)
+            .unwrap();
+        capability.read_brick(coordinates, || false).unwrap();
+        let before = capability.catalog().reader().read_diagnostics();
+        capability.read_brick(coordinates, || false).unwrap();
+        let after = capability.catalog().reader().read_diagnostics();
+
+        assert_eq!(
+            after.currentness_pre_use_batches - before.currentness_pre_use_batches,
+            1
+        );
+        assert_eq!(
+            after.currentness_post_use_batches - before.currentness_post_use_batches,
+            1
+        );
+        assert_eq!(
+            after.currentness_snapshot_batches - before.currentness_snapshot_batches,
+            1
+        );
+        // Two phases for the two consumed shards plus one authority pass.
+        // Every named check is one no-symlink, beneath-root `openat2`
+        // resolution plus one descriptor metadata snapshot; parent paths are
+        // not walked component by component.
+        assert_eq!(
+            after.currentness_root_metadata_checks - before.currentness_root_metadata_checks,
+            3
+        );
+        assert_eq!(
+            after.currentness_named_object_resolutions
+                - before.currentness_named_object_resolutions,
+            6
+        );
+        assert_eq!(
+            after.currentness_object_fd_metadata_checks
+                - before.currentness_object_fd_metadata_checks,
+            6
+        );
+    }
+
+    #[test]
     fn scientific_capability_rejects_cancellation_and_a_declared_identity_mismatch() {
         let root = fixture(FixtureDrift::None);
         let exact = LocalPackageCatalog::open(&root.0)
@@ -2336,5 +2406,74 @@ mod tests {
             catalog.read_brick_core_for_test(coordinates),
             Err(PackageReadError::Shard(_))
         ));
+    }
+
+    #[test]
+    fn normal_delivery_reuses_guarded_handles_and_indexes_but_detects_replacement() {
+        let root = fixture(FixtureDrift::None);
+        let catalog = LocalPackageCatalog::open(&root.0).unwrap();
+        let coordinates = crate::PackedIndexCoordinates::new(0, 0, 0, 0, 0, 0, 0);
+        let before = catalog.reader().read_diagnostics();
+        let first = catalog.read_brick_unverified(coordinates).unwrap();
+        let after_first = catalog.reader().read_diagnostics();
+        let second = catalog.read_brick_unverified(coordinates).unwrap();
+        let after_second = catalog.reader().read_diagnostics();
+
+        assert_eq!(first.pixel_payload(), second.pixel_payload());
+        assert_eq!(first.range_requests(), 4);
+        assert_eq!(second.range_requests(), 4);
+        assert_eq!(
+            after_first.object_open_operations - before.object_open_operations,
+            2
+        );
+        assert_eq!(
+            after_second.object_open_operations,
+            after_first.object_open_operations
+        );
+        assert_eq!(after_first.shard_index_cache_misses, 2);
+        assert_eq!(after_second.shard_index_cache_hits, 2);
+        assert_eq!(after_second.shard_index_decode_operations, 2);
+        assert_eq!(after_first.packed_inner_cache_misses, 1);
+        assert_eq!(after_second.packed_inner_cache_hits, 1);
+        assert_eq!(after_second.physical_range_read_operations, 5);
+        assert_eq!(
+            after_second.currentness_pre_use_batches - after_first.currentness_pre_use_batches,
+            1
+        );
+        assert_eq!(
+            after_second.currentness_post_use_batches - after_first.currentness_post_use_batches,
+            1
+        );
+        assert_eq!(
+            after_second.currentness_root_metadata_checks
+                - after_first.currentness_root_metadata_checks,
+            2
+        );
+        assert_eq!(
+            after_second.currentness_named_object_resolutions
+                - after_first.currentness_named_object_resolutions,
+            4
+        );
+        assert_eq!(
+            after_second.currentness_object_fd_metadata_checks
+                - after_first.currentness_object_fd_metadata_checks,
+            4
+        );
+
+        let pixel = root.0.join("images/i00000000/s00/c/0/0/0/0/0");
+        let replacement = root.0.join("replacement-hot-pixel");
+        fs::write(&replacement, fs::read(&pixel).unwrap()).unwrap();
+        fs::rename(replacement, pixel).unwrap();
+        let changed = catalog.read_brick_unverified(coordinates);
+        assert!(
+            matches!(
+                &changed,
+                Err(crate::PackageReadError::Range(
+                    crate::RangeReadError::ObjectChanged { .. }
+                        | crate::RangeReadError::Hardlink { .. }
+                ))
+            ),
+            "{changed:?}"
+        );
     }
 }

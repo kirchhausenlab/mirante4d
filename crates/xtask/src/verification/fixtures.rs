@@ -814,7 +814,7 @@ mod tests {
         assert!(validate_registry_document(&value).is_err());
 
         let mut value = registry();
-        record_mut(&mut value, "wp09a-semantic-small")["deletion_gate"] = Value::Bool(false);
+        record_mut(&mut value, "wp10b-hostile-lifecycle")["deletion_gate"] = Value::Bool(false);
         assert!(validate_registry_document(&value).is_err());
     }
 

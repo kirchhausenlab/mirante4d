@@ -1,4 +1,4 @@
-use mirante4d_dataset::{DatasetResourceKey, ResourcePayloadView};
+use mirante4d_dataset::{BrickKey, ResourcePayloadView};
 use mirante4d_domain::IntensityDType;
 
 use crate::{AnalysisArtifactSet, AnalysisError, AnalysisPlan, artifact::build_artifacts};
@@ -245,7 +245,7 @@ impl AnalysisAccumulator {
 
     pub fn include(
         &mut self,
-        resource: DatasetResourceKey,
+        resource: BrickKey,
         payload: ResourcePayloadView<'_>,
     ) -> Result<(), AnalysisError> {
         let expected = self

@@ -1,12 +1,29 @@
 use std::io::{Cursor, Read, Write};
 use std::ops::Range;
 
+use mirante4d_dataset::{DecodeSinkError, ReservedDecodeSink};
 use thiserror::Error;
 
 const ZSTD_LEVEL: i32 = 3;
+const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+const ZSTD_FRAME_DESCRIPTOR_OFFSET: usize = ZSTD_FRAME_MAGIC.len();
+const ZSTD_FRAME_DICTIONARY_ID_FLAG_MASK: u8 = 0b0000_0011;
+const ZSTD_FRAME_CONTENT_CHECKSUM_FLAG: u8 = 0b0000_0100;
+const ZSTD_FRAME_RESERVED_FLAG_MASK: u8 = 0b0001_1000;
+/// Conservative native Zstd context/workspace authority charged by every
+/// importer or validator that can execute an inner-payload codec call.
+pub const INNER_CODEC_WORKING_BYTES_MAX: u64 = 8 * 1024 * 1024;
 const CRC32C_BYTES: usize = 4;
 const INDEX_ENTRY_BYTES: usize = 16;
 const MISSING: u64 = u64::MAX;
+pub(crate) const DIRECT_DECODE_SPAN_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+pub(crate) enum DirectInnerDecodeError<E> {
+    Shard(ShardCodecError),
+    Sink(DecodeSinkError),
+    Observer(E),
+}
 
 /// One closed storage-profile row for indexed shard payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,6 +181,8 @@ pub enum ShardCodecError {
     EncodedInnerTooShort,
     #[error("inner payload CRC32C mismatch")]
     InnerChecksumMismatch,
+    #[error("encoded inner Zstandard frame violates the storage profile: {reason}")]
+    ZstdFrameProfile { reason: &'static str },
     #[error("zstd {operation} failed: {message}")]
     Zstd {
         operation: &'static str,
@@ -254,23 +273,7 @@ pub fn decode_inner_payload(
     kind: ShardProfileKind,
     encoded: &[u8],
 ) -> Result<Vec<u8>, ShardCodecError> {
-    let limit = kind.encoded_inner_bytes_max();
-    if encoded.len() > limit {
-        return Err(ShardCodecError::EncodedInnerTooLarge {
-            limit,
-            actual: encoded.len(),
-        });
-    }
-    if encoded.len() < CRC32C_BYTES {
-        return Err(ShardCodecError::EncodedInnerTooShort);
-    }
-
-    let checksum_at = encoded.len() - CRC32C_BYTES;
-    let (compressed, checksum_bytes) = encoded.split_at(checksum_at);
-    let expected_checksum = u32::from_le_bytes(checksum_bytes.try_into().expect("four bytes"));
-    if crc32c::crc32c(compressed) != expected_checksum {
-        return Err(ShardCodecError::InnerChecksumMismatch);
-    }
+    let compressed = validate_encoded_inner_envelope(kind, encoded)?;
 
     let expected = kind.decoded_inner_bytes();
     let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))
@@ -294,6 +297,194 @@ pub fn decode_inner_payload(
         });
     }
     Ok(decoded)
+}
+
+/// Decodes one validated inner frame directly into the caller-owned reserved
+/// sink in bounded spans. `observe` sees each span after decode and before its
+/// explicit commit; verified delivery uses a no-op observer while provisional
+/// delivery derives facts from the bytes in their final allocation. No
+/// decoded payload-sized staging allocation or post-decode copy is involved.
+pub(crate) fn decode_inner_payload_direct<E>(
+    kind: ShardProfileKind,
+    encoded: &[u8],
+    sink: &mut dyn ReservedDecodeSink,
+    mut observe: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), DirectInnerDecodeError<E>> {
+    let compressed =
+        validate_encoded_inner_envelope(kind, encoded).map_err(DirectInnerDecodeError::Shard)?;
+    let expected = kind.decoded_inner_bytes();
+    let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))
+        .map_err(|error| DirectInnerDecodeError::Shard(zstd_error("decode", error)))?;
+    decoder
+        .window_log_max(window_log_max(expected))
+        .map_err(|error| DirectInnerDecodeError::Shard(zstd_error("decode", error)))?;
+    let mut decoded = 0_usize;
+    while decoded != expected {
+        let requested = (expected - decoded).min(DIRECT_DECODE_SPAN_BYTES);
+        {
+            let output = sink
+                .writable_span(requested)
+                .map_err(DirectInnerDecodeError::Sink)?;
+            if output.len() != requested {
+                return Err(DirectInnerDecodeError::Sink(
+                    DecodeSinkError::WritableCommitExceeded {
+                        offered: output.len(),
+                        attempted: requested,
+                    },
+                ));
+            }
+            decoder
+                .read_exact(output)
+                .map_err(|error| DirectInnerDecodeError::Shard(zstd_error("decode", error)))?;
+            observe(output).map_err(DirectInnerDecodeError::Observer)?;
+        }
+        sink.commit_written(requested)
+            .map_err(DirectInnerDecodeError::Sink)?;
+        decoded += requested;
+    }
+    let mut extra = [0_u8; 1];
+    let extra_bytes = decoder
+        .read(&mut extra)
+        .map_err(|error| DirectInnerDecodeError::Shard(zstd_error("decode", error)))?;
+    if extra_bytes != 0 {
+        return Err(DirectInnerDecodeError::Shard(
+            ShardCodecError::DecodedInnerLength {
+                expected,
+                actual: expected.saturating_add(extra_bytes),
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn validate_encoded_inner_envelope(
+    kind: ShardProfileKind,
+    encoded: &[u8],
+) -> Result<&[u8], ShardCodecError> {
+    let limit = kind.encoded_inner_bytes_max();
+    if encoded.len() > limit {
+        return Err(ShardCodecError::EncodedInnerTooLarge {
+            limit,
+            actual: encoded.len(),
+        });
+    }
+    if encoded.len() < CRC32C_BYTES {
+        return Err(ShardCodecError::EncodedInnerTooShort);
+    }
+
+    let checksum_at = encoded.len() - CRC32C_BYTES;
+    let (compressed, checksum_bytes) = encoded.split_at(checksum_at);
+    let expected_checksum = u32::from_le_bytes(checksum_bytes.try_into().expect("four bytes"));
+    if crc32c::crc32c(compressed) != expected_checksum {
+        return Err(ShardCodecError::InnerChecksumMismatch);
+    }
+
+    validate_zstd_frame_profile(compressed)?;
+    let frame_bytes = zstd::zstd_safe::find_frame_compressed_size(compressed).map_err(|code| {
+        ShardCodecError::Zstd {
+            operation: "validate encoded frame",
+            message: code.to_string(),
+        }
+    })?;
+    if frame_bytes != compressed.len() {
+        return Err(ShardCodecError::Zstd {
+            operation: "validate encoded frame",
+            message: "inner payload is not exactly one Zstandard frame".to_owned(),
+        });
+    }
+    let content_bytes = zstd::zstd_safe::get_frame_content_size(compressed)
+        .map_err(|error| ShardCodecError::Zstd {
+            operation: "validate encoded frame content size",
+            message: error.to_string(),
+        })?
+        .ok_or(ShardCodecError::ZstdFrameProfile {
+            reason: "the frame must declare its decoded content size",
+        })?;
+    let expected =
+        u64::try_from(kind.decoded_inner_bytes()).map_err(|_| ShardCodecError::LengthOverflow)?;
+    if content_bytes != expected {
+        return Err(ShardCodecError::DecodedInnerLength {
+            expected: kind.decoded_inner_bytes(),
+            actual: usize::try_from(content_bytes).unwrap_or(usize::MAX),
+        });
+    }
+    Ok(compressed)
+}
+
+fn validate_zstd_frame_profile(compressed: &[u8]) -> Result<(), ShardCodecError> {
+    if !compressed.starts_with(&ZSTD_FRAME_MAGIC) {
+        return Err(ShardCodecError::ZstdFrameProfile {
+            reason: "the payload must be one standard Zstandard frame",
+        });
+    }
+    let descriptor = compressed
+        .get(ZSTD_FRAME_DESCRIPTOR_OFFSET)
+        .copied()
+        .ok_or(ShardCodecError::ZstdFrameProfile {
+            reason: "the frame descriptor is missing",
+        })?;
+    if descriptor & ZSTD_FRAME_RESERVED_FLAG_MASK != 0 {
+        return Err(ShardCodecError::ZstdFrameProfile {
+            reason: "reserved frame-descriptor flags must be zero",
+        });
+    }
+    if descriptor & ZSTD_FRAME_DICTIONARY_ID_FLAG_MASK != 0 {
+        return Err(ShardCodecError::ZstdFrameProfile {
+            reason: "dictionary IDs are forbidden",
+        });
+    }
+    if descriptor & ZSTD_FRAME_CONTENT_CHECKSUM_FLAG != 0 {
+        return Err(ShardCodecError::ZstdFrameProfile {
+            reason: "the Zstandard content checksum must be disabled",
+        });
+    }
+    Ok(())
+}
+
+/// One fully codec-validated inner payload ready for outer-shard assembly
+/// without a re-encode cycle.
+///
+/// Persisted or otherwise untrusted bytes must enter through [`Self::validate`],
+/// which checks the selected storage kind, encoded ceiling, CRC, complete
+/// single-frame extent, observable frame-profile flags, declared decoded
+/// length, bounded window, and a full decode of the frame body. Fresh decoded
+/// bytes should enter through [`Self::encode`] so the sole canonical encoder
+/// establishes those properties without an immediately redundant decode.
+///
+/// Zstandard frames do not record the compression level. Level 3 is therefore
+/// provenance established by [`Self::encode`], not a property that
+/// [`Self::validate`] can infer from persisted bytes without re-encoding them.
+/// The fields stay opaque so validated bytes cannot be mutated afterward.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalEncodedInner {
+    kind: ShardProfileKind,
+    bytes: Vec<u8>,
+}
+
+impl CanonicalEncodedInner {
+    /// Encodes decoded bytes through the sole canonical level-3 authority.
+    pub fn encode(kind: ShardProfileKind, decoded: &[u8]) -> Result<Self, ShardCodecError> {
+        let bytes = encode_inner_payload(kind, decoded)?;
+        Ok(Self { kind, bytes })
+    }
+
+    /// Fully validates and decodes one persisted or otherwise untrusted inner.
+    ///
+    /// The decoded bytes are intentionally discarded: successful construction
+    /// proves codec validity while preserving the exact encoded bytes for
+    /// pass-through outer-shard assembly.
+    pub fn validate(kind: ShardProfileKind, bytes: Vec<u8>) -> Result<Self, ShardCodecError> {
+        drop(decode_inner_payload(kind, &bytes)?);
+        Ok(Self { kind, bytes })
+    }
+
+    pub const fn kind(&self) -> ShardProfileKind {
+        self.kind
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// Decode and structurally validate an exact fixed end-index tail.
@@ -514,10 +705,29 @@ mod tests {
         )
     }
 
-    fn crc_protected_zstd(bytes: &[u8]) -> Vec<u8> {
-        let mut encoded = zstd::stream::encode_all(Cursor::new(bytes), ZSTD_LEVEL).unwrap();
+    fn profiled_zstd(
+        bytes: &[u8],
+        level: i32,
+        include_checksum: bool,
+        pledged_size: bool,
+    ) -> Vec<u8> {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), level).unwrap();
+        encoder.include_checksum(include_checksum).unwrap();
+        if pledged_size {
+            encoder
+                .set_pledged_src_size(Some(bytes.len() as u64))
+                .unwrap();
+        }
+        encoder.write_all(bytes).unwrap();
+        let mut encoded = encoder.finish().unwrap();
         encoded.extend_from_slice(&crc32c::crc32c(&encoded).to_le_bytes());
         encoded
+    }
+
+    fn replace_inner_crc(encoded: &mut Vec<u8>) {
+        encoded.truncate(encoded.len() - CRC32C_BYTES);
+        let checksum = crc32c::crc32c(encoded);
+        encoded.extend_from_slice(&checksum.to_le_bytes());
     }
 
     #[test]
@@ -608,11 +818,10 @@ mod tests {
 
     #[test]
     fn inner_payload_round_trips_and_corruption_is_rejected() {
-        let kind = ShardProfileKind::Validity2d;
+        let kind = ShardProfileKind::Pixel2dUint16;
         let decoded = vec![0x5a; kind.decoded_inner_bytes()];
         let encoded = encode_inner_payload(kind, &decoded).unwrap();
         assert_eq!(decode_inner_payload(kind, &encoded).unwrap(), decoded);
-
         let mut corrupt = encoded;
         corrupt[0] ^= 1;
         assert_eq!(
@@ -622,9 +831,168 @@ mod tests {
     }
 
     #[test]
+    fn canonical_encoded_inner_distinguishes_fresh_encoding_from_persisted_validation() {
+        let kind = ShardProfileKind::Validity2d;
+        let decoded = (0..kind.decoded_inner_bytes())
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let fresh = CanonicalEncodedInner::encode(kind, &decoded).unwrap();
+        assert_eq!(fresh.kind(), kind);
+        assert_eq!(decode_inner_payload(kind, fresh.bytes()).unwrap(), decoded);
+
+        let persisted = CanonicalEncodedInner::validate(kind, fresh.bytes().to_vec()).unwrap();
+        assert_eq!(persisted, fresh);
+    }
+
+    #[test]
+    fn persisted_inner_rejects_nonprofile_frame_flags_missing_size_and_extra_frames() {
+        let kind = ShardProfileKind::Validity2d;
+        let decoded = vec![0x5a; kind.decoded_inner_bytes()];
+
+        let checksum_frame = profiled_zstd(&decoded, ZSTD_LEVEL, true, true);
+        assert_eq!(
+            CanonicalEncodedInner::validate(kind, checksum_frame),
+            Err(ShardCodecError::ZstdFrameProfile {
+                reason: "the Zstandard content checksum must be disabled",
+            })
+        );
+
+        let no_content_size = profiled_zstd(&decoded, ZSTD_LEVEL, false, false);
+        assert_eq!(
+            CanonicalEncodedInner::validate(kind, no_content_size),
+            Err(ShardCodecError::ZstdFrameProfile {
+                reason: "the frame must declare its decoded content size",
+            })
+        );
+
+        let canonical = encode_inner_payload(kind, &decoded).unwrap();
+        let compressed = &canonical[..canonical.len() - CRC32C_BYTES];
+
+        let mut bad_inner_crc = canonical.clone();
+        bad_inner_crc[ZSTD_FRAME_DESCRIPTOR_OFFSET + 1] ^= 1;
+        assert_eq!(
+            CanonicalEncodedInner::validate(kind, bad_inner_crc),
+            Err(ShardCodecError::InnerChecksumMismatch)
+        );
+
+        let mut bad_magic = canonical.clone();
+        bad_magic[0] ^= 1;
+        replace_inner_crc(&mut bad_magic);
+        assert_eq!(
+            CanonicalEncodedInner::validate(kind, bad_magic),
+            Err(ShardCodecError::ZstdFrameProfile {
+                reason: "the payload must be one standard Zstandard frame",
+            })
+        );
+
+        let mut reserved_flag = canonical.clone();
+        reserved_flag[ZSTD_FRAME_DESCRIPTOR_OFFSET] |= 0b0000_1000;
+        replace_inner_crc(&mut reserved_flag);
+        assert_eq!(
+            CanonicalEncodedInner::validate(kind, reserved_flag),
+            Err(ShardCodecError::ZstdFrameProfile {
+                reason: "reserved frame-descriptor flags must be zero",
+            })
+        );
+
+        let mut concatenated = Vec::with_capacity(compressed.len() * 2 + CRC32C_BYTES);
+        concatenated.extend_from_slice(compressed);
+        concatenated.extend_from_slice(compressed);
+        let checksum = crc32c::crc32c(&concatenated);
+        concatenated.extend_from_slice(&checksum.to_le_bytes());
+        assert!(matches!(
+            CanonicalEncodedInner::validate(kind, concatenated),
+            Err(ShardCodecError::Zstd {
+                operation: "validate encoded frame",
+                ..
+            })
+        ));
+
+        let mut dictionary_flag = canonical;
+        dictionary_flag[ZSTD_FRAME_DESCRIPTOR_OFFSET] |= 1;
+        replace_inner_crc(&mut dictionary_flag);
+        assert_eq!(
+            CanonicalEncodedInner::validate(kind, dictionary_flag),
+            Err(ShardCodecError::ZstdFrameProfile {
+                reason: "dictionary IDs are forbidden",
+            })
+        );
+    }
+
+    #[test]
+    fn persisted_inner_fully_decodes_a_structurally_sized_frame_body() {
+        let kind = ShardProfileKind::Validity2d;
+        let decoded = (0..kind.decoded_inner_bytes())
+            .map(|index| ((index * 31 + index / 7) % 251) as u8)
+            .collect::<Vec<_>>();
+        let canonical = encode_inner_payload(kind, &decoded).unwrap();
+        let checksum_at = canonical.len() - CRC32C_BYTES;
+        let mut malformed = None;
+
+        'candidate: for index in (ZSTD_FRAME_DESCRIPTOR_OFFSET + 1)..checksum_at {
+            for bit in 0..u8::BITS {
+                let mut candidate = canonical.clone();
+                candidate[index] ^= 1 << bit;
+                replace_inner_crc(&mut candidate);
+                let compressed = &candidate[..candidate.len() - CRC32C_BYTES];
+                if zstd::zstd_safe::find_frame_compressed_size(compressed) != Ok(compressed.len())
+                    || !matches!(
+                        zstd::zstd_safe::get_frame_content_size(compressed),
+                        Ok(Some(bytes)) if bytes == kind.decoded_inner_bytes() as u64
+                    )
+                {
+                    continue;
+                }
+                if matches!(
+                    decode_inner_payload(kind, &candidate),
+                    Err(ShardCodecError::Zstd {
+                        operation: "decode",
+                        ..
+                    })
+                ) {
+                    malformed = Some(candidate);
+                    break 'candidate;
+                }
+            }
+        }
+
+        let malformed = malformed.expect(
+            "the fixture must contain a body mutation accepted by frame sizing but rejected by decoding",
+        );
+        assert!(matches!(
+            CanonicalEncodedInner::validate(kind, malformed),
+            Err(ShardCodecError::Zstd {
+                operation: "decode",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn persisted_validation_cannot_infer_the_encoder_compression_level() {
+        let kind = ShardProfileKind::Validity2d;
+        let decoded = (0..kind.decoded_inner_bytes())
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let level_one = profiled_zstd(&decoded, 1, false, true);
+
+        let validated = CanonicalEncodedInner::validate(kind, level_one).unwrap();
+        assert_eq!(
+            decode_inner_payload(kind, validated.bytes()).unwrap(),
+            decoded
+        );
+    }
+
+    #[test]
     fn inner_decode_rejects_bombs_and_encoded_oversize_before_decompression() {
         let kind = ShardProfileKind::Validity2d;
-        let bomb = crc_protected_zstd(&vec![0; kind.decoded_inner_bytes() + 1]);
+        let bomb = profiled_zstd(
+            &vec![0; kind.decoded_inner_bytes() + 1],
+            ZSTD_LEVEL,
+            false,
+            true,
+        );
         assert!(matches!(
             decode_inner_payload(kind, &bomb),
             Err(ShardCodecError::Zstd {

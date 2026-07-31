@@ -14,10 +14,10 @@ use std::{
 };
 
 use mirante4d_application::{
-    ApplicationCommand, ApplicationState, SourceSessionGeneration, stepped_timepoint,
+    ApplicationCommand, ApplicationState, RenderIntentMailbox, SourceSessionGeneration,
+    stepped_timepoint,
 };
 use mirante4d_dataset::{CpuLedgerCategory, ResourcePayloadView};
-use mirante4d_dataset_runtime::RequestPriority;
 use mirante4d_domain::IntensityDType;
 use mirante4d_render_api::MAX_RENDER_REQUIREMENTS;
 use mirante4d_render_wgpu::{qualify_adapter, renderer_device_descriptor};
@@ -25,10 +25,15 @@ use mirante4d_settings::recommended_for_current_system;
 
 use crate::{
     application_view,
-    dataset_demand_plan::{
-        DatasetDemandPlanLimits, plan_current_3d, render_extent_from_dimensions,
+    camera_demand_cache::{
+        CameraDemandRequest, Current3dDemandBaselines, Current3dDemandRequest,
+        PreparedRendererRequirementUpdate, PreparedVisibleDemand, ScopeDemandBaseline,
     },
-    dataset_requests::SCOPE_CURRENT_3D,
+    dataset_demand_plan::DatasetDemandPlanLimits,
+    dataset_requests::{
+        SCOPE_ANALYSIS, SCOPE_CURRENT_3D, SCOPE_CURRENT_3D_REFINEMENT, SCOPE_PLAYBACK,
+        ScopeReconciliationTargets,
+    },
     unified_source_open,
 };
 
@@ -95,7 +100,7 @@ pub fn run_headless_smoke(
     let gpu_adapter_summary = if options.disable_gpu {
         None
     } else {
-        Some(successor_gpu_adapter_summary()?)
+        Some(gpu_adapter_summary()?)
     };
 
     load_current_requirements(&application, &mut opened, options.timeout)?;
@@ -165,7 +170,7 @@ pub fn run_headless_smoke(
     Ok(report)
 }
 
-fn successor_gpu_adapter_summary() -> anyhow::Result<String> {
+fn gpu_adapter_summary() -> anyhow::Result<String> {
     wait_for_future(async {
         let instance = eframe::wgpu::Instance::new(eframe::wgpu::InstanceDescriptor {
             backends: eframe::wgpu::Backends::VULKAN,
@@ -219,31 +224,129 @@ fn load_current_requirements(
     opened: &mut unified_source_open::UnifiedOpenedSource,
     timeout: Duration,
 ) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
     let snapshot = application.snapshot();
     let diagnostics = opened.dataset.dispatcher().diagnostics()?;
-    let plan = plan_current_3d(
-        snapshot.catalog(),
-        application_view(&snapshot),
-        opened.render_coordination.presentation_viewport,
-        render_extent_from_dimensions(
-            u64::from(opened.render_coordination.render_viewport.width_pixels()),
-            u64::from(opened.render_coordination.render_viewport.height_pixels()),
-        )?,
-        DatasetDemandPlanLimits::new(
-            MAX_RENDER_REQUIREMENTS,
-            MAX_RENDER_REQUIREMENTS,
-            diagnostics.category_cap_bytes(CpuLedgerCategory::DecodedResidency),
-        ),
+    let baseline = |scope| {
+        ScopeDemandBaseline::new(
+            opened.dataset.scope_prepared_body_handle(scope),
+            opened.dataset.scope_admitted_prefix_len(scope),
+        )
+    };
+    let intent_revision = RenderIntentMailbox::new().snapshot().latest_revision;
+    let global_limits = DatasetDemandPlanLimits::new(
+        MAX_RENDER_REQUIREMENTS,
+        MAX_RENDER_REQUIREMENTS,
+        diagnostics.category_cap_bytes(CpuLedgerCategory::DecodedResidency),
+    );
+    let request = CameraDemandRequest::new(
+        intent_revision,
+        Arc::clone(snapshot.catalog()),
+        opened.dataset.cpu_ledger_arc(),
+        application_view(&snapshot).clone(),
+        global_limits,
+        Some(Current3dDemandRequest::new(
+            opened.render_coordination.presentation_viewport,
+            opened.render_coordination.render_viewport,
+            global_limits,
+            Current3dDemandBaselines::new(
+                baseline(SCOPE_CURRENT_3D),
+                baseline(SCOPE_CURRENT_3D_REFINEMENT),
+                baseline(SCOPE_PLAYBACK),
+            ),
+        )),
+        Vec::new(),
+        opened.dataset.renderer_requirement_handle(),
+        vec![opened.dataset.scope_prepared_body_handle(SCOPE_ANALYSIS)],
+        None,
+    );
+    if !opened.dataset.submit_visible_demand_plan(request) {
+        anyhow::bail!("headless demand used a stale render-intent revision");
+    }
+    let prepared = loop {
+        if let Some(result) = opened.dataset.take_visible_demand_plan_result() {
+            break result.outcome?;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for headless camera-demand planning");
+        }
+        std::thread::yield_now();
+    };
+    let PreparedVisibleDemand {
+        current_3d,
+        cross_sections,
+        renderer_requirement_update,
+        renderer_requirement_payload_bytes: _,
+        post_refinement_promotion_update,
+        candidates_visited: _,
+    } = prepared;
+    if !cross_sections.is_empty() {
+        anyhow::bail!("headless single-view planning unexpectedly produced linked-panel demand");
+    }
+    let current = current_3d
+        .ok_or_else(|| anyhow::anyhow!("headless camera planning omitted current 3D demand"))?;
+    let playback_layer_scales = current.plan.target.layer_scales.clone();
+    let mut scope_targets = ScopeReconciliationTargets::default();
+    opened.dataset.prepare_progressive_current_scope_targets(
+        &current.plan,
         false,
-    )?;
-    opened.dataset.install_current_plan(plan, false)?;
-    opened.dataset.refresh_retained_requirements()?;
+        false,
+        &mut scope_targets,
+    );
+    scope_targets.replace(SCOPE_PLAYBACK, &current.playback.requirements);
     opened
         .dataset
-        .submit_scope(SCOPE_CURRENT_3D, RequestPriority::CurrentView)?;
+        .preflight_prepared_renderer_requirement_update(
+            &renderer_requirement_update.previous.requirements,
+            &renderer_requirement_update.next.requirements,
+        )?;
+    if let Some(promotion) = post_refinement_promotion_update.as_ref() {
+        if !Arc::ptr_eq(
+            &promotion.previous.requirements,
+            &renderer_requirement_update.next.requirements,
+        ) {
+            anyhow::bail!("headless promotion union is not bound to the installed worker union");
+        }
+        opened
+            .dataset
+            .preflight_prepared_renderer_requirement_union(&promotion.next.requirements)?;
+    }
+    let reconciliation = opened.dataset.prepare_scope_reconciliation(scope_targets)?;
+    opened
+        .dataset
+        .commit_prepared_scope_reconciliation(reconciliation)?;
+    opened
+        .dataset
+        .commit_preflighted_progressive_current_plan(current.plan, false, false);
+    opened.dataset.commit_preflighted_scope_replacement(
+        SCOPE_PLAYBACK,
+        current.playback.requirements,
+        playback_layer_scales,
+    );
+    let PreparedRendererRequirementUpdate {
+        previous,
+        next,
+        removals,
+        removal_charge: _removal_charge,
+    } = renderer_requirement_update;
+    opened
+        .dataset
+        .commit_preflighted_renderer_requirement_update(
+            previous.requirements,
+            next.requirements,
+            &removals,
+            next.charge,
+        );
+    let mut promotion_update = if opened.dataset.staging_current_refinement() {
+        post_refinement_promotion_update
+    } else {
+        None
+    };
+    opened.dataset.pump_interactive_admission()?;
 
-    let deadline = Instant::now() + timeout;
-    while !opened.dataset.scope_complete(SCOPE_CURRENT_3D) {
+    while opened.dataset.staging_current_refinement()
+        || !opened.dataset.scope_complete(SCOPE_CURRENT_3D)
+    {
         if Instant::now() >= deadline {
             let retained = opened.dataset.retained_leases();
             anyhow::bail!(
@@ -255,6 +358,54 @@ fn load_current_requirements(
         opened
             .dataset
             .drain_runtime_results(32, |_ticket, _outcome| {})?;
+        opened.dataset.pump_interactive_admission()?;
+        if opened.dataset.staging_current_refinement()
+            && opened
+                .dataset
+                .scope_resources_complete(SCOPE_CURRENT_3D_REFINEMENT)
+        {
+            let update = promotion_update.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("a staged headless target has no worker promotion union")
+            })?;
+            let mut promotion_targets = ScopeReconciliationTargets::default();
+            if !opened
+                .dataset
+                .prepare_staged_current_promotion_scope_targets(&mut promotion_targets)
+            {
+                anyhow::bail!("a complete headless refinement has no staged dataset plan");
+            }
+            opened
+                .dataset
+                .preflight_prepared_renderer_requirement_update(
+                    &update.previous.requirements,
+                    &update.next.requirements,
+                )?;
+            let promotion_reconciliation = opened
+                .dataset
+                .prepare_scope_reconciliation(promotion_targets)?;
+            opened
+                .dataset
+                .commit_prepared_scope_reconciliation(promotion_reconciliation)?;
+            opened
+                .dataset
+                .commit_reconciled_gpu_prefilled_staged_current_plan();
+            let PreparedRendererRequirementUpdate {
+                previous,
+                next,
+                removals,
+                removal_charge: _removal_charge,
+            } = promotion_update
+                .take()
+                .expect("the checked headless promotion update remains installed");
+            opened
+                .dataset
+                .commit_preflighted_renderer_requirement_update(
+                    previous.requirements,
+                    next.requirements,
+                    &removals,
+                    next.charge,
+                );
+        }
         std::thread::yield_now();
     }
     Ok(())

@@ -17,3 +17,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 zarrs_metadata.workspace = true
 zstd.workspace = true
+
+[dev-dependencies]
+mirante4d-dataset-runtime.workspace = true

@@ -2,8 +2,8 @@ use eframe::egui;
 use mirante4d_application::{
     ApplicationCommand, ApplicationSnapshot, CameraView, CrossSectionView,
     DEFAULT_DVR_OPACITY_GAMMA, DvrOpacityTransfer, IsoShadingPolicy, LayerViewState,
-    PresentationViewport, Projection, RenderMode, RenderState, SamplingPolicy,
-    SourceVerificationSnapshot, TimeIndex, TransferCurve, ViewerLayout, channel_preset_from_view,
+    PresentationViewport, Projection, RenderMode, RenderState, SourceVerificationSnapshot,
+    TimeIndex, TransferCurve, ViewerLayout, channel_preset_from_view,
     import_workflow::{ImportCommand, ImportWorkflowSnapshot},
     next_user_channel_preset_id, stepped_timepoint,
     viewport_interaction::{fit_active_layer_camera, reset_active_layer_view},
@@ -319,7 +319,11 @@ pub(crate) fn show_left_workbench_panel(
                                 ui.selectable_value(&mut mode, RenderMode::Dvr, "DVR");
                             });
                             if mode != layer.render_state().mode() {
-                                match layer_render_state_for_mode(layer, mode) {
+                                match layer_render_state_for_mode(
+                                    *layer.render_state(),
+                                    layer.transfer(),
+                                    mode,
+                                ) {
                                     Ok(render_state) => output.application_commands.push(
                                         ApplicationCommand::SetLayerView(LayerViewState::new(
                                             layer.layer_key(),
@@ -504,7 +508,11 @@ fn render_mode_selector(
             current_layer.layer_key(),
             current_layer.visible(),
             current_layer.transfer().clone(),
-            render_state_for_mode(current_layer, mode),
+            render_state_for_mode(
+                *current_layer.render_state(),
+                current_layer.transfer(),
+                mode,
+            ),
         ))
     })
 }
@@ -541,9 +549,12 @@ fn projection_selector(ui: &mut egui::Ui, camera: CameraView) -> Option<Applicat
     })
 }
 
-fn render_state_for_mode(layer: &LayerViewState, mode: RenderMode) -> RenderState {
-    let current = *layer.render_state();
-    let sampling = SamplingPolicy::VoxelExact;
+fn render_state_for_mode(
+    current: RenderState,
+    transfer: &mirante4d_application::LayerTransfer,
+    mode: RenderMode,
+) -> RenderState {
+    let sampling = current.sampling_policy();
     match mode {
         RenderMode::Mip => RenderState::mip(sampling),
         RenderMode::Isosurface => {
@@ -551,7 +562,12 @@ fn render_state_for_mode(layer: &LayerViewState, mode: RenderMode) -> RenderStat
                 .iso_parameters()
                 .map(|parameters| parameters.display_level())
                 .unwrap_or(DEFAULT_ISO_DISPLAY_LEVEL);
-            RenderState::iso(sampling, IsoShadingPolicy::Flat, display_level)
+            let shading = current
+                .iso_parameters()
+                .map_or(IsoShadingPolicy::GradientLighting, |parameters| {
+                    parameters.shading_policy()
+                });
+            RenderState::iso(sampling, shading, display_level)
                 .expect("the retained or default ISO parameters are valid")
         }
         RenderMode::Dvr => {
@@ -561,7 +577,7 @@ fn render_state_for_mode(layer: &LayerViewState, mode: RenderMode) -> RenderStat
                 .unwrap_or_else(|| {
                     (
                         DvrOpacityTransfer::new(
-                            layer.transfer().window(),
+                            transfer.window(),
                             TransferCurve::gamma(DEFAULT_DVR_OPACITY_GAMMA)
                                 .expect("the default DVR opacity gamma is valid"),
                         ),
@@ -575,11 +591,11 @@ fn render_state_for_mode(layer: &LayerViewState, mode: RenderMode) -> RenderStat
 }
 
 fn layer_render_state_for_mode(
-    layer: &LayerViewState,
+    current: RenderState,
+    transfer: &mirante4d_application::LayerTransfer,
     mode: RenderMode,
 ) -> Result<RenderState, String> {
-    let current = *layer.render_state();
-    let sampling = SamplingPolicy::VoxelExact;
+    let sampling = current.sampling_policy();
     match mode {
         RenderMode::Mip => Ok(RenderState::mip(sampling)),
         RenderMode::Isosurface => {
@@ -587,15 +603,19 @@ fn layer_render_state_for_mode(
                 .iso_parameters()
                 .map(|parameters| parameters.display_level())
                 .unwrap_or(DEFAULT_ISO_DISPLAY_LEVEL);
-            RenderState::iso(sampling, IsoShadingPolicy::Flat, display_level)
-                .map_err(|error| error.to_string())
+            let shading = current
+                .iso_parameters()
+                .map_or(IsoShadingPolicy::GradientLighting, |parameters| {
+                    parameters.shading_policy()
+                });
+            RenderState::iso(sampling, shading, display_level).map_err(|error| error.to_string())
         }
         RenderMode::Dvr => {
             let (opacity_transfer, density_scale) = current
                 .dvr_parameters()
                 .map(|parameters| (parameters.opacity_transfer(), parameters.density_scale()))
                 .unwrap_or((
-                    DvrOpacityTransfer::new(layer.transfer().window(), layer.transfer().curve()),
+                    DvrOpacityTransfer::new(transfer.window(), transfer.curve()),
                     DEFAULT_DVR_DENSITY_SCALE,
                 ));
             RenderState::dvr(sampling, opacity_transfer, density_scale)
@@ -677,15 +697,31 @@ pub fn playback_status_label(playing: bool, active: TimeIndex, count: u64) -> St
 }
 
 pub fn viewport_hover_status_label(hover: ViewportHover) -> String {
+    let sample = match hover.sample_kind {
+        crate::ViewportSampleKind::Voxel => "voxel intensity",
+        crate::ViewportSampleKind::Interpolated => "interpolated intensity",
+    };
     format!(
-        "hover x{} y{} intensity {}",
-        hover.x, hover.y, hover.intensity
+        "hover x{} y{} {sample} {}",
+        hover.x, hover.y, hover.intensity,
     )
 }
 
 #[cfg(test)]
 mod tests {
+    use mirante4d_application::{DisplayWindow, LayerTransfer, Opacity, RgbColor, SamplingPolicy};
+
     use super::*;
+
+    fn transfer() -> LayerTransfer {
+        LayerTransfer::new(
+            DisplayWindow::new(0.0, 1.0).unwrap(),
+            RgbColor::new([1.0; 3]).unwrap(),
+            Opacity::new(1.0).unwrap(),
+            TransferCurve::linear(),
+            false,
+        )
+    }
 
     #[test]
     fn stepped_timepoint_wraps_in_both_directions() {
@@ -730,8 +766,44 @@ mod tests {
                 x: 12,
                 y: 34,
                 intensity: crate::ViewportIntensity::U16(4095),
+                sample_kind: crate::ViewportSampleKind::Voxel,
             }),
-            "hover x12 y34 intensity 4095"
+            "hover x12 y34 voxel intensity 4095"
         );
+        assert_eq!(
+            viewport_hover_status_label(ViewportHover {
+                x: 12,
+                y: 34,
+                intensity: crate::ViewportIntensity::F32(12.5),
+                sample_kind: crate::ViewportSampleKind::Interpolated,
+            }),
+            "hover x12 y34 interpolated intensity 12.500000"
+        );
+    }
+
+    #[test]
+    fn mode_switches_preserve_sampling_and_restore_gradient_iso() {
+        let smooth_mip = RenderState::mip(SamplingPolicy::SmoothLinear);
+        let transfer = transfer();
+        for converted in [
+            render_state_for_mode(smooth_mip, &transfer, RenderMode::Isosurface),
+            layer_render_state_for_mode(smooth_mip, &transfer, RenderMode::Isosurface).unwrap(),
+        ] {
+            assert_eq!(converted.sampling_policy(), SamplingPolicy::SmoothLinear);
+            assert_eq!(
+                converted.iso_parameters().unwrap().shading_policy(),
+                IsoShadingPolicy::GradientLighting
+            );
+        }
+
+        let flat_iso =
+            RenderState::iso(SamplingPolicy::VoxelExact, IsoShadingPolicy::Flat, 0.25).unwrap();
+        let retained = render_state_for_mode(flat_iso, &transfer, RenderMode::Isosurface);
+        assert_eq!(retained.sampling_policy(), SamplingPolicy::VoxelExact);
+        assert_eq!(
+            retained.iso_parameters().unwrap().shading_policy(),
+            IsoShadingPolicy::Flat
+        );
+        assert_eq!(retained.iso_parameters().unwrap().display_level(), 0.25);
     }
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use mirante4d_dataset::{
-    DatasetCatalog, DatasetLayer, DatasetResourceIdentity, DatasetResourceKey, DatasetSourceId,
+    BrickKey, DatasetCatalog, DatasetLayer, DatasetResourceIdentity, DatasetSourceId,
     ResourceRegion, ScientificIdentityStatus,
 };
 use mirante4d_domain::{
@@ -19,7 +19,7 @@ use mirante4d_project_model::{
 };
 use mirante4d_render_api::{
     FrameCompleteness, FrameCoverage, FrameIdentity, FrameProgress, LayerRenderIntent,
-    PresentationPaintRequest, PresentationToken, PresentationViewport, PresentedFrame,
+    PresentationPaintRequest, PresentationTarget, PresentationViewport, PresentedFrame,
     RenderExtent, RenderIntent, RenderRequirement, RenderRequirementRole, RenderRequirements,
     RenderViewIntent,
 };
@@ -41,7 +41,7 @@ fn snapshot_carries_four_fixed_backend_neutral_presentation_slots() {
         ))
         .unwrap(),
     );
-    let key = DatasetResourceKey::new(
+    let key = BrickKey::new(
         resource_identity,
         LogicalLayerKey::new(0),
         TimeIndex::new(0),
@@ -78,21 +78,17 @@ fn snapshot_carries_four_fixed_backend_neutral_presentation_slots() {
     )
     .unwrap();
     let viewport = PresentationViewport::new(32.0, 24.0).unwrap();
-    let surface = |token| {
+    let surface = |target| {
         PresentationSurface::new(
             viewport,
-            Some(PresentedFrame::new(
-                PresentationToken::new(token).unwrap(),
-                extent,
-                progress.clone(),
-            )),
+            Some(PresentedFrame::new(target, extent, progress.clone())),
         )
     };
     let presentations = PresentationSnapshot::new(
-        Some(surface(1)),
-        Some(surface(2)),
-        Some(surface(3)),
-        Some(surface(4)),
+        Some(surface(PresentationTarget::ThreeD)),
+        Some(surface(PresentationTarget::Xy)),
+        Some(surface(PresentationTarget::Xz)),
+        Some(surface(PresentationTarget::Yz)),
     );
     let projected = snapshot.with_presentations(presentations);
 
@@ -104,15 +100,22 @@ fn snapshot_carries_four_fixed_backend_neutral_presentation_slots() {
             .collect::<Vec<_>>(),
         PresentationSlot::ALL
     );
-    for (index, slot) in PresentationSlot::ALL.into_iter().enumerate() {
+    for slot in PresentationSlot::ALL {
         let surface = projected.presentations().get(slot).unwrap();
-        let token = PresentationToken::new(u64::try_from(index + 1).unwrap()).unwrap();
-        assert_eq!(surface.frame().unwrap().token(), token);
+        assert_eq!(surface.frame().unwrap().target(), slot);
         assert_eq!(
             surface.paint_request(),
-            Some(PresentationPaintRequest::new(token, viewport))
+            Some(PresentationPaintRequest::new(slot, viewport))
         );
     }
+
+    let retained = surface(PresentationTarget::ThreeD);
+    let stale =
+        PresentationSurface::with_frame_currentness(viewport, retained.frame().cloned(), false);
+    assert!(stale.frame().is_some());
+    assert!(stale.paint_request().is_some());
+    assert_eq!(stale.current_frame(), None);
+    assert!(!stale.frame_is_current());
 }
 
 #[test]
@@ -150,6 +153,8 @@ fn presentation_surface_without_a_frame_has_no_paint_request() {
 
     assert_eq!(surface.viewport(), viewport);
     assert_eq!(surface.frame(), None);
+    assert_eq!(surface.current_frame(), None);
+    assert!(!surface.frame_is_current());
     assert_eq!(surface.paint_request(), None);
 }
 
@@ -2434,6 +2439,60 @@ fn transient_commands_never_dirty_or_advance_the_project_revision() {
 }
 
 #[test]
+fn cross_section_panel_activity_exists_only_while_four_panel_is_visible() {
+    let mut application = bound_application();
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::SetActiveCrossSectionPanel(Some(
+                CrossSectionPanelId::Xy,
+            )))
+            .unwrap(),
+        CommandEffect::NoChange
+    );
+    assert_eq!(
+        application
+            .snapshot()
+            .transient()
+            .active_cross_section_panel(),
+        None
+    );
+
+    application
+        .dispatch(ApplicationCommand::SetLayout {
+            layout: ViewerLayout::FourPanel,
+            cross_section: cross_section(),
+        })
+        .unwrap();
+    application
+        .dispatch(ApplicationCommand::SetActiveCrossSectionPanel(Some(
+            CrossSectionPanelId::Xz,
+        )))
+        .unwrap();
+    assert_eq!(
+        application
+            .snapshot()
+            .transient()
+            .active_cross_section_panel(),
+        Some(CrossSectionPanelId::Xz)
+    );
+
+    application
+        .dispatch(ApplicationCommand::SetLayout {
+            layout: ViewerLayout::Single3d,
+            cross_section: cross_section(),
+        })
+        .unwrap();
+    assert_eq!(
+        application
+            .snapshot()
+            .transient()
+            .active_cross_section_panel(),
+        None
+    );
+}
+
+#[test]
 fn selected_ids_are_normalized_after_removal_and_history_movement() {
     let mut application = bound_application();
     application
@@ -2668,6 +2727,170 @@ fn dataset_open_request_rejects_while_an_operation_is_active() {
             .unwrap_err()
             .code(),
         ApplicationFaultCode::OperationConflict
+    );
+    assert_eq!(application, before);
+}
+
+#[test]
+fn verified_dataset_open_atomically_replaces_and_verifies_the_source() {
+    let mut application = bound_application();
+    application.drain_events(MAX_PENDING_EVENTS);
+    application
+        .dispatch(ApplicationCommand::SetPlaybackActive(true))
+        .unwrap();
+    application
+        .dispatch(ApplicationCommand::SetActiveTool(ToolKind::Crosshair))
+        .unwrap();
+    application
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    let token = dataset_open_token(&mut application);
+    let dataset = dataset_reference_at('7', "imported.m4d");
+    let scientific_content_id = *dataset.scientific_content_id();
+    let catalog = verified_catalog(&catalog_for_source(4, 2), &dataset);
+    let provisional_project_id = project_id(9);
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token: token.clone(),
+                completion: OperationCompletion::VerifiedDatasetOpened {
+                    source_generation: SourceSessionGeneration::new(2),
+                    catalog,
+                    workspace: Box::new(unbound_workspace(provisional_project_id)),
+                    dataset: dataset.clone(),
+                },
+            })
+            .unwrap(),
+        CommandEffect::Changed
+    );
+
+    let snapshot = application.snapshot();
+    assert_eq!(
+        snapshot.source_generation(),
+        SourceSessionGeneration::new(2)
+    );
+    assert_eq!(
+        snapshot.source(),
+        &SourceVerificationSnapshot::Verified(dataset)
+    );
+    assert_eq!(snapshot.catalog().label(), "catalog-4");
+    assert_eq!(
+        snapshot.catalog().scientific_identity().verified_id(),
+        Some(&scientific_content_id)
+    );
+    assert_eq!(snapshot.transient(), &TransientApplicationState::default());
+    let WorkspaceSnapshot::Unbound { workspace } = snapshot.workspace() else {
+        panic!("verified dataset open did not install an unbound workspace");
+    };
+    assert_eq!(workspace.provisional_project_id(), provisional_project_id);
+    assert!(snapshot.active_operations().is_empty());
+
+    let events = application.drain_events(MAX_PENDING_EVENTS);
+    assert_eq!(events.len(), 3);
+    assert!(matches!(
+        &events[0],
+        ApplicationEvent::CurrentSourceReplaced {
+            source_generation,
+            provisional_project_id: event_project_id,
+        } if *source_generation == SourceSessionGeneration::new(2)
+            && *event_project_id == provisional_project_id
+    ));
+    assert!(matches!(
+        &events[1],
+        ApplicationEvent::SourceVerified {
+            source_generation,
+            scientific_content_id: event_identity,
+        } if *source_generation == SourceSessionGeneration::new(2)
+            && *event_identity == scientific_content_id
+    ));
+    assert!(matches!(
+        &events[2],
+        ApplicationEvent::OperationCompleted {
+            token: completed,
+            outcome: OperationOutcome::VerifiedDatasetOpened,
+        } if completed == &token
+    ));
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::RequestSourceVerification)
+            .unwrap(),
+        CommandEffect::NoChange
+    );
+    assert!(application.drain_events(MAX_PENDING_EVENTS).is_empty());
+}
+
+#[test]
+fn verified_dataset_open_rejects_identity_drift_atomically_and_can_retry() {
+    let mut application = application();
+    application
+        .dispatch(ApplicationCommand::RequestDatasetOpen)
+        .unwrap();
+    let token = dataset_open_token(&mut application);
+    let dataset = dataset_reference_at('7', "imported.m4d");
+    let catalog = verified_catalog(&catalog_for_source(4, 2), &dataset);
+    let before = application.fork_for_dispatch();
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token: token.clone(),
+                completion: OperationCompletion::VerifiedDatasetOpened {
+                    source_generation: SourceSessionGeneration::new(2),
+                    catalog: Arc::clone(&catalog),
+                    workspace: Box::new(unbound_workspace(project_id(9))),
+                    dataset: dataset_reference_at('8', "imported.m4d"),
+                },
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::DatasetIdentityMismatch
+    );
+    assert_eq!(application, before);
+
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::VerifiedDatasetOpened {
+                source_generation: SourceSessionGeneration::new(2),
+                catalog,
+                workspace: Box::new(unbound_workspace(project_id(9))),
+                dataset,
+            },
+        })
+        .unwrap();
+    assert!(matches!(
+        application.snapshot().source(),
+        SourceVerificationSnapshot::Verified(_)
+    ));
+}
+
+#[test]
+fn verified_dataset_open_completion_is_valid_only_for_dataset_open() {
+    let mut application = application();
+    application
+        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Import))
+        .unwrap();
+    let token = started_token(&mut application, OperationKind::Import);
+    let dataset = dataset_reference_at('7', "imported.m4d");
+    let catalog = verified_catalog(&catalog_for_source(4, 2), &dataset);
+    let before = application.fork_for_dispatch();
+
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::CompleteOperation {
+                token,
+                completion: OperationCompletion::VerifiedDatasetOpened {
+                    source_generation: SourceSessionGeneration::new(2),
+                    catalog,
+                    workspace: Box::new(unbound_workspace(project_id(9))),
+                    dataset,
+                },
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::InvalidOperationCompletion
     );
     assert_eq!(application, before);
 }

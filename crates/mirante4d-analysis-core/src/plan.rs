@@ -1,4 +1,4 @@
-use mirante4d_dataset::{DatasetCatalog, DatasetResourceKey, ResourceRegion};
+use mirante4d_dataset::{BrickKey, DatasetCatalog, DatasetResourceIdentity, ResourceRegion};
 use mirante4d_domain::{IntensityDType, LogicalLayerKey, ScaleLevel, Shape3D, TimeIndex};
 use mirante4d_identity::ScientificContentId;
 
@@ -24,6 +24,7 @@ impl AnalysisOperation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalysisDefinition {
     source_content_id: ScientificContentId,
+    resource_identity: DatasetResourceIdentity,
     layer: LogicalLayerKey,
     dtype: IntensityDType,
     time_start: u64,
@@ -112,6 +113,7 @@ impl AnalysisDefinition {
         }
         Ok(Self {
             source_content_id,
+            resource_identity: catalog.resource_identity(),
             layer,
             dtype: layer_facts.dtype(),
             time_start,
@@ -124,6 +126,15 @@ impl AnalysisDefinition {
 
     pub const fn source_content_id(&self) -> ScientificContentId {
         self.source_content_id
+    }
+
+    /// Identity used to address this source in the live dataset runtime.
+    ///
+    /// This is deliberately independent from `source_content_id`: exact
+    /// verification can promote a source's scientific identity while its
+    /// already-issued runtime keys remain stable and resident.
+    pub const fn resource_identity(&self) -> DatasetResourceIdentity {
+        self.resource_identity
     }
 
     pub const fn layer(&self) -> LogicalLayerKey {
@@ -158,7 +169,7 @@ impl AnalysisDefinition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnalysisBlock {
     ordinal: u64,
-    resource: DatasetResourceKey,
+    resource: BrickKey,
 }
 
 impl AnalysisBlock {
@@ -166,7 +177,7 @@ impl AnalysisBlock {
         self.ordinal
     }
 
-    pub const fn resource(self) -> DatasetResourceKey {
+    pub const fn resource(self) -> BrickKey {
         self.resource
     }
 }
@@ -240,10 +251,8 @@ impl AnalysisPlan {
                 .expect("a clipped analysis block is nonempty"),
         )
         .expect("a planned region is bounded by a validated dataset shape");
-        let resource = DatasetResourceKey::new(
-            mirante4d_dataset::DatasetResourceIdentity::Verified(
-                self.definition.source_content_id(),
-            ),
+        let resource = BrickKey::new(
+            self.definition.resource_identity(),
             self.definition.layer(),
             TimeIndex::new(self.definition.time_start() + time_offset),
             ScaleLevel::BASE,

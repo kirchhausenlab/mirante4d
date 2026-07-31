@@ -2,6 +2,7 @@ use std::{
     env, fs,
     path::{Component, Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use anyhow::{Context, bail};
@@ -9,13 +10,22 @@ use serde_json::{Value, json};
 
 use crate::{
     deps::{self, CargoMetadata, cargo_metadata},
-    process::{run_cargo, run_command},
+    process::{BoundedOutputPolicy, run_cargo, run_command, run_command_with_bounded_output},
     target_fixture::extract_target_u16_fixture,
 };
 
 const DIST_ROOT: &str = "target/mirante4d/dist";
 const RELEASE_BUILD_PROFILE: &str = "release";
 const RELEASE_PACKAGE_KIND: &str = "linux-release";
+const PACKAGE_SMOKE_APP_TIMEOUT_SECS: u64 = 30;
+const PACKAGE_SMOKE_OUTPUT_POLICY: BoundedOutputPolicy = BoundedOutputPolicy {
+    scope: "package_smoke",
+    inactivity_timeout: Duration::from_secs(40),
+    absolute_timeout: Duration::from_secs(45),
+    progress_interval: Duration::from_secs(5),
+    max_stdout_bytes: 1024 * 1024,
+    max_stderr_bytes: 1024 * 1024,
+};
 
 #[derive(Debug, Clone)]
 struct LinuxReleaseArtifacts {
@@ -513,15 +523,20 @@ fn run_package_smoke_test(
     expected_version: &str,
     output_path: &Path,
 ) -> anyhow::Result<Value> {
-    let output = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .env("MIRANTE4D_APP_SMOKE", "1")
+        .env(
+            "MIRANTE4D_APP_SMOKE_TIMEOUT_SECS",
+            PACKAGE_SMOKE_APP_TIMEOUT_SECS.to_string(),
+        )
         .env("MIRANTE4D_DEV_DATASET", dataset)
         .env("APPIMAGE_EXTRACT_AND_RUN", "1")
         .env(
             "RUST_LOG",
             env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned()),
-        )
-        .output()
+        );
+    let output = run_command_with_bounded_output(&mut command, PACKAGE_SMOKE_OUTPUT_POLICY)
         .with_context(|| format!("failed to run package smoke test {}", binary.display()))?;
     let mut report = String::new();
     report.push_str(&format!("binary: {}\n", binary.display()));
@@ -795,6 +810,21 @@ mod tests {
             linux_release_package_id("0.1.0", "x86_64"),
             "mirante4d-0.1.0-linux-x86_64-release"
         );
+    }
+
+    #[test]
+    fn package_smoke_outer_watchdog_strictly_contains_the_app_deadline() {
+        assert_eq!(PACKAGE_SMOKE_APP_TIMEOUT_SECS, 30);
+        assert!(
+            PACKAGE_SMOKE_OUTPUT_POLICY.inactivity_timeout
+                > Duration::from_secs(PACKAGE_SMOKE_APP_TIMEOUT_SECS)
+        );
+        assert!(
+            PACKAGE_SMOKE_OUTPUT_POLICY.absolute_timeout
+                > PACKAGE_SMOKE_OUTPUT_POLICY.inactivity_timeout
+        );
+        assert_eq!(PACKAGE_SMOKE_OUTPUT_POLICY.max_stdout_bytes, 1024 * 1024);
+        assert_eq!(PACKAGE_SMOKE_OUTPUT_POLICY.max_stderr_bytes, 1024 * 1024);
     }
 
     #[test]

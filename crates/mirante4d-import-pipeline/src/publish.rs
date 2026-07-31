@@ -7,12 +7,13 @@ use std::{
 
 use mirante4d_dataset::{CpuByteLease, CpuByteLedger, CpuLedgerCategory};
 use mirante4d_storage::{
-    GLOBAL_UNCOMPRESSED_OUTER_SHARD_BYTES_MAX, LocalPackageWriter, PACKED_INDEX_RECORD_BYTES,
-    PackagePath, PackageShardInput, PackageWriteError, PackageWriteInput, ShardProfileKind,
+    GLOBAL_UNCOMPRESSED_OUTER_SHARD_BYTES_MAX, INNER_CODEC_WORKING_BYTES_MAX, LocalPackageWriter,
+    PACKAGE_VALIDATION_WORKING_BYTES, PACKED_INDEX_RECORD_BYTES, PackagePath, PackageShardInput,
+    PackageWriteError, PackageWriteEvent, PackageWriteInput, PackageWriteStage, ShardProfileKind,
 };
 
 use crate::{
-    ImportCancellation, ImportError,
+    ImportCancellation, ImportError, ImportEvent, ImportStage, ImportStageTiming, ImportStatistics,
     chunk::chunk_grid,
     package::PackageMetadata,
     plan::ImportPlan,
@@ -21,8 +22,12 @@ use crate::{
 
 /// Bounded writer, descriptor, manifest, and staged-catalog control state.
 pub(crate) const PUBLICATION_CONTROL_BYTES_MAX: u64 = 64 * 1024 * 1024;
+// Covers simultaneous input/output slot vectors, per-chunk Vec/enum state,
+// path/coordinate fields, the writer's length table, and allocator rounding
+// for the profile maximum of 64 inner chunks.
+const PUBLICATION_SHARD_METADATA_BYTES_MAX: u64 = 64 * 1024;
 pub(crate) const PUBLICATION_VALIDATION_BYTES_MAX: u64 =
-    PUBLICATION_CONTROL_BYTES_MAX + GLOBAL_UNCOMPRESSED_OUTER_SHARD_BYTES_MAX;
+    PACKAGE_VALIDATION_WORKING_BYTES + GLOBAL_UNCOMPRESSED_OUTER_SHARD_BYTES_MAX;
 
 #[derive(Clone)]
 struct LevelPaths {
@@ -49,8 +54,9 @@ pub(crate) fn publish_package(
     resident_working_bytes: u64,
     ledger: &dyn CpuByteLedger,
     cancellation: &ImportCancellation,
-    peak_working_bytes: &mut u64,
-) -> Result<mirante4d_storage::PackageWriteReceipt, ImportError> {
+    statistics: &mut ImportStatistics,
+    progress: &mut impl FnMut(ImportEvent),
+) -> Result<mirante4d_storage::PublishedScientificPackageTransfer, ImportError> {
     let paths = metadata.profile.images()[0]
         .levels()
         .iter()
@@ -61,7 +67,7 @@ pub(crate) fn publish_package(
         })
         .collect();
     let deferred_error = Rc::new(RefCell::new(None));
-    let observed_peak = Rc::new(Cell::new(*peak_working_bytes));
+    let observed_peak = Rc::new(Cell::new(statistics.peak_working_bytes));
     let initial_combined = resident_working_bytes
         .checked_add(PUBLICATION_CONTROL_BYTES_MAX)
         .ok_or(ImportError::Overflow)?;
@@ -105,17 +111,62 @@ pub(crate) fn publish_package(
         stream,
     );
 
-    let result = LocalPackageWriter::write_new_scientifically_validated(destination, input, || {
-        cancellation.is_cancelled() || deferred_error.borrow().is_some()
-    });
-    *peak_working_bytes = (*peak_working_bytes).max(observed_peak.get());
-    if let Some(error) = deferred_error.borrow_mut().take() {
-        return Err(error);
-    }
+    let result = LocalPackageWriter::write_new_scientifically_validated_observed(
+        destination,
+        input,
+        || cancellation.is_cancelled() || deferred_error.borrow().is_some(),
+        |event| record_package_write_event(event, statistics, progress),
+    );
+    statistics.peak_working_bytes = statistics.peak_working_bytes.max(observed_peak.get());
     match result {
         Ok(receipt) => Ok(receipt),
-        Err(PackageWriteError::Cancelled) => Err(ImportError::Cancelled),
-        Err(error) => Err(error.into()),
+        Err(PackageWriteError::Cancelled) => {
+            if let Some(error) = deferred_error.borrow_mut().take() {
+                Err(error)
+            } else {
+                Err(ImportError::Cancelled)
+            }
+        }
+        Err(error) => {
+            if let Some(error) = deferred_error.borrow_mut().take() {
+                Err(error)
+            } else {
+                Err(error.into())
+            }
+        }
+    }
+}
+
+fn record_package_write_event(
+    event: PackageWriteEvent,
+    statistics: &mut ImportStatistics,
+    progress: &mut impl FnMut(ImportEvent),
+) {
+    match event {
+        PackageWriteEvent::StageStarted(stage) => progress(ImportEvent::StageStarted {
+            stage: import_stage(stage),
+            completed_work_units: 0,
+            total_work_units: None,
+        }),
+        PackageWriteEvent::StageFinished(timing) => {
+            let timing = ImportStageTiming {
+                stage: import_stage(timing.stage),
+                wall_time_ns: timing.wall_time_ns,
+                cpu_time_ns: timing.cpu_time_ns,
+            };
+            statistics.stages.push(timing);
+            progress(ImportEvent::StageFinished(timing));
+        }
+    }
+}
+
+const fn import_stage(stage: PackageWriteStage) -> ImportStage {
+    match stage {
+        PackageWriteStage::ShardPublication => ImportStage::ShardPublication,
+        PackageWriteStage::StagedStructureValidation => ImportStage::StagedStructureValidation,
+        PackageWriteStage::StagedExactValidation => ImportStage::StagedExactValidation,
+        PackageWriteStage::StagedScientificValidation => ImportStage::StagedScientificValidation,
+        PackageWriteStage::Commit => ImportStage::Commit,
     }
 }
 
@@ -328,14 +379,14 @@ impl ShardStream<'_> {
                             "checkpoint is missing a completed work unit".to_owned(),
                         ));
                     }
-                    let component = self.spool.read_component(key, validity)?;
+                    let component = self.spool.read_encoded_component(key, validity)?;
                     if let Some(component) = component {
-                        if component.kind != kind {
+                        if component.kind() != kind {
                             return Err(ImportError::InvalidCheckpoint(
                                 "checkpoint chunk uses the wrong storage kind".to_owned(),
                             ));
                         }
-                        chunks[slot] = Some(component.decoded);
+                        chunks[slot] = Some(component);
                     }
                 }
             }
@@ -349,7 +400,11 @@ impl ShardStream<'_> {
         } else {
             self.paths[self.scale].pixel.clone()
         };
-        Ok(PackageShardInput::new(path, vec![t, c, oz, oy, ox], chunks))
+        Ok(PackageShardInput::new_encoded(
+            path,
+            vec![t, c, oz, oy, ox],
+            chunks,
+        ))
     }
 
     fn build_packed(&mut self, outer: u64) -> Result<PackageShardInput, ImportError> {
@@ -419,9 +474,14 @@ impl ShardStream<'_> {
 }
 
 pub(crate) fn publication_shard_bytes(kind: ShardProfileKind) -> Result<u64, ImportError> {
-    u64::try_from(kind.decoded_outer_bytes())
+    let retained_payload_bytes = kind
+        .decoded_outer_bytes()
+        .max(kind.encoded_shard_bytes_max());
+    u64::try_from(retained_payload_bytes)
         .ok()
         .and_then(|value| value.checked_add(u64::try_from(kind.encoded_inner_bytes_max()).ok()?))
+        .and_then(|value| value.checked_add(INNER_CODEC_WORKING_BYTES_MAX))
+        .and_then(|value| value.checked_add(PUBLICATION_SHARD_METADATA_BYTES_MAX))
         .and_then(|value| value.checked_add(PUBLICATION_CONTROL_BYTES_MAX))
         .ok_or(ImportError::Overflow)
 }
@@ -456,4 +516,109 @@ fn checked_product<const N: usize>(values: [u64; N]) -> Result<u64, ImportError>
         .into_iter()
         .try_fold(1_u64, |product, value| product.checked_mul(value))
         .ok_or(ImportError::Overflow)
+}
+
+#[cfg(test)]
+mod tests {
+    use mirante4d_storage::PackageWriteStageTiming;
+
+    use super::*;
+
+    #[test]
+    fn publication_reserves_every_decoded_or_encoded_shard_representation() {
+        let kinds = [
+            ShardProfileKind::Pixel3dUint8,
+            ShardProfileKind::Pixel3dUint16,
+            ShardProfileKind::Pixel3dFloat32,
+            ShardProfileKind::Pixel2dUint8,
+            ShardProfileKind::Pixel2dUint16,
+            ShardProfileKind::Pixel2dFloat32,
+            ShardProfileKind::Validity3d,
+            ShardProfileKind::Validity2d,
+            ShardProfileKind::PackedIndex,
+        ];
+        for kind in kinds {
+            let retained = u64::try_from(
+                kind.decoded_outer_bytes()
+                    .max(kind.encoded_shard_bytes_max()),
+            )
+            .unwrap();
+            let expected = retained
+                + u64::try_from(kind.encoded_inner_bytes_max()).unwrap()
+                + INNER_CODEC_WORKING_BYTES_MAX
+                + PUBLICATION_SHARD_METADATA_BYTES_MAX
+                + PUBLICATION_CONTROL_BYTES_MAX;
+            assert_eq!(publication_shard_bytes(kind).unwrap(), expected);
+            assert!(
+                publication_shard_bytes(kind).unwrap()
+                    >= u64::try_from(kind.encoded_shard_bytes_max()).unwrap()
+                        + PUBLICATION_SHARD_METADATA_BYTES_MAX
+                        + PUBLICATION_CONTROL_BYTES_MAX
+            );
+        }
+    }
+
+    #[test]
+    fn package_writer_observation_maps_exactly_and_in_order() {
+        let mappings = [
+            (
+                PackageWriteStage::ShardPublication,
+                ImportStage::ShardPublication,
+            ),
+            (
+                PackageWriteStage::StagedStructureValidation,
+                ImportStage::StagedStructureValidation,
+            ),
+            (
+                PackageWriteStage::StagedExactValidation,
+                ImportStage::StagedExactValidation,
+            ),
+            (
+                PackageWriteStage::StagedScientificValidation,
+                ImportStage::StagedScientificValidation,
+            ),
+            (PackageWriteStage::Commit, ImportStage::Commit),
+        ];
+        let mut statistics = ImportStatistics::default();
+        let mut events = Vec::new();
+
+        for (ordinal, (writer_stage, import_stage)) in mappings.into_iter().enumerate() {
+            record_package_write_event(
+                PackageWriteEvent::StageStarted(writer_stage),
+                &mut statistics,
+                &mut |event| events.push(event),
+            );
+            record_package_write_event(
+                PackageWriteEvent::StageFinished(PackageWriteStageTiming {
+                    stage: writer_stage,
+                    wall_time_ns: ordinal as u64 + 11,
+                    cpu_time_ns: ordinal as u64 + 3,
+                }),
+                &mut statistics,
+                &mut |event| events.push(event),
+            );
+
+            assert_eq!(statistics.stages[ordinal].stage, import_stage);
+            assert_eq!(statistics.stages[ordinal].wall_time_ns, ordinal as u64 + 11);
+            assert_eq!(statistics.stages[ordinal].cpu_time_ns, ordinal as u64 + 3);
+        }
+
+        assert_eq!(events.len(), mappings.len() * 2);
+        for (ordinal, (pair, (_, expected_stage))) in
+            events.chunks_exact(2).zip(mappings).enumerate()
+        {
+            assert_eq!(
+                pair[0],
+                ImportEvent::StageStarted {
+                    stage: expected_stage,
+                    completed_work_units: 0,
+                    total_work_units: None,
+                }
+            );
+            assert_eq!(
+                pair[1],
+                ImportEvent::StageFinished(statistics.stages[ordinal])
+            );
+        }
+    }
 }

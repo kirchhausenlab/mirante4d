@@ -38,8 +38,8 @@ impl MiranteWorkbenchApp {
         if !snapshot.active_operations().is_empty() {
             return Some("Finish the current background operation first.".to_owned());
         }
-        if self.dataset.resource_identity()
-            != snapshot.catalog().scientific_identity().resource_identity()
+        if self.dataset.source_quarantined()
+            || self.dataset.resource_identity() != snapshot.catalog().resource_identity()
         {
             return Some("The verified microscopy runtime is not ready yet.".to_owned());
         }
@@ -291,6 +291,7 @@ impl MiranteWorkbenchApp {
                 request.resource(),
                 RequestPriority::Analysis,
                 false,
+                None,
             ) {
                 Ok(Some(ticket)) => ticket,
                 Ok(None) => break,

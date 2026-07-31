@@ -11,6 +11,7 @@ mod histogram;
 pub mod import_workflow;
 mod project_store_service;
 pub mod render_coordination;
+pub mod render_intent_mailbox;
 pub mod viewer_tools;
 pub mod viewport_interaction;
 
@@ -23,17 +24,25 @@ pub use histogram::{
     auto_signal_window_from_histogram, histogram_can_auto_window,
 };
 pub use mirante4d_analysis_core::{AnalysisPlot, AnalysisTable, IntensityStatistics};
+pub use mirante4d_render_api::PresentationTarget as PresentationSlot;
 pub use project_store_service::{
     MonotonicClock, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,
     ProjectStoreLifecycle, ProjectStoreServiceError, ProjectStoreServiceEvent,
     ProjectStoreServiceStatus, SystemMonotonicClock,
 };
 pub use render_coordination::{
+    CoordinatedPresentationGroup, CoordinatedPublicationDiagnostics,
     CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
-    CrossSectionPanelScheduleStatus, DisplayRefreshPath, DisplayRefreshTiming,
-    DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind, FrameFidelityStatus,
-    LodDecisionReason, RenderBackend, RenderCoordinationState, RenderSurfaceState,
-    ResidentRenderFailureStatus,
+    CrossSectionPanelScheduleStatus, DISPLAY_TIMING_SAMPLE_CAPACITY, DisplayGenerationStatus,
+    DisplayRefreshPath, DisplayRefreshTiming, DisplayTimingSamples, DisplayedFrameFreshness,
+    FrameCompleteness, FrameFailureKind, FrameFidelityStatus, LayerPresentationOverflow,
+    LayerPresentationStatus, LodDecisionReason, RenderBackend, RenderCoordinationState,
+    RenderSurfaceState, ResidentRenderFailureStatus,
+};
+pub use render_intent_mailbox::{
+    CompletedRenderIntent, RenderGestureId, RenderGestureKind, RenderIntentBase,
+    RenderIntentFamily, RenderIntentMailbox, RenderIntentMailboxError, RenderIntentMailboxSnapshot,
+    RenderIntentPayload, RenderIntentRevision, RenderIntentSample, RenderIntentTarget,
 };
 
 use std::{
@@ -47,7 +56,7 @@ pub use mirante4d_domain::{
     CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer, IsoLightState,
     IsoShadingPolicy, LayerTransfer, Opacity, Projection, RenderMode, RenderState, RgbColor,
     SamplingPolicy, TRANSFER_GAMMA_MAX, TRANSFER_GAMMA_MIN, TimeIndex, ToolKind, TransferCurve,
-    ViewerLayout,
+    ViewerLayout, WorldPoint3,
 };
 use mirante4d_identity::ScientificContentId;
 use mirante4d_project_model::{
@@ -61,7 +70,11 @@ pub use mirante4d_project_model::{
 };
 pub use mirante4d_project_store::ProjectGenerationId;
 use mirante4d_render_api::PresentedFrame;
-pub use mirante4d_render_api::{PresentationPaintRequest, PresentationViewport, RenderExtent};
+pub use mirante4d_render_api::{
+    CameraFrame, PresentationPaintRequest, PresentationViewport, ProjectedWorldPoint, RenderExtent,
+    RenderExtentEnvelope, VolumePickCompleteness, VolumePickHitKind, VolumePickPolicy,
+    VolumePickQuery, VolumePickResult, VolumePickTicket, VolumePickValue,
+};
 use mirante4d_settings::RejectedFileDisposition;
 pub use mirante4d_settings::ResourcePolicy;
 
@@ -494,6 +507,18 @@ pub enum OperationCompletion {
         source_generation: SourceSessionGeneration,
         catalog: Arc<DatasetCatalog>,
         workspace: Box<UnboundWorkspace>,
+    },
+    /// A newly opened source whose exact package and scientific identity were
+    /// already proved before this completion was prepared.
+    ///
+    /// The catalog, durable dataset reference, and initial workspace are
+    /// admitted as one atomic source replacement. This is distinct from
+    /// `DatasetOpened`, which deliberately accepts only a provisional catalog.
+    VerifiedDatasetOpened {
+        source_generation: SourceSessionGeneration,
+        catalog: Arc<DatasetCatalog>,
+        workspace: Box<UnboundWorkspace>,
+        dataset: DatasetReference,
     },
     SourceVerified {
         source_generation: SourceSessionGeneration,
@@ -979,6 +1004,7 @@ pub enum OperationOutcome {
     Cancelled,
     Failed(OperationFailureCode),
     DatasetOpened,
+    VerifiedDatasetOpened,
     SourceVerified,
     AnalysisCommitted,
     ProjectOpened,
@@ -1283,6 +1309,11 @@ pub struct ApplicationState {
     latest_problem: Option<ApplicationEvent>,
 }
 
+enum OpenedSourceBinding {
+    Provisional,
+    Verified(DatasetReference),
+}
+
 impl ApplicationState {
     pub fn new_unbound(
         source_generation: SourceSessionGeneration,
@@ -1551,15 +1582,60 @@ impl ApplicationState {
         catalog: Arc<DatasetCatalog>,
         workspace: UnboundWorkspace,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
+        self.install_opened_source(
+            source_generation,
+            catalog,
+            workspace,
+            OpenedSourceBinding::Provisional,
+        )
+    }
+
+    fn admit_verified_opened_source(
+        &mut self,
+        source_generation: SourceSessionGeneration,
+        catalog: Arc<DatasetCatalog>,
+        workspace: UnboundWorkspace,
+        dataset: DatasetReference,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
+        self.install_opened_source(
+            source_generation,
+            catalog,
+            workspace,
+            OpenedSourceBinding::Verified(dataset),
+        )
+    }
+
+    fn install_opened_source(
+        &mut self,
+        source_generation: SourceSessionGeneration,
+        catalog: Arc<DatasetCatalog>,
+        workspace: UnboundWorkspace,
+        binding: OpenedSourceBinding,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
         if source_generation.get() <= self.source_generation.get() {
             return Err(ApplicationFaultCode::SourceGenerationNotAdvanced);
         }
-        require_unverified_catalog(&catalog, source_generation)?;
+        let verified_identity = match &binding {
+            OpenedSourceBinding::Provisional => {
+                require_unverified_catalog(&catalog, source_generation)?;
+                None
+            }
+            OpenedSourceBinding::Verified(dataset) => {
+                let identity = *dataset.scientific_content_id();
+                if catalog.scientific_identity().verified_id() != Some(&identity) {
+                    return Err(ApplicationFaultCode::DatasetIdentityMismatch);
+                }
+                Some(identity)
+            }
+        };
         validate_view_against_catalog(&catalog, workspace.view())?;
         let provisional_project_id = workspace.provisional_project_id();
         self.source_generation = source_generation;
         self.catalog = catalog;
-        self.verified_source = None;
+        self.verified_source = match binding {
+            OpenedSourceBinding::Provisional => None,
+            OpenedSourceBinding::Verified(dataset) => Some(dataset),
+        };
         self.source_verification_progress = None;
         self.workspace = Workspace::Unbound(Arc::new(workspace));
         self.transient = TransientApplicationState::default();
@@ -1570,6 +1646,12 @@ impl ApplicationState {
             source_generation,
             provisional_project_id,
         })?;
+        if let Some(scientific_content_id) = verified_identity {
+            self.push_event(ApplicationEvent::SourceVerified {
+                source_generation,
+                scientific_content_id,
+            })?;
+        }
         Ok(CommandEffect::Changed)
     }
 
@@ -2031,6 +2113,13 @@ impl ApplicationState {
         &mut self,
         panel: Option<CrossSectionPanelId>,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
+        let four_panel = match &self.workspace {
+            Workspace::Unbound(workspace) => workspace.view.layout() == ViewerLayout::FourPanel,
+            Workspace::Bound(workspace) => {
+                workspace.current_state().view().layout() == ViewerLayout::FourPanel
+            }
+        };
+        let panel = panel.filter(|_| four_panel);
         if self.transient.active_cross_section_panel == panel {
             return Ok(CommandEffect::NoChange);
         }
@@ -2112,6 +2201,16 @@ impl ApplicationState {
     }
 
     fn normalize_transient_selections(&mut self) {
+        let four_panel = match &self.workspace {
+            Workspace::Unbound(workspace) => workspace.view.layout() == ViewerLayout::FourPanel,
+            Workspace::Bound(workspace) => {
+                workspace.current_state().view().layout() == ViewerLayout::FourPanel
+            }
+        };
+        if !four_panel {
+            self.transient.active_cross_section_panel = None;
+        }
+
         let (analysis_tables, analysis_plots) = match &self.workspace {
             Workspace::Unbound(_) => (Vec::new(), Vec::new()),
             Workspace::Bound(workspace) => {
@@ -2684,6 +2783,18 @@ impl ApplicationState {
                 self.admit_opened_source(source_generation, catalog, *workspace)?;
                 OperationOutcome::DatasetOpened
             }
+            OperationCompletion::VerifiedDatasetOpened {
+                source_generation,
+                catalog,
+                workspace,
+                dataset,
+            } => {
+                if token.kind != OperationKind::DatasetOpen {
+                    return Err(ApplicationFaultCode::InvalidOperationCompletion);
+                }
+                self.admit_verified_opened_source(source_generation, catalog, *workspace, dataset)?;
+                OperationOutcome::VerifiedDatasetOpened
+            }
             OperationCompletion::SourceVerified {
                 source_generation,
                 catalog,
@@ -2828,9 +2939,17 @@ impl ApplicationState {
         if catalog.scientific_identity().verified_id() != Some(&identity) {
             return Err(ApplicationFaultCode::DatasetIdentityMismatch);
         }
-        let expected =
+        let expected_runtime_catalog =
             catalog_with_identity(&self.catalog, ScientificIdentityStatus::Verified(identity))?;
-        if catalog.as_ref() != &expected {
+        let expected_scientific_catalog = DatasetCatalog::new(
+            self.catalog.label(),
+            ScientificIdentityStatus::Verified(identity),
+            self.catalog.layers().cloned().collect(),
+        )
+        .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)?;
+        if catalog.as_ref() != &expected_runtime_catalog
+            && catalog.as_ref() != &expected_scientific_catalog
+        {
             return Err(ApplicationFaultCode::DatasetIdentityMismatch);
         }
         if let Workspace::Bound(bound) = &self.workspace
@@ -2842,7 +2961,7 @@ impl ApplicationState {
             return Err(ApplicationFaultCode::DatasetIdentityMismatch);
         }
 
-        self.catalog = catalog;
+        self.catalog = Arc::new(expected_runtime_catalog);
         self.verified_source = Some(dataset);
         self.source_verification_progress = None;
         self.advance_currentness()?;
@@ -3168,42 +3287,37 @@ pub enum WorkspaceSnapshot {
     },
 }
 
-/// One of the viewer's fixed presentation surfaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum PresentationSlot {
-    ThreeD,
-    Xy,
-    Xz,
-    Yz,
-}
-
-impl PresentationSlot {
-    pub const ALL: [Self; 4] = [Self::ThreeD, Self::Xy, Self::Xz, Self::Yz];
-
-    pub const fn is_cross_section(self) -> bool {
-        !matches!(self, Self::ThreeD)
-    }
-
-    const fn index(self) -> usize {
-        match self {
-            Self::ThreeD => 0,
-            Self::Xy => 1,
-            Self::Xz => 2,
-            Self::Yz => 3,
-        }
-    }
-}
-
 /// Backend-neutral facts needed to paint one viewer surface.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PresentationSurface {
     viewport: PresentationViewport,
     frame: Option<PresentedFrame>,
+    frame_current: bool,
 }
 
 impl PresentationSurface {
     pub const fn new(viewport: PresentationViewport, frame: Option<PresentedFrame>) -> Self {
-        Self { viewport, frame }
+        Self {
+            viewport,
+            frame_current: frame.is_some(),
+            frame,
+        }
+    }
+
+    /// Projects a retained display frame separately from whether it is
+    /// scientifically current for interaction. A stale frame may remain
+    /// paintable while its replacement is pending, but cannot be picked.
+    pub const fn with_frame_currentness(
+        viewport: PresentationViewport,
+        frame: Option<PresentedFrame>,
+        frame_current: bool,
+    ) -> Self {
+        let frame_current = frame.is_some() && frame_current;
+        Self {
+            viewport,
+            frame,
+            frame_current,
+        }
     }
 
     pub const fn viewport(&self) -> PresentationViewport {
@@ -3214,10 +3328,18 @@ impl PresentationSurface {
         self.frame.as_ref()
     }
 
+    pub fn current_frame(&self) -> Option<&PresentedFrame> {
+        self.frame_current.then_some(self.frame.as_ref()).flatten()
+    }
+
+    pub const fn frame_is_current(&self) -> bool {
+        self.frame_current
+    }
+
     pub fn paint_request(&self) -> Option<PresentationPaintRequest> {
         self.frame
             .as_ref()
-            .map(|frame| PresentationPaintRequest::new(frame.token(), self.viewport))
+            .map(|frame| PresentationPaintRequest::new(frame.target(), self.viewport))
     }
 }
 
@@ -3495,12 +3617,9 @@ fn catalog_with_identity(
     catalog: &DatasetCatalog,
     scientific_identity: ScientificIdentityStatus,
 ) -> Result<DatasetCatalog, ApplicationFaultCode> {
-    DatasetCatalog::new(
-        catalog.label(),
-        scientific_identity,
-        catalog.layers().cloned().collect(),
-    )
-    .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)
+    catalog
+        .with_scientific_identity(scientific_identity)
+        .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)
 }
 
 fn catalog_timepoint_count(catalog: &DatasetCatalog) -> u64 {
@@ -3669,7 +3788,9 @@ fn completion_matches_kind(kind: OperationKind, completion: &OperationCompletion
     match kind {
         OperationKind::DatasetOpen => matches!(
             completion,
-            OperationCompletion::DatasetOpened { .. } | OperationCompletion::Cancelled
+            OperationCompletion::DatasetOpened { .. }
+                | OperationCompletion::VerifiedDatasetOpened { .. }
+                | OperationCompletion::Cancelled
         ),
         OperationKind::SourceVerification => matches!(
             completion,

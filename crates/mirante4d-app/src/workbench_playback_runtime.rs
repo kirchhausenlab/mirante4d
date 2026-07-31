@@ -3,6 +3,7 @@ use mirante4d_application::{
     ApplicationCommand, ApplicationSnapshot, CrossSectionPanelScheduleStatus, OperationKind,
 };
 use mirante4d_domain::ViewerLayout;
+use mirante4d_render_api::PresentationTarget;
 
 use crate::{
     BACKGROUND_WORK_REPAINT_INTERVAL, RenderCoordinationState,
@@ -18,40 +19,108 @@ pub(crate) fn background_work_active(
     dataset: &DatasetDemandState,
     render: &RenderCoordinationState,
     presentation: &NativePresentationBridge,
+    progressive_render_required: bool,
 ) -> bool {
     application_service_work_active(snapshot)
         || import.status().is_active()
         || snapshot.transient().playback_active()
         || dataset.dispatcher().has_pending_work()
         || presentation.product_gpu.as_ref().is_some_and(|product| {
-            product.targets.values().any(|target| {
-                (target.request.is_some() && target.presented.is_none())
-                    || target.presented.as_ref().is_some_and(|frame| {
-                        frame.progress().completeness()
-                            == mirante4d_render_api::FrameCompleteness::Progressive
-                    })
-            })
+            product
+                .renderer
+                .pipeline_readiness()
+                .is_ok_and(|readiness| readiness != mirante4d_render_wgpu::PipelineReadiness::Ready)
+                || product.renderer.has_pending_residency_work()
+                || product.renderer.has_pending_residency_evictions()
+                || !product.pending_validation_captures.is_empty()
         })
+        || progressive_render_required
         || (crate::application_view(snapshot).layout() == ViewerLayout::FourPanel
             && render.iter().any(|(_, panel)| {
                 panel.cross_section_schedule().is_some_and(|schedule| {
-                    matches!(
-                        schedule.status,
-                        CrossSectionPanelScheduleStatus::Loading
-                            | CrossSectionPanelScheduleStatus::Coarse
-                    )
+                    cross_section_schedule_requires_polling(schedule.status)
                 })
             }))
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProgressiveRenderSubmissionWork {
+    pub(crate) three_d_required: bool,
+    pub(crate) any_required: bool,
+}
+
+/// Renderer-owned progress must not wait for unrelated dataset work to become
+/// idle. This applies equally to 3D and linked targets: once newly offered
+/// resources make a target executable, one coordinated refresh must consume
+/// that work instead of stranding a `Ready` linked schedule.
+pub(crate) const fn renderer_progress_refresh_required(
+    work: ProgressiveRenderSubmissionWork,
+    _dispatcher_has_pending_work: bool,
+) -> bool {
+    work.any_required
+}
+
+const fn cross_section_schedule_requires_polling(status: CrossSectionPanelScheduleStatus) -> bool {
+    // `Coarse` is a settled, honest display at the selected current scale; no
+    // background work can improve it until view/demand changes. Only missing
+    // CPU resources require periodic polling.
+    matches!(status, CrossSectionPanelScheduleStatus::Loading)
+}
+
+/// Returns true only when another renderer execution can admit data that is
+/// already CPU-resident. Dataset I/O completion owns refreshes while resources
+/// are still pending, so slow I/O cannot cause identical full-frame renders.
+pub(crate) fn progressive_render_submission_work(
+    presentation: &NativePresentationBridge,
+) -> ProgressiveRenderSubmissionWork {
+    let Some(product) = presentation.product_gpu.as_ref() else {
+        return ProgressiveRenderSubmissionWork::default();
+    };
+    if !product
+        .renderer
+        .pipeline_capability_is_ready(mirante4d_render_wgpu::PipelineCapability::InitialRender)
+        .unwrap_or(false)
+    {
+        return ProgressiveRenderSubmissionWork::default();
+    }
+    let mut work = ProgressiveRenderSubmissionWork::default();
+    for target in PresentationTarget::ALL {
+        let required = match product
+            .renderer
+            .coordinated_target_requires_execution(target)
+        {
+            Ok(required) => required,
+            Err(
+                mirante4d_render_wgpu::WgpuRenderRuntimeError::CoordinatedTargetNotConfigured {
+                    ..
+                },
+            ) => false,
+            Err(error) => {
+                tracing::error!(%error, ?target, "renderer target refresh query failed");
+                true
+            }
+        };
+        work.any_required |= required;
+        if target == PresentationTarget::ThreeD {
+            work.three_d_required = required;
+        }
+    }
+    work
+}
+
 fn application_service_work_active(snapshot: &ApplicationSnapshot) -> bool {
-    pending_application_service_work(
-        snapshot
-            .active_operations()
-            .iter()
-            .map(|operation| operation.kind()),
-        snapshot.pending_settings_change().is_some(),
-    )
+    // Events emitted after the update's initial service pump still own one
+    // subsequent turn. In particular, a terminal source fault can leave the
+    // dataset dispatcher idle while its invalidation event is waiting to
+    // retire composition-root state.
+    snapshot.pending_event_count() != 0
+        || pending_application_service_work(
+            snapshot
+                .active_operations()
+                .iter()
+                .map(|operation| operation.kind()),
+            snapshot.pending_settings_change().is_some(),
+        )
 }
 
 fn pending_application_service_work(
@@ -119,6 +188,33 @@ pub(crate) fn catalog_timepoint_count(snapshot: &ApplicationSnapshot) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_loading_cross_sections_keep_background_polling() {
+        assert!(cross_section_schedule_requires_polling(
+            CrossSectionPanelScheduleStatus::Loading,
+        ));
+        assert!(!cross_section_schedule_requires_polling(
+            CrossSectionPanelScheduleStatus::Coarse,
+        ));
+        assert!(!cross_section_schedule_requires_polling(
+            CrossSectionPanelScheduleStatus::Ready,
+        ));
+    }
+
+    #[test]
+    fn linked_renderer_progress_requests_a_refresh_without_waiting_for_dataset_idle() {
+        let linked_only = ProgressiveRenderSubmissionWork {
+            three_d_required: false,
+            any_required: true,
+        };
+        assert!(renderer_progress_refresh_required(linked_only, true));
+        assert!(renderer_progress_refresh_required(linked_only, false));
+        assert!(!renderer_progress_refresh_required(
+            ProgressiveRenderSubmissionWork::default(),
+            false,
+        ));
+    }
 
     #[test]
     fn source_project_and_analysis_operations_keep_application_services_polling() {

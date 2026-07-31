@@ -1,27 +1,28 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, VecDeque},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use mirante4d_dataset::{
-    CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError, DatasetCatalog,
-    DatasetResourceKey, DatasetSource, DatasetSourceFault, DecodeSinkError, ReservedDecodeSink,
-    ResourcePayloadDescriptor,
+    BrickKey, CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError, DatasetCatalog,
+    DatasetSource, DatasetSourceFault, DecodeSinkError, ReservedDecodeSink,
+    ResourcePayloadDescriptor, ResourcePayloadFacts,
 };
 
 use crate::{
     AccountedCpuCharge, AccountedCpuLease, AccountedPayload, AccountedResourceLease,
     CancellationGeneration, DatasetRuntime, DatasetRuntimeConfig, DatasetRuntimeDiagnostics,
-    RequestDedupeKey, RequestPriority, RequestTicket, ResourceRequest, RuntimeCharge,
-    RuntimeCompletion, RuntimeFault, RuntimeFaultCode, RuntimeOutcome, RuntimeRequestId,
-    RuntimeRequestProgress, ShutdownState,
-    ledger::{LedgerCharge, LedgerCore, LedgerHandle},
+    DatasetRuntimePerformanceCounters, RequestDedupeKey, RequestPriority, RequestTicket,
+    ResourceRequest, RuntimeCharge, RuntimeCompletion, RuntimeFault, RuntimeFaultCode,
+    RuntimeOutcome, RuntimeRequestId, RuntimeRequestProgress, ShutdownState,
+    ledger::{ChangeSignal, LedgerCharge, LedgerCore, LedgerHandle},
 };
 
 // These are explicit conservative charges for bounded scheduler metadata.
@@ -29,6 +30,12 @@ use crate::{
 const REQUEST_RECORD_BYTES: u64 = 512;
 const CACHE_RECORD_BYTES: u64 = 192;
 const SCOPE_RECORD_BYTES: u64 = 128;
+// Sources may stream decoded payloads in small chunks. Publishing every chunk
+// through the runtime mutex made a 1 MiB brick take roughly 128 contended
+// progress updates even though the product does not consume byte-granular
+// progress. Preserve an immediate first update and exact completion while
+// coalescing the middle of large writes.
+const PROGRESS_UPDATE_GRANULARITY_BYTES: usize = 1024 * 1024;
 
 struct ProductionDatasetRuntime {
     shared: Arc<RuntimeShared>,
@@ -43,7 +50,7 @@ struct RuntimeShared {
     config: DatasetRuntimeConfig,
     ledger: Arc<LedgerCore>,
     state: Mutex<RuntimeState>,
-    work_available: Condvar,
+    work_available: Arc<ChangeSignal>,
 }
 
 struct RuntimeState {
@@ -58,14 +65,33 @@ struct RuntimeState {
     jobs: BTreeMap<u64, DecodeJob>,
     dedupe: BTreeMap<RequestDedupeKey, u64>,
     queue: BinaryHeap<QueueEntry>,
+    queued_size_counts: BTreeMap<u64, usize>,
+    queued_priority_counts: [usize; 6],
     completions: VecDeque<RuntimeCompletion>,
-    cache: BTreeMap<DatasetResourceKey, CacheEntry>,
+    cache: BTreeMap<BrickKey, CacheEntry>,
+    decoded_cache_lru: BTreeSet<(u64, BrickKey)>,
+    prefetch_cache_lru: BTreeSet<(u64, BrickKey)>,
     submitted_requests: u64,
     started_decodes: u64,
     completed_decodes: u64,
     ready_requests: u64,
     cancelled_requests: u64,
     failed_requests: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_evictions: u64,
+    progress_updates: u64,
+    queue_wait_ns: u64,
+    decode_time_ns: u64,
+    decoded_output_bytes: u64,
+    cancelled_decode_executions: u64,
+    cancelled_decode_time_ns: u64,
+    cancelled_decode_bytes: u64,
+    active_decode_cohorts: usize,
+    workers_with_priority_claims: [usize; 6],
+    decode_cohorts: u64,
+    decode_cohort_members: u64,
+    peak_decode_cohort_members: usize,
 }
 
 struct ScopeRecord {
@@ -85,6 +111,7 @@ struct RequestRecord {
 struct DecodeJob {
     key: RequestDedupeKey,
     descriptor: ResourcePayloadDescriptor,
+    admission_bytes: u64,
     waiters: Vec<RuntimeRequestId>,
     priority: RequestPriority,
     phase: JobPhase,
@@ -92,6 +119,7 @@ struct DecodeJob {
     queue_version: u64,
     queue_sequence: u64,
     cancellation: Arc<AtomicBool>,
+    queued_at: Instant,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -99,6 +127,9 @@ enum JobPhase {
     Queued,
     Claimed,
     InFlight,
+    // The source observes its existing cancellation checkpoint, while this
+    // phase keeps cooperative yield distinct from terminal waiter retirement.
+    Yielding,
     Aborting,
 }
 
@@ -134,8 +165,10 @@ struct CacheEntry {
 
 struct JobClaim {
     job_id: u64,
-    key: DatasetResourceKey,
+    key: BrickKey,
     descriptor: ResourcePayloadDescriptor,
+    admission_bytes: u64,
+    priority: RequestPriority,
     cancellation: Arc<AtomicBool>,
 }
 
@@ -153,14 +186,33 @@ impl RuntimeState {
             jobs: BTreeMap::new(),
             dedupe: BTreeMap::new(),
             queue: BinaryHeap::new(),
+            queued_size_counts: BTreeMap::new(),
+            queued_priority_counts: [0; 6],
             completions: VecDeque::new(),
             cache: BTreeMap::new(),
+            decoded_cache_lru: BTreeSet::new(),
+            prefetch_cache_lru: BTreeSet::new(),
             submitted_requests: 0,
             started_decodes: 0,
             completed_decodes: 0,
             ready_requests: 0,
             cancelled_requests: 0,
             failed_requests: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            cache_evictions: 0,
+            progress_updates: 0,
+            queue_wait_ns: 0,
+            decode_time_ns: 0,
+            decoded_output_bytes: 0,
+            cancelled_decode_executions: 0,
+            cancelled_decode_time_ns: 0,
+            cancelled_decode_bytes: 0,
+            active_decode_cohorts: 0,
+            workers_with_priority_claims: [0; 6],
+            decode_cohorts: 0,
+            decode_cohort_members: 0,
+            peak_decode_cohort_members: 0,
         }
     }
 
@@ -207,19 +259,196 @@ impl RuntimeState {
 
     fn remove_job(&mut self, job_id: u64) -> Option<DecodeJob> {
         let job = self.jobs.remove(&job_id)?;
-        self.queue.retain(|entry| entry.job_id != job_id);
+        if job.phase == JobPhase::Queued {
+            self.remove_queued_job(job.admission_bytes, job.priority);
+        }
         if self.dedupe.get(&job.key).copied() == Some(job_id) {
             self.dedupe.remove(&job.key);
         }
         Some(job)
     }
 
-    fn replace_queued_entry(&mut self, entry: QueueEntry) {
-        self.queue.retain(|queued| queued.job_id != entry.job_id);
+    fn add_queued_job(&mut self, bytes: u64, priority: RequestPriority) {
+        let count = self.queued_size_counts.entry(bytes).or_default();
+        *count = count.saturating_add(1);
+        let priority_count = &mut self.queued_priority_counts[usize::from(priority.rank())];
+        *priority_count = priority_count.saturating_add(1);
+    }
+
+    fn remove_queued_job(&mut self, bytes: u64, priority: RequestPriority) {
+        let remove = {
+            let count = self
+                .queued_size_counts
+                .get_mut(&bytes)
+                .expect("each queued job contributes one size-index entry");
+            *count = count
+                .checked_sub(1)
+                .expect("a queued size count is removed exactly once");
+            *count == 0
+        };
+        if remove {
+            self.queued_size_counts.remove(&bytes);
+        }
+        let priority_count = &mut self.queued_priority_counts[usize::from(priority.rank())];
+        *priority_count = priority_count
+            .checked_sub(1)
+            .expect("each queued job contributes one priority-count entry");
+    }
+
+    fn change_queued_priority(&mut self, previous: RequestPriority, next: RequestPriority) {
+        if previous == next {
+            return;
+        }
+        let previous_count = &mut self.queued_priority_counts[usize::from(previous.rank())];
+        *previous_count = previous_count
+            .checked_sub(1)
+            .expect("a queued priority change removes one previous entry");
+        let next_count = &mut self.queued_priority_counts[usize::from(next.rank())];
+        *next_count = next_count.saturating_add(1);
+    }
+
+    fn minimum_queued_bytes(&self) -> Option<u64> {
+        self.queued_size_counts
+            .first_key_value()
+            .map(|(bytes, _)| *bytes)
+    }
+
+    fn request_foreground_preemption(
+        &mut self,
+        incoming: RequestPriority,
+        worker_limit: usize,
+    ) -> bool {
+        if !matches!(
+            incoming,
+            RequestPriority::CurrentView | RequestPriority::LinkedView
+        ) || self.active_decode_cohorts < worker_limit
+        {
+            return false;
+        }
+
+        let mut requested = false;
+        for job in self.jobs.values_mut() {
+            if job.phase == JobPhase::InFlight
+                && matches!(
+                    job.priority,
+                    RequestPriority::Playback
+                        | RequestPriority::Analysis
+                        | RequestPriority::Prefetch
+                )
+            {
+                job.phase = JobPhase::Yielding;
+                job.cancellation.store(true, AtomicOrdering::Release);
+                requested = true;
+            }
+        }
+        requested
+    }
+
+    fn cache_lru(&self, category: CpuLedgerCategory) -> &BTreeSet<(u64, BrickKey)> {
+        if category == CpuLedgerCategory::Prefetch {
+            &self.prefetch_cache_lru
+        } else {
+            debug_assert_eq!(category, CpuLedgerCategory::DecodedResidency);
+            &self.decoded_cache_lru
+        }
+    }
+
+    fn cache_lru_mut(&mut self, category: CpuLedgerCategory) -> &mut BTreeSet<(u64, BrickKey)> {
+        if category == CpuLedgerCategory::Prefetch {
+            &mut self.prefetch_cache_lru
+        } else {
+            debug_assert_eq!(category, CpuLedgerCategory::DecodedResidency);
+            &mut self.decoded_cache_lru
+        }
+    }
+
+    fn insert_cache_entry(&mut self, key: BrickKey, entry: CacheEntry) {
+        if let Some(replaced) = self.remove_cache_entry(&key) {
+            drop(replaced);
+        }
+        let category = entry.lease.ledger_category();
+        self.cache_lru_mut(category).insert((entry.last_touch, key));
+        self.cache.insert(key, entry);
+    }
+
+    fn remove_cache_entry(&mut self, key: &BrickKey) -> Option<CacheEntry> {
+        let entry = self.cache.remove(key)?;
+        let category = entry.lease.ledger_category();
+        let removed = self
+            .cache_lru_mut(category)
+            .remove(&(entry.last_touch, *key));
+        debug_assert!(removed, "a cached lease has one LRU index entry");
+        Some(entry)
+    }
+
+    fn touch_cache_entry(&mut self, key: BrickKey) {
+        let (category, old_touch) = {
+            let entry = self
+                .cache
+                .get(&key)
+                .expect("the touched cache entry remains present");
+            (entry.lease.ledger_category(), entry.last_touch)
+        };
+        let removed = self.cache_lru_mut(category).remove(&(old_touch, key));
+        debug_assert!(removed, "a touched lease has one old LRU entry");
+        let touch = self.touch();
+        self.cache
+            .get_mut(&key)
+            .expect("the touched cache entry remains present")
+            .last_touch = touch;
+        self.cache_lru_mut(category).insert((touch, key));
+    }
+
+    fn reclassify_cache_entry_index(
+        &mut self,
+        key: BrickKey,
+        old: CpuLedgerCategory,
+        new: CpuLedgerCategory,
+    ) {
+        if old == new {
+            return;
+        }
+        let touch = self
+            .cache
+            .get(&key)
+            .expect("the promoted cache entry remains present")
+            .last_touch;
+        let removed = self.cache_lru_mut(old).remove(&(touch, key));
+        debug_assert!(removed, "promotion removes the old cache LRU class");
+        self.cache_lru_mut(new).insert((touch, key));
+    }
+
+    fn oldest_cache_key(
+        &self,
+        category: CpuLedgerCategory,
+        excluded: Option<BrickKey>,
+    ) -> Option<BrickKey> {
+        self.cache_lru(category)
+            .iter()
+            .map(|(_, key)| *key)
+            .find(|key| Some(*key) != excluded)
+    }
+
+    /// Adds a versioned heap entry in logarithmic time. Older versions are
+    /// rejected by `claim_job`; compacting only at a hard multiple of the
+    /// admitted-request bound avoids the predecessor's O(n) heap scan on
+    /// every one of tens of thousands of submissions.
+    fn enqueue_version(&mut self, entry: QueueEntry, request_limit: usize) {
+        let compact_at = request_limit.saturating_mul(2).max(1);
+        if self.queue.len() >= compact_at {
+            let jobs = &self.jobs;
+            self.queue.retain(|queued| {
+                jobs.get(&queued.job_id).is_some_and(|job| {
+                    job.phase == JobPhase::Queued
+                        && job.queue_version == queued.version
+                        && job.priority == queued.priority
+                })
+            });
+        }
         self.queue.push(entry);
         assert!(
-            self.queue.len() <= self.jobs.len(),
-            "one charged live decode job owns at most one scheduler entry"
+            self.queue.len() <= compact_at,
+            "versioned scheduler entries remain within twice admission"
         );
     }
 }
@@ -231,7 +460,8 @@ impl dyn DatasetRuntime {
             Arc<dyn CpuByteLedger>,
         ) -> Result<Arc<dyn DatasetSource>, RuntimeFault>,
     ) -> Result<(Arc<dyn DatasetRuntime>, Arc<DatasetCatalog>), RuntimeFault> {
-        let ledger = LedgerCore::new(config);
+        let work_available = Arc::new(ChangeSignal::default());
+        let ledger = LedgerCore::new(config, Arc::clone(&work_available));
         let source_ledger: Arc<dyn CpuByteLedger> = Arc::new(LedgerHandle(Arc::clone(&ledger)));
         let source = catch_unwind(AssertUnwindSafe(|| source_factory(source_ledger)))
             .map_err(|_| RuntimeFault::new(RuntimeFaultCode::InvariantViolation))??;
@@ -249,7 +479,7 @@ impl dyn DatasetRuntime {
             config,
             ledger,
             state: Mutex::new(RuntimeState::new()),
-            work_available: Condvar::new(),
+            work_available,
         });
 
         let mut workers = Vec::with_capacity(config.worker_limit());
@@ -332,11 +562,16 @@ impl RuntimeShared {
             .iter()
             .filter_map(|(id, record)| (!record.terminal).then_some(*id))
             .collect::<Vec<_>>();
-        cancel_request_ids(&mut state, &ids, self.config.completion_queue_limit());
+        cancel_request_ids(
+            &mut state,
+            ids,
+            self.config.completion_queue_limit(),
+            self.config.request_queue_limit(),
+        );
         for job in state.jobs.values_mut() {
             if matches!(
                 job.phase,
-                JobPhase::Claimed | JobPhase::InFlight | JobPhase::Aborting
+                JobPhase::Claimed | JobPhase::InFlight | JobPhase::Yielding | JobPhase::Aborting
             ) {
                 job.phase = JobPhase::Aborting;
                 job.cancellation.store(true, AtomicOrdering::Release);
@@ -366,8 +601,28 @@ impl RuntimeShared {
     }
 
     fn claim_job(&self) -> Option<JobClaim> {
-        let mut state = self.lock_state();
         loop {
+            // Queue mutations and ledger releases advance this predicate before
+            // notifying. Sampling before either authority prevents a change in
+            // the former check/wait window from being lost.
+            let observed_change = self.work_available.generation();
+            let available = self.ledger.available(CpuLedgerCategory::InFlightDecode);
+            let mut state = self.lock_state();
+            if state
+                .minimum_queued_bytes()
+                .is_some_and(|minimum| minimum > available)
+            {
+                if state.shutdown != ShutdownState::Running {
+                    return None;
+                }
+                // No queued work can fit the current exact ledger headroom.
+                // Avoid repeatedly draining and rebuilding the entire priority
+                // heap while other workers hold decode reservations.
+                drop(state);
+                self.work_available.wait_for_change_after(observed_change);
+                continue;
+            }
+            let mut capacity_blocked = Vec::new();
             while let Some(entry) = state.queue.pop() {
                 let Some(job) = state.jobs.get_mut(&entry.job_id) else {
                     continue;
@@ -378,60 +633,299 @@ impl RuntimeShared {
                 {
                     continue;
                 }
+                if job.admission_bytes > available {
+                    capacity_blocked.push(entry);
+                    continue;
+                }
                 job.phase = JobPhase::Claimed;
-                return Some(JobClaim {
+                let claimed_bytes = job.admission_bytes;
+                let claim = JobClaim {
                     job_id: entry.job_id,
                     key: job.key.resource(),
                     descriptor: job.descriptor,
+                    admission_bytes: job.admission_bytes,
+                    priority: job.priority,
                     cancellation: Arc::clone(&job.cancellation),
-                });
+                };
+                state.remove_queued_job(claimed_bytes, claim.priority);
+                state.queue.extend(capacity_blocked);
+                return Some(claim);
             }
+            state.queue.extend(capacity_blocked);
             if state.shutdown != ShutdownState::Running {
                 return None;
             }
-            state = self
-                .work_available
-                .wait(state)
-                .unwrap_or_else(|poison| poison.into_inner());
+            // An empty queue waits for work; a capacity-blocked queue waits for
+            // either released bytes or newly queued smaller work. Both are one
+            // predicate-driven notification path with no recovery polling.
+            drop(state);
+            self.work_available.wait_for_change_after(observed_change);
         }
     }
 
-    fn requeue_claim(&self, claim: &JobClaim) {
+    /// Claims one immediately executable peer for an already admitted
+    /// cohort. This never waits, never crosses the first member's priority,
+    /// and preserves the normal lazy-version/no-head-of-line selector within
+    /// that class. The caller acquires the exact byte charge before asking for
+    /// another member.
+    fn try_claim_cohort_peer(
+        &self,
+        priority: RequestPriority,
+        available: u64,
+        current_members: usize,
+    ) -> Option<JobClaim> {
+        let mut state = self.lock_state();
+        if state.shutdown != ShutdownState::Running {
+            return None;
+        }
+        let priority_index = usize::from(priority.rank());
+        let future_workers = self
+            .config
+            .worker_limit()
+            .saturating_sub(state.workers_with_priority_claims[priority_index]);
+        let participating_workers = future_workers.saturating_add(1);
+        let remaining_members =
+            state.queued_priority_counts[priority_index].saturating_add(current_members);
+        let fair_member_limit = remaining_members.div_ceil(participating_workers);
+        if current_members >= fair_member_limit {
+            return None;
+        }
+        let mut capacity_blocked = Vec::new();
+        while let Some(entry) = state.queue.pop() {
+            let Some(job) = state.jobs.get_mut(&entry.job_id) else {
+                continue;
+            };
+            if job.phase != JobPhase::Queued
+                || job.queue_version != entry.version
+                || job.priority != entry.priority
+            {
+                continue;
+            }
+            if job.priority != priority {
+                capacity_blocked.push(entry);
+                break;
+            }
+            if job.admission_bytes > available {
+                capacity_blocked.push(entry);
+                continue;
+            }
+            job.phase = JobPhase::Claimed;
+            let claimed_bytes = job.admission_bytes;
+            let claim = JobClaim {
+                job_id: entry.job_id,
+                key: job.key.resource(),
+                descriptor: job.descriptor,
+                admission_bytes: job.admission_bytes,
+                priority: job.priority,
+                cancellation: Arc::clone(&job.cancellation),
+            };
+            state.remove_queued_job(claimed_bytes, claim.priority);
+            state.queue.extend(capacity_blocked);
+            return Some(claim);
+        }
+        state.queue.extend(capacity_blocked);
+        None
+    }
+
+    fn requeue_claim(&self, claim: &JobClaim) -> Result<(), RuntimeFaultCode> {
         let mut state = self.lock_state();
         let running = state.shutdown == ShutdownState::Running;
-        let Some(job) = state.jobs.get_mut(&claim.job_id) else {
-            return;
+        // Capacity-blocked work moves to the back of its priority class. The
+        // predecessor retained its original FIFO sequence, so one large job
+        // that could not fit was immediately reclaimed while smaller ready
+        // jobs starved behind it.
+        let sequence = state.allocate_queue_sequence()?;
+        let (queued_bytes, priority, entry) = {
+            let Some(job) = state.jobs.get_mut(&claim.job_id) else {
+                return Ok(());
+            };
+            if job.waiters.is_empty() || !running {
+                job.phase = JobPhase::Aborting;
+                job.cancellation.store(true, AtomicOrdering::Release);
+                return Ok(());
+            }
+            job.phase = JobPhase::Queued;
+            job.queue_version = job.queue_version.saturating_add(1);
+            job.queue_sequence = sequence;
+            let priority = job.priority;
+            (
+                job.admission_bytes,
+                priority,
+                QueueEntry {
+                    priority,
+                    sequence,
+                    job_id: claim.job_id,
+                    version: job.queue_version,
+                },
+            )
         };
-        if job.waiters.is_empty() || !running {
-            job.phase = JobPhase::Aborting;
-            job.cancellation.store(true, AtomicOrdering::Release);
-            return;
-        }
-        job.phase = JobPhase::Queued;
-        job.queue_version = job.queue_version.saturating_add(1);
-        let entry = QueueEntry {
-            priority: job.priority,
-            sequence: job.queue_sequence,
-            job_id: claim.job_id,
-            version: job.queue_version,
-        };
-        state.replace_queued_entry(entry);
+        state.add_queued_job(queued_bytes, priority);
+        state.enqueue_version(entry, self.config.request_queue_limit());
         self.work_available.notify_one();
+        Ok(())
+    }
+
+    fn retry_in_flight_capacity(&self, job_id: u64) -> Result<(), RuntimeFaultCode> {
+        let mut state = self.lock_state();
+        if state.shutdown != ShutdownState::Running {
+            return Err(RuntimeFaultCode::ShuttingDown);
+        }
+        let sequence = state.allocate_queue_sequence()?;
+        let (admission_bytes, priority, entry) = {
+            let Some(job) = state.jobs.get_mut(&job_id) else {
+                return Err(RuntimeFaultCode::Cancelled);
+            };
+            if job.waiters.is_empty() || job.phase == JobPhase::Aborting {
+                return Err(RuntimeFaultCode::Cancelled);
+            }
+            job.phase = JobPhase::Queued;
+            job.queue_version = job.queue_version.saturating_add(1);
+            job.queue_sequence = sequence;
+            (
+                job.admission_bytes,
+                job.priority,
+                QueueEntry {
+                    priority: job.priority,
+                    sequence,
+                    job_id,
+                    version: job.queue_version,
+                },
+            )
+        };
+        state.add_queued_job(admission_bytes, priority);
+        state.enqueue_version(entry, self.config.request_queue_limit());
+        self.work_available.notify_one();
+        Ok(())
+    }
+
+    fn retry_preempted(&self, job_id: u64) -> Result<bool, RuntimeFaultCode> {
+        let mut state = self.lock_state();
+        if state.shutdown != ShutdownState::Running {
+            return Ok(false);
+        }
+        if !state
+            .jobs
+            .get(&job_id)
+            .is_some_and(|job| job.phase == JobPhase::Yielding && !job.waiters.is_empty())
+        {
+            return Ok(false);
+        }
+        let sequence = state.allocate_queue_sequence()?;
+        let (admission_bytes, priority, entry, waiters, reserved_bytes) = {
+            let job = state
+                .jobs
+                .get_mut(&job_id)
+                .expect("the prevalidated yielded job remains installed");
+            job.cancellation.store(false, AtomicOrdering::Release);
+            job.phase = JobPhase::Queued;
+            job.queue_version = job.queue_version.saturating_add(1);
+            job.queue_sequence = sequence;
+            (
+                job.admission_bytes,
+                job.priority,
+                QueueEntry {
+                    priority: job.priority,
+                    sequence,
+                    job_id,
+                    version: job.queue_version,
+                },
+                job.waiters.clone(),
+                job.descriptor.byte_len(),
+            )
+        };
+        for id in waiters {
+            if let Some(record) = state.requests.get_mut(&id)
+                && !record.terminal
+            {
+                record.progress = RuntimeRequestProgress::new(record.ticket, 0, reserved_bytes)
+                    .expect("a yielded decode restarts within its original reservation");
+            }
+        }
+        state.add_queued_job(admission_bytes, priority);
+        state.enqueue_version(entry, self.config.request_queue_limit());
+        self.work_available.notify_one();
+        Ok(true)
     }
 
     fn activate_claim(&self, claim: &JobClaim) -> bool {
         let mut state = self.lock_state();
-        let Some(job) = state.jobs.get_mut(&claim.job_id) else {
-            return false;
+        let (first_start, queue_wait_ns) = {
+            let Some(job) = state.jobs.get_mut(&claim.job_id) else {
+                return false;
+            };
+            if job.waiters.is_empty() || job.phase == JobPhase::Aborting {
+                state.remove_job(claim.job_id);
+                return false;
+            }
+            job.phase = JobPhase::InFlight;
+            let first_start = !job.decode_started;
+            job.decode_started = true;
+            (first_start, duration_ns(job.queued_at.elapsed()))
         };
-        if job.waiters.is_empty() || job.phase == JobPhase::Aborting {
-            state.remove_job(claim.job_id);
-            return false;
+        if first_start {
+            state.started_decodes = state.started_decodes.saturating_add(1);
         }
-        job.phase = JobPhase::InFlight;
-        job.decode_started = true;
-        state.started_decodes = state.started_decodes.saturating_add(1);
+        state.queue_wait_ns = state.queue_wait_ns.saturating_add(queue_wait_ns);
         true
+    }
+
+    fn record_decode_observation(&self, elapsed: Duration, written_bytes: u64) {
+        let mut state = self.lock_state();
+        state.decode_time_ns = state.decode_time_ns.saturating_add(duration_ns(elapsed));
+        state.decoded_output_bytes = state.decoded_output_bytes.saturating_add(written_bytes);
+    }
+
+    fn record_cancelled_decode_waste(&self, elapsed: Duration, written_bytes: u64) {
+        let mut state = self.lock_state();
+        state.cancelled_decode_executions = state.cancelled_decode_executions.saturating_add(1);
+        state.cancelled_decode_time_ns = state
+            .cancelled_decode_time_ns
+            .saturating_add(duration_ns(elapsed));
+        state.cancelled_decode_bytes = state.cancelled_decode_bytes.saturating_add(written_bytes);
+    }
+
+    fn begin_worker_claim(&self, priority: RequestPriority) {
+        let mut state = self.lock_state();
+        let priority_claims = &mut state.workers_with_priority_claims[usize::from(priority.rank())];
+        *priority_claims = priority_claims.saturating_add(1);
+        assert!(
+            state.workers_with_priority_claims.iter().sum::<usize>() <= self.config.worker_limit(),
+            "each worker owns at most one primary claim"
+        );
+    }
+
+    fn end_worker_claim(&self, priority: RequestPriority) {
+        let mut state = self.lock_state();
+        let priority_claims = &mut state.workers_with_priority_claims[usize::from(priority.rank())];
+        *priority_claims = priority_claims
+            .checked_sub(1)
+            .expect("each primary worker claim ends exactly once");
+    }
+
+    fn begin_decode_cohort(&self, members: usize) {
+        let mut state = self.lock_state();
+        state.active_decode_cohorts = state.active_decode_cohorts.saturating_add(1);
+        state.decode_cohorts = state.decode_cohorts.saturating_add(1);
+        state.decode_cohort_members = state
+            .decode_cohort_members
+            .saturating_add(u64::try_from(members).unwrap_or(u64::MAX));
+        state.peak_decode_cohort_members = state.peak_decode_cohort_members.max(members);
+        assert!(
+            state.active_decode_cohorts <= self.config.worker_limit(),
+            "one worker owns at most one active source cohort"
+        );
+        assert!(
+            members <= self.config.worker_limit(),
+            "one source cohort is bounded by the existing worker limit"
+        );
+    }
+
+    fn end_decode_cohort(&self) {
+        let mut state = self.lock_state();
+        state.active_decode_cohorts = state
+            .active_decode_cohorts
+            .checked_sub(1)
+            .expect("each active source cohort ends exactly once");
     }
 
     fn update_progress(&self, job_id: u64, written_bytes: u64, reserved_bytes: u64) {
@@ -449,6 +943,7 @@ impl RuntimeShared {
                         .expect("the reservation-bound sink reports bounded progress");
             }
         }
+        state.progress_updates = state.progress_updates.saturating_add(1);
     }
 
     fn finish_failure(&self, job_id: u64, code: RuntimeFaultCode, started: bool) {
@@ -482,13 +977,28 @@ impl RuntimeShared {
         }
     }
 
-    fn finish_success(&self, job_id: u64, bytes: Box<[u8]>, charge: LedgerCharge) {
+    fn finish_success(
+        &self,
+        job_id: u64,
+        bytes: Box<[u8]>,
+        facts: ResourcePayloadFacts,
+        charge: LedgerCharge,
+        decode_elapsed: Duration,
+    ) {
         let target = {
-            let state = self.lock_state();
+            let mut state = self.lock_state();
             let Some(job) = state.jobs.get(&job_id) else {
                 return;
             };
             if job.waiters.is_empty() {
+                let discarded_bytes = job.descriptor.byte_len();
+                state.cancelled_decode_executions =
+                    state.cancelled_decode_executions.saturating_add(1);
+                state.cancelled_decode_time_ns = state
+                    .cancelled_decode_time_ns
+                    .saturating_add(duration_ns(decode_elapsed));
+                state.cancelled_decode_bytes =
+                    state.cancelled_decode_bytes.saturating_add(discarded_bytes);
                 drop(state);
                 self.finish_failure(job_id, RuntimeFaultCode::Cancelled, true);
                 return;
@@ -511,19 +1021,27 @@ impl RuntimeShared {
         };
         state.completed_decodes = state.completed_decodes.saturating_add(1);
         if job.waiters.is_empty() {
+            state.cancelled_decode_executions = state.cancelled_decode_executions.saturating_add(1);
+            state.cancelled_decode_time_ns = state
+                .cancelled_decode_time_ns
+                .saturating_add(duration_ns(decode_elapsed));
+            state.cancelled_decode_bytes = state
+                .cancelled_decode_bytes
+                .saturating_add(job.descriptor.byte_len());
             return;
         }
         let lease = AccountedResourceLease {
             inner: Arc::new(AccountedPayload {
                 key: job.key.resource(),
                 descriptor: job.descriptor,
+                facts,
                 bytes,
                 charge: RuntimeCharge::Production(charge),
             }),
         };
         if let Some(cache_charge) = cache_charge {
             let touch = state.touch();
-            state.cache.insert(
+            state.insert_cache_entry(
                 job.key.resource(),
                 CacheEntry {
                     lease: lease.clone(),
@@ -561,7 +1079,6 @@ impl RuntimeShared {
         charge: &LedgerCharge,
         target: CpuLedgerCategory,
     ) -> Result<(), CpuLedgerError> {
-        let mut considered: Vec<DatasetResourceKey> = Vec::new();
         loop {
             match charge.reclassify(target) {
                 Ok(()) => return Ok(()),
@@ -569,19 +1086,13 @@ impl RuntimeShared {
                     let evicted = {
                         let mut state = self.lock_state();
                         let current_key = state.jobs.get(&job_id).map(|job| job.key.resource());
-                        let candidate = state
-                            .cache
-                            .iter()
-                            .filter(|(key, entry)| {
-                                Some(**key) != current_key
-                                    && entry.lease.ledger_category() == target
-                                    && !considered.contains(*key)
-                            })
-                            .min_by_key(|(_, entry)| entry.last_touch)
-                            .map(|(key, _)| *key);
+                        let candidate = state.oldest_cache_key(target, current_key);
                         candidate.and_then(|key| {
-                            considered.push(key);
-                            state.cache.remove(&key)
+                            let removed = state.remove_cache_entry(&key);
+                            if removed.is_some() {
+                                state.cache_evictions = state.cache_evictions.saturating_add(1);
+                            }
+                            removed
                         })
                     };
                     if evicted.is_none() {
@@ -596,14 +1107,31 @@ impl RuntimeShared {
 }
 
 impl ProductionDatasetRuntime {
+    #[allow(
+        clippy::result_large_err,
+        reason = "the frozen DatasetSource contract requires its context-rich typed fault"
+    )]
     fn submit_inner(&self, request: ResourceRequest) -> Result<RequestTicket, RuntimeFault> {
         let descriptor = self
             .shared
             .catalog
             .resource_payload_descriptor(request.resource())
             .map_err(|_| RuntimeFault::for_request(RuntimeFaultCode::SourceRejected, request))?;
+        let working_bytes = catch_unwind(AssertUnwindSafe(|| {
+            self.shared
+                .source
+                .minimum_decode_working_bytes(request.resource(), descriptor)
+        }))
+        .map_err(|_| RuntimeFault::for_request(RuntimeFaultCode::InvariantViolation, request))?
+        .map_err(|fault| RuntimeFault::for_request(map_source_fault_code(&fault), request))?;
+        let admission_bytes = descriptor
+            .byte_len()
+            .checked_add(working_bytes)
+            .ok_or_else(|| {
+                RuntimeFault::for_request(RuntimeFaultCode::MinimumWorkUnitExceedsBudget, request)
+            })?;
         let destination = destination_category(request.priority());
-        if descriptor.byte_len()
+        if admission_bytes
             > self
                 .shared
                 .config
@@ -694,12 +1222,7 @@ impl ProductionDatasetRuntime {
                 )
                 .map_err(|error| RuntimeFault::for_ticket(map_ledger_error_code(error), ticket))?;
             }
-            let touch = state.touch();
-            state
-                .cache
-                .get_mut(&request.resource())
-                .expect("the cache entry remains present while locked")
-                .last_touch = touch;
+            state.touch_cache_entry(request.resource());
             let progress =
                 RuntimeRequestProgress::new(ticket, descriptor.byte_len(), descriptor.byte_len())
                     .map_err(|code| RuntimeFault::for_ticket(code, ticket))?;
@@ -716,18 +1239,21 @@ impl ProductionDatasetRuntime {
             );
             state.submitted_requests = state.submitted_requests.saturating_add(1);
             state.ready_requests = state.ready_requests.saturating_add(1);
+            state.cache_hits = state.cache_hits.saturating_add(1);
             state.push_completion(
                 RuntimeCompletion::new(ticket, RuntimeOutcome::Ready(lease)),
                 self.shared.config.completion_queue_limit(),
             );
             return Ok(ticket);
         }
+        state.cache_misses = state.cache_misses.saturating_add(1);
 
         let progress = RuntimeRequestProgress::new(ticket, 0, descriptor.byte_len())
             .map_err(|code| RuntimeFault::for_ticket(code, ticket))?;
         let dedupe_key = request.dedupe_key();
         let job_id = if let Some(job_id) = state.dedupe.get(&dedupe_key).copied() {
             let mut queue_update = None;
+            let mut priority_change = None;
             {
                 let job = state
                     .jobs
@@ -735,8 +1261,10 @@ impl ProductionDatasetRuntime {
                     .expect("the dedupe index points to a live job");
                 job.waiters.push(id);
                 if request.priority().outranks(job.priority) {
+                    let previous = job.priority;
                     job.priority = request.priority();
                     if job.phase == JobPhase::Queued {
+                        priority_change = Some((previous, job.priority));
                         job.queue_version = job.queue_version.saturating_add(1);
                         queue_update = Some(QueueEntry {
                             priority: job.priority,
@@ -747,8 +1275,11 @@ impl ProductionDatasetRuntime {
                     }
                 }
             }
+            if let Some((previous, next)) = priority_change {
+                state.change_queued_priority(previous, next);
+            }
             if let Some(entry) = queue_update {
-                state.replace_queued_entry(entry);
+                state.enqueue_version(entry, self.shared.config.request_queue_limit());
             }
             job_id
         } else {
@@ -761,6 +1292,7 @@ impl ProductionDatasetRuntime {
             let job = DecodeJob {
                 key: dedupe_key,
                 descriptor,
+                admission_bytes,
                 waiters: vec![id],
                 priority: request.priority(),
                 phase: JobPhase::Queued,
@@ -768,15 +1300,20 @@ impl ProductionDatasetRuntime {
                 queue_version: 0,
                 queue_sequence: sequence,
                 cancellation: Arc::new(AtomicBool::new(false)),
+                queued_at: Instant::now(),
             };
             state.dedupe.insert(dedupe_key, job_id);
             state.jobs.insert(job_id, job);
-            state.replace_queued_entry(QueueEntry {
-                priority: request.priority(),
-                sequence,
-                job_id,
-                version: 0,
-            });
+            state.add_queued_job(admission_bytes, request.priority());
+            state.enqueue_version(
+                QueueEntry {
+                    priority: request.priority(),
+                    sequence,
+                    job_id,
+                    version: 0,
+                },
+                self.shared.config.request_queue_limit(),
+            );
             job_id
         };
         state.requests.insert(
@@ -791,8 +1328,14 @@ impl ProductionDatasetRuntime {
             },
         );
         state.submitted_requests = state.submitted_requests.saturating_add(1);
+        let preemption_requested = state
+            .request_foreground_preemption(request.priority(), self.shared.config.worker_limit());
         drop(state);
-        self.shared.work_available.notify_one();
+        if preemption_requested {
+            self.shared.work_available.notify_all();
+        } else {
+            self.shared.work_available.notify_one();
+        }
         Ok(ticket)
     }
 }
@@ -805,11 +1348,133 @@ impl CpuByteLedger for ProductionDatasetRuntime {
     ) -> Result<Box<dyn CpuByteLease>, CpuLedgerError> {
         Ok(Box::new(self.shared.ledger.acquire(category, bytes)?))
     }
+
+    fn capacity_epoch(&self) -> u64 {
+        self.shared.ledger.capacity_epoch()
+    }
 }
 
 impl DatasetRuntime for ProductionDatasetRuntime {
+    fn config(&self) -> DatasetRuntimeConfig {
+        self.shared.config
+    }
+
     fn submit(&self, request: ResourceRequest) -> Result<RequestTicket, RuntimeFault> {
         self.submit_inner(request)
+    }
+
+    fn promote_priority(
+        &self,
+        ticket: RequestTicket,
+        priority: RequestPriority,
+    ) -> Result<bool, RuntimeFault> {
+        let mut state = self.shared.lock_state();
+        if state.shutdown != ShutdownState::Running {
+            return Err(RuntimeFault::for_ticket(
+                RuntimeFaultCode::ShuttingDown,
+                ticket,
+            ));
+        }
+        let Some(record) = state.requests.get(&ticket.id()) else {
+            return Ok(false);
+        };
+        if record.ticket != ticket {
+            return Err(RuntimeFault::for_ticket(
+                RuntimeFaultCode::InvariantViolation,
+                ticket,
+            ));
+        }
+        if record.terminal || !priority.outranks(record.request.priority()) {
+            return Ok(false);
+        }
+        let promoted_request = record.request.with_priority(priority);
+        let job_id = record.job_id.ok_or_else(|| {
+            RuntimeFault::for_ticket(RuntimeFaultCode::InvariantViolation, ticket)
+        })?;
+
+        let mut queue_update = None;
+        let mut queued_priority_change = None;
+        {
+            let job = state.jobs.get_mut(&job_id).ok_or_else(|| {
+                RuntimeFault::for_ticket(RuntimeFaultCode::InvariantViolation, ticket)
+            })?;
+            if priority.outranks(job.priority) {
+                let previous = job.priority;
+                job.priority = priority;
+                if job.phase == JobPhase::Queued {
+                    job.queue_version = job.queue_version.saturating_add(1);
+                    queued_priority_change = Some((previous, priority));
+                    queue_update = Some(QueueEntry {
+                        priority,
+                        sequence: job.queue_sequence,
+                        job_id,
+                        version: job.queue_version,
+                    });
+                }
+            }
+        }
+        state
+            .requests
+            .get_mut(&ticket.id())
+            .expect("the validated live request remains installed")
+            .request = promoted_request;
+        if let Some((previous, next)) = queued_priority_change {
+            state.change_queued_priority(previous, next);
+        }
+        if let Some(entry) = queue_update {
+            state.enqueue_version(entry, self.shared.config.request_queue_limit());
+        }
+        let preemption_requested =
+            state.request_foreground_preemption(priority, self.shared.config.worker_limit());
+        drop(state);
+        if preemption_requested {
+            self.shared.work_available.notify_all();
+        } else {
+            self.shared.work_available.notify_one();
+        }
+        Ok(true)
+    }
+
+    fn cancel_many(&self, tickets: &[RequestTicket]) -> Result<(), RuntimeFault> {
+        if tickets.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.shared.lock_state();
+        if state.shutdown != ShutdownState::Running {
+            return Err(tickets.first().map_or_else(
+                || RuntimeFault::new(RuntimeFaultCode::ShuttingDown),
+                |ticket| RuntimeFault::for_ticket(RuntimeFaultCode::ShuttingDown, *ticket),
+            ));
+        }
+        let mut has_live = false;
+        for ticket in tickets {
+            let Some(record) = state.requests.get(&ticket.id()) else {
+                return Err(RuntimeFault::for_ticket(
+                    RuntimeFaultCode::InvariantViolation,
+                    *ticket,
+                ));
+            };
+            if record.ticket != *ticket {
+                return Err(RuntimeFault::for_ticket(
+                    RuntimeFaultCode::InvariantViolation,
+                    *ticket,
+                ));
+            }
+            has_live |= !record.terminal;
+        }
+        if has_live {
+            cancel_request_ids(
+                &mut state,
+                tickets.iter().map(|ticket| ticket.id()),
+                self.shared.config.completion_queue_limit(),
+                self.shared.config.request_queue_limit(),
+            );
+        }
+        drop(state);
+        if has_live {
+            self.shared.work_available.notify_all();
+        }
+        Ok(())
     }
 
     fn cancel_before(&self, current: CancellationGeneration) -> Result<(), RuntimeFault> {
@@ -860,8 +1525,9 @@ impl DatasetRuntime for ProductionDatasetRuntime {
             .collect::<Vec<_>>();
         cancel_request_ids(
             &mut state,
-            &ids,
+            ids,
             self.shared.config.completion_queue_limit(),
+            self.shared.config.request_queue_limit(),
         );
         drop(state);
         self.shared.work_available.notify_all();
@@ -890,6 +1556,11 @@ impl DatasetRuntime for ProductionDatasetRuntime {
     }
 
     fn diagnostics(&self) -> Result<DatasetRuntimeDiagnostics, RuntimeFault> {
+        // Runtime mutations acquire the byte ledger before scheduler state.
+        // Never invert that order here: diagnostics is allowed to observe a
+        // near-simultaneous ledger snapshot, but it must not deadlock submit,
+        // completion, or eviction while the panel is open.
+        let ledger_snapshot = self.shared.ledger.snapshot();
         let state = self.shared.lock_state();
         let queued_requests = state
             .jobs
@@ -897,20 +1568,13 @@ impl DatasetRuntime for ProductionDatasetRuntime {
             .filter(|job| job.phase == JobPhase::Queued)
             .map(|job| job.waiters.len())
             .sum();
-        let in_flight_decodes = state
-            .jobs
-            .values()
-            .filter(|job| {
-                job.decode_started
-                    && matches!(
-                        job.phase,
-                        JobPhase::Claimed | JobPhase::InFlight | JobPhase::Aborting
-                    )
-            })
-            .count();
-        DatasetRuntimeDiagnostics::new(
+        // This remains an execution/worker count, not a member count. A
+        // worker owns one source cohort at a time; cumulative and peak cohort
+        // member counts are exposed separately below.
+        let in_flight_decodes = state.active_decode_cohorts;
+        DatasetRuntimeDiagnostics::new_with_performance(
             self.shared.config,
-            self.shared.ledger.snapshot(),
+            ledger_snapshot,
             queued_requests,
             in_flight_decodes,
             state.completions.len(),
@@ -921,6 +1585,21 @@ impl DatasetRuntime for ProductionDatasetRuntime {
             state.ready_requests,
             state.cancelled_requests,
             state.failed_requests,
+            DatasetRuntimePerformanceCounters::new(
+                state.cache_hits,
+                state.cache_misses,
+                state.cache_evictions,
+                state.progress_updates,
+                state.queue_wait_ns,
+                state.decode_time_ns,
+                state.decoded_output_bytes,
+                state.cancelled_decode_executions,
+                state.cancelled_decode_time_ns,
+                state.cancelled_decode_bytes,
+                state.decode_cohorts,
+                state.decode_cohort_members,
+                u64::try_from(state.peak_decode_cohort_members).unwrap_or(u64::MAX),
+            ),
         )
         .map_err(RuntimeFault::new)
     }
@@ -976,10 +1655,15 @@ impl Drop for ProductionDatasetRuntime {
     }
 }
 
-fn cancel_request_ids(state: &mut RuntimeState, ids: &[RuntimeRequestId], completion_limit: usize) {
+fn cancel_request_ids(
+    state: &mut RuntimeState,
+    ids: impl IntoIterator<Item = RuntimeRequestId>,
+    completion_limit: usize,
+    request_limit: usize,
+) {
     let mut affected_jobs = Vec::new();
     for id in ids {
-        let Some(record) = state.requests.get_mut(id) else {
+        let Some(record) = state.requests.get_mut(&id) else {
             continue;
         };
         if record.terminal {
@@ -989,9 +1673,6 @@ fn cancel_request_ids(state: &mut RuntimeState, ids: &[RuntimeRequestId], comple
         let ticket = record.ticket;
         if let Some(job_id) = record.job_id {
             affected_jobs.push(job_id);
-            if let Some(job) = state.jobs.get_mut(&job_id) {
-                job.waiters.retain(|waiter| waiter != id);
-            }
         }
         state.cancelled_requests = state.cancelled_requests.saturating_add(1);
         state.push_completion(
@@ -1002,6 +1683,11 @@ fn cancel_request_ids(state: &mut RuntimeState, ids: &[RuntimeRequestId], comple
     affected_jobs.sort_unstable();
     affected_jobs.dedup();
     for job_id in affected_jobs {
+        if let Some(job) = state.jobs.get_mut(&job_id) {
+            let requests = &state.requests;
+            job.waiters
+                .retain(|waiter| requests.get(waiter).is_some_and(|record| !record.terminal));
+        }
         let Some(job) = state.jobs.get(&job_id) else {
             continue;
         };
@@ -1010,7 +1696,10 @@ fn cancel_request_ids(state: &mut RuntimeState, ids: &[RuntimeRequestId], comple
                 JobPhase::Queued => {
                     state.remove_job(job_id);
                 }
-                JobPhase::Claimed | JobPhase::InFlight | JobPhase::Aborting => {
+                JobPhase::Claimed
+                | JobPhase::InFlight
+                | JobPhase::Yielding
+                | JobPhase::Aborting => {
                     let key = job.key;
                     let cancellation = Arc::clone(&job.cancellation);
                     if state.dedupe.get(&key).copied() == Some(job_id) {
@@ -1037,138 +1726,316 @@ fn cancel_request_ids(state: &mut RuntimeState, ids: &[RuntimeRequestId], comple
             })
             .max()
             .expect("a nonempty waiter set has an effective priority");
-        let queue_update = {
+        let (queue_update, priority_change) = {
             let job = state
                 .jobs
                 .get_mut(&job_id)
                 .expect("the affected job remains present");
             if priority == job.priority {
-                None
+                (None, None)
             } else {
+                let previous = job.priority;
                 job.priority = priority;
                 if job.phase == JobPhase::Queued {
                     job.queue_version = job.queue_version.saturating_add(1);
-                    Some(QueueEntry {
-                        priority,
-                        sequence: job.queue_sequence,
-                        job_id,
-                        version: job.queue_version,
-                    })
+                    (
+                        Some(QueueEntry {
+                            priority,
+                            sequence: job.queue_sequence,
+                            job_id,
+                            version: job.queue_version,
+                        }),
+                        Some((previous, priority)),
+                    )
                 } else {
-                    None
+                    (None, None)
                 }
             }
         };
+        if let Some((previous, next)) = priority_change {
+            state.change_queued_priority(previous, next);
+        }
         if let Some(entry) = queue_update {
-            state.replace_queued_entry(entry);
+            state.enqueue_version(entry, request_limit);
         }
     }
 }
 
 fn worker_loop(shared: Arc<RuntimeShared>) {
-    while let Some(claim) = shared.claim_job() {
-        let charge = match shared.ledger.acquire(
+    while let Some(first_claim) = shared.claim_job() {
+        let observed_capacity_epoch = shared.ledger.capacity_epoch();
+        let first_charge = match shared.ledger.acquire(
             CpuLedgerCategory::InFlightDecode,
-            claim.descriptor.byte_len(),
+            first_claim.descriptor.byte_len(),
         ) {
             Ok(charge) => charge,
             Err(CpuLedgerError::CapacityExceeded { .. }) => {
-                shared.requeue_claim(&claim);
-                shared.ledger.wait_for_change();
+                if let Err(code) = shared.requeue_claim(&first_claim) {
+                    shared.finish_failure(first_claim.job_id, code, false);
+                    continue;
+                }
+                shared.ledger.wait_for_change_after(observed_capacity_epoch);
                 continue;
             }
             Err(error) => {
-                shared.finish_failure(claim.job_id, map_ledger_error_code(error), false);
+                shared.finish_failure(first_claim.job_id, map_ledger_error_code(error), false);
                 continue;
             }
         };
-        let byte_len = match usize::try_from(claim.descriptor.byte_len()) {
-            Ok(byte_len) => byte_len,
-            Err(_) => {
+
+        shared.begin_worker_claim(first_claim.priority);
+        let _worker_claim = WorkerClaimGuard {
+            shared: Arc::clone(&shared),
+            priority: first_claim.priority,
+        };
+
+        let mut claimed = vec![(first_claim, first_charge)];
+        let mut uncharged_working_bytes = claimed[0]
+            .0
+            .admission_bytes
+            .saturating_sub(claimed[0].0.descriptor.byte_len());
+        // Only the highest priority can be safely executed as a multi-member
+        // synchronous source cohort: it has no higher class that could arrive
+        // while the source is between members. Lower classes remain one-member
+        // cohorts, so newly visible work waits for at most the currently
+        // decoding lower-priority member rather than an already-claimed batch.
+        if claimed[0].0.priority == RequestPriority::CurrentView {
+            while claimed.len() < shared.config.worker_limit() {
+                // Final buffers already hold exact ledger charges. Subtract
+                // every claimed member's not-yet-acquired source working bound
+                // as a virtual reservation so this cohort cannot overcommit
+                // itself and deterministically retry the same impossible
+                // partition forever. Other workers remain intentionally
+                // optimistic; their genuine races use the source retry path.
+                let available = shared
+                    .ledger
+                    .available(CpuLedgerCategory::InFlightDecode)
+                    .saturating_sub(uncharged_working_bytes);
+                let Some(peer) =
+                    shared.try_claim_cohort_peer(claimed[0].0.priority, available, claimed.len())
+                else {
+                    break;
+                };
+                match shared.ledger.acquire(
+                    CpuLedgerCategory::InFlightDecode,
+                    peer.descriptor.byte_len(),
+                ) {
+                    Ok(charge) => {
+                        uncharged_working_bytes = uncharged_working_bytes.saturating_add(
+                            peer.admission_bytes
+                                .saturating_sub(peer.descriptor.byte_len()),
+                        );
+                        claimed.push((peer, charge));
+                    }
+                    Err(CpuLedgerError::CapacityExceeded { .. }) => {
+                        if let Err(code) = shared.requeue_claim(&peer) {
+                            shared.finish_failure(peer.job_id, code, false);
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        shared.finish_failure(peer.job_id, map_ledger_error_code(error), false);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut sinks = Vec::with_capacity(claimed.len());
+        for (claim, charge) in claimed {
+            if claim.cancellation.load(AtomicOrdering::Acquire) {
+                shared.finish_failure(claim.job_id, RuntimeFaultCode::Cancelled, false);
+                continue;
+            }
+            let byte_len = match usize::try_from(claim.descriptor.byte_len()) {
+                Ok(byte_len) => byte_len,
+                Err(_) => {
+                    shared.finish_failure(
+                        claim.job_id,
+                        RuntimeFaultCode::MinimumWorkUnitExceedsBudget,
+                        false,
+                    );
+                    continue;
+                }
+            };
+            let mut buffer = Vec::new();
+            if buffer.try_reserve_exact(byte_len).is_err() {
                 shared.finish_failure(
                     claim.job_id,
-                    RuntimeFaultCode::MinimumWorkUnitExceedsBudget,
+                    RuntimeFaultCode::CapacityExceeded {
+                        category: CpuLedgerCategory::InFlightDecode,
+                        requested_bytes: claim.descriptor.byte_len(),
+                        available_bytes: 0,
+                    },
                     false,
                 );
                 continue;
             }
-        };
-        let mut buffer = Vec::new();
-        if buffer.try_reserve_exact(byte_len).is_err() {
-            shared.finish_failure(
-                claim.job_id,
-                RuntimeFaultCode::CapacityExceeded {
-                    category: CpuLedgerCategory::InFlightDecode,
-                    requested_bytes: claim.descriptor.byte_len(),
-                    available_bytes: 0,
-                },
-                false,
-            );
+            buffer.resize(byte_len, 0);
+            if !shared.activate_claim(&claim) {
+                continue;
+            }
+            sinks.push(RuntimeDecodeSink {
+                shared: Arc::clone(&shared),
+                job_id: claim.job_id,
+                key: claim.key,
+                descriptor: claim.descriptor,
+                cancellation: claim.cancellation,
+                buffer,
+                written: 0,
+                last_reported: 0,
+                offered_span: 0,
+                finished: false,
+                facts: None,
+                charge: Some(charge),
+            });
+        }
+        if sinks.is_empty() {
             continue;
         }
-        buffer.resize(byte_len, 0);
-        if !shared.activate_claim(&claim) {
-            continue;
-        }
-        let mut sink = RuntimeDecodeSink {
-            shared: Arc::clone(&shared),
-            job_id: claim.job_id,
-            key: claim.key,
-            descriptor: claim.descriptor,
-            cancellation: claim.cancellation,
-            buffer,
-            written: 0,
-            finished: false,
-            charge: Some(charge),
-        };
+
+        shared.begin_decode_cohort(sinks.len());
+        let decode_started = Instant::now();
         let decode = catch_unwind(AssertUnwindSafe(|| {
-            shared
-                .source
-                .decode_into(&mut sink)
-                .map_err(|fault| map_source_fault_code(&fault))
+            let mut cohort = sinks
+                .iter_mut()
+                .map(|sink| sink as &mut dyn ReservedDecodeSink)
+                .collect::<Vec<_>>();
+            shared.source.decode_cohort_into(&mut cohort)
         }));
-        match decode {
-            Err(_) => {
-                shared.finish_failure(claim.job_id, RuntimeFaultCode::InvariantViolation, true)
-            }
-            Ok(Err(code)) => shared.finish_failure(claim.job_id, code, true),
-            Ok(Ok(())) if !sink.finished => {
-                shared.finish_failure(claim.job_id, RuntimeFaultCode::SinkRejected, true)
-            }
-            Ok(Ok(())) => {
-                let (bytes, charge) = sink.into_parts();
-                shared.finish_success(claim.job_id, bytes, charge);
+        let decode_elapsed = decode_started.elapsed();
+        shared.end_decode_cohort();
+        let written_bytes = sinks.iter().fold(0_u64, |total, sink| {
+            total.saturating_add(sink.written as u64)
+        });
+        shared.record_decode_observation(decode_elapsed, written_bytes);
+        let member_elapsed = decode_elapsed / u32::try_from(sinks.len()).unwrap_or(u32::MAX);
+        let outcomes = match decode {
+            Err(_) => None,
+            Ok(outcomes) if outcomes.len() != sinks.len() => None,
+            Ok(outcomes) => Some(outcomes),
+        };
+        for (index, sink) in sinks.into_iter().enumerate() {
+            let job_id = sink.job_id;
+            let outcome = outcomes
+                .as_ref()
+                .map(|outcomes| &outcomes[index])
+                .map(|outcome| outcome.as_ref().map_err(map_source_fault_code));
+            match outcome {
+                None => shared.finish_failure(job_id, RuntimeFaultCode::InvariantViolation, true),
+                Some(Err(code)) => {
+                    if code == RuntimeFaultCode::Cancelled {
+                        let written = sink.written as u64;
+                        drop(sink);
+                        // Only a runtime-issued Yielding phase may convert the
+                        // source's cancellation outcome back into queued work.
+                        // Ordinary cancellation first moves the job to
+                        // Aborting and therefore remains terminal.
+                        match shared.retry_preempted(job_id) {
+                            Ok(true) => continue,
+                            Ok(false) => {
+                                shared.record_cancelled_decode_waste(member_elapsed, written);
+                                shared.finish_failure(job_id, code, true);
+                            }
+                            Err(retry_code) => {
+                                shared.finish_failure(job_id, retry_code, true);
+                            }
+                        }
+                        continue;
+                    }
+                    if sink.written == 0
+                        && !sink.finished
+                        && matches!(
+                            code,
+                            RuntimeFaultCode::CapacityExceeded {
+                                category: CpuLedgerCategory::InFlightDecode,
+                                ..
+                            }
+                        )
+                    {
+                        // The source's pure admission bound established that
+                        // this job fits when run alone. A source-side capacity
+                        // miss is therefore only a race with another cohort's
+                        // exact staging/scratch leases. Release this final
+                        // buffer and retry instead of terminally failing valid
+                        // submitted work.
+                        drop(sink);
+                        if let Err(retry_code) = shared.retry_in_flight_capacity(job_id) {
+                            shared.finish_failure(job_id, retry_code, true);
+                        }
+                        continue;
+                    }
+                    shared.finish_failure(job_id, code, true);
+                }
+                Some(Ok(())) if !sink.finished => {
+                    shared.finish_failure(job_id, RuntimeFaultCode::SinkRejected, true)
+                }
+                Some(Ok(())) => {
+                    let (bytes, facts, charge) = sink.into_parts();
+                    shared.finish_success(job_id, bytes, facts, charge, member_elapsed);
+                }
             }
         }
+    }
+}
+
+struct WorkerClaimGuard {
+    shared: Arc<RuntimeShared>,
+    priority: RequestPriority,
+}
+
+impl Drop for WorkerClaimGuard {
+    fn drop(&mut self) {
+        self.shared.end_worker_claim(self.priority);
     }
 }
 
 struct RuntimeDecodeSink {
     shared: Arc<RuntimeShared>,
     job_id: u64,
-    key: DatasetResourceKey,
+    key: BrickKey,
     descriptor: ResourcePayloadDescriptor,
     cancellation: Arc<AtomicBool>,
     buffer: Vec<u8>,
     written: usize,
+    last_reported: usize,
+    offered_span: usize,
     finished: bool,
+    facts: Option<ResourcePayloadFacts>,
     charge: Option<LedgerCharge>,
 }
 
 impl RuntimeDecodeSink {
-    fn into_parts(mut self) -> (Box<[u8]>, LedgerCharge) {
+    fn into_parts(mut self) -> (Box<[u8]>, ResourcePayloadFacts, LedgerCharge) {
         assert!(self.finished);
         (
             std::mem::take(&mut self.buffer).into_boxed_slice(),
+            self.facts
+                .take()
+                .expect("a completed sink retains decoded payload facts"),
             self.charge
                 .take()
                 .expect("a completed sink retains its in-flight charge"),
         )
     }
+
+    fn report_progress_after_advance(&mut self) {
+        let report = self.last_reported == 0
+            || self.written == self.buffer.len()
+            || self.written.saturating_sub(self.last_reported) >= PROGRESS_UPDATE_GRANULARITY_BYTES;
+        if report {
+            self.shared.update_progress(
+                self.job_id,
+                self.written as u64,
+                self.descriptor.byte_len(),
+            );
+            self.last_reported = self.written;
+        }
+    }
 }
 
 impl ReservedDecodeSink for RuntimeDecodeSink {
-    fn resource_key(&self) -> DatasetResourceKey {
+    fn resource_key(&self) -> BrickKey {
         self.key
     }
 
@@ -1184,12 +2051,60 @@ impl ReservedDecodeSink for RuntimeDecodeSink {
         self.cancellation.load(AtomicOrdering::Acquire)
     }
 
+    fn writable_span(&mut self, maximum_bytes: usize) -> Result<&mut [u8], DecodeSinkError> {
+        if self.is_cancelled() {
+            return Err(DecodeSinkError::Cancelled);
+        }
+        if self.finished {
+            return Err(DecodeSinkError::AlreadyFinished);
+        }
+        if self.offered_span != 0 {
+            return Err(DecodeSinkError::WritableSpanOutstanding);
+        }
+        let remaining = self.buffer.len().saturating_sub(self.written);
+        if maximum_bytes == 0 || remaining == 0 {
+            return Err(DecodeSinkError::InvalidWritableSpanRequest);
+        }
+        let offered = remaining.min(maximum_bytes);
+        self.offered_span = offered;
+        Ok(&mut self.buffer[self.written..self.written + offered])
+    }
+
+    fn commit_written(&mut self, bytes: usize) -> Result<(), DecodeSinkError> {
+        if self.is_cancelled() {
+            return Err(DecodeSinkError::Cancelled);
+        }
+        if self.finished {
+            return Err(DecodeSinkError::AlreadyFinished);
+        }
+        let offered = self.offered_span;
+        if offered == 0 {
+            return Err(DecodeSinkError::WritableCommitWithoutSpan);
+        }
+        if bytes > offered {
+            return Err(DecodeSinkError::WritableCommitExceeded {
+                offered,
+                attempted: bytes,
+            });
+        }
+        self.written = self
+            .written
+            .checked_add(bytes)
+            .ok_or(DecodeSinkError::ByteCountOverflow)?;
+        self.offered_span = 0;
+        self.report_progress_after_advance();
+        Ok(())
+    }
+
     fn write(&mut self, bytes: &[u8]) -> Result<(), DecodeSinkError> {
         if self.is_cancelled() {
             return Err(DecodeSinkError::Cancelled);
         }
         if self.finished {
             return Err(DecodeSinkError::AlreadyFinished);
+        }
+        if self.offered_span != 0 {
+            return Err(DecodeSinkError::WritableSpanOutstanding);
         }
         let end = self
             .written
@@ -1203,8 +2118,7 @@ impl ReservedDecodeSink for RuntimeDecodeSink {
         }
         self.buffer[self.written..end].copy_from_slice(bytes);
         self.written = end;
-        self.shared
-            .update_progress(self.job_id, self.written as u64, self.descriptor.byte_len());
+        self.report_progress_after_advance();
         Ok(())
     }
 
@@ -1214,6 +2128,9 @@ impl ReservedDecodeSink for RuntimeDecodeSink {
         }
         if self.finished {
             return Err(DecodeSinkError::AlreadyFinished);
+        }
+        if self.offered_span != 0 {
+            return Err(DecodeSinkError::WritableSpanOutstanding);
         }
         if self.written != self.buffer.len() {
             return Err(DecodeSinkError::Incomplete {
@@ -1225,12 +2142,42 @@ impl ReservedDecodeSink for RuntimeDecodeSink {
             .map_err(|_| DecodeSinkError::ByteCountOverflow)?;
         let (values, validity) = self.buffer.split_at(value_len);
         let validity = (self.descriptor.validity_byte_len() != 0).then_some(validity);
-        self.descriptor.view(values, validity).map_err(|_| {
+        let payload = self.descriptor.view(values, validity).map_err(|_| {
             DecodeSinkError::ReservationExceeded {
                 reserved: self.descriptor.byte_len(),
                 attempted: self.descriptor.byte_len(),
             }
         })?;
+        self.facts = Some(
+            ResourcePayloadFacts::from_payload(payload)
+                .map_err(|_| DecodeSinkError::InvalidPayloadValues)?,
+        );
+        self.finished = true;
+        Ok(())
+    }
+
+    fn finish_with_facts(&mut self, facts: ResourcePayloadFacts) -> Result<(), DecodeSinkError> {
+        if self.is_cancelled() {
+            return Err(DecodeSinkError::Cancelled);
+        }
+        if self.finished {
+            return Err(DecodeSinkError::AlreadyFinished);
+        }
+        if self.offered_span != 0 {
+            return Err(DecodeSinkError::WritableSpanOutstanding);
+        }
+        if self.written != self.buffer.len() {
+            return Err(DecodeSinkError::Incomplete {
+                reserved: self.descriptor.byte_len(),
+                written: self.written as u64,
+            });
+        }
+        if self.descriptor.validity() == mirante4d_dataset::ResourceValidity::AllValid
+            && !facts.all_valid()
+        {
+            return Err(DecodeSinkError::InvalidPayloadValues);
+        }
+        self.facts = Some(facts);
         self.finished = true;
         Ok(())
     }
@@ -1248,32 +2195,33 @@ fn destination_category(priority: RequestPriority) -> CpuLedgerCategory {
     }
 }
 
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
 fn reclassify_cached_with_eviction(
     state: &mut RuntimeState,
-    current_key: DatasetResourceKey,
+    current_key: BrickKey,
     charge: &LedgerCharge,
     target: CpuLedgerCategory,
 ) -> Result<(), CpuLedgerError> {
-    let mut considered: Vec<DatasetResourceKey> = Vec::new();
+    let old_category = charge.category();
     loop {
         match charge.reclassify(target) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                state.reclassify_cache_entry_index(current_key, old_category, target);
+                return Ok(());
+            }
             Err(error @ CpuLedgerError::CapacityExceeded { .. }) => {
-                let candidate = state
-                    .cache
-                    .iter()
-                    .filter(|(key, entry)| {
-                        **key != current_key
-                            && entry.lease.ledger_category() == target
-                            && !considered.contains(*key)
-                    })
-                    .min_by_key(|(_, entry)| entry.last_touch)
-                    .map(|(key, _)| *key);
+                let candidate = state.oldest_cache_key(target, Some(current_key));
                 let Some(candidate) = candidate else {
                     return Err(error);
                 };
-                considered.push(candidate);
-                drop(state.cache.remove(&candidate));
+                let removed = state.remove_cache_entry(&candidate);
+                if removed.is_some() {
+                    state.cache_evictions = state.cache_evictions.saturating_add(1);
+                }
+                drop(removed);
             }
             Err(error) => return Err(error),
         }
@@ -1345,6 +2293,7 @@ mod tests {
         None,
         BeforeWrite,
         AfterFirstByte,
+        AfterFinish,
     }
 
     struct TestSource {
@@ -1359,6 +2308,7 @@ mod tests {
     struct GateState {
         entered: usize,
         first_byte_written: usize,
+        finished: usize,
         released: bool,
     }
 
@@ -1388,6 +2338,7 @@ mod tests {
                     Mutex::new(GateState {
                         entered: 0,
                         first_byte_written: 0,
+                        finished: 0,
                         released: matches!(gate_point, GatePoint::None),
                     }),
                     Condvar::new(),
@@ -1439,6 +2390,19 @@ mod tests {
             }
         }
 
+        fn wait_finished(&self) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (lock, changed) = &self.gate;
+            let mut state = lock.lock().unwrap();
+            while state.finished == 0 {
+                assert!(Instant::now() < deadline, "decode did not finish in time");
+                state = changed
+                    .wait_timeout(state, Duration::from_millis(5))
+                    .unwrap()
+                    .0;
+            }
+        }
+
         #[allow(
             clippy::result_large_err,
             reason = "the frozen DatasetSource contract requires this exact typed fault"
@@ -1466,80 +2430,582 @@ mod tests {
             Ok(Arc::clone(&self.catalog))
         }
 
-        fn decode_into(&self, sink: &mut dyn ReservedDecodeSink) -> Result<(), DatasetSourceFault> {
-            self.decode_count.fetch_add(1, AtomicOrdering::SeqCst);
-            self.decode_order
-                .lock()
-                .unwrap()
-                .push(sink.resource_key().region().origin()[2]);
-            {
-                let (lock, changed) = &self.gate;
-                lock.lock().unwrap().entered += 1;
-                changed.notify_all();
-            }
-            if self.corrupt {
-                return Err(DatasetSourceFault::CorruptResource {
-                    key: sink.resource_key(),
-                });
-            }
-            if matches!(self.gate_point, GatePoint::BeforeWrite) {
-                self.wait_gate(sink)?;
-            }
-
-            let descriptor = sink.payload_descriptor();
-            let value_len = usize::try_from(descriptor.value_byte_len()).unwrap();
-            let origin = sink.resource_key().region().origin()[2] as u8;
-            let values = (0..value_len)
-                .map(|offset| origin.wrapping_add(offset as u8))
-                .collect::<Vec<_>>();
-            if matches!(self.gate_point, GatePoint::AfterFirstByte) {
-                sink.write(&values[..1])
-                    .map_err(|reason| DatasetSourceFault::SinkRejected {
-                        key: sink.resource_key(),
-                        reason: Box::new(reason),
-                    })?;
-                {
-                    let (lock, changed) = &self.gate;
-                    lock.lock().unwrap().first_byte_written += 1;
-                    changed.notify_all();
-                }
-                self.wait_gate(sink)?;
-                sink.write(&values[1..])
-                    .map_err(|reason| DatasetSourceFault::SinkRejected {
-                        key: sink.resource_key(),
-                        reason: Box::new(reason),
-                    })?;
-            } else {
-                sink.write(&values)
-                    .map_err(|reason| DatasetSourceFault::SinkRejected {
-                        key: sink.resource_key(),
-                        reason: Box::new(reason),
-                    })?;
-            }
-            if descriptor.validity_byte_len() != 0 {
-                let sample_count = descriptor.sample_count();
-                let mut mask = vec![0_u8; usize::try_from(descriptor.validity_byte_len()).unwrap()];
-                for index in 0..sample_count {
-                    if index % 2 == 0 {
-                        mask[usize::try_from(index / 8).unwrap()] |= 1 << (index % 8);
+        #[allow(
+            clippy::result_large_err,
+            reason = "the frozen DatasetSource contract requires this exact typed fault"
+        )]
+        fn decode_cohort_into(
+            &self,
+            sinks: &mut [&mut dyn ReservedDecodeSink],
+        ) -> Vec<Result<(), DatasetSourceFault>> {
+            sinks
+                .iter_mut()
+                .map(|sink| {
+                    let sink = &mut **sink;
+                    self.decode_count.fetch_add(1, AtomicOrdering::SeqCst);
+                    self.decode_order
+                        .lock()
+                        .unwrap()
+                        .push(sink.resource_key().region().origin()[2]);
+                    {
+                        let (lock, changed) = &self.gate;
+                        lock.lock().unwrap().entered += 1;
+                        changed.notify_all();
                     }
-                }
-                sink.write(&mask)
-                    .map_err(|reason| DatasetSourceFault::SinkRejected {
-                        key: sink.resource_key(),
-                        reason: Box::new(reason),
-                    })?;
-            }
-            sink.finish()
-                .map_err(|reason| DatasetSourceFault::SinkRejected {
-                    key: sink.resource_key(),
-                    reason: Box::new(reason),
+                    if self.corrupt {
+                        return Err(DatasetSourceFault::CorruptResource {
+                            key: sink.resource_key(),
+                        });
+                    }
+                    if matches!(self.gate_point, GatePoint::BeforeWrite) {
+                        self.wait_gate(sink)?;
+                    }
+
+                    let descriptor = sink.payload_descriptor();
+                    let value_len = usize::try_from(descriptor.value_byte_len()).unwrap();
+                    let origin = sink.resource_key().region().origin()[2] as u8;
+                    let values = (0..value_len)
+                        .map(|offset| origin.wrapping_add(offset as u8))
+                        .collect::<Vec<_>>();
+                    if matches!(self.gate_point, GatePoint::AfterFirstByte) {
+                        sink.write(&values[..1]).map_err(|reason| {
+                            DatasetSourceFault::SinkRejected {
+                                key: sink.resource_key(),
+                                reason: Box::new(reason),
+                            }
+                        })?;
+                        {
+                            let (lock, changed) = &self.gate;
+                            lock.lock().unwrap().first_byte_written += 1;
+                            changed.notify_all();
+                        }
+                        self.wait_gate(sink)?;
+                        sink.write(&values[1..]).map_err(|reason| {
+                            DatasetSourceFault::SinkRejected {
+                                key: sink.resource_key(),
+                                reason: Box::new(reason),
+                            }
+                        })?;
+                    } else {
+                        sink.write(&values)
+                            .map_err(|reason| DatasetSourceFault::SinkRejected {
+                                key: sink.resource_key(),
+                                reason: Box::new(reason),
+                            })?;
+                    }
+                    if descriptor.validity_byte_len() != 0 {
+                        let sample_count = descriptor.sample_count();
+                        let mut mask =
+                            vec![0_u8; usize::try_from(descriptor.validity_byte_len()).unwrap()];
+                        for index in 0..sample_count {
+                            if index % 2 == 0 {
+                                mask[usize::try_from(index / 8).unwrap()] |= 1 << (index % 8);
+                            }
+                        }
+                        sink.write(&mask)
+                            .map_err(|reason| DatasetSourceFault::SinkRejected {
+                                key: sink.resource_key(),
+                                reason: Box::new(reason),
+                            })?;
+                    }
+                    sink.finish()
+                        .map_err(|reason| DatasetSourceFault::SinkRejected {
+                            key: sink.resource_key(),
+                            reason: Box::new(reason),
+                        })?;
+                    if matches!(self.gate_point, GatePoint::AfterFinish) {
+                        let (lock, changed) = &self.gate;
+                        let mut state = lock.lock().unwrap();
+                        state.finished += 1;
+                        changed.notify_all();
+                        while !state.released {
+                            state = changed.wait(state).unwrap();
+                        }
+                    }
+                    Ok(())
                 })
+                .collect()
         }
     }
 
-    fn key(origin_x: u64, samples: u64) -> DatasetResourceKey {
-        DatasetResourceKey::new(
+    #[derive(Clone, Copy)]
+    enum DirectSpanBehavior {
+        Complete,
+        OverrunCommit,
+        IncompleteFinish,
+        OutstandingFinish,
+    }
+
+    struct DirectSpanSource {
+        catalog: Arc<DatasetCatalog>,
+        behavior: DirectSpanBehavior,
+    }
+
+    struct TransientCapacitySource {
+        catalog: Arc<DatasetCatalog>,
+        attempts: AtomicUsize,
+    }
+
+    struct CohortAdmissionSource {
+        catalog: Arc<DatasetCatalog>,
+        ledger: Arc<dyn CpuByteLedger>,
+        control: Arc<CohortAdmissionControl>,
+    }
+
+    #[derive(Default)]
+    struct CohortAdmissionState {
+        blocker_entered: bool,
+        blocker_released: bool,
+        target_cohort_sizes: Vec<usize>,
+        target_capacity_failures: usize,
+    }
+
+    #[derive(Default)]
+    struct CohortAdmissionControl {
+        state: Mutex<CohortAdmissionState>,
+        changed: Condvar,
+    }
+
+    impl CohortAdmissionControl {
+        fn wait_for_blocker(&self) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut state = self.state.lock().unwrap();
+            while !state.blocker_entered {
+                assert!(Instant::now() < deadline, "blocker did not occupy a worker");
+                state = self
+                    .changed
+                    .wait_timeout(state, Duration::from_millis(5))
+                    .unwrap()
+                    .0;
+            }
+        }
+
+        fn release_blocker(&self) {
+            self.state.lock().unwrap().blocker_released = true;
+            self.changed.notify_all();
+        }
+    }
+
+    const VISIBLE_BURST_ORIGIN: u64 = 10_000;
+
+    struct BurstGateSource {
+        catalog: Arc<DatasetCatalog>,
+        gate: (Mutex<BurstGateState>, Condvar),
+    }
+
+    #[derive(Default)]
+    struct BurstGateState {
+        low_members_entered: usize,
+        low_released: bool,
+        visible_members_entered: usize,
+        visible_cohorts_entered: usize,
+        active_visible_cohorts: usize,
+        peak_active_visible_cohorts: usize,
+        largest_visible_cohort: usize,
+        visible_released: bool,
+    }
+
+    impl DirectSpanSource {
+        fn new(behavior: DirectSpanBehavior) -> Arc<Self> {
+            let layer = DatasetLayer::new(
+                LogicalLayerKey::new(0),
+                "intensity",
+                Shape4D::new(1, 1, 1, 65_536).unwrap(),
+                IntensityDType::Uint8,
+                GridToWorld::identity(),
+                ResourceValidity::AllValid,
+            )
+            .unwrap();
+            Arc::new(Self {
+                catalog: Arc::new(
+                    DatasetCatalog::new(
+                        "direct-span-runtime-test",
+                        ScientificIdentityStatus::Unverified(DatasetSourceId::new(41)),
+                        vec![layer],
+                    )
+                    .unwrap(),
+                ),
+                behavior,
+            })
+        }
+    }
+
+    impl TransientCapacitySource {
+        fn new() -> Arc<Self> {
+            let layer = DatasetLayer::new(
+                LogicalLayerKey::new(0),
+                "intensity",
+                Shape4D::new(1, 1, 1, 65_536).unwrap(),
+                IntensityDType::Uint8,
+                GridToWorld::identity(),
+                ResourceValidity::AllValid,
+            )
+            .unwrap();
+            Arc::new(Self {
+                catalog: Arc::new(
+                    DatasetCatalog::new(
+                        "transient-capacity-runtime-test",
+                        ScientificIdentityStatus::Unverified(DatasetSourceId::new(41)),
+                        vec![layer],
+                    )
+                    .unwrap(),
+                ),
+                attempts: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl BurstGateSource {
+        fn new() -> Arc<Self> {
+            let layer = DatasetLayer::new(
+                LogicalLayerKey::new(0),
+                "intensity",
+                Shape4D::new(1, 1, 1, 65_536).unwrap(),
+                IntensityDType::Uint8,
+                GridToWorld::identity(),
+                ResourceValidity::AllValid,
+            )
+            .unwrap();
+            Arc::new(Self {
+                catalog: Arc::new(
+                    DatasetCatalog::new(
+                        "burst-gate-runtime-test",
+                        ScientificIdentityStatus::Unverified(DatasetSourceId::new(41)),
+                        vec![layer],
+                    )
+                    .unwrap(),
+                ),
+                gate: (Mutex::new(BurstGateState::default()), Condvar::new()),
+            })
+        }
+
+        fn wait_for(&self, predicate: impl Fn(&BurstGateState) -> bool, reason: &'static str) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let (lock, changed) = &self.gate;
+            let mut state = lock.lock().unwrap();
+            while !predicate(&state) {
+                assert!(Instant::now() < deadline, "{reason}");
+                state = changed
+                    .wait_timeout(state, Duration::from_millis(5))
+                    .unwrap()
+                    .0;
+            }
+        }
+
+        fn release_low(&self) {
+            let (lock, changed) = &self.gate;
+            lock.lock().unwrap().low_released = true;
+            changed.notify_all();
+        }
+
+        fn release_visible(&self) {
+            let (lock, changed) = &self.gate;
+            lock.lock().unwrap().visible_released = true;
+            changed.notify_all();
+        }
+    }
+
+    impl DatasetSource for DirectSpanSource {
+        fn catalog(&self) -> Result<Arc<DatasetCatalog>, DatasetSourceFault> {
+            Ok(Arc::clone(&self.catalog))
+        }
+
+        #[allow(
+            clippy::result_large_err,
+            reason = "the frozen DatasetSource contract requires this exact typed fault"
+        )]
+        fn decode_cohort_into(
+            &self,
+            sinks: &mut [&mut dyn ReservedDecodeSink],
+        ) -> Vec<Result<(), DatasetSourceFault>> {
+            sinks
+                .iter_mut()
+                .map(|sink| {
+                    let sink = &mut **sink;
+                    let key = sink.resource_key();
+                    let result = (|| -> Result<(), DecodeSinkError> {
+                        match self.behavior {
+                            DirectSpanBehavior::Complete => {
+                                {
+                                    let span = sink.writable_span(2)?;
+                                    span.copy_from_slice(&[11, 12]);
+                                }
+                                sink.commit_written(2)?;
+                                {
+                                    let span = sink.writable_span(usize::MAX)?;
+                                    span.copy_from_slice(&[13, 14]);
+                                }
+                                sink.commit_written(2)?;
+                                sink.finish()
+                            }
+                            DirectSpanBehavior::OverrunCommit => {
+                                let _ = sink.writable_span(2)?;
+                                sink.commit_written(3)
+                            }
+                            DirectSpanBehavior::IncompleteFinish => {
+                                {
+                                    let span = sink.writable_span(2)?;
+                                    span[0] = 11;
+                                }
+                                sink.commit_written(1)?;
+                                sink.finish()
+                            }
+                            DirectSpanBehavior::OutstandingFinish => {
+                                let _ = sink.writable_span(2)?;
+                                sink.finish()
+                            }
+                        }
+                    })();
+                    result.map_err(|reason| DatasetSourceFault::SinkRejected {
+                        key,
+                        reason: Box::new(reason),
+                    })
+                })
+                .collect()
+        }
+    }
+
+    impl DatasetSource for TransientCapacitySource {
+        fn catalog(&self) -> Result<Arc<DatasetCatalog>, DatasetSourceFault> {
+            Ok(Arc::clone(&self.catalog))
+        }
+
+        fn minimum_decode_working_bytes(
+            &self,
+            _key: BrickKey,
+            _descriptor: ResourcePayloadDescriptor,
+        ) -> Result<u64, DatasetSourceFault> {
+            Ok(64)
+        }
+
+        #[allow(
+            clippy::result_large_err,
+            reason = "the frozen DatasetSource contract requires this exact typed fault"
+        )]
+        fn decode_cohort_into(
+            &self,
+            sinks: &mut [&mut dyn ReservedDecodeSink],
+        ) -> Vec<Result<(), DatasetSourceFault>> {
+            if self.attempts.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                return sinks
+                    .iter()
+                    .map(|sink| DatasetSourceFault::CapacityExceeded {
+                        key: sink.resource_key(),
+                        category: CpuLedgerCategory::InFlightDecode,
+                        requested_bytes: 64,
+                        available_bytes: 0,
+                    })
+                    .map(Err)
+                    .collect();
+            }
+
+            sinks
+                .iter_mut()
+                .map(|sink| {
+                    let sink = &mut **sink;
+                    let key = sink.resource_key();
+                    let bytes =
+                        vec![7; usize::try_from(sink.payload_descriptor().byte_len()).unwrap()];
+                    sink.write(&bytes)
+                        .and_then(|()| sink.finish())
+                        .map_err(|reason| DatasetSourceFault::SinkRejected {
+                            key,
+                            reason: Box::new(reason),
+                        })
+                })
+                .collect()
+        }
+    }
+
+    impl DatasetSource for CohortAdmissionSource {
+        fn catalog(&self) -> Result<Arc<DatasetCatalog>, DatasetSourceFault> {
+            Ok(Arc::clone(&self.catalog))
+        }
+
+        fn minimum_decode_working_bytes(
+            &self,
+            _key: BrickKey,
+            descriptor: ResourcePayloadDescriptor,
+        ) -> Result<u64, DatasetSourceFault> {
+            Ok(if descriptor.byte_len() == 1 {
+                0
+            } else {
+                30_000
+            })
+        }
+
+        #[allow(
+            clippy::result_large_err,
+            reason = "the frozen DatasetSource contract requires this exact typed fault"
+        )]
+        fn decode_cohort_into(
+            &self,
+            sinks: &mut [&mut dyn ReservedDecodeSink],
+        ) -> Vec<Result<(), DatasetSourceFault>> {
+            if sinks[0].payload_descriptor().byte_len() == 1 {
+                let mut state = self.control.state.lock().unwrap();
+                state.blocker_entered = true;
+                self.control.changed.notify_all();
+                while !state.blocker_released {
+                    state = self.control.changed.wait(state).unwrap();
+                }
+                drop(state);
+            } else {
+                self.control
+                    .state
+                    .lock()
+                    .unwrap()
+                    .target_cohort_sizes
+                    .push(sinks.len());
+            }
+
+            // Model an all-or-none source cohort such as unaligned staging:
+            // every member's zero-publication working set must coexist before
+            // shared decode may begin. A partial acquisition is discarded and
+            // the complete cohort is retried without publishing sink bytes.
+            let mut working = Vec::with_capacity(sinks.len());
+            if sinks[0].payload_descriptor().byte_len() != 1 {
+                for _ in 0..sinks.len() {
+                    match self
+                        .ledger
+                        .try_acquire(CpuLedgerCategory::InFlightDecode, 30_000)
+                    {
+                        Ok(lease) => working.push(lease),
+                        Err(error) => {
+                            self.control.state.lock().unwrap().target_capacity_failures += 1;
+                            return sinks
+                                .iter()
+                                .map(|sink| {
+                                    let key = sink.resource_key();
+                                    Err(match error {
+                                        CpuLedgerError::CapacityExceeded {
+                                            category,
+                                            requested_bytes,
+                                            available_bytes,
+                                        } => DatasetSourceFault::CapacityExceeded {
+                                            key,
+                                            category,
+                                            requested_bytes,
+                                            available_bytes,
+                                        },
+                                        CpuLedgerError::ShuttingDown => {
+                                            DatasetSourceFault::ShuttingDown {
+                                                key,
+                                                category: CpuLedgerCategory::InFlightDecode,
+                                                requested_bytes: 30_000,
+                                            }
+                                        }
+                                        CpuLedgerError::ZeroByteReservation => {
+                                            DatasetSourceFault::DecodeFailed { key }
+                                        }
+                                    })
+                                })
+                                .collect();
+                        }
+                    }
+                }
+            }
+
+            sinks
+                .iter_mut()
+                .map(|sink| {
+                    let sink = &mut **sink;
+                    let key = sink.resource_key();
+                    let bytes =
+                        vec![9; usize::try_from(sink.payload_descriptor().byte_len()).unwrap()];
+                    sink.write(&bytes)
+                        .and_then(|()| sink.finish())
+                        .map_err(|reason| DatasetSourceFault::SinkRejected {
+                            key,
+                            reason: Box::new(reason),
+                        })
+                })
+                .collect::<Vec<_>>()
+        }
+    }
+
+    impl DatasetSource for BurstGateSource {
+        fn catalog(&self) -> Result<Arc<DatasetCatalog>, DatasetSourceFault> {
+            Ok(Arc::clone(&self.catalog))
+        }
+
+        #[allow(
+            clippy::result_large_err,
+            reason = "the frozen DatasetSource contract requires this exact typed fault"
+        )]
+        fn decode_cohort_into(
+            &self,
+            sinks: &mut [&mut dyn ReservedDecodeSink],
+        ) -> Vec<Result<(), DatasetSourceFault>> {
+            let visible = sinks[0].resource_key().region().origin()[2] >= VISIBLE_BURST_ORIGIN;
+            let (lock, changed) = &self.gate;
+            let mut state = lock.lock().unwrap();
+            if visible {
+                state.visible_members_entered += sinks.len();
+                state.visible_cohorts_entered += 1;
+                state.active_visible_cohorts += 1;
+                state.peak_active_visible_cohorts = state
+                    .peak_active_visible_cohorts
+                    .max(state.active_visible_cohorts);
+                state.largest_visible_cohort = state.largest_visible_cohort.max(sinks.len());
+                changed.notify_all();
+                while !state.visible_released {
+                    state = changed.wait(state).unwrap();
+                }
+                state.active_visible_cohorts -= 1;
+            } else {
+                state.low_members_entered += sinks.len();
+                changed.notify_all();
+                while !state.low_released {
+                    state = changed.wait(state).unwrap();
+                }
+            }
+            drop(state);
+
+            sinks
+                .iter_mut()
+                .map(|sink| {
+                    let sink = &mut **sink;
+                    let key = sink.resource_key();
+                    let bytes =
+                        vec![0; usize::try_from(sink.payload_descriptor().byte_len()).unwrap()];
+                    sink.write(&bytes)
+                        .and_then(|()| sink.finish())
+                        .map_err(|reason| DatasetSourceFault::SinkRejected {
+                            key,
+                            reason: Box::new(reason),
+                        })
+                })
+                .collect()
+        }
+    }
+
+    fn start_direct_span_source(source: Arc<DirectSpanSource>) -> Arc<dyn DatasetRuntime> {
+        let config = DatasetRuntimeConfig::new(1 << 20, 1, 4, 4).unwrap();
+        let source_for_factory = Arc::clone(&source);
+        let (runtime, catalog) = <dyn DatasetRuntime>::start(config, move |_| {
+            let source: Arc<dyn DatasetSource> = source_for_factory;
+            Ok(source)
+        })
+        .unwrap();
+        assert!(Arc::ptr_eq(&catalog, &source.catalog));
+        runtime
+    }
+
+    fn start_burst_gate_source(source: Arc<BurstGateSource>) -> Arc<dyn DatasetRuntime> {
+        let config = DatasetRuntimeConfig::new(1 << 20, 8, 32, 32).unwrap();
+        let source_for_factory = Arc::clone(&source);
+        let (runtime, catalog) = <dyn DatasetRuntime>::start(config, move |_| {
+            let source: Arc<dyn DatasetSource> = source_for_factory;
+            Ok(source)
+        })
+        .unwrap();
+        assert!(Arc::ptr_eq(&catalog, &source.catalog));
+        runtime
+    }
+
+    fn key(origin_x: u64, samples: u64) -> BrickKey {
+        BrickKey::new(
             DatasetResourceIdentity::Unverified(DatasetSourceId::new(41)),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
@@ -1549,7 +3015,7 @@ mod tests {
     }
 
     fn request(
-        resource: DatasetResourceKey,
+        resource: BrickKey,
         priority: RequestPriority,
         scope: u64,
         generation: u64,
@@ -1602,7 +3068,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_queue_replaces_priority_versions_and_removes_cancelled_jobs() {
+    fn scheduler_queue_lazily_versions_entries_and_compacts_at_a_hard_bound() {
         let source = TestSource::new(ResourceValidity::AllValid, GatePoint::BeforeWrite);
         let resource = key(9, 4);
         let request = request(resource, RequestPriority::Prefetch, 1, 0);
@@ -1618,6 +3084,7 @@ mod tests {
             DecodeJob {
                 key: request.dedupe_key(),
                 descriptor,
+                admission_bytes: descriptor.byte_len(),
                 waiters: Vec::new(),
                 priority: RequestPriority::Prefetch,
                 phase: JobPhase::Queued,
@@ -1625,14 +3092,19 @@ mod tests {
                 queue_version: 0,
                 queue_sequence: sequence,
                 cancellation: Arc::new(AtomicBool::new(false)),
+                queued_at: Instant::now(),
             },
         );
-        state.replace_queued_entry(QueueEntry {
-            priority: RequestPriority::Prefetch,
-            sequence,
-            job_id,
-            version: 0,
-        });
+        state.add_queued_job(descriptor.byte_len(), RequestPriority::Prefetch);
+        state.enqueue_version(
+            QueueEntry {
+                priority: RequestPriority::Prefetch,
+                sequence,
+                job_id,
+                version: 0,
+            },
+            2,
+        );
 
         for (version, priority) in [
             RequestPriority::Playback,
@@ -1643,21 +3115,48 @@ mod tests {
         .enumerate()
         {
             let version = version as u64 + 1;
-            let job = state.jobs.get_mut(&job_id).unwrap();
-            job.priority = priority;
-            job.queue_version = version;
-            state.replace_queued_entry(QueueEntry {
-                priority,
-                sequence,
-                job_id,
-                version,
-            });
-            assert_eq!(state.queue.len(), 1);
+            let previous = state.jobs[&job_id].priority;
+            {
+                let job = state.jobs.get_mut(&job_id).unwrap();
+                job.priority = priority;
+                job.queue_version = version;
+            }
+            state.change_queued_priority(previous, priority);
+            state.enqueue_version(
+                QueueEntry {
+                    priority,
+                    sequence,
+                    job_id,
+                    version,
+                },
+                2,
+            );
+            assert_eq!(state.queue.len(), usize::try_from(version + 1).unwrap());
             assert_eq!(state.queue.peek().unwrap().version, version);
         }
 
+        // The next update reaches twice the request-admission bound, compacts
+        // stale versions once, and then appends the new current version.
+        let previous = state.jobs[&job_id].priority;
+        {
+            let job = state.jobs.get_mut(&job_id).unwrap();
+            job.priority = RequestPriority::VisibleRefinement;
+            job.queue_version = 4;
+        }
+        state.change_queued_priority(previous, RequestPriority::VisibleRefinement);
+        state.enqueue_version(
+            QueueEntry {
+                priority: RequestPriority::VisibleRefinement,
+                sequence,
+                job_id,
+                version: 4,
+            },
+            2,
+        );
+        assert_eq!(state.queue.len(), 1);
+
         state.remove_job(job_id);
-        assert!(state.queue.is_empty());
+        assert!(state.queue.iter().all(|entry| entry.job_id == job_id));
     }
 
     #[test]
@@ -1771,6 +3270,11 @@ mod tests {
         };
         assert!(cached.shares_allocation_with(&leases[0]));
         assert_eq!(source.decode_count.load(AtomicOrdering::SeqCst), 1);
+        let performance = runtime.diagnostics().unwrap().performance();
+        assert_eq!(performance.cache_hits(), 1);
+        assert_eq!(performance.cache_misses(), 2);
+        assert_eq!(performance.cache_evictions(), 0);
+        assert_eq!(performance.decoded_output_bytes(), 4);
     }
 
     #[test]
@@ -1802,6 +3306,186 @@ mod tests {
     }
 
     #[test]
+    fn production_runtime_ticket_cancellation_preserves_shared_decode_and_scope() {
+        let source = TestSource::new(ResourceValidity::AllValid, GatePoint::BeforeWrite);
+        let runtime = start(Arc::clone(&source), 1, 8, 8);
+        let resource = key(13, 4);
+        let retired = runtime
+            .submit(request(resource, RequestPriority::CurrentView, 10, 1))
+            .unwrap();
+        source.wait_entered(1);
+        let retained = runtime
+            .submit(request(resource, RequestPriority::CurrentView, 10, 1))
+            .unwrap();
+        runtime.cancel(retired).unwrap();
+        source.release();
+
+        let completions = wait_completions(&runtime, 2);
+        assert!(completions.iter().any(|completion| {
+            completion.ticket() == retired
+                && matches!(completion.outcome(), RuntimeOutcome::Cancelled)
+        }));
+        assert!(completions.iter().any(|completion| {
+            completion.ticket() == retained
+                && matches!(completion.outcome(), RuntimeOutcome::Ready(_))
+        }));
+        assert_eq!(source.decode_count.load(AtomicOrdering::SeqCst), 1);
+
+        // The scope generation remains current and accepts new differential
+        // demand without cancelling retained work.
+        runtime
+            .submit(request(key(21, 4), RequestPriority::CurrentView, 10, 1))
+            .unwrap();
+        assert!(matches!(
+            wait_completions(&runtime, 1)[0].outcome(),
+            RuntimeOutcome::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn cancel_many_prevalidates_every_ticket_before_atomic_retirement() {
+        let source = TestSource::new(ResourceValidity::AllValid, GatePoint::BeforeWrite);
+        let runtime = start(Arc::clone(&source), 1, 8, 8);
+        let first = runtime
+            .submit(request(key(0, 4), RequestPriority::CurrentView, 1, 0))
+            .unwrap();
+        source.wait_entered(1);
+        let second = runtime
+            .submit(request(key(8, 4), RequestPriority::CurrentView, 2, 0))
+            .unwrap();
+        let forged = RequestTicket::for_request(
+            second.id(),
+            request(key(16, 4), RequestPriority::CurrentView, 2, 0),
+        );
+
+        assert_eq!(
+            runtime.cancel_many(&[first, forged]).unwrap_err().code(),
+            RuntimeFaultCode::InvariantViolation
+        );
+        assert!(runtime.progress(first).unwrap().is_some());
+        assert!(runtime.progress(second).unwrap().is_some());
+        source.release();
+        let completions = wait_completions(&runtime, 2);
+        assert!(
+            completions
+                .iter()
+                .all(|completion| matches!(completion.outcome(), RuntimeOutcome::Ready(_)))
+        );
+    }
+
+    #[test]
+    fn cancel_many_retires_active_and_queued_waiters_together() {
+        let source = TestSource::new(ResourceValidity::AllValid, GatePoint::BeforeWrite);
+        let runtime = start(Arc::clone(&source), 1, 8, 8);
+        let first = runtime
+            .submit(request(key(0, 4), RequestPriority::CurrentView, 1, 0))
+            .unwrap();
+        source.wait_entered(1);
+        let second = runtime
+            .submit(request(key(8, 4), RequestPriority::CurrentView, 2, 0))
+            .unwrap();
+        runtime.cancel_many(&[first, second, first]).unwrap();
+        let completions = wait_completions(&runtime, 2);
+        assert!(
+            completions
+                .iter()
+                .all(|completion| matches!(completion.outcome(), RuntimeOutcome::Cancelled))
+        );
+        assert_eq!(runtime.progress(first).unwrap(), None);
+        assert_eq!(runtime.progress(second).unwrap(), None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let diagnostics = loop {
+            let diagnostics = runtime.diagnostics().unwrap();
+            if diagnostics.in_flight_decodes() == 0 {
+                break diagnostics;
+            }
+            assert!(Instant::now() < deadline, "cancelled cohort did not retire");
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(diagnostics.cancelled_requests(), 2);
+    }
+
+    #[test]
+    fn cancel_many_duplicate_max_batch_is_linear_and_empty_shutdown_batch_is_noop() {
+        const BATCH: usize = 65_536;
+        let source = TestSource::new(ResourceValidity::AllValid, GatePoint::BeforeWrite);
+        let runtime = start(Arc::clone(&source), 1, 2, 2);
+        let ticket = runtime
+            .submit(request(key(0, 4), RequestPriority::CurrentView, 1, 0))
+            .unwrap();
+        source.wait_entered(1);
+        let tickets = vec![ticket; BATCH];
+        runtime.cancel_many(&tickets).unwrap();
+        assert!(matches!(
+            wait_completions(&runtime, 1)[0].outcome(),
+            RuntimeOutcome::Cancelled
+        ));
+        runtime.request_shutdown().unwrap();
+        assert_eq!(runtime.cancel_many(&[]), Ok(()));
+    }
+
+    #[test]
+    fn cancellation_waste_counts_only_bytes_from_a_discarded_started_decode() {
+        let source = TestSource::new(ResourceValidity::AllValid, GatePoint::AfterFirstByte);
+        let runtime = start(Arc::clone(&source), 1, 8, 8);
+        let ticket = runtime
+            .submit(request(key(19, 4), RequestPriority::CurrentView, 10, 1))
+            .unwrap();
+        source.wait_first_byte();
+        runtime.cancel(ticket).unwrap();
+        assert!(matches!(
+            wait_completions(&runtime, 1)[0].outcome(),
+            RuntimeOutcome::Cancelled
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let diagnostics = loop {
+            let diagnostics = runtime.diagnostics().unwrap();
+            if diagnostics.completed_decodes() == 1 {
+                break diagnostics;
+            }
+            assert!(Instant::now() < deadline, "cancelled decode did not retire");
+            thread::sleep(Duration::from_millis(1));
+        };
+        let performance = diagnostics.performance();
+        assert_eq!(performance.decoded_output_bytes(), 1);
+        assert_eq!(performance.cancelled_decode_executions(), 1);
+        assert_eq!(performance.cancelled_decode_bytes(), 1);
+        assert!(performance.cancelled_decode_time_ns() > 0);
+    }
+
+    #[test]
+    fn cancellation_after_source_finish_counts_the_discarded_complete_payload() {
+        let source = TestSource::new(ResourceValidity::AllValid, GatePoint::AfterFinish);
+        let runtime = start(Arc::clone(&source), 1, 8, 8);
+        let ticket = runtime
+            .submit(request(key(23, 4), RequestPriority::CurrentView, 10, 1))
+            .unwrap();
+        source.wait_finished();
+        runtime.cancel(ticket).unwrap();
+        source.release();
+        assert!(matches!(
+            wait_completions(&runtime, 1)[0].outcome(),
+            RuntimeOutcome::Cancelled
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let diagnostics = loop {
+            let diagnostics = runtime.diagnostics().unwrap();
+            if diagnostics.completed_decodes() == 1 {
+                break diagnostics;
+            }
+            assert!(Instant::now() < deadline, "cancelled decode did not retire");
+            thread::sleep(Duration::from_millis(1));
+        };
+        let performance = diagnostics.performance();
+        assert_eq!(performance.decoded_output_bytes(), 4);
+        assert_eq!(performance.cancelled_decode_executions(), 1);
+        assert_eq!(performance.cancelled_decode_bytes(), 4);
+        assert!(performance.cancelled_decode_time_ns() > 0);
+    }
+
+    #[test]
     fn production_runtime_priority_upgrade_and_fifo_drive_one_worker() {
         let source = TestSource::new(ResourceValidity::AllValid, GatePoint::BeforeWrite);
         let runtime = start(Arc::clone(&source), 1, 8, 8);
@@ -1823,7 +3507,179 @@ mod tests {
             .unwrap();
         source.release();
         let _ = wait_completions(&runtime, 5);
+        assert_eq!(
+            *source.decode_order.lock().unwrap(),
+            vec![0, 10, 30, 20, 0],
+            "foreground admission must yield and later resume the occupied prefetch decode"
+        );
+    }
+
+    #[test]
+    fn live_waiter_priority_promotion_reorders_without_a_duplicate_waiter() {
+        let source = TestSource::new(ResourceValidity::AllValid, GatePoint::BeforeWrite);
+        let runtime = start(Arc::clone(&source), 1, 8, 8);
+        runtime
+            .submit(request(key(0, 2), RequestPriority::CurrentView, 1, 0))
+            .unwrap();
+        source.wait_entered(1);
+        let guard = runtime
+            .submit(request(key(10, 2), RequestPriority::Prefetch, 2, 0))
+            .unwrap();
+        runtime
+            .submit(request(key(20, 2), RequestPriority::Playback, 3, 0))
+            .unwrap();
+        runtime
+            .submit(request(key(30, 2), RequestPriority::LinkedView, 4, 0))
+            .unwrap();
+
+        assert!(
+            runtime
+                .promote_priority(guard, RequestPriority::CurrentView)
+                .unwrap()
+        );
+        assert!(
+            !runtime
+                .promote_priority(guard, RequestPriority::CurrentView)
+                .unwrap()
+        );
+        source.release();
+        let _ = wait_completions(&runtime, 4);
+
         assert_eq!(*source.decode_order.lock().unwrap(), vec![0, 10, 30, 20]);
+        assert_eq!(runtime.diagnostics().unwrap().submitted_requests(), 4);
+    }
+
+    #[test]
+    fn foreground_preemption_resumes_the_same_low_priority_job_after_foreground_completes() {
+        let source = TestSource::new(ResourceValidity::AllValid, GatePoint::AfterFirstByte);
+        let runtime = start(Arc::clone(&source), 1, 4, 4);
+        let low = runtime
+            .submit(request(key(0, 4), RequestPriority::Prefetch, 1, 0))
+            .unwrap();
+        source.wait_first_byte();
+
+        let foreground = runtime
+            .submit(request(
+                key(VISIBLE_BURST_ORIGIN, 4),
+                RequestPriority::CurrentView,
+                2,
+                0,
+            ))
+            .unwrap();
+        source.wait_entered(2);
+        assert_eq!(
+            *source.decode_order.lock().unwrap(),
+            vec![0, VISIBLE_BURST_ORIGIN]
+        );
+
+        source.release();
+        let completions = wait_completions(&runtime, 2);
+        assert_eq!(completions[0].ticket(), foreground);
+        assert_eq!(completions[1].ticket(), low);
+        let RuntimeOutcome::Ready(foreground_lease) = completions[0].outcome() else {
+            panic!("foreground request must complete with its decoded payload");
+        };
+        let RuntimeOutcome::Ready(resumed_lease) = completions[1].outcome() else {
+            panic!("resumed low-priority request must complete with its decoded payload");
+        };
+        assert_eq!(foreground_lease.payload().value_bytes(), &[16, 17, 18, 19]);
+        assert_eq!(resumed_lease.payload().value_bytes(), &[0, 1, 2, 3]);
+        assert_eq!(
+            *source.decode_order.lock().unwrap(),
+            vec![0, VISIBLE_BURST_ORIGIN, 0]
+        );
+
+        let diagnostics = runtime.diagnostics().unwrap();
+        assert_eq!(diagnostics.submitted_requests(), 2);
+        assert_eq!(diagnostics.started_decodes(), 2);
+        assert_eq!(diagnostics.completed_decodes(), 2);
+        assert_eq!(diagnostics.ready_requests(), 2);
+        assert_eq!(diagnostics.resident_resources(), 2);
+        assert_eq!(diagnostics.cancelled_requests(), 0);
+        assert_eq!(diagnostics.failed_requests(), 0);
+        assert_eq!(source.decode_count.load(AtomicOrdering::SeqCst), 3);
+    }
+
+    #[test]
+    fn capacity_blocked_priority_does_not_starve_a_decode_that_fits() {
+        let source = TestSource::new(ResourceValidity::AllValid, GatePoint::BeforeWrite);
+        // In-flight decode receives one eighth of this budget: 65,536 bytes.
+        // The first worker holds 60,000, leaving room for the 1,000-byte
+        // prefetch but not the higher-priority 6,000-byte request.
+        let runtime = start_with_config(
+            Arc::clone(&source),
+            DatasetRuntimeConfig::new(512 * 1024, 2, 8, 8).unwrap(),
+        );
+        runtime
+            .submit(request(key(0, 60_000), RequestPriority::CurrentView, 1, 0))
+            .unwrap();
+        source.wait_entered(1);
+        runtime
+            .submit(request(key(1, 6_000), RequestPriority::CurrentView, 2, 0))
+            .unwrap();
+        runtime
+            .submit(request(key(2, 1_000), RequestPriority::Prefetch, 3, 0))
+            .unwrap();
+
+        source.wait_entered(2);
+        assert_eq!(*source.decode_order.lock().unwrap(), vec![0, 2]);
+        source.release();
+        let _ = wait_completions(&runtime, 3);
+        assert_eq!(*source.decode_order.lock().unwrap(), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn eight_worker_visible_burst_reserves_parallel_primary_cohorts() {
+        const WORKERS: usize = 8;
+        let source = BurstGateSource::new();
+        let runtime = start_burst_gate_source(Arc::clone(&source));
+        for index in 0..WORKERS {
+            runtime
+                .submit(request(
+                    key(index as u64 * 4, 4),
+                    RequestPriority::Prefetch,
+                    100 + index as u64,
+                    0,
+                ))
+                .unwrap();
+        }
+        source.wait_for(
+            |state| state.low_members_entered == WORKERS,
+            "all workers did not enter the low-priority gate",
+        );
+        for index in 0..WORKERS {
+            runtime
+                .submit(request(
+                    key(VISIBLE_BURST_ORIGIN + index as u64 * 4, 4),
+                    RequestPriority::CurrentView,
+                    200 + index as u64,
+                    0,
+                ))
+                .unwrap();
+        }
+        source.release_low();
+        source.wait_for(
+            |state| state.visible_members_entered == WORKERS,
+            "visible burst did not enter all worker cohorts",
+        );
+        {
+            let state = source.gate.0.lock().unwrap();
+            assert_eq!(state.visible_cohorts_entered, WORKERS);
+            assert_eq!(state.peak_active_visible_cohorts, WORKERS);
+            assert_eq!(state.largest_visible_cohort, 1);
+        }
+        assert_eq!(runtime.diagnostics().unwrap().in_flight_decodes(), WORKERS);
+        source.release_visible();
+        let completions = wait_completions(&runtime, WORKERS * 2);
+        assert!(
+            completions
+                .iter()
+                .all(|completion| matches!(completion.outcome(), RuntimeOutcome::Ready(_)))
+        );
+        let performance = runtime.diagnostics().unwrap().performance();
+        assert_eq!(performance.decode_cohorts(), (WORKERS * 3) as u64);
+        assert_eq!(performance.decode_cohort_members(), (WORKERS * 3) as u64);
+        assert_eq!(performance.peak_decode_cohort_members(), 1);
     }
 
     #[test]
@@ -1879,7 +3735,207 @@ mod tests {
         assert_eq!(lease.payload().validity_bits(), Some(&[0b0000_0101][..]));
         assert_eq!(lease.payload().sample_is_valid(0), Ok(true));
         assert_eq!(lease.payload().sample_is_valid(1), Ok(false));
+        assert_eq!(lease.payload_facts().minimum(), 40.0);
+        assert_eq!(lease.payload_facts().maximum(), 42.0);
+        assert!(lease.payload_facts().any_valid());
+        assert!(!lease.payload_facts().all_valid());
         assert_eq!(runtime.progress(ticket).unwrap(), None);
+        assert_eq!(
+            runtime
+                .diagnostics()
+                .unwrap()
+                .performance()
+                .progress_updates(),
+            2
+        );
+    }
+
+    #[test]
+    fn transient_source_in_flight_capacity_miss_requeues_once_and_completes() {
+        let source = TransientCapacitySource::new();
+        let source_for_factory = Arc::clone(&source);
+        let config = DatasetRuntimeConfig::new(1 << 20, 1, 4, 4).unwrap();
+        let (runtime, _) = <dyn DatasetRuntime>::start(config, move |_| {
+            let source: Arc<dyn DatasetSource> = source_for_factory;
+            Ok(source)
+        })
+        .unwrap();
+        runtime
+            .submit(request(key(0, 4), RequestPriority::CurrentView, 1, 0))
+            .unwrap();
+
+        let completion = wait_completions(&runtime, 1).pop().unwrap();
+        let RuntimeOutcome::Ready(lease) = completion.outcome() else {
+            panic!("a transient source capacity race must be retried");
+        };
+        assert_eq!(lease.payload().value_bytes(), &[7, 7, 7, 7]);
+        assert_eq!(source.attempts.load(AtomicOrdering::SeqCst), 2);
+        assert!(runtime.poll(4).unwrap().is_empty());
+
+        let diagnostics = runtime.diagnostics().unwrap();
+        assert_eq!(diagnostics.submitted_requests(), 1);
+        assert_eq!(diagnostics.started_decodes(), 1);
+        assert_eq!(diagnostics.completed_decodes(), 1);
+        assert_eq!(diagnostics.ready_requests(), 1);
+        assert_eq!(diagnostics.failed_requests(), 0);
+        assert_eq!(diagnostics.performance().decode_cohorts(), 2);
+        assert_eq!(diagnostics.performance().decode_cohort_members(), 2);
+    }
+
+    #[test]
+    fn cohort_virtual_admission_prevents_self_overcommit_retry_livelock() {
+        const TARGETS: usize = 4;
+
+        let layer = DatasetLayer::new(
+            LogicalLayerKey::new(0),
+            "intensity",
+            Shape4D::new(1, 1, 1, 200_000).unwrap(),
+            IntensityDType::Uint8,
+            GridToWorld::identity(),
+            ResourceValidity::AllValid,
+        )
+        .unwrap();
+        let catalog = Arc::new(
+            DatasetCatalog::new(
+                "cohort-virtual-admission-test",
+                ScientificIdentityStatus::Unverified(DatasetSourceId::new(41)),
+                vec![layer],
+            )
+            .unwrap(),
+        );
+        let control = Arc::new(CohortAdmissionControl::default());
+        let factory_catalog = Arc::clone(&catalog);
+        let factory_control = Arc::clone(&control);
+        let config = DatasetRuntimeConfig::new(1 << 20, 2, 8, 8).unwrap();
+        let peer_headroom = config
+            .category_cap(CpuLedgerCategory::InFlightDecode)
+            .saturating_sub(1)
+            .saturating_sub(40_000);
+        assert!(40_000 + 30_000 <= peer_headroom);
+        assert!(30_000 + 40_000 + 30_000 > peer_headroom);
+        let (runtime, _) = <dyn DatasetRuntime>::start(config, move |ledger| {
+            let source: Arc<dyn DatasetSource> = Arc::new(CohortAdmissionSource {
+                catalog: factory_catalog,
+                ledger,
+                control: factory_control,
+            });
+            Ok(source)
+        })
+        .unwrap();
+
+        runtime
+            // Keep the ledger/worker blocker in the same foreground class as
+            // the targets. It is already inside its source call before the
+            // targets are submitted, so it cannot join their cohorts, while
+            // equal priority prevents the unrelated foreground-preemption
+            // path from adding a timing-dependent blocker retry.
+            .submit(request(key(199_999, 1), RequestPriority::CurrentView, 1, 0))
+            .unwrap();
+        control.wait_for_blocker();
+        for index in 0..TARGETS {
+            runtime
+                .submit(request(
+                    key(u64::try_from(index).unwrap() * 40_000, 40_000),
+                    RequestPriority::CurrentView,
+                    10 + u64::try_from(index).unwrap(),
+                    0,
+                ))
+                .unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut target_completions = Vec::with_capacity(TARGETS);
+        while target_completions.len() < TARGETS {
+            target_completions.extend(runtime.poll(TARGETS - target_completions.len()).unwrap());
+            if Instant::now() >= deadline {
+                control.release_blocker();
+                panic!("individually admissible targets made no forward progress");
+            }
+            if target_completions.len() < TARGETS {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(
+            target_completions
+                .iter()
+                .all(|completion| matches!(completion.outcome(), RuntimeOutcome::Ready(_)))
+        );
+        {
+            let state = control.state.lock().unwrap();
+            assert_eq!(state.target_cohort_sizes, vec![1; TARGETS]);
+            assert_eq!(state.target_capacity_failures, 0);
+        }
+
+        control.release_blocker();
+        let blocker = wait_completions(&runtime, 1).pop().unwrap();
+        assert!(matches!(blocker.outcome(), RuntimeOutcome::Ready(_)));
+        let diagnostics = runtime.diagnostics().unwrap();
+        assert_eq!(diagnostics.ready_requests(), (TARGETS + 1) as u64);
+        assert_eq!(diagnostics.failed_requests(), 0);
+        assert_eq!(
+            diagnostics.performance().decode_cohorts(),
+            (TARGETS + 1) as u64
+        );
+        assert_eq!(
+            diagnostics.performance().decode_cohort_members(),
+            (TARGETS + 1) as u64
+        );
+        assert_eq!(diagnostics.performance().peak_decode_cohort_members(), 1);
+    }
+
+    #[test]
+    fn runtime_direct_spans_commit_progress_and_complete_without_a_copy_write() {
+        let source = DirectSpanSource::new(DirectSpanBehavior::Complete);
+        let runtime = start_direct_span_source(source);
+        runtime
+            .submit(request(key(0, 4), RequestPriority::CurrentView, 1, 0))
+            .unwrap();
+        let completion = wait_completions(&runtime, 1).pop().unwrap();
+        let RuntimeOutcome::Ready(lease) = completion.outcome() else {
+            panic!("direct-span payload must become ready");
+        };
+        assert_eq!(lease.payload().value_bytes(), &[11, 12, 13, 14]);
+        let diagnostics = runtime.diagnostics().unwrap();
+        assert_eq!(diagnostics.performance().progress_updates(), 2);
+        assert_eq!(diagnostics.performance().decoded_output_bytes(), 4);
+        assert_eq!(
+            diagnostics.category_used_bytes(CpuLedgerCategory::InFlightDecode),
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_direct_span_overrun_incomplete_and_outstanding_fail_unfinished() {
+        for (behavior, expected_progress, expected_written) in [
+            (DirectSpanBehavior::OverrunCommit, 0, 0),
+            (DirectSpanBehavior::IncompleteFinish, 1, 1),
+            (DirectSpanBehavior::OutstandingFinish, 0, 0),
+        ] {
+            let source = DirectSpanSource::new(behavior);
+            let runtime = start_direct_span_source(source);
+            runtime
+                .submit(request(key(0, 4), RequestPriority::CurrentView, 1, 0))
+                .unwrap();
+            let completion = wait_completions(&runtime, 1).pop().unwrap();
+            let RuntimeOutcome::Failed(fault) = completion.outcome() else {
+                panic!("invalid direct-span sequence must fail");
+            };
+            assert_eq!(fault.code(), RuntimeFaultCode::SinkRejected);
+            let diagnostics = runtime.diagnostics().unwrap();
+            assert_eq!(
+                diagnostics.performance().progress_updates(),
+                expected_progress
+            );
+            assert_eq!(
+                diagnostics.performance().decoded_output_bytes(),
+                expected_written
+            );
+            assert_eq!(
+                diagnostics.category_used_bytes(CpuLedgerCategory::InFlightDecode),
+                0
+            );
+            assert_eq!(diagnostics.in_flight_decodes(), 0);
+        }
     }
 
     #[test]

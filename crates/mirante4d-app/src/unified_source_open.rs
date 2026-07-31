@@ -27,6 +27,7 @@ use mirante4d_storage::{
 use crate::{
     FrameCompleteness, FrameFidelityStatus, LodDecisionReason, StartupDiagnostics,
     analysis_session::AnalysisProductRuntime,
+    camera_demand_cache::CameraDemandPlannerError,
     collect_startup_diagnostics,
     dataset_requests::DatasetDemandState,
     default_camera_for_shape,
@@ -57,7 +58,9 @@ pub(crate) enum UnifiedVerifiedSourceOpenError {
     RuntimeConfiguration(RuntimeFaultCode),
     Adapter(LocalDatasetSourceOpenError),
     Runtime(RuntimeFault),
+    DemandPlanner(CameraDemandPlannerError),
     MissingCpuLedger,
+    MissingLocalSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +93,8 @@ pub(crate) fn open(
     let worker_error = Arc::clone(&source_error);
     let captured_ledger = Arc::new(Mutex::new(None));
     let worker_ledger = Arc::clone(&captured_ledger);
+    let captured_source = Arc::new(Mutex::new(None));
+    let worker_source = Arc::clone(&captured_source);
     let source_path = selected_path.clone();
     let display_label = dataset_display_label(&selected_path);
     let (runtime, catalog) = <dyn DatasetRuntime>::start(config, move |ledger| {
@@ -104,8 +109,11 @@ pub(crate) fn open(
             });
         match source {
             Ok(source) => {
-                let source: Arc<dyn DatasetSource> = source;
-                Ok(source)
+                *worker_source
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&source));
+                let source_contract: Arc<dyn DatasetSource> = source;
+                Ok(source_contract)
             }
             Err(error) => {
                 *worker_error
@@ -127,12 +135,23 @@ pub(crate) fn open(
         .unwrap_or_else(|poison| poison.into_inner())
         .take()
         .ok_or_else(|| anyhow::anyhow!("unified runtime did not supply its CPU ledger"))?;
+    let local_source = captured_source
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("unified runtime did not retain its local source"))?;
 
     let workspace = workspace_from_catalog(catalog.as_ref())?;
     let (render_coordination, analysis_runtime) =
         initial_runtime_state(catalog.as_ref(), &workspace)?;
-    let resource_identity = catalog.scientific_identity().resource_identity();
-    let dataset = DatasetDemandState::new(runtime, cpu_ledger, resource_identity, selected_path);
+    let resource_identity = catalog.resource_identity();
+    let dataset = DatasetDemandState::new_local(
+        runtime,
+        cpu_ledger,
+        resource_identity,
+        selected_path,
+        local_source,
+    )?;
     Ok(UnifiedOpenedSource {
         dataset,
         catalog,
@@ -184,17 +203,18 @@ pub(crate) fn verify_target_package(
 }
 
 pub(crate) fn open_verified(
-    path: impl AsRef<Path>,
     resource_policy: ResourcePolicy,
     capability: VerifiedScientificPackageCapability,
 ) -> Result<UnifiedVerifiedSource, UnifiedVerifiedSourceOpenError> {
-    let selected_path = path.as_ref().to_path_buf();
+    let selected_path = capability.root_path().to_path_buf();
     let config = runtime_config(resource_policy)
         .map_err(UnifiedVerifiedSourceOpenError::RuntimeConfiguration)?;
     let source_error = Arc::new(Mutex::new(None));
     let worker_error = Arc::clone(&source_error);
     let captured_ledger = Arc::new(Mutex::new(None));
     let worker_ledger = Arc::clone(&captured_ledger);
+    let captured_source = Arc::new(Mutex::new(None));
+    let worker_source = Arc::clone(&captured_source);
     let display_label = dataset_display_label(&selected_path);
     let (runtime, catalog) = <dyn DatasetRuntime>::start(config, move |ledger| {
         *worker_ledger
@@ -202,8 +222,11 @@ pub(crate) fn open_verified(
             .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&ledger));
         match LocalDatasetSource::from_verified(capability, &display_label, ledger) {
             Ok(source) => {
-                let source: Arc<dyn DatasetSource> = source;
-                Ok(source)
+                *worker_source
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&source));
+                let source_contract: Arc<dyn DatasetSource> = source;
+                Ok(source_contract)
             }
             Err(error) => {
                 *worker_error
@@ -226,9 +249,44 @@ pub(crate) fn open_verified(
         .unwrap_or_else(|poison| poison.into_inner())
         .take()
         .ok_or(UnifiedVerifiedSourceOpenError::MissingCpuLedger)?;
-    let resource_identity = catalog.scientific_identity().resource_identity();
-    let dataset = DatasetDemandState::new(runtime, cpu_ledger, resource_identity, selected_path);
+    let local_source = captured_source
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take()
+        .ok_or(UnifiedVerifiedSourceOpenError::MissingLocalSource)?;
+    let resource_identity = catalog.resource_identity();
+    let dataset = DatasetDemandState::new_local(
+        runtime,
+        cpu_ledger,
+        resource_identity,
+        selected_path,
+        local_source,
+    )
+    .map_err(UnifiedVerifiedSourceOpenError::DemandPlanner)?;
     Ok(UnifiedVerifiedSource { dataset, catalog })
+}
+
+/// Expands an already-verified runtime into the complete state required for a
+/// current-source replacement.
+///
+/// Imported packages use this after consuming their one-shot publication
+/// transfer. No path is accepted here: the selected path already came from the
+/// destination-bound verified capability.
+pub(crate) fn prepare_verified_current_source(
+    opened: UnifiedVerifiedSource,
+) -> anyhow::Result<UnifiedOpenedSource> {
+    let UnifiedVerifiedSource { dataset, catalog } = opened;
+    let workspace = workspace_from_catalog(catalog.as_ref())?;
+    let (render_coordination, analysis_runtime) =
+        initial_runtime_state(catalog.as_ref(), &workspace)?;
+    Ok(UnifiedOpenedSource {
+        dataset,
+        catalog,
+        workspace,
+        render_coordination,
+        analysis_runtime,
+        startup_diagnostics: collect_startup_diagnostics(),
+    })
 }
 
 #[derive(Debug)]

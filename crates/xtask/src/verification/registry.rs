@@ -11,7 +11,6 @@ use serde_json::{Value, json};
 
 const REGISTRY_PATH: &str = "verification/registry.json";
 const SELECTORS_PATH: &str = "verification/generated/selectors.json";
-const DOCTESTS_PATH: &str = "verification/generated/doctests.json";
 const NEXTEST_CONFIG_PATH: &str = ".config/nextest.toml";
 
 #[derive(Debug, Deserialize)]
@@ -152,62 +151,14 @@ pub(super) fn read_registry() -> anyhow::Result<Registry> {
 pub(super) fn sync_generated(check: bool) -> anyhow::Result<()> {
     let registry = read_registry()?;
     let selectors = generated_selectors(&registry)?;
-    let doctests = generated_doctests()?;
     let nextest = generated_nextest(&registry)?;
     sync_one(SELECTORS_PATH, selectors.as_bytes(), check)?;
-    sync_one(DOCTESTS_PATH, doctests.as_bytes(), check)?;
     sync_one(NEXTEST_CONFIG_PATH, nextest.as_bytes(), check)?;
     println!(
-        "verification-sync: {} generated selectors, doctest inventory, and Nextest configuration",
+        "verification-sync: {} generated selectors and Nextest configuration",
         if check { "checked" } else { "wrote" }
     );
     Ok(())
-}
-
-fn generated_doctests() -> anyhow::Result<String> {
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&repo_root)
-        .args(["ls-files", "-z", "--", "crates/**/*.rs"])
-        .output()
-        .context("failed to inventory tracked Rust sources for doctests")?;
-    if !output.status.success() {
-        bail!("git ls-files failed while inventorying doctests");
-    }
-    let mut discovered = Vec::new();
-    for encoded in output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-    {
-        let relative = std::str::from_utf8(encoded).context("tracked Rust path was not UTF-8")?;
-        let path = repo_root.join(relative);
-        if !path.is_file() {
-            continue;
-        }
-        let source = fs::read_to_string(path)?;
-        if source.lines().any(|line| {
-            let trimmed = line.trim_start();
-            (trimmed.starts_with("///") || trimmed.starts_with("//!")) && trimmed.contains("```")
-        }) {
-            discovered.push(relative.to_owned());
-        }
-    }
-    if !discovered.is_empty() {
-        bail!(
-            "tracked Rust doctest sources are not represented by the zero-case inventory: {discovered:?}"
-        );
-    }
-    let value = json!({
-        "schema": "mirante4d-verification-doctest-inventory",
-        "schema_version": 1,
-        "source": "tracked crates/**/*.rs doc comments",
-        "cases": [],
-    });
-    let mut encoded = serde_json::to_string_pretty(&value)?;
-    encoded.push('\n');
-    Ok(encoded)
 }
 
 fn safe_repo_relative_path(relative: &str) -> anyhow::Result<PathBuf> {
@@ -266,7 +217,7 @@ fn validate_registry(registry: &Registry) -> anyhow::Result<()> {
     validate_lint_exceptions(&registry.lint_exceptions)?;
     validate_test_timeout_overrides(&registry.test_timeout_overrides)?;
 
-    let required = ["policy", "lint", "unit", "contract", "ui", "doctest"];
+    let required = ["policy", "lint", "unit", "contract", "ui"];
     let allowed_fixture_tiers = [
         "none",
         "none-or-T2",
@@ -474,15 +425,6 @@ fn validate_tool_pins(tools: &[ToolPin]) -> anyhow::Result<()> {
                 "0.2.30",
                 Some("eb51e28ef9dff2b2d29b4527bc40123e840bb997dc8bae39d99496b898ee9f72"),
                 None,
-                None,
-            ),
-        ),
-        (
-            "sourcemeta-jsonschema",
-            (
-                "16.1.0",
-                Some("96b214be67bf25c6184f1d009a94e082d1eaa83787a8f1878607aebf3185668e"),
-                Some("4aa8ba3f4bc0b1ef4f8d82b109676b186fa66603d1953be25fde22b2854190d5"),
                 None,
             ),
         ),
@@ -920,7 +862,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             ids,
-            BTreeSet::from(["policy", "lint", "unit", "contract", "ui", "doctest"])
+            BTreeSet::from(["policy", "lint", "unit", "contract", "ui"])
         );
     }
 

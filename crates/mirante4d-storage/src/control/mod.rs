@@ -52,7 +52,7 @@ pub const MAX_PORTABLE_CONTROL_OBJECT_BYTES: usize = 1_048_576;
 pub const MAX_PROFILE_HEADER_BYTES: usize = 4_194_304;
 
 pub(super) const IMAGE_COUNT_MAX: usize = 4;
-pub(super) const LEVEL_COUNT_MAX: usize = 7;
+pub(super) const LEVEL_COUNT_MAX: usize = 64;
 pub(super) const PORTABLE_RECORD_COUNT_MAX: usize = 14;
 pub(super) const CONTROL_COLLECTION_ITEMS_MAX: usize = 4_096;
 

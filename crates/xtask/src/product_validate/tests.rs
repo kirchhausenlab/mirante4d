@@ -1,25 +1,82 @@
 use super::*;
 
-fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_resources: u64) {
-    assert_eq!(script["schema_version"], PRODUCT_AUTOMATION_SCHEMA_VERSION);
-    assert_eq!(script["limits"]["max_cpu_total_bytes"], total_bytes);
+#[test]
+fn x11_automation_helpers_have_short_silence_absolute_and_output_bounds() {
     assert_eq!(
-        script["limits"]["max_cpu_decoded_residency_bytes"],
+        X11_AUTOMATION_OUTPUT_POLICY.inactivity_timeout,
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        X11_AUTOMATION_OUTPUT_POLICY.absolute_timeout,
+        Duration::from_secs(3)
+    );
+    assert!(
+        X11_AUTOMATION_OUTPUT_POLICY.inactivity_timeout
+            < X11_AUTOMATION_OUTPUT_POLICY.absolute_timeout
+    );
+    assert_eq!(X11_AUTOMATION_OUTPUT_POLICY.max_stdout_bytes, 64 * 1024);
+    assert_eq!(X11_AUTOMATION_OUTPUT_POLICY.max_stderr_bytes, 64 * 1024);
+}
+
+fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_resources: u64) {
+    assert_eq!(SCRIPT_SCHEMA_VERSION, 8);
+    assert_eq!(REPORT_SCHEMA_VERSION, 8);
+    assert_eq!(script["schema_version"], 8);
+    assert_eq!(
+        script["hard_safety_limits"]["max_cpu_total_bytes"],
+        total_bytes
+    );
+    assert_eq!(
+        script["hard_safety_limits"]["max_cpu_decoded_residency_bytes"],
         total_bytes / 2
     );
     assert_eq!(
-        script["limits"]["max_cpu_in_flight_decode_bytes"],
+        script["hard_safety_limits"]["max_cpu_in_flight_decode_bytes"],
         (total_bytes / 8)
             .saturating_add(PACKAGE_VALIDATION_WORKING_BYTES)
             .min(total_bytes)
     );
-    assert_eq!(script["limits"]["max_runtime_queued_requests"], 1_024);
-    assert_eq!(script["limits"]["max_runtime_in_flight_decodes"], 8);
-    assert_eq!(script["limits"]["max_runtime_pending_completions"], 1_024);
     assert_eq!(
-        script["limits"]["max_runtime_resident_resources"],
+        script["hard_safety_limits"]["max_runtime_queued_requests"],
+        1_024
+    );
+    assert_eq!(
+        script["hard_safety_limits"]["max_runtime_in_flight_decodes"],
+        8
+    );
+    assert_eq!(
+        script["hard_safety_limits"]["max_runtime_pending_completions"],
+        1_024
+    );
+    assert_eq!(
+        script["hard_safety_limits"]["max_runtime_resident_resources"],
         resident_resources
     );
+}
+
+fn bind_report_to_script(report: &mut Value, script: &Value, script_path: &Path) {
+    report["schema"] = json!(PRODUCT_AUTOMATION_REPORT_SCHEMA);
+    report["schema_version"] = json!(REPORT_SCHEMA_VERSION);
+    report["status"] = json!("passed");
+    report["failure_reason"] = Value::Null;
+    report["script"] = json!({
+        "path": script_path,
+        "schema": script["schema"],
+        "schema_version": script["schema_version"],
+        "scenario": script["scenario"],
+        "command_count": script["commands"].as_array().unwrap().len(),
+    });
+    report["hard_safety_limits"] =
+        canonical_product_automation_hard_safety_limits(&script["hard_safety_limits"]).unwrap();
+}
+
+fn bound_automation_report(mut report: Value) -> (tempfile::TempDir, Value, PathBuf, Value) {
+    let tempdir = tempfile::tempdir().unwrap();
+    let script_path = tempdir.path().join("product-automation-script.json");
+    let script = target_fixture_camera_smoke_script(&tempdir.path().join("fixture.m4d"));
+    write_json_file(&script_path, &script).unwrap();
+    bind_report_to_script(&mut report, &script, &script_path);
+    (tempdir, script, script_path, report)
 }
 
 fn b3_exact_capture_report(second_width: u64) -> Value {
@@ -33,6 +90,9 @@ fn b3_exact_capture_report(second_width: u64) -> Value {
                 "width": B3_VIEWPORT_WIDTH,
                 "height": B3_VIEWPORT_HEIGHT,
                 "command_index": 20,
+                "target": "three_d",
+                "frame_identity": 20,
+                "surface_generation": 2,
                 "pixel_stats": {
                     "pixel_count": u64::from(B3_VIEWPORT_WIDTH) * u64::from(B3_VIEWPORT_HEIGHT),
                     "nonzero_rgb_pixels": 1,
@@ -46,6 +106,9 @@ fn b3_exact_capture_report(second_width: u64) -> Value {
                 "width": second_width,
                 "height": B3_SECOND_VIEWPORT_HEIGHT,
                 "command_index": 30,
+                "target": "three_d",
+                "frame_identity": 30,
+                "surface_generation": 3,
                 "pixel_stats": {
                     "pixel_count": second_width * u64::from(B3_SECOND_VIEWPORT_HEIGHT),
                     "nonzero_rgb_pixels": 1,
@@ -109,6 +172,9 @@ fn b4_normal_automation_report(width: u32, height: u32) -> Value {
             "path": "capture.ppm",
             "width": 16,
             "height": 16,
+            "target": "three_d",
+            "frame_identity": 1,
+            "surface_generation": 1,
             "pixel_stats": {
                 "pixel_count": 256,
                 "nonzero_rgb_pixels": 1,
@@ -118,13 +184,25 @@ fn b4_normal_automation_report(width: u32, height: u32) -> Value {
     })
 }
 
-fn b4_valid_attempt(number: u64) -> Value {
+fn b4_valid_attempt(number: u64, root: &Path) -> Value {
     let (width, height) = if number == 1 {
         (B4_PRIMARY_CLIENT_WIDTH, B4_PRIMARY_CLIENT_HEIGHT)
     } else {
         (B4_SECONDARY_CLIENT_WIDTH, B4_SECONDARY_CLIENT_HEIGHT)
     };
-    let (signal, exit_success, external_sigkill_sent, checkpoint, automation_report) =
+    let package = root.join("fixture.m4d");
+    let original = root.join("original.m4dproj");
+    let save_as = root.join("save-as.m4dproj");
+    let checkpoint_path = root.join("external-kill-checkpoint.json");
+    let script = match number {
+        1 => b4_launch_one_script(&package, &original, &checkpoint_path),
+        2 => b4_launch_two_script(&package, &original, &save_as),
+        3 => b4_launch_three_script(&package, &save_as),
+        _ => panic!("unsupported B4 test attempt"),
+    };
+    let script_path = root.join(format!("launch-{number}-script.json"));
+    write_json_file(&script_path, &script).unwrap();
+    let (signal, exit_success, external_sigkill_sent, checkpoint, mut automation_report) =
         if number == 1 {
             (
                 json!(9),
@@ -142,12 +220,16 @@ fn b4_valid_attempt(number: u64) -> Value {
                 b4_normal_automation_report(width, height),
             )
         };
+    if number != 1 {
+        bind_report_to_script(&mut automation_report, &script, &script_path);
+    }
     json!({
         "attempt": number,
         "phase": format!("launch-{number}"),
         "retry_index": 0,
         "status": "passed",
         "failure_reason": null,
+        "script": script_path,
         "requested_client_area_pixels": {"width": width, "height": height},
         "process": {
             "timed_out": false,
@@ -227,12 +309,57 @@ fn target_fixture_product_automation_script_uses_semantic_commands() {
             .iter()
             .any(|command| command["command"] == "copy_diagnostics")
     );
-    assert!(
-        commands
-            .iter()
-            .any(|command| command["command"] == "capture_screenshot")
-    );
+    assert!(commands.iter().any(|command| {
+        command["command"] == "capture_screenshot" && command["target"] == "three_d"
+    }));
     assert_eq!(commands.last().unwrap()["command"], "quit");
+}
+
+#[test]
+fn representative_native_navigation_script_exercises_the_real_navigation_cut() {
+    let script = representative_native_navigation_script(Path::new("/tmp/cell.m4d"));
+    let commands = script["commands"].as_array().unwrap();
+
+    assert_eq!(script["schema"], PRODUCT_AUTOMATION_SCRIPT_SCHEMA);
+    assert_eq!(
+        script["scenario"],
+        REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO
+    );
+    assert_dataset_runtime_limits(&script, 2_048 * MIB, 16_384);
+    assert_eq!(
+        script_render_modes_json(&script),
+        json!(["mip", "dvr", "iso"])
+    );
+    assert!(commands.iter().any(|command| {
+        command["command"] == "set_layer_sampling" && command["sampling"] == "smooth_linear"
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "set_viewer_layout" && command["layout"] == "four_panel"
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "set_viewer_layout" && command["layout"] == "single3d"
+    }));
+    let orbit = commands
+        .iter()
+        .position(|command| command["command"] == "camera_orbit_sequence")
+        .unwrap();
+    let linked = commands
+        .iter()
+        .enumerate()
+        .skip(orbit + 1)
+        .find(|(_, command)| command["command"] == "cross_section_rotate_sequence")
+        .map(|(index, _)| index)
+        .unwrap();
+    assert!(
+        orbit < linked,
+        "linked-only input must follow unfinished 3D settlement"
+    );
+    assert!(commands[orbit + 1..linked].iter().all(|command| {
+        command["command"] != "wait_for"
+            || command["condition"] != "coordinated_presentation_settled"
+    }));
+    assert_eq!(commands.last().unwrap()["command"], "quit");
+    validate_product_automation_script(&script).unwrap();
 }
 
 #[test]
@@ -246,6 +373,7 @@ fn target_fixture_render_modes_script_switches_supported_modes() {
 
     assert_eq!(script["schema"], PRODUCT_AUTOMATION_SCRIPT_SCHEMA);
     assert_eq!(script["scenario"], GENERATED_RENDER_MODES_SCENARIO);
+    assert_eq!(script["gpu_timing"], false);
     assert_dataset_runtime_limits(&script, 128 * MIB, 192);
     assert_eq!(
         script_requested_window_inner_size_points_json(&script)["width"],
@@ -264,7 +392,7 @@ fn target_fixture_render_modes_script_switches_supported_modes() {
             .iter()
             .filter(|&&name| name == "set_render_mode")
             .count(),
-        4
+        5
     );
     assert!(commands.iter().any(|command| {
         command["command"] == "set_layer_window"
@@ -284,6 +412,19 @@ fn target_fixture_render_modes_script_switches_supported_modes() {
             && command["opacity"].as_f64() == Some(1.0)
     }));
     assert!(commands.iter().any(|command| {
+        command["command"] == "set_projection" && command["projection"] == "perspective"
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "set_layer_sampling"
+            && command["layer_index"].as_u64() == Some(0)
+            && command["sampling"] == "smooth_linear"
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "set_layer_iso_shading"
+            && command["layer_index"].as_u64() == Some(0)
+            && command["shading"] == "gradient_lighting"
+    }));
+    assert!(commands.iter().any(|command| {
         command["command"] == "set_layer_opacity"
             && command["layer_index"].as_u64() == Some(1)
             && command["opacity"].as_f64() == Some(1.0)
@@ -293,7 +434,7 @@ fn target_fixture_render_modes_script_switches_supported_modes() {
             .iter()
             .filter(|&&name| name == "set_layer_render_mode")
             .count(),
-        4
+        5
     );
     assert!(commands.iter().any(|command| {
         command["command"] == "set_layer_render_mode"
@@ -313,14 +454,28 @@ fn target_fixture_render_modes_script_switches_supported_modes() {
             .iter()
             .filter(|&&name| name == "copy_diagnostics")
             .count(),
-        4
+        5
     );
     assert_eq!(
         command_names
             .iter()
             .filter(|&&name| name == "probe_hover")
             .count(),
-        3
+        4
+    );
+    assert_eq!(
+        command_names
+            .iter()
+            .filter(|&&name| name == "set_iso_light")
+            .count(),
+        2
+    );
+    assert_eq!(
+        command_names
+            .iter()
+            .filter(|&&name| name == "primary_click")
+            .count(),
+        5
     );
     assert!(
         commands
@@ -335,8 +490,118 @@ fn target_fixture_render_modes_script_switches_supported_modes() {
     assert!(
         commands
             .iter()
-            .any(|command| command["name"] == "generated-iso")
+            .any(|command| command["name"] == "generated-iso-detached-light")
     );
+    assert!(
+        commands
+            .iter()
+            .any(|command| command["name"] == "generated-mixed-mip-dvr")
+    );
+    for (name, target) in [
+        ("generated-linked-panels-3d", "three_d"),
+        ("generated-linked-panels-xy", "xy"),
+        ("generated-linked-panels-xz", "xz"),
+        ("generated-linked-panels-yz", "yz"),
+    ] {
+        assert!(commands.iter().any(|command| {
+            command["command"] == "capture_screenshot"
+                && command["name"] == name
+                && command["target"] == target
+        }));
+    }
+    let mixed_capture = commands
+        .iter()
+        .position(|command| command["name"] == "generated-mixed-mip-dvr")
+        .unwrap();
+    let previous_homogeneous_capture = commands
+        .iter()
+        .position(|command| command["name"] == "generated-iso-attached-light")
+        .unwrap();
+    let mixed_commands = &commands[previous_homogeneous_capture + 1..=mixed_capture];
+    assert!(
+        mixed_commands
+            .iter()
+            .any(|command| { command["command"] == "set_render_mode" && command["mode"] == "mip" })
+    );
+    assert!(mixed_commands.iter().any(|command| {
+        command["command"] == "set_layer_render_mode"
+            && command["layer_index"] == 1
+            && command["mode"] == "dvr"
+    }));
+    assert!(mixed_commands.iter().any(|command| {
+        command["command"] == "wait_for"
+            && command["condition"] == "coordinated_presentation_settled"
+    }));
+    assert!(
+        mixed_commands
+            .iter()
+            .any(|command| { command["condition"]["nonblank_panel"]["target"] == "three_d" })
+    );
+    assert!(
+        mixed_commands
+            .iter()
+            .any(|command| command["condition"] == "no_render_error")
+    );
+    assert!(mixed_commands.iter().any(|command| {
+        command["condition"]["frame_fidelity"]["scale_level"] == 0
+            && command["condition"]["frame_fidelity"]["complete"] == true
+            && command["condition"]["frame_fidelity"]["exact"] == true
+    }));
+    for policy in [
+        "mip_argmax",
+        "maximum_opacity_contribution",
+        "first_threshold_hit",
+    ] {
+        assert!(commands.iter().any(|command| {
+            command["condition"]["pick_evidence"]["policy"].as_str() == Some(policy)
+        }));
+    }
+    let validated_probe_policies = commands
+        .windows(2)
+        .filter(|pair| pair[0]["command"] == "probe_hover")
+        .map(|pair| {
+            pair[1]["condition"]["pick_evidence"]["policy"]
+                .as_str()
+                .expect("every probe is immediately validated")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        validated_probe_policies,
+        vec![
+            "mip_argmax",
+            "maximum_opacity_contribution",
+            "first_threshold_hit",
+            "mip_argmax",
+        ]
+    );
+    assert!(commands.iter().all(|command| {
+        command["command"] != "sleep_frames" || command["frames"].as_u64() != Some(8)
+    }));
+    let four_panel = commands
+        .iter()
+        .position(|command| {
+            command["command"] == "set_viewer_layout" && command["layout"] == "four_panel"
+        })
+        .unwrap();
+    let distinct = commands
+        .iter()
+        .position(|command| {
+            command["condition"]
+                .get("four_panel_images_distinct")
+                .is_some()
+        })
+        .unwrap();
+    assert!(commands[four_panel + 1..distinct].iter().any(|command| {
+        command["command"] == "wait_for"
+            && command["condition"] == "coordinated_presentation_settled"
+    }));
+    for condition in ["crosshair_linked", "roi_committed", "distance_committed"] {
+        assert!(
+            commands
+                .iter()
+                .any(|command| command["condition"] == condition)
+        );
+    }
     assert!(commands.iter().any(|command| {
         command["condition"]["viewer_layout"]["layout"].as_str() == Some("four_panel")
     }));
@@ -374,6 +639,10 @@ fn target_source_verification_script_proves_cancel_progress_success_and_both_siz
     let cancellation = commands
         .iter()
         .position(|command| command["command"] == "cancel_source_verification")
+        .unwrap();
+    let retry = commands
+        .iter()
+        .position(|command| command["command"] == "request_source_verification")
         .unwrap();
     assert!(initial_verified_wait < cancellation);
     assert!(
@@ -419,15 +688,171 @@ fn target_source_verification_script_proves_cancel_progress_success_and_both_siz
             && command["width"] == B3_SECOND_VIEWPORT_WIDTH
             && command["height"] == B3_SECOND_VIEWPORT_HEIGHT
     }));
-    assert!(commands.iter().any(|command| {
-        command["command"] == "capture_screenshot" && command["name"] == "b3-after-cancel-1280x720"
+    assert!(commands[cancellation + 1..retry].iter().all(|command| {
+        command["command"] != "capture_screenshot"
+            && command["condition"].get("nonblank_panel").is_none()
+            && command["condition"].get("render_target_pixels").is_none()
     }));
     assert!(commands.iter().any(|command| {
         command["command"] == "capture_screenshot"
             && command["name"] == "b3-after-success-1920x1080"
+            && command["target"] == "three_d"
     }));
     assert_eq!(commands.last().unwrap()["command"], "quit");
     validate_product_automation_script(&script).unwrap();
+}
+
+#[test]
+fn import_preprocessing_script_uses_normal_cancel_resume_open_ready_path() {
+    let script = import_preprocessing_script(
+        Path::new("/tmp/startup.m4d"),
+        Path::new("/tmp/source"),
+        Path::new("/tmp/output"),
+        Path::new("/tmp/output/source.m4d"),
+    );
+    let commands = script["commands"].as_array().unwrap();
+    assert_eq!(script["scenario"], IMPORT_PREPROCESSING_SCENARIO);
+    assert_dataset_runtime_limits(&script, 512 * MIB, IMPORT_RESIDENT_RESOURCE_LIMIT);
+    validate_product_automation_script(&script).unwrap();
+
+    let starts = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            (command["command"] == "start_reviewed_import").then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 2);
+    let progress = commands
+        .iter()
+        .position(|command| command["command"] == "wait_for_import_progress")
+        .unwrap();
+    let cancel = commands
+        .iter()
+        .position(|command| command["command"] == "cancel_import")
+        .unwrap();
+    let open_ready = commands
+        .iter()
+        .position(|command| command["command"] == "wait_for_imported_open_ready")
+        .unwrap();
+    assert!(starts[0] < progress && progress < cancel && cancel < starts[1]);
+    assert!(starts[1] < open_ready);
+    assert!(
+        commands[open_ready + 1..]
+            .iter()
+            .all(|command| command["command"] != "open_dataset"),
+        "the imported verified source must render directly without an external reopen"
+    );
+    assert_eq!(
+        commands[progress]["minimum_completed_work_units"],
+        IMPORT_DURABLE_PREFIX_WORK_UNITS
+    );
+    assert!(commands.iter().any(|command| {
+        command["condition"]["import_workflow_evidence"]["required_stage_names"]
+            .as_array()
+            .is_some_and(|stages| stages.iter().any(|stage| stage == "commit"))
+            && command["condition"]["import_workflow_evidence"]["min_cancelled_runs"] == 1
+            && command["condition"]["import_workflow_evidence"]["min_successful_runs"] == 1
+            && command["condition"]["import_workflow_evidence"]["min_resumed_work_units"]
+                == IMPORT_DURABLE_PREFIX_WORK_UNITS
+            && command["condition"]["import_workflow_evidence"]["min_projected_elapsed_ms"] == 1
+    }));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "capture_screenshot"
+            && command["name"] == "import-preprocessing-open-ready-navigation"
+            && command["target"] == "three_d"
+    }));
+    assert_eq!(commands.last().unwrap()["command"], "quit");
+}
+
+#[test]
+fn import_preprocessing_evidence_requires_named_progress_resume_and_open_ready() {
+    let report = json!({
+        "schema": PRODUCT_AUTOMATION_REPORT_SCHEMA,
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "import_workflow_evidence": {
+            "worker_emitted_stage_names": [
+                "planning-and-preflight",
+                "source-revalidation",
+                "checkpoint-open-or-resume",
+                "base-production",
+                "pyramid-production",
+                "source-scientific-identity",
+                "shard-publication",
+                "staged-structure-validation",
+                "staged-exact-validation",
+                "staged-scientific-validation",
+                "commit"
+            ],
+            "projected_named_stage_observations": ["base-production", "pyramid-production"],
+            "cancelled_runs": 1,
+            "successful_runs": 1,
+            "failed_runs": 0,
+            "published_events": 1,
+            "maximum_resumed_work_units": IMPORT_DURABLE_PREFIX_WORK_UNITS,
+            "maximum_peak_working_bytes": IMPORT_WORKING_MEMORY_BYTES,
+            "maximum_elapsed_ms": 2,
+            "maximum_projected_elapsed_ms": 1,
+            "publication_to_open_ready_clock": {
+                "status": IMPORT_OPEN_READY_COMPLETE_STATUS,
+                "transfer_mode": "staged_verified_capability",
+                "included_in_primary_clock": true,
+                "publication_currentness_execution": {
+                    "contract_id": PUBLICATION_CURRENTNESS_CONTRACT_ID,
+                    "expected_snapshot_object_reads": 7,
+                    "first_inventory_object_reads": 11,
+                    "observed_snapshot_object_reads": 7,
+                    "second_inventory_object_reads": 11,
+                    "observed_total_object_reads": 29,
+                    "observed_codec_decode_calls": 0
+                },
+                "source_verification_started_runs": 0,
+                "source_verification_progress_updates": 0,
+                "source_verification_cancelled_runs": 0,
+                "source_verification_failed_runs": 0,
+                "source_verification_successes": 0
+            }
+        },
+        "events": [{
+            "command": "wait_for_imported_open_ready",
+            "status": "passed",
+            "details": {
+                "verified": true,
+                "normal_product_open_path": true
+            }
+        }]
+    });
+    assert!(import_preprocessing_evidence(Some(&report)).is_ok());
+
+    let mut unavailable_transfer = report.clone();
+    unavailable_transfer["import_workflow_evidence"]["publication_to_open_ready_clock"] = json!({
+        "status": "open_ready_deadline_failed_before_transfer",
+    });
+    assert!(import_preprocessing_evidence(Some(&unavailable_transfer)).is_err());
+
+    let mut unexpected_verifier = report.clone();
+    unexpected_verifier["import_workflow_evidence"]["publication_to_open_ready_clock"]["source_verification_successes"] =
+        json!(1);
+    assert!(import_preprocessing_evidence(Some(&unexpected_verifier)).is_err());
+
+    let mut hidden_object_work = report.clone();
+    hidden_object_work["import_workflow_evidence"]["publication_to_open_ready_clock"]["publication_currentness_execution"]
+        ["observed_snapshot_object_reads"] = json!(14);
+    hidden_object_work["import_workflow_evidence"]["publication_to_open_ready_clock"]["publication_currentness_execution"]
+        ["observed_total_object_reads"] = json!(36);
+    assert!(import_preprocessing_evidence(Some(&hidden_object_work)).is_err());
+
+    let mut hidden_decode_work = report.clone();
+    hidden_decode_work["import_workflow_evidence"]["publication_to_open_ready_clock"]["publication_currentness_execution"]
+        ["observed_codec_decode_calls"] = json!(1);
+    assert!(import_preprocessing_evidence(Some(&hidden_decode_work)).is_err());
+
+    let mut missing_commit = report;
+    missing_commit["import_workflow_evidence"]["worker_emitted_stage_names"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|stage| stage != "commit");
+    assert!(import_preprocessing_evidence(Some(&missing_commit)).is_err());
 }
 
 #[test]
@@ -537,6 +962,170 @@ fn b4_scripts_lock_the_fixed_three_launch_cutover() {
 }
 
 #[test]
+fn pre_alpha_reliability_scripts_lock_recovery_exposure_and_native_close() {
+    let package = Path::new("/tmp/source.m4d");
+    let provisional_checkpoint = Path::new("/tmp/provisional-checkpoint.json");
+    let native_close_checkpoint = Path::new("/tmp/native-close-checkpoint.json");
+    let first = pre_alpha_provisional_launch_script(package, provisional_checkpoint);
+    let second = pre_alpha_recovery_launch_script(package);
+    let third = pre_alpha_native_close_launch_script(package, native_close_checkpoint);
+    for script in [&first, &second, &third] {
+        validate_product_automation_script(script).unwrap();
+        let commands = script["commands"].as_array().unwrap();
+        assert!(commands.iter().any(|command| {
+            command["command"] == "set_mapped_client_pixels"
+                && command["width"] == B4_PRIMARY_CLIENT_WIDTH
+                && command["height"] == B4_PRIMARY_CLIENT_HEIGHT
+        }));
+    }
+
+    let first_commands = first["commands"].as_array().unwrap();
+    let autosave = first_commands
+        .iter()
+        .position(|command| {
+            command["command"] == "wait_for" && command["condition"] == "project_autosaved"
+        })
+        .unwrap();
+    let checkpoint = first_commands
+        .iter()
+        .position(|command| command["command"] == "write_external_kill_checkpoint")
+        .unwrap();
+    assert!(autosave < checkpoint);
+    assert_eq!(first_commands[autosave]["timeout_ms"], 45_000);
+    assert_eq!(
+        first_commands[checkpoint]["stage"],
+        PRE_ALPHA_PROVISIONAL_CHECKPOINT_STAGE
+    );
+    assert_eq!(
+        first_commands.last().unwrap()["command"],
+        "hold_for_external_kill"
+    );
+
+    let second_commands = second["commands"].as_array().unwrap();
+    let exposed = second_commands
+        .iter()
+        .position(|command| {
+            command["command"] == "wait_for"
+                && command["condition"] == "unsaved_autosave_recovery_exposed"
+        })
+        .unwrap();
+    let recovered = second_commands
+        .iter()
+        .position(|command| command["command"] == "recover_exposed_unsaved_autosave")
+        .unwrap();
+    assert!(exposed < recovered);
+    validate_pre_alpha_recovery_script(&second).unwrap();
+    assert_eq!(second_commands.last().unwrap()["command"], "quit");
+
+    let third_commands = third["commands"].as_array().unwrap();
+    let checkpoint = third_commands
+        .iter()
+        .find(|command| command["command"] == "write_external_kill_checkpoint")
+        .unwrap();
+    assert_eq!(checkpoint["stage"], PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE);
+    assert_eq!(
+        third_commands.last().unwrap()["command"],
+        "hold_for_external_kill"
+    );
+}
+
+#[test]
+fn pre_alpha_recovery_and_stderr_evidence_are_bounded_and_strict() {
+    let state_home = tempfile::tempdir().unwrap();
+    let recovery_root = state_home.path().join("mirante4d").join("recovery");
+    fs::create_dir_all(recovery_root.join("12345678-1234-1234-1234-123456789abc.m4dproj")).unwrap();
+    let evidence = pre_alpha_recovery_store_evidence(state_home.path()).unwrap();
+    assert_eq!(evidence["entries"], 1);
+    assert_eq!(evidence["canonical_store_directories"], 1);
+    assert!(is_canonical_project_store_directory_name(
+        "12345678-1234-1234-1234-123456789abc.m4dproj"
+    ));
+    assert!(!is_canonical_project_store_directory_name(
+        "12345678-1234-1234-1234-123456789ABC.m4dproj"
+    ));
+
+    let stderr = state_home.path().join("stderr.log");
+    fs::write(&stderr, "normal diagnostic\n").unwrap();
+    assert_eq!(
+        pre_alpha_stderr_evidence(&stderr).unwrap()["panic_free"],
+        true
+    );
+    fs::write(&stderr, "thread 'main' panicked at source.rs:1\n").unwrap();
+    assert_eq!(
+        pre_alpha_stderr_evidence(&stderr).unwrap()["panic_free"],
+        false
+    );
+}
+
+#[test]
+fn pre_alpha_checkpoints_require_provisional_autosave_and_clean_unbound_close() {
+    let provisional = json!({
+        "schema": B4_CHECKPOINT_SCHEMA,
+        "schema_version": 1,
+        "stage": PRE_ALPHA_PROVISIONAL_CHECKPOINT_STAGE,
+        "viewport_evidence": {
+            "requested_mapped_client_pixels": {
+                "width": B4_PRIMARY_CLIENT_WIDTH,
+                "height": B4_PRIMARY_CLIENT_HEIGHT,
+            }
+        },
+        "project_state": {
+            "bound": true,
+            "dirty": true,
+            "current_revision": {"project_id": "project", "sequence": 2},
+            "saved_revision": null,
+            "lifecycle": "provisional",
+            "can_save": true,
+            "can_save_as": false,
+            "manual": false,
+            "autosave": true,
+            "current_manual": null,
+            "current_autosave": "autosave-generation",
+        },
+        "project_evidence": {
+            "latest_autosave_captured_revision": {
+                "project_id": "project",
+                "sequence": 2,
+            }
+        }
+    });
+    validate_pre_alpha_checkpoint(&provisional, PRE_ALPHA_PROVISIONAL_CHECKPOINT_STAGE, 1).unwrap();
+
+    let clean = json!({
+        "schema": B4_CHECKPOINT_SCHEMA,
+        "schema_version": 1,
+        "stage": PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE,
+        "viewport_evidence": {
+            "requested_mapped_client_pixels": {
+                "width": B4_PRIMARY_CLIENT_WIDTH,
+                "height": B4_PRIMARY_CLIENT_HEIGHT,
+            }
+        },
+        "project_state": {
+            "bound": false,
+            "dirty": false,
+            "current_revision": null,
+            "saved_revision": null,
+            "lifecycle": "unbound",
+            "can_save": true,
+            "can_save_as": false,
+            "manual": false,
+            "autosave": false,
+            "current_manual": null,
+            "current_autosave": null,
+        }
+    });
+    validate_pre_alpha_checkpoint(&clean, PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE, 3).unwrap();
+
+    let mut unsafe_clean = clean;
+    unsafe_clean["project_state"]["dirty"] = json!(true);
+    assert!(
+        validate_pre_alpha_checkpoint(&unsafe_clean, PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE, 3)
+            .is_err()
+    );
+}
+
+#[test]
 fn b4_checkpoint_requires_real_passive_autosave_and_revision_order() {
     let checkpoint = b4_valid_checkpoint();
     validate_b4_checkpoint(&checkpoint, B4_CHECKPOINT_STAGE).unwrap();
@@ -574,10 +1163,11 @@ xwininfo: Window id: 0x123 \"Mirante4D\"\n\
 
 #[test]
 fn b4_aggregate_requires_signal_nine_normal_joins_and_zero_retries() {
+    let tempdir = tempfile::tempdir().unwrap();
     let attempts = vec![
-        b4_valid_attempt(1),
-        b4_valid_attempt(2),
-        b4_valid_attempt(3),
+        b4_valid_attempt(1, tempdir.path()),
+        b4_valid_attempt(2, tempdir.path()),
+        b4_valid_attempt(3, tempdir.path()),
     ];
     validate_b4_aggregate_attempts(&attempts).unwrap();
 
@@ -664,12 +1254,24 @@ fn product_validation_scenario_resolution_is_strict() {
             ProductValidationScenario::GeneratedFixtureRenderModes,
         ),
         (
+            REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO,
+            ProductValidationScenario::RepresentativeNativeNavigation,
+        ),
+        (
             B3_SOURCE_VERIFICATION_SCENARIO,
             ProductValidationScenario::B3SourceVerification,
         ),
         (
+            IMPORT_PREPROCESSING_SCENARIO,
+            ProductValidationScenario::ImportPreprocessing,
+        ),
+        (
             B4_PROJECT_PERSISTENCE_SCENARIO,
             ProductValidationScenario::B4ProjectPersistence,
+        ),
+        (
+            PRE_ALPHA_RELIABILITY_SCENARIO,
+            ProductValidationScenario::PreAlphaReliability,
         ),
     ] {
         assert_eq!(
@@ -706,12 +1308,24 @@ fn product_validation_output_dirs_are_scenario_scoped() {
         Path::new(OUTPUT_DIR).join(GENERATED_RENDER_MODES_SCENARIO)
     );
     assert_eq!(
+        product_validation_output_dir(&ProductValidationScenario::RepresentativeNativeNavigation),
+        Path::new(OUTPUT_DIR).join(REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO)
+    );
+    assert_eq!(
         product_validation_output_dir(&ProductValidationScenario::B3SourceVerification),
         Path::new(OUTPUT_DIR).join(B3_SOURCE_VERIFICATION_SCENARIO)
     );
     assert_eq!(
+        product_validation_output_dir(&ProductValidationScenario::ImportPreprocessing),
+        Path::new(OUTPUT_DIR).join(IMPORT_PREPROCESSING_SCENARIO)
+    );
+    assert_eq!(
         product_validation_output_dir(&ProductValidationScenario::B4ProjectPersistence),
         Path::new(OUTPUT_DIR).join(B4_PROJECT_PERSISTENCE_SCENARIO)
+    );
+    assert_eq!(
+        product_validation_output_dir(&ProductValidationScenario::PreAlphaReliability),
+        Path::new(OUTPUT_DIR).join(PRE_ALPHA_RELIABILITY_SCENARIO)
     );
 }
 
@@ -719,7 +1333,7 @@ fn product_validation_output_dirs_are_scenario_scoped() {
 fn fixed_product_automation_script_validation_rejects_wrong_schema() {
     let script = json!({
         "schema": "wrong",
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "unit",
         "commands": [
             { "command": "open_dataset", "path": "/tmp/demo.m4d" },
@@ -733,9 +1347,9 @@ fn fixed_product_automation_script_validation_rejects_wrong_schema() {
 
     assert!(err.contains(PRODUCT_AUTOMATION_SCRIPT_SCHEMA));
 
-    let old_version = json!({
+    let predecessor_version = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": 1,
+        "schema_version": 5,
         "scenario": "unit",
         "commands": [
             { "command": "open_dataset", "path": "/tmp/demo.m4d" },
@@ -743,10 +1357,49 @@ fn fixed_product_automation_script_validation_rejects_wrong_schema() {
         ]
     });
     assert!(
-        validate_product_automation_script(&old_version)
+        validate_product_automation_script(&predecessor_version)
             .unwrap_err()
             .to_string()
-            .contains("schema_version must be 2")
+            .contains("schema_version must be 8")
+    );
+}
+
+#[test]
+fn product_automation_v8_rejects_implicit_capture_and_nonblank_targets() {
+    let implicit_capture = json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": "unit",
+        "hard_safety_limits": {},
+        "commands": [
+            { "command": "open_dataset", "path": "/tmp/demo.m4d" },
+            { "command": "capture_screenshot", "name": "implicit" },
+            { "command": "quit" }
+        ]
+    });
+    assert!(
+        validate_product_automation_script(&implicit_capture)
+            .unwrap_err()
+            .to_string()
+            .contains("explicit target")
+    );
+
+    let removed_nonblank = json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": "unit",
+        "hard_safety_limits": {},
+        "commands": [
+            { "command": "open_dataset", "path": "/tmp/demo.m4d" },
+            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "quit" }
+        ]
+    });
+    assert!(
+        validate_product_automation_script(&removed_nonblank)
+            .unwrap_err()
+            .to_string()
+            .contains("was removed")
     );
 }
 
@@ -754,7 +1407,7 @@ fn fixed_product_automation_script_validation_rejects_wrong_schema() {
 fn fixed_product_automation_script_validation_requires_open_dataset_and_quit() {
     let missing_open = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "unit",
         "commands": [
             { "command": "quit" }
@@ -762,7 +1415,7 @@ fn fixed_product_automation_script_validation_requires_open_dataset_and_quit() {
     });
     let missing_quit = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "unit",
         "commands": [
             { "command": "open_dataset", "path": "/tmp/demo.m4d" }
@@ -784,12 +1437,21 @@ fn fixed_product_automation_script_validation_requires_open_dataset_and_quit() {
 }
 
 #[test]
-fn fixed_product_automation_script_validation_rejects_bad_limits() {
+fn fixed_product_automation_script_validation_rejects_bad_hard_safety_limits() {
+    let missing = json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": "unit",
+        "commands": [
+            { "command": "open_dataset", "path": "/tmp/demo.m4d" },
+            { "command": "quit" }
+        ]
+    });
     let unknown = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "unit",
-        "limits": {
+        "hard_safety_limits": {
             "max_surprise_bytes": 1
         },
         "commands": [
@@ -799,9 +1461,9 @@ fn fixed_product_automation_script_validation_rejects_bad_limits() {
     });
     let non_integer = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "unit",
-        "limits": {
+        "hard_safety_limits": {
             "max_cpu_total_bytes": "lots"
         },
         "commands": [
@@ -811,17 +1473,124 @@ fn fixed_product_automation_script_validation_rejects_bad_limits() {
     });
 
     assert!(
+        validate_product_automation_script(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("hard_safety_limits must be present")
+    );
+    assert!(
         validate_product_automation_script(&unknown)
             .unwrap_err()
             .to_string()
-            .contains("unknown automation script limit")
+            .contains("unknown automation script hard-safety limit")
     );
     assert!(
         validate_product_automation_script(&non_integer)
             .unwrap_err()
             .to_string()
-            .contains("must be an unsigned integer")
+            .contains("must be null or an unsigned integer")
     );
+}
+
+#[test]
+fn product_automation_script_shape_rejects_legacy_and_unknown_top_level_fields() {
+    let valid = json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": "unit",
+        "hard_safety_limits": {
+            "max_cpu_total_bytes": 1024,
+            "max_cpu_prefetch_bytes": null
+        },
+        "commands": [
+            { "command": "open_dataset", "path": "/tmp/demo.m4d" },
+            { "command": "quit" }
+        ]
+    });
+    validate_product_automation_script(&valid).unwrap();
+    let canonical =
+        canonical_product_automation_hard_safety_limits(&valid["hard_safety_limits"]).unwrap();
+    assert_eq!(
+        canonical.as_object().unwrap().len(),
+        PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS.len()
+    );
+    assert_eq!(canonical["max_cpu_total_bytes"], 1024);
+    assert_eq!(canonical["max_cpu_prefetch_bytes"], Value::Null);
+    assert_eq!(canonical["max_runtime_resident_resources"], Value::Null);
+
+    let mut legacy = valid.clone();
+    legacy["limits"] = json!({});
+    assert!(validate_product_automation_script(&legacy).is_err());
+
+    let mut unknown = valid;
+    unknown["unexpected"] = json!(true);
+    assert!(validate_product_automation_script(&unknown).is_err());
+}
+
+#[test]
+fn product_automation_report_contract_requires_v8_script_and_report_binding() {
+    let report = json!({
+        "status": "passed",
+        "artifacts": []
+    });
+    let (tempdir, script, script_path, report) = bound_automation_report(report);
+    validate_product_automation_report_contract(&report, &script, &script_path).unwrap();
+
+    let mut old_schema = report.clone();
+    old_schema["schema_version"] = json!(REPORT_SCHEMA_VERSION - 1);
+    assert!(
+        validate_product_automation_report_contract(&old_schema, &script, &script_path).is_err()
+    );
+
+    let mut failed_status = report.clone();
+    failed_status["status"] = json!("failed");
+    failed_status["failure_reason"] = json!("hard safety cap exceeded");
+    assert!(
+        validate_product_automation_report_contract(&failed_status, &script, &script_path).is_err()
+    );
+
+    let mut missing_failure = report.clone();
+    missing_failure
+        .as_object_mut()
+        .unwrap()
+        .remove("failure_reason");
+    assert!(
+        validate_product_automation_report_contract(&missing_failure, &script, &script_path)
+            .is_err()
+    );
+
+    let mut wrong_script = report.clone();
+    wrong_script["script"]["scenario"] = json!("other");
+    assert!(
+        validate_product_automation_report_contract(&wrong_script, &script, &script_path).is_err()
+    );
+
+    let other_script_path = tempdir.path().join("other-script.json");
+    write_json_file(&other_script_path, &script).unwrap();
+    let mut wrong_path = report.clone();
+    wrong_path["script"]["path"] = json!(other_script_path);
+    assert!(
+        validate_product_automation_report_contract(&wrong_path, &script, &script_path).is_err()
+    );
+
+    let mut incomplete_limits = report.clone();
+    incomplete_limits["hard_safety_limits"]
+        .as_object_mut()
+        .unwrap()
+        .remove("max_cpu_prefetch_bytes");
+    assert!(
+        validate_product_automation_report_contract(&incomplete_limits, &script, &script_path)
+            .is_err()
+    );
+
+    let mut legacy_limits = report;
+    legacy_limits["limits"] = json!({});
+    assert!(
+        validate_product_automation_report_contract(&legacy_limits, &script, &script_path).is_err()
+    );
+    let (status, _) =
+        completed_product_validation_outcome(true, Some(&legacy_limits), &script, &script_path);
+    assert_eq!(status, ProductValidationStatus::Failed);
 }
 
 #[test]
@@ -881,9 +1650,11 @@ fn completed_product_validation_fails_without_viewport_capture() {
         "status": "passed",
         "artifacts": []
     });
+    let (_tempdir, script, script_path, automation_report) =
+        bound_automation_report(automation_report);
 
     let (status, failure_reason) =
-        completed_product_validation_outcome(true, Some("passed"), None, Some(&automation_report));
+        completed_product_validation_outcome(true, Some(&automation_report), &script, &script_path);
 
     assert_eq!(status, ProductValidationStatus::Failed);
     assert!(
@@ -904,6 +1675,9 @@ fn completed_product_validation_fails_with_blank_viewport_capture() {
             "path": "blank.ppm",
             "width": 2,
             "height": 2,
+            "target": "three_d",
+            "frame_identity": 1,
+            "surface_generation": 1,
             "pixel_stats": {
                 "pixel_count": 4,
                 "nonzero_rgb_pixels": 0,
@@ -911,9 +1685,11 @@ fn completed_product_validation_fails_with_blank_viewport_capture() {
             }
         }]
     });
+    let (_tempdir, script, script_path, automation_report) =
+        bound_automation_report(automation_report);
 
     let (status, failure_reason) =
-        completed_product_validation_outcome(true, Some("passed"), None, Some(&automation_report));
+        completed_product_validation_outcome(true, Some(&automation_report), &script, &script_path);
 
     assert_eq!(status, ProductValidationStatus::Failed);
     assert!(failure_reason.is_some());
@@ -929,6 +1705,9 @@ fn completed_product_validation_passes_with_nonblank_viewport_capture() {
             "path": "nonblank.ppm",
             "width": 2,
             "height": 2,
+            "target": "three_d",
+            "frame_identity": 1,
+            "surface_generation": 1,
             "pixel_stats": {
                 "pixel_count": 4,
                 "nonzero_rgb_pixels": 1,
@@ -936,9 +1715,11 @@ fn completed_product_validation_passes_with_nonblank_viewport_capture() {
             }
         }]
     });
+    let (_tempdir, script, script_path, automation_report) =
+        bound_automation_report(automation_report);
 
     let (status, failure_reason) =
-        completed_product_validation_outcome(true, Some("passed"), None, Some(&automation_report));
+        completed_product_validation_outcome(true, Some(&automation_report), &script, &script_path);
 
     assert_eq!(status, ProductValidationStatus::Passed);
     assert_eq!(failure_reason, None);
@@ -954,6 +1735,9 @@ fn completed_product_validation_rejects_nonblank_loading_reference_capture() {
             "path": "loading.ppm",
             "width": 2,
             "height": 2,
+            "target": "three_d",
+            "frame_identity": 1,
+            "surface_generation": 1,
             "pixel_stats": {
                 "pixel_count": 4,
                 "nonzero_rgb_pixels": 1,
@@ -961,9 +1745,11 @@ fn completed_product_validation_rejects_nonblank_loading_reference_capture() {
             }
         }]
     });
+    let (_tempdir, script, script_path, automation_report) =
+        bound_automation_report(automation_report);
 
     let (status, failure_reason) =
-        completed_product_validation_outcome(true, Some("passed"), None, Some(&automation_report));
+        completed_product_validation_outcome(true, Some(&automation_report), &script, &script_path);
 
     assert_eq!(status, ProductValidationStatus::Failed);
     assert!(failure_reason.unwrap().contains("GPU viewport_capture"));
@@ -1021,6 +1807,9 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
                 "path": "target/mirante4d/product-validation/artifacts/post-camera-sequence.ppm",
                 "width": 16,
                 "height": 16,
+                "target": "three_d",
+                "frame_identity": 1,
+                "surface_generation": 1,
                 "capture_source": "gpu_display_frame_readback",
                 "pixel_stats": {
                     "pixel_count": 256,
@@ -1272,15 +2061,15 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
     assert_eq!(report["limits"]["runtime_work_limit_enforced"], true);
     assert_eq!(
         report["limits"]["cpu_total_byte_limit_bytes"],
-        script["limits"]["max_cpu_total_bytes"]
+        script["hard_safety_limits"]["max_cpu_total_bytes"]
     );
     assert_eq!(
         report["limits"]["cpu_category_byte_limits"]["decoded_residency"],
-        script["limits"]["max_cpu_decoded_residency_bytes"]
+        script["hard_safety_limits"]["max_cpu_decoded_residency_bytes"]
     );
     assert_eq!(
         report["limits"]["runtime_work_limits"]["queued_requests"],
-        script["limits"]["max_runtime_queued_requests"]
+        script["hard_safety_limits"]["max_runtime_queued_requests"]
     );
 }
 

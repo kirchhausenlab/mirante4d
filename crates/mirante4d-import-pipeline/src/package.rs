@@ -25,9 +25,11 @@ use crate::ImportError;
 
 const IMAGE_ORDINAL: u32 = 0;
 const PACKED_INDEX_RECORD_BYTES: u64 = 64;
-const MAX_LEVELS: usize = 7;
 const MAX_SOURCE_FILES: usize = 4_096;
 const EXECUTABLE_HASH_BUFFER_BYTES: usize = 64 * 1024;
+const BASE_OPERATION_REGISTRY_V1: &[u8] = b"mirante4d-import-pipeline-base-operation-registry-v1";
+const U8_SENTINEL_OPERATION_REGISTRY_V2: &[u8] =
+    b"mirante4d-import-pipeline-u8-sentinel-guarded-pyramid-operation-registry-v2";
 
 /// The scientific and storage facts needed to construct package metadata.
 #[derive(Clone, Debug, PartialEq)]
@@ -135,12 +137,9 @@ fn validate_input(input: &PackageMetadataInput) -> Result<(), ImportError> {
             "package metadata requires at least one channel",
         ));
     }
-    if input.pyramid_shapes.is_empty()
-        || input.pyramid_shapes.len() > MAX_LEVELS
-        || input.pyramid_shapes[0] != input.base_shape
-    {
+    if input.pyramid_shapes.is_empty() || input.pyramid_shapes[0] != input.base_shape {
         return Err(ImportError::InvalidRequest(
-            "pyramid shapes must begin with the base shape and contain one through seven levels",
+            "pyramid shapes must begin with the base shape",
         ));
     }
     for pair in input.pyramid_shapes.windows(2) {
@@ -221,22 +220,37 @@ fn ome_metadata(
     temporal: &ScienceTemporalCalibration,
     input: &PackageMetadataInput,
 ) -> Result<OmeImageGroupMetadata, ImportError> {
-    let mut factor = 1_u64;
+    let centered_mean_pyramid = input.u8_sentinel.is_some();
+    let mut factors_zyx = [1_u64; 3];
     let mut transforms = Vec::with_capacity(input.pyramid_shapes.len());
-    for _ in &input.pyramid_shapes {
-        let factor_f64 = factor as f64;
-        let scale_zyx = [
-            input.spacing_zyx_um[0] * factor_f64,
-            input.spacing_zyx_um[1] * factor_f64,
-            input.spacing_zyx_um[2] * factor_f64,
-        ];
+    for (ordinal, shape) in input.pyramid_shapes.iter().enumerate() {
+        if ordinal > 0 {
+            let previous = input.pyramid_shapes[ordinal - 1];
+            for (axis, prior_length) in previous.dimensions()[1..].iter().copied().enumerate() {
+                if !centered_mean_pyramid || prior_length > 1 {
+                    factors_zyx[axis] = factors_zyx[axis]
+                        .checked_mul(2)
+                        .ok_or(ImportError::Overflow)?;
+                }
+            }
+        }
+        debug_assert_eq!(shape.t(), input.base_shape.t());
+        let scale_zyx =
+            std::array::from_fn(|axis| input.spacing_zyx_um[axis] * factors_zyx[axis] as f64);
+        let translation_zyx = if centered_mean_pyramid {
+            std::array::from_fn(|axis| {
+                input.spacing_zyx_um[axis] * (factors_zyx[axis] - 1) as f64 / 2.0
+            })
+        } else {
+            // The no-sentinel route retains its point-sampled, base-origin
+            // transform exactly. Restoring mean semantics is intentionally
+            // limited to the reviewed sentinel policy.
+            [0.0; 3]
+        };
         transforms.push(OmeLevelTransform::DiagonalMicrometer {
             scale_zyx: f64_bits3(scale_zyx)?,
-            // The accepted target profile anchors every level at the base
-            // grid origin; only the spatial scale changes with level.
-            translation_zyx: f64_bits3([0.0; 3])?,
+            translation_zyx: f64_bits3(translation_zyx)?,
         });
-        factor = factor.checked_mul(2).ok_or(ImportError::Overflow)?;
     }
     OmeImageGroupMetadata::new(image, temporal, transforms).map_err(|_| {
         ImportError::InvalidRequest("package OME metadata is inconsistent with the import plan")
@@ -443,7 +457,7 @@ fn portable_records(input: &PackageMetadataInput) -> Result<Vec<PortableRecord>,
 }
 
 fn recipe(input: &PackageMetadataInput) -> Result<RecipePayload, ImportError> {
-    let mut parameters = vec![
+    let base_parameters = vec![
         CanonicalMapEntry::new(
             token("spacing_x_um")?,
             CanonicalValue::from_f64(f64_bits(input.spacing_zyx_um[2])?),
@@ -457,24 +471,29 @@ fn recipe(input: &PackageMetadataInput) -> Result<RecipePayload, ImportError> {
             CanonicalValue::from_f64(f64_bits(input.spacing_zyx_um[0])?),
         ),
     ];
+    let (operation, registry_preimage) = match input.u8_sentinel {
+        Some(sentinel) => sentinel_recipe_operation(input, base_parameters, sentinel)?,
+        None => base_recipe_operation(input, base_parameters)?,
+    };
+    let registry = ExactBytesDigest::from_digest(Sha256Hasher::digest(registry_preimage));
+    RecipePayload::new(RecipeBody::new(
+        registry,
+        RecipeDeterminism::BitExact,
+        vec![operation],
+    )?)
+    .map_err(ImportError::from)
+}
+
+fn base_recipe_operation(
+    input: &PackageMetadataInput,
+    mut parameters: Vec<CanonicalMapEntry>,
+) -> Result<(RecipeOperation, &'static [u8]), ImportError> {
     if let Some(seconds) = input.regular_time_step_seconds {
         parameters.push(CanonicalMapEntry::new(
             token("time_step_seconds")?,
             CanonicalValue::from_f64(f64_bits(seconds)?),
         ));
     }
-    if let Some(sentinel) = input.u8_sentinel {
-        parameters.push(CanonicalMapEntry::new(
-            token("u8_sentinel")?,
-            CanonicalValue::from_u64(number(u64::from(sentinel))?),
-        ));
-    }
-
-    let no_data = if input.explicit_validity {
-        "sentinel-to-invalid"
-    } else {
-        "all-valid"
-    };
     let operation = RecipeOperation::new(
         number(0)?,
         token("tiff-import-canonical-base")?,
@@ -489,22 +508,96 @@ fn recipe(input: &PackageMetadataInput) -> Result<RecipePayload, ImportError> {
             token("identity")?,
             token("none")?,
             token("none")?,
-            token(no_data)?,
+            token("all-valid")?,
             token("tczyx")?,
             token("identity")?,
             None,
         ),
         vec![token("base-image")?],
     )?;
-    let registry = ExactBytesDigest::from_digest(Sha256Hasher::digest(
-        b"mirante4d-import-pipeline-base-operation-registry-v1",
+    Ok((operation, BASE_OPERATION_REGISTRY_V1))
+}
+
+fn sentinel_recipe_operation(
+    input: &PackageMetadataInput,
+    base_parameters: Vec<CanonicalMapEntry>,
+    sentinel: u8,
+) -> Result<(RecipeOperation, &'static [u8]), ImportError> {
+    // Canonical maps require strict lexical key order. These fields make the
+    // complete restored policy identity-bearing instead of relying on an
+    // ambiguous sentinel-to-invalid label.
+    let mut parameters = vec![
+        CanonicalMapEntry::new(
+            token("canonical_invalid_u8")?,
+            CanonicalValue::from_u64(number(0)?),
+        ),
+        CanonicalMapEntry::new(
+            token("dilation_application")?,
+            CanonicalValue::from_ascii(token("base-and-every-lod")?),
+        ),
+        CanonicalMapEntry::new(
+            token("dilation_metric")?,
+            CanonicalValue::from_ascii(token("chebyshev")?),
+        ),
+        CanonicalMapEntry::new(
+            token("dilation_radius_xy")?,
+            CanonicalValue::from_u64(number(1)?),
+        ),
+        CanonicalMapEntry::new(
+            token("dilation_radius_z_2d")?,
+            CanonicalValue::from_u64(number(0)?),
+        ),
+        CanonicalMapEntry::new(
+            token("dilation_radius_z_3d")?,
+            CanonicalValue::from_u64(number(1)?),
+        ),
+        CanonicalMapEntry::new(
+            token("mean_block")?,
+            CanonicalValue::from_ascii(token("aligned-factor-two-reduced-axes")?),
+        ),
+        CanonicalMapEntry::new(
+            token("no_support")?,
+            CanonicalValue::from_ascii(token("invalid")?),
+        ),
+        CanonicalMapEntry::new(
+            token("sentinel_classification")?,
+            CanonicalValue::from_ascii(token("exact-source-byte-equality")?),
+        ),
+    ];
+    parameters.extend(base_parameters);
+    if let Some(seconds) = input.regular_time_step_seconds {
+        parameters.push(CanonicalMapEntry::new(
+            token("time_step_seconds")?,
+            CanonicalValue::from_f64(f64_bits(seconds)?),
+        ));
+    }
+    parameters.push(CanonicalMapEntry::new(
+        token("u8_sentinel")?,
+        CanonicalValue::from_u64(number(u64::from(sentinel))?),
     ));
-    RecipePayload::new(RecipeBody::new(
-        registry,
-        RecipeDeterminism::BitExact,
-        vec![operation],
-    )?)
-    .map_err(ImportError::from)
+
+    let operation = RecipeOperation::new(
+        number(0)?,
+        token("tiff-import-u8-sentinel-guarded-pyramid")?,
+        token("2.0.0")?,
+        token("m4d.import.u8-sentinel-guarded-pyramid.v2")?,
+        CanonicalValue::map(parameters)?,
+        Vec::new(),
+        RecipeNumericPolicy::new(
+            token("uint8")?,
+            token("half-up")?,
+            token("valid-only-mean")?,
+            token("aligned-factor-two-mean")?,
+            token("ignore-out-of-bounds")?,
+            token("none")?,
+            token("u8-sentinel-chebyshev-radius-one-every-level")?,
+            token("tczyx")?,
+            token("exact-integer")?,
+            None,
+        ),
+        vec![token("multiscale-image")?],
+    )?;
+    Ok((operation, U8_SENTINEL_OPERATION_REGISTRY_V2))
 }
 
 fn running_executable_digest() -> Result<ExactBytesDigest, ImportError> {
@@ -658,6 +751,27 @@ mod tests {
     }
 
     #[test]
+    fn package_metadata_accepts_a_geometry_required_15_level_pyramid() {
+        let shapes = [
+            1_048_576, 524_288, 262_144, 131_072, 65_536, 32_768, 16_384, 8_192, 4_096, 2_048,
+            1_024, 512, 256, 128, 64,
+        ]
+        .into_iter()
+        .map(|x| Shape4D::new(1, 1, 1, x).unwrap())
+        .collect::<Vec<_>>();
+        let metadata = build_package_metadata(&input(shapes[0], shapes)).unwrap();
+
+        assert_eq!(metadata.profile.images()[0].levels().len(), 15);
+        assert_eq!(metadata.ome_images[0].level_transforms().len(), 15);
+        assert_eq!(metadata.arrays.len(), 30);
+        assert!(
+            String::from_utf8(metadata.ome_images[0].deterministic_bytes().unwrap())
+                .unwrap()
+                .contains("\"path\":\"s14\"")
+        );
+    }
+
+    #[test]
     fn builds_2d_explicit_validity_arrays_for_all_channels() {
         let base = Shape4D::new(1, 1, 512, 512).unwrap();
         let coarse = Shape4D::new(1, 1, 256, 256).unwrap();
@@ -688,16 +802,52 @@ mod tests {
             metadata.ome_images[0].level_transforms()[1],
             OmeLevelTransform::DiagonalMicrometer {
                 scale_zyx: [
-                    f64_bits(1.0).unwrap(),
+                    f64_bits(0.5).unwrap(),
                     f64_bits(0.6).unwrap(),
                     f64_bits(0.4).unwrap()
                 ],
                 translation_zyx: [
                     f64_bits(0.0).unwrap(),
-                    f64_bits(0.0).unwrap(),
-                    f64_bits(0.0).unwrap(),
+                    f64_bits(0.15).unwrap(),
+                    f64_bits(0.1).unwrap(),
                 ],
             }
+        );
+    }
+
+    #[test]
+    fn sentinel_mean_transforms_center_only_axes_reduced_at_each_level() {
+        let s0 = Shape4D::new(1, 2, 5, 9).unwrap();
+        let s1 = Shape4D::new(1, 1, 3, 5).unwrap();
+        let s2 = Shape4D::new(1, 1, 2, 3).unwrap();
+        let s3 = Shape4D::new(1, 1, 1, 2).unwrap();
+        let mut input = input(s0, vec![s0, s1, s2, s3]);
+        input.profile_kind = ProfileKind::Ds4;
+        input.dtype = IntensityDType::Uint8;
+        input.explicit_validity = true;
+        input.u8_sentinel = Some(255);
+
+        let metadata = build_package_metadata(&input).unwrap();
+        assert_eq!(
+            metadata.ome_images[0].level_transforms(),
+            [
+                centered_transform([0.5, 0.3, 0.2], [1, 1, 1]),
+                centered_transform([0.5, 0.3, 0.2], [2, 2, 2]),
+                centered_transform([0.5, 0.3, 0.2], [2, 4, 4]),
+                centered_transform([0.5, 0.3, 0.2], [2, 8, 8]),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_sentinel_transform_remains_origin_anchored_and_uniform() {
+        let base = Shape4D::new(1, 1, 8, 8).unwrap();
+        let coarse = Shape4D::new(1, 1, 4, 4).unwrap();
+        let metadata = build_package_metadata(&input(base, vec![base, coarse])).unwrap();
+
+        assert_eq!(
+            metadata.ome_images[0].level_transforms()[1],
+            diagonal_transform([1.0, 0.6, 0.4], [0.0; 3])
         );
     }
 
@@ -791,17 +941,151 @@ mod tests {
         let PortableRecordPayload::Recipe(recipe) = metadata.portable_records[1].payload() else {
             panic!("record one must be recipe provenance");
         };
+        assert_eq!(
+            recipe.recipe_id().to_string(),
+            "m4d-recipe-v1-sha256:89ab81cae5f2424aa965b5ec36979b0e1ee251632db008145ed9ec60b1a276ff"
+        );
         let operation = &recipe.body().operations()[0];
         assert_eq!(operation.name().as_str(), "tiff-import-canonical-base");
+        assert_eq!(operation.semantic_version().as_str(), "1.0.0");
         assert_eq!(operation.parameter_schema().as_str(), "m4d.import.base.v1");
         assert_eq!(operation.output_roles()[0].as_str(), "base-image");
+        assert_eq!(
+            recipe.body().operation_registry_digest(),
+            ExactBytesDigest::from_digest(Sha256Hasher::digest(
+                b"mirante4d-import-pipeline-base-operation-registry-v1"
+            ))
+        );
         let policy = operation.numeric_policy();
         assert_eq!(policy.rounding().as_str(), "identity");
         assert_eq!(policy.reduction().as_str(), "none");
         assert_eq!(policy.kernel().as_str(), "identity");
         assert_eq!(policy.boundary().as_str(), "none");
         assert_eq!(policy.interpolation().as_str(), "none");
+        assert_eq!(policy.no_data().as_str(), "all-valid");
         assert_eq!(policy.precision().as_str(), "identity");
+    }
+
+    #[test]
+    fn sentinel_recipe_records_the_complete_restored_policy() {
+        let base = Shape4D::new(1, 1, 9, 11).unwrap();
+        let coarse = Shape4D::new(1, 1, 5, 6).unwrap();
+        let mut input = input(base, vec![base, coarse]);
+        input.dtype = IntensityDType::Uint8;
+        input.explicit_validity = true;
+        input.u8_sentinel = Some(253);
+
+        let recipe = recipe(&input).unwrap();
+        let operation = &recipe.body().operations()[0];
+        assert_eq!(
+            operation.name().as_str(),
+            "tiff-import-u8-sentinel-guarded-pyramid"
+        );
+        assert_eq!(operation.semantic_version().as_str(), "2.0.0");
+        assert_eq!(
+            operation.parameter_schema().as_str(),
+            "m4d.import.u8-sentinel-guarded-pyramid.v2"
+        );
+        assert_eq!(operation.output_roles()[0].as_str(), "multiscale-image");
+        assert_eq!(
+            recipe.body().operation_registry_digest(),
+            ExactBytesDigest::from_digest(Sha256Hasher::digest(
+                b"mirante4d-import-pipeline-u8-sentinel-guarded-pyramid-operation-registry-v2"
+            ))
+        );
+
+        let parameter_names = operation
+            .parameters()
+            .as_map()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.key().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parameter_names,
+            [
+                "canonical_invalid_u8",
+                "dilation_application",
+                "dilation_metric",
+                "dilation_radius_xy",
+                "dilation_radius_z_2d",
+                "dilation_radius_z_3d",
+                "mean_block",
+                "no_support",
+                "sentinel_classification",
+                "spacing_x_um",
+                "spacing_y_um",
+                "spacing_z_um",
+                "time_step_seconds",
+                "u8_sentinel",
+            ]
+        );
+        assert_eq!(parameter_u64(operation, "canonical_invalid_u8"), 0);
+        assert_eq!(
+            parameter_ascii(operation, "dilation_application"),
+            "base-and-every-lod"
+        );
+        assert_eq!(parameter_ascii(operation, "dilation_metric"), "chebyshev");
+        assert_eq!(parameter_u64(operation, "dilation_radius_xy"), 1);
+        assert_eq!(parameter_u64(operation, "dilation_radius_z_2d"), 0);
+        assert_eq!(parameter_u64(operation, "dilation_radius_z_3d"), 1);
+        assert_eq!(
+            parameter_ascii(operation, "mean_block"),
+            "aligned-factor-two-reduced-axes"
+        );
+        assert_eq!(parameter_ascii(operation, "no_support"), "invalid");
+        assert_eq!(
+            parameter_ascii(operation, "sentinel_classification"),
+            "exact-source-byte-equality"
+        );
+        assert_eq!(parameter_u64(operation, "u8_sentinel"), 253);
+
+        let policy = operation.numeric_policy();
+        assert_eq!(policy.dtype().as_str(), "uint8");
+        assert_eq!(policy.rounding().as_str(), "half-up");
+        assert_eq!(policy.reduction().as_str(), "valid-only-mean");
+        assert_eq!(policy.kernel().as_str(), "aligned-factor-two-mean");
+        assert_eq!(policy.boundary().as_str(), "ignore-out-of-bounds");
+        assert_eq!(policy.interpolation().as_str(), "none");
+        assert_eq!(
+            policy.no_data().as_str(),
+            "u8-sentinel-chebyshev-radius-one-every-level"
+        );
+        assert_eq!(policy.ordering().as_str(), "tczyx");
+        assert_eq!(policy.precision().as_str(), "exact-integer");
+    }
+
+    fn diagonal_transform(scale: [f64; 3], translation: [f64; 3]) -> OmeLevelTransform {
+        OmeLevelTransform::DiagonalMicrometer {
+            scale_zyx: f64_bits3(scale).unwrap(),
+            translation_zyx: f64_bits3(translation).unwrap(),
+        }
+    }
+
+    fn centered_transform(spacing: [f64; 3], factors: [u64; 3]) -> OmeLevelTransform {
+        diagonal_transform(
+            std::array::from_fn(|axis| spacing[axis] * factors[axis] as f64),
+            std::array::from_fn(|axis| spacing[axis] * (factors[axis] - 1) as f64 / 2.0),
+        )
+    }
+
+    fn parameter<'a>(operation: &'a RecipeOperation, name: &str) -> &'a CanonicalValue {
+        operation
+            .parameters()
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|entry| entry.key().as_str() == name)
+            .unwrap()
+            .value()
+    }
+
+    fn parameter_ascii<'a>(operation: &'a RecipeOperation, name: &str) -> &'a str {
+        parameter(operation, name).as_ascii().unwrap().as_str()
+    }
+
+    fn parameter_u64(operation: &RecipeOperation, name: &str) -> u64 {
+        parameter(operation, name).as_u64().unwrap().get()
     }
 
     fn independently_hash_running_executable() -> ExactBytesDigest {

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env, fs,
     os::unix::{ffi::OsStrExt, fs::MetadataExt, process::ExitStatusExt},
     path::{Path, PathBuf},
@@ -8,20 +9,47 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use mirante4d_import_pipeline::{TiffSource, deterministic_tiff_destination};
 use mirante4d_storage::{LocalPackageCatalog, PACKAGE_VALIDATION_WORKING_BYTES};
 use serde_json::{Value, json};
 
 use crate::{
     host::benchmark_host_context,
-    process::run_cargo,
+    process::{
+        BoundedOutputPolicy, isolate_process_tree, run_cargo, run_command_with_bounded_output,
+        terminate_process_tree,
+    },
+    product_automation_progress::{
+        FILE_POLL_INTERVAL, ProductAutomationProgressLaunch, ProductAutomationProgressPlan,
+        ProgressMonitorAction, safe_automation_progress_line,
+    },
     reports::{read_json_file, write_json_file},
     target_fixture::extract_target_u16_fixture,
 };
 
 const PRODUCT_VALIDATION_SCHEMA: &str = "mirante4d-product-validation-report";
-const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
-const PRODUCT_AUTOMATION_SCHEMA_VERSION: u32 = 2;
-const PRODUCT_VALIDATION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
+pub(crate) const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
+pub(crate) const SCRIPT_SCHEMA_VERSION: u32 = 8;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 8;
+pub(crate) const IMPORT_OPEN_READY_COMPLETE_STATUS: &str = "open_ready_complete";
+pub(crate) const PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS: [&str; 12] = [
+    "max_cpu_total_bytes",
+    "max_cpu_decoded_residency_bytes",
+    "max_cpu_upload_staging_bytes",
+    "max_cpu_in_flight_decode_bytes",
+    "max_cpu_metadata_and_indexes_bytes",
+    "max_cpu_queues_and_results_bytes",
+    "max_cpu_prefetch_bytes",
+    "max_cpu_import_working_set_bytes",
+    "max_runtime_queued_requests",
+    "max_runtime_in_flight_decodes",
+    "max_runtime_pending_completions",
+    "max_runtime_resident_resources",
+];
+const PRODUCT_VALIDATION_SCHEMA_VERSION: u32 = 2;
+const PUBLICATION_CURRENTNESS_CONTRACT_ID: &str =
+    "mirante4d-publication-currentness-inventory-snapshot-inventory-1";
 const OUTPUT_DIR: &str = "target/mirante4d/product-validation";
 const TIMEOUT_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_TIMEOUT_SECS";
 const ALLOW_NO_DISPLAY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_ALLOW_NO_DISPLAY";
@@ -32,13 +60,22 @@ const SCENARIO_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_SCENARIO";
 const PREFLIGHT_ONLY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_PREFLIGHT_ONLY";
 const GENERATED_FIXTURE_SCENARIO: &str = "target_fixture_camera_smoke";
 const GENERATED_RENDER_MODES_SCENARIO: &str = "target_fixture_render_modes";
+const REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO: &str = "representative_native_navigation";
 const B3_SOURCE_VERIFICATION_SCENARIO: &str = "target_source_verification";
+const IMPORT_PREPROCESSING_SCENARIO: &str = "import_preprocessing";
 const B4_PROJECT_PERSISTENCE_SCENARIO: &str = "b4_project_persistence";
+const PRE_ALPHA_RELIABILITY_SCENARIO: &str = "pre_alpha_reliability";
 const B4_TRUSTED_REPORT_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_PROJECT_STORE_LIFECYCLE_REPORT";
 const B4_CHECKPOINT_SCHEMA: &str = "mirante4d-product-external-kill-checkpoint";
 const B4_CHECKPOINT_STAGE: &str = "after_real_autosave_before_external_kill";
+const PRE_ALPHA_PROVISIONAL_CHECKPOINT_STAGE: &str =
+    "after_provisional_autosave_before_external_kill";
+const PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE: &str = "mapped_clean_window_ready_for_native_close";
 const B4_AUTOSAVE_MIN_ELAPSED_MS: u64 = 30_000;
 const B4_PHASE_TIMEOUT_SECS: u64 = 90;
+const NATIVE_CLOSE_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+const B3_SCENARIO_TIMEOUT_SECS: u64 = 180;
+const IMPORT_SCENARIO_TIMEOUT_SECS: u64 = 600;
 const B4_PRIMARY_CLIENT_WIDTH: u32 = 1280;
 const B4_PRIMARY_CLIENT_HEIGHT: u32 = 720;
 const B4_SECONDARY_CLIENT_WIDTH: u32 = 1920;
@@ -53,10 +90,28 @@ const B3_SECOND_VIEWPORT_WIDTH: u32 = 1920;
 const B3_SECOND_VIEWPORT_HEIGHT: u32 = 1080;
 const B3_PRIMARY_E1_CAPTURE: &str = "b3-after-success-1280x720";
 const B3_SECONDARY_E1_CAPTURE: &str = "b3-after-success-1920x1080";
+const IMPORT_FIXTURE_Z: u32 = 65;
+const IMPORT_FIXTURE_Y: u32 = 1_025;
+const IMPORT_FIXTURE_X: u32 = 1_537;
+const IMPORT_DURABLE_PREFIX_WORK_UNITS: u64 = 512;
+const IMPORT_WORKING_MEMORY_BYTES: u64 = 256 * MIB;
+const IMPORT_RESIDENT_RESOURCE_LIMIT: u64 = 1_024;
+const IMPORT_VIEWPORT_WIDTH: u32 = 1_280;
+const IMPORT_VIEWPORT_HEIGHT: u32 = 720;
 const MIB: u64 = 1024 * 1024;
 const PREFLIGHT_ONLY_DISPLAY_SOURCE: &str = "preflight_only";
 const SOURCE_CLOSURE_EVIDENCE_ENTRY_MAX: usize = 131_072;
 const SOURCE_CLOSURE_EVIDENCE_BYTES_MAX: u64 = 256 * MIB;
+const PRE_ALPHA_RECOVERY_ROOT_ENTRIES_MAX: usize = 64;
+const PRE_ALPHA_STDERR_BYTES_MAX: u64 = 4 * MIB;
+const X11_AUTOMATION_OUTPUT_POLICY: BoundedOutputPolicy = BoundedOutputPolicy {
+    scope: "x11_automation",
+    inactivity_timeout: Duration::from_secs(2),
+    absolute_timeout: Duration::from_secs(3),
+    progress_interval: Duration::from_secs(1),
+    max_stdout_bytes: 64 * 1024,
+    max_stderr_bytes: 64 * 1024,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceClosureSnapshot {
@@ -259,6 +314,9 @@ fn product_validate_report_inner(
     if matches!(scenario, ProductValidationScenario::B4ProjectPersistence) {
         return product_validate_b4_project_persistence(package, scenario);
     }
+    if matches!(scenario, ProductValidationScenario::PreAlphaReliability) {
+        return product_validate_pre_alpha_reliability(package, scenario);
+    }
     let started_at = Instant::now();
     let started_at_epoch_ms = epoch_ms();
     let binary = ProductValidationAppBinary::from_environment()?;
@@ -266,9 +324,13 @@ fn product_validate_report_inner(
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
-    let (package, script) = product_validation_package_and_script(package, scenario)?;
-    let source_closure_before = matches!(scenario, ProductValidationScenario::B3SourceVerification)
-        .then(|| SourceClosureSnapshot::capture(&package))
+    let (package, script, preserved_source) =
+        product_validation_package_and_script(package, scenario)?;
+    validate_product_automation_script(&script)
+        .context("generated product automation script is invalid")?;
+    let source_closure_before = preserved_source
+        .as_deref()
+        .map(SourceClosureSnapshot::capture)
         .transpose()?;
     let pending_source_closure_evidence = source_closure_before
         .as_ref()
@@ -393,6 +455,8 @@ fn product_validate_report_inner(
 
     binary.validate_for_launch()?;
     let timeout = Duration::from_secs(timeout_seconds);
+    let progress_root = fs::canonicalize(&output_dir)
+        .context("product validation output directory is unavailable for progress monitoring")?;
     let status = run_product_automation(ProductAutomationRun {
         binary: binary.path(),
         package: &package,
@@ -401,16 +465,52 @@ fn product_validate_report_inner(
         stdout_path: &stdout_path,
         stderr_path: &stderr_path,
         timeout,
+        scenario: scenario.name(),
+        progress_plan: ProductAutomationProgressPlan::from_script(&script)?,
+        progress_launch: ProductAutomationProgressLaunch::new_replacing_stale(&progress_root)?,
     })?;
     let source_closure_evidence = source_closure_before
         .as_ref()
-        .map(|before| before.compare_json(&package))
+        .zip(preserved_source.as_deref())
+        .map(|(before, source)| before.compare_json(source))
         .transpose()?
         .unwrap_or(Value::Null);
     let source_closure_changed = source_closure_evidence
         .get("byte_identical")
         .and_then(Value::as_bool)
         == Some(false);
+
+    if let Some(progress_failure) = status.progress_failure_reason {
+        write_wrapper_report(WrapperReport {
+            path: &wrapper_report_path,
+            scenario_name: scenario.name(),
+            status: ProductValidationStatus::Failed,
+            failure_reason: Some(format!(
+                "native app automation progress protocol failed: {progress_failure}"
+            )),
+            started_at_epoch_ms,
+            duration_ms: duration_ms(started_at.elapsed()),
+            timeout_secs: timeout_seconds,
+            package: &package,
+            binary: binary.path(),
+            script: &script_path,
+            script_value: &script,
+            automation_report: &automation_report_path,
+            automation_report_value: None,
+            stdout: &stdout_path,
+            stderr: &stderr_path,
+            display,
+            preflight_only,
+            source_closure_evidence: source_closure_evidence.clone(),
+            automation_status: None,
+            exit_status: status.exit_status,
+            exit_success: status.exit_success,
+        })?;
+        return Ok(ProductValidationOutcome {
+            report_path: wrapper_report_path,
+            status: ProductValidationStatus::Failed,
+        });
+    }
 
     if status.timed_out {
         write_wrapper_report(WrapperReport {
@@ -455,17 +555,12 @@ fn product_validate_report_inner(
         .and_then(|report| report.get("status"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let automation_failure = automation_report
-        .as_ref()
-        .and_then(|report| report.get("failure_reason"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
     let app_exited_successfully = status.exit_success.unwrap_or(false);
     let (mut validation_status, mut failure_reason) = completed_product_validation_outcome(
         app_exited_successfully,
-        automation_status.as_deref(),
-        automation_failure.as_deref(),
         automation_report.as_ref(),
+        &script,
+        &script_path,
     );
     if validation_status == ProductValidationStatus::Passed
         && matches!(scenario, ProductValidationScenario::B3SourceVerification)
@@ -474,10 +569,17 @@ fn product_validate_report_inner(
         validation_status = ProductValidationStatus::Failed;
         failure_reason = Some(reason);
     }
+    if validation_status == ProductValidationStatus::Passed
+        && matches!(scenario, ProductValidationScenario::ImportPreprocessing)
+        && let Err(reason) = import_preprocessing_evidence(automation_report.as_ref())
+    {
+        validation_status = ProductValidationStatus::Failed;
+        failure_reason = Some(reason);
+    }
     if source_closure_changed {
         validation_status = ProductValidationStatus::Failed;
         failure_reason = Some(
-            "source closure changed during B3 product validation; source bytes must remain identical"
+            "source closure changed during product validation; source bytes must remain identical"
                 .to_owned(),
         );
     }
@@ -515,8 +617,11 @@ fn product_validate_report_inner(
 enum ProductValidationScenario {
     GeneratedFixtureCameraSmoke,
     GeneratedFixtureRenderModes,
+    RepresentativeNativeNavigation,
     B3SourceVerification,
+    ImportPreprocessing,
     B4ProjectPersistence,
+    PreAlphaReliability,
 }
 
 impl ProductValidationScenario {
@@ -524,8 +629,11 @@ impl ProductValidationScenario {
         match self {
             Self::GeneratedFixtureCameraSmoke => GENERATED_FIXTURE_SCENARIO,
             Self::GeneratedFixtureRenderModes => GENERATED_RENDER_MODES_SCENARIO,
+            Self::RepresentativeNativeNavigation => REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO,
             Self::B3SourceVerification => B3_SOURCE_VERIFICATION_SCENARIO,
+            Self::ImportPreprocessing => IMPORT_PREPROCESSING_SCENARIO,
             Self::B4ProjectPersistence => B4_PROJECT_PERSISTENCE_SCENARIO,
+            Self::PreAlphaReliability => PRE_ALPHA_RELIABILITY_SCENARIO,
         }
     }
 
@@ -534,12 +642,17 @@ impl ProductValidationScenario {
         match requested.unwrap_or(GENERATED_FIXTURE_SCENARIO) {
             GENERATED_FIXTURE_SCENARIO => Ok(Self::GeneratedFixtureCameraSmoke),
             GENERATED_RENDER_MODES_SCENARIO => Ok(Self::GeneratedFixtureRenderModes),
+            REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO => Ok(Self::RepresentativeNativeNavigation),
             B3_SOURCE_VERIFICATION_SCENARIO => Ok(Self::B3SourceVerification),
+            IMPORT_PREPROCESSING_SCENARIO => Ok(Self::ImportPreprocessing),
             B4_PROJECT_PERSISTENCE_SCENARIO => Ok(Self::B4ProjectPersistence),
+            PRE_ALPHA_RELIABILITY_SCENARIO => Ok(Self::PreAlphaReliability),
             other => bail!(
                 "unknown product validation scenario {other:?}; expected \
                  {GENERATED_FIXTURE_SCENARIO}, {GENERATED_RENDER_MODES_SCENARIO}, \
-                 {B3_SOURCE_VERIFICATION_SCENARIO}, or {B4_PROJECT_PERSISTENCE_SCENARIO}"
+                 {REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO}, \
+                 {B3_SOURCE_VERIFICATION_SCENARIO}, {IMPORT_PREPROCESSING_SCENARIO}, or \
+                 {B4_PROJECT_PERSISTENCE_SCENARIO}, or {PRE_ALPHA_RELIABILITY_SCENARIO}"
             ),
         }
     }
@@ -549,17 +662,22 @@ impl ProductValidationScenario {
             name,
             GENERATED_FIXTURE_SCENARIO
                 | GENERATED_RENDER_MODES_SCENARIO
+                | REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO
                 | B3_SOURCE_VERIFICATION_SCENARIO
+                | IMPORT_PREPROCESSING_SCENARIO
                 | B4_PROJECT_PERSISTENCE_SCENARIO
+                | PRE_ALPHA_RELIABILITY_SCENARIO
         )
     }
 
     fn default_timeout_secs(&self) -> u64 {
         match self {
-            Self::GeneratedFixtureCameraSmoke
-            | Self::GeneratedFixtureRenderModes
-            | Self::B3SourceVerification => 60,
+            Self::GeneratedFixtureCameraSmoke | Self::GeneratedFixtureRenderModes => 60,
+            Self::RepresentativeNativeNavigation => B3_SCENARIO_TIMEOUT_SECS,
+            Self::B3SourceVerification => B3_SCENARIO_TIMEOUT_SECS,
+            Self::ImportPreprocessing => IMPORT_SCENARIO_TIMEOUT_SECS,
             Self::B4ProjectPersistence => B4_PHASE_TIMEOUT_SECS * 3,
+            Self::PreAlphaReliability => B4_PHASE_TIMEOUT_SECS * 3,
         }
     }
 }
@@ -864,6 +982,308 @@ fn product_validate_b4_project_persistence(
     })
 }
 
+struct PreAlphaReliabilityReport<'a> {
+    path: &'a Path,
+    binary: &'a Path,
+    status: ProductValidationStatus,
+    failure_reason: Option<String>,
+    started_at_epoch_ms: u128,
+    started_at: Instant,
+    package: &'a Path,
+    run_dir: &'a Path,
+    recovery_state_home: &'a Path,
+    clean_close_state_home: &'a Path,
+    scripts: &'a [Value],
+    attempts: &'a [Value],
+    display: DisplayClassification,
+    preflight_only: bool,
+}
+
+fn product_validate_pre_alpha_reliability(
+    package: Option<&Path>,
+    scenario: &ProductValidationScenario,
+) -> anyhow::Result<ProductValidationOutcome> {
+    let started_at = Instant::now();
+    let started_at_epoch_ms = epoch_ms();
+    let binary = ProductValidationAppBinary::from_environment()?;
+    let output_dir = product_validation_output_dir(scenario);
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    let run_dir = output_dir.join(format!("run-{}-{}", epoch_ms(), std::process::id()));
+    fs::create_dir(&run_dir).with_context(|| {
+        format!(
+            "failed to create unique pre-alpha reliability directory {}",
+            run_dir.display()
+        )
+    })?;
+    let work_dir = run_dir.join("work");
+    let recovery_state_home = work_dir.join("recovery-xdg-state-home");
+    let clean_close_state_home = work_dir.join("clean-close-xdg-state-home");
+    fs::create_dir_all(&recovery_state_home)
+        .with_context(|| format!("failed to create {}", recovery_state_home.display()))?;
+    fs::create_dir_all(&clean_close_state_home)
+        .with_context(|| format!("failed to create {}", clean_close_state_home.display()))?;
+    let package = match package {
+        Some(package) => package.to_path_buf(),
+        None => default_target_fixture()?,
+    };
+    let provisional_checkpoint = run_dir
+        .join("launch-1-provisional")
+        .join("external-process-checkpoint.json");
+    let native_close_checkpoint = run_dir
+        .join("launch-3-native-close")
+        .join("external-process-checkpoint.json");
+    let scripts = [
+        pre_alpha_provisional_launch_script(&package, &provisional_checkpoint),
+        pre_alpha_recovery_launch_script(&package),
+        pre_alpha_native_close_launch_script(&package, &native_close_checkpoint),
+    ];
+    let phase_names = [
+        "launch-1-provisional",
+        "launch-2-recovery",
+        "launch-3-native-close",
+    ];
+    let mut script_records = Vec::with_capacity(scripts.len());
+    for (phase, script) in phase_names.iter().zip(&scripts) {
+        validate_product_automation_script(script)
+            .with_context(|| format!("invalid pre-alpha reliability script for {phase}"))?;
+        let phase_dir = run_dir.join(phase);
+        fs::create_dir_all(&phase_dir)
+            .with_context(|| format!("failed to create {}", phase_dir.display()))?;
+        let path = phase_dir.join("product-automation-script.json");
+        write_json_file(&path, script)?;
+        script_records.push(json!({
+            "phase": phase,
+            "path": path,
+            "scenario": script.get("scenario").and_then(Value::as_str),
+        }));
+    }
+
+    let report_path = run_dir.join("product-validation-report.json");
+    let display = display_status();
+    let preflight_only = env_flag(PREFLIGHT_ONLY_ENV);
+    let mut attempts = Vec::new();
+    if preflight_only {
+        write_pre_alpha_reliability_report(PreAlphaReliabilityReport {
+            path: &report_path,
+            binary: binary.path(),
+            status: ProductValidationStatus::Unsupported,
+            failure_reason: Some(
+                "pre-alpha reliability preflight generated all three scripts without launching the app"
+                    .to_owned(),
+            ),
+            started_at_epoch_ms,
+            started_at,
+            package: &package,
+            run_dir: &run_dir,
+            recovery_state_home: &recovery_state_home,
+            clean_close_state_home: &clean_close_state_home,
+            scripts: &script_records,
+            attempts: &attempts,
+            display: DisplayClassification {
+                class: DisplayClass::Unsupported,
+                source: PREFLIGHT_ONLY_DISPLAY_SOURCE,
+            },
+            preflight_only,
+        })?;
+        return Ok(ProductValidationOutcome {
+            report_path,
+            status: ProductValidationStatus::Unsupported,
+        });
+    }
+
+    let setup = (|| -> anyhow::Result<()> {
+        if display.class != DisplayClass::RealDisplay || env::var_os("DISPLAY").is_none() {
+            bail!("pre-alpha reliability validation requires a real X11 display");
+        }
+        require_b4_x11_tools()?;
+        if binary.should_build_default_release() {
+            run_cargo(["build", "--release", "-p", "mirante4d-app"])?;
+        }
+        binary.validate_for_launch()
+    })();
+    if let Err(err) = setup {
+        write_pre_alpha_reliability_report(PreAlphaReliabilityReport {
+            path: &report_path,
+            binary: binary.path(),
+            status: ProductValidationStatus::Failed,
+            failure_reason: Some(err.to_string()),
+            started_at_epoch_ms,
+            started_at,
+            package: &package,
+            run_dir: &run_dir,
+            recovery_state_home: &recovery_state_home,
+            clean_close_state_home: &clean_close_state_home,
+            scripts: &script_records,
+            attempts: &attempts,
+            display,
+            preflight_only,
+        })?;
+        return Ok(ProductValidationOutcome {
+            report_path,
+            status: ProductValidationStatus::Failed,
+        });
+    }
+
+    let specs = [
+        PreAlphaAttemptSpec {
+            number: 1,
+            phase: phase_names[0],
+            script: &script_records[0]["path"],
+            state_home: &recovery_state_home,
+            termination: B4Termination::ExternalSigkill {
+                checkpoint: &provisional_checkpoint,
+                expected_stage: PRE_ALPHA_PROVISIONAL_CHECKPOINT_STAGE,
+            },
+        },
+        PreAlphaAttemptSpec {
+            number: 2,
+            phase: phase_names[1],
+            script: &script_records[1]["path"],
+            state_home: &recovery_state_home,
+            termination: B4Termination::Normal,
+        },
+        PreAlphaAttemptSpec {
+            number: 3,
+            phase: phase_names[2],
+            script: &script_records[2]["path"],
+            state_home: &clean_close_state_home,
+            termination: B4Termination::ExternalNativeClose {
+                checkpoint: &native_close_checkpoint,
+                expected_stage: PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE,
+            },
+        },
+    ];
+
+    for spec in specs {
+        let attempt = run_pre_alpha_attempt(binary.path(), &package, &run_dir, spec);
+        let passed = attempt.get("status").and_then(Value::as_str) == Some("passed");
+        attempts.push(attempt);
+        let failure_reason = (!passed).then(|| {
+            attempts
+                .last()
+                .and_then(|attempt| attempt.get("failure_reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("pre-alpha reliability phase failed")
+                .to_owned()
+        });
+        write_pre_alpha_reliability_report(PreAlphaReliabilityReport {
+            path: &report_path,
+            binary: binary.path(),
+            status: ProductValidationStatus::Failed,
+            failure_reason: failure_reason
+                .or_else(|| Some("pre-alpha reliability scenario is incomplete".to_owned())),
+            started_at_epoch_ms,
+            started_at,
+            package: &package,
+            run_dir: &run_dir,
+            recovery_state_home: &recovery_state_home,
+            clean_close_state_home: &clean_close_state_home,
+            scripts: &script_records,
+            attempts: &attempts,
+            display: display.clone(),
+            preflight_only,
+        })?;
+        if !passed {
+            return Ok(ProductValidationOutcome {
+                report_path,
+                status: ProductValidationStatus::Failed,
+            });
+        }
+    }
+
+    let (status, failure_reason) = match validate_pre_alpha_attempts(&attempts) {
+        Ok(()) => (ProductValidationStatus::Passed, None),
+        Err(err) => (ProductValidationStatus::Failed, Some(err.to_string())),
+    };
+    write_pre_alpha_reliability_report(PreAlphaReliabilityReport {
+        path: &report_path,
+        binary: binary.path(),
+        status,
+        failure_reason,
+        started_at_epoch_ms,
+        started_at,
+        package: &package,
+        run_dir: &run_dir,
+        recovery_state_home: &recovery_state_home,
+        clean_close_state_home: &clean_close_state_home,
+        scripts: &script_records,
+        attempts: &attempts,
+        display,
+        preflight_only,
+    })?;
+    Ok(ProductValidationOutcome {
+        report_path,
+        status,
+    })
+}
+
+fn write_pre_alpha_reliability_report(report: PreAlphaReliabilityReport<'_>) -> anyhow::Result<()> {
+    let all_source_byte_identical = report.attempts.len() == 3
+        && report.attempts.iter().all(|attempt| {
+            attempt
+                .pointer("/source_closure_evidence/byte_identical")
+                .and_then(Value::as_bool)
+                == Some(true)
+        });
+    let value = json!({
+        "schema": PRODUCT_VALIDATION_SCHEMA,
+        "schema_version": PRODUCT_VALIDATION_SCHEMA_VERSION,
+        "command": "product-validate",
+        "status": report.status.name(),
+        "failure_reason": report.failure_reason,
+        "started_at_epoch_ms": report.started_at_epoch_ms,
+        "started_at_utc": unix_epoch_ms_to_utc_rfc3339(report.started_at_epoch_ms),
+        "finished_at_epoch_ms": epoch_ms(),
+        "duration_ms": duration_ms(report.started_at.elapsed()),
+        "host": benchmark_host_context(),
+        "build_profile": "release",
+        "binary": report.binary,
+        "dataset": dataset_context_json(report.package),
+        "scenario": {
+            "name": PRE_ALPHA_RELIABILITY_SCENARIO,
+            "kind": "fixed_three_launch_packaged_recovery_and_native_close",
+            "required_launches": 3,
+            "scripts": report.scripts,
+            "mapped_client_pixels": {
+                "width": B4_PRIMARY_CLIENT_WIDTH,
+                "height": B4_PRIMARY_CLIENT_HEIGHT,
+            },
+            "native_close_exit_deadline_seconds": NATIVE_CLOSE_EXIT_TIMEOUT.as_secs(),
+        },
+        "claim_boundary": {
+            "evidence_type": "normal_release_multi_launch_with_external_sigkill_and_mapped_x11_close",
+            "real_display_required": true,
+            "provisional_autosave_recovery": true,
+            "native_window_manager_close": true,
+            "public_release_claim": false,
+        },
+        "environment": {
+            "display_class": report.display.class.name(),
+            "display_class_source": report.display.source,
+            "display_env_present": env::var_os("DISPLAY").is_some(),
+            "isolated_recovery_xdg_state_home": report.recovery_state_home,
+            "isolated_clean_close_xdg_state_home": report.clean_close_state_home,
+            "preflight_only": report.preflight_only,
+        },
+        "retry_policy": {
+            "automatic_retries": 0,
+            "attempts_per_phase_max": 1,
+            "observed_retries": 0,
+        },
+        "source_nonmutation": {
+            "required_per_launch": true,
+            "all_three_launches_byte_identical": all_source_byte_identical,
+        },
+        "attempts": report.attempts,
+        "artifacts": {
+            "run_directory": report.run_dir,
+            "retention": "all_phase_scripts_logs_reports_checkpoints_and_capture",
+        },
+    });
+    write_json_file(report.path, &value)
+}
+
 fn write_b4_aggregate_report(report: B4AggregateReport<'_>) -> anyhow::Result<()> {
     let all_source_byte_identical = report.attempts.len() == 3
         && report.attempts.iter().all(|attempt| {
@@ -1067,9 +1487,9 @@ fn require_b4_x11_tools() -> anyhow::Result<()> {
         ("xwininfo", "-version"),
         ("wmctrl", "-h"),
     ] {
-        Command::new(program)
-            .arg(arg)
-            .output()
+        let mut command = Command::new(program);
+        command.arg(arg);
+        run_command_with_bounded_output(&mut command, X11_AUTOMATION_OUTPUT_POLICY)
             .with_context(|| format!("B4 product validation requires {program}"))?;
     }
     Ok(())
@@ -1077,10 +1497,16 @@ fn require_b4_x11_tools() -> anyhow::Result<()> {
 
 fn completed_product_validation_outcome(
     app_exited_successfully: bool,
-    automation_status: Option<&str>,
-    automation_failure: Option<&str>,
     automation_report: Option<&Value>,
+    automation_script: &Value,
+    automation_script_path: &Path,
 ) -> (ProductValidationStatus, Option<String>) {
+    let automation_status = automation_report
+        .and_then(|report| report.get("status"))
+        .and_then(Value::as_str);
+    let automation_failure = automation_report
+        .and_then(|report| report.get("failure_reason"))
+        .and_then(Value::as_str);
     if !app_exited_successfully || automation_status != Some("passed") {
         return (
             ProductValidationStatus::Failed,
@@ -1094,8 +1520,27 @@ fn completed_product_validation_outcome(
             )),
         );
     }
+    let Some(automation_report) = automation_report else {
+        return (
+            ProductValidationStatus::Failed,
+            Some("native app exited without an automation report".to_owned()),
+        );
+    };
+    if let Err(error) = validate_product_automation_report_contract(
+        automation_report,
+        automation_script,
+        automation_script_path,
+    ) {
+        return (
+            ProductValidationStatus::Failed,
+            Some(format!(
+                "product automation report contract is invalid: {error}"
+            )),
+        );
+    }
 
-    match qualifying_nonblank_viewport_capture(automation_report) {
+    let evidence = qualifying_nonblank_viewport_capture(Some(automation_report)).map(|_| ());
+    match evidence {
         Ok(_) => (ProductValidationStatus::Passed, None),
         Err(reason) => (ProductValidationStatus::Failed, Some(reason)),
     }
@@ -1137,6 +1582,18 @@ fn nonblank_gpu_viewport_capture(artifact: &Value) -> bool {
     let Some(path) = artifact.get("path").and_then(Value::as_str) else {
         return false;
     };
+    let target_is_explicit = artifact
+        .get("target")
+        .and_then(Value::as_str)
+        .is_some_and(valid_product_presentation_target);
+    let frame_identity_is_explicit = artifact
+        .get("frame_identity")
+        .and_then(Value::as_u64)
+        .is_some();
+    let surface_generation_is_explicit = artifact
+        .get("surface_generation")
+        .and_then(Value::as_u64)
+        .is_some();
     let pixel_stats = artifact.get("pixel_stats");
     let pixel_count = pixel_stats
         .and_then(|stats| stats.get("pixel_count"))
@@ -1151,6 +1608,9 @@ fn nonblank_gpu_viewport_capture(artifact: &Value) -> bool {
     width > 0
         && height > 0
         && !path.trim().is_empty()
+        && target_is_explicit
+        && frame_identity_is_explicit
+        && surface_generation_is_explicit
         && width.checked_mul(height) == pixel_count
         && nonzero_rgb_pixels.is_some_and(|count| count > 0 && Some(count) <= pixel_count)
         && max_rgb.is_some_and(|value| value > 0)
@@ -1237,10 +1697,203 @@ fn b3_exact_e1_capture_evidence(automation_report: Option<&Value>) -> Result<Val
     }))
 }
 
+fn import_preprocessing_evidence(automation_report: Option<&Value>) -> Result<Value, String> {
+    let report = automation_report
+        .ok_or_else(|| "import scenario is missing its automation report".to_owned())?;
+    if report.get("schema").and_then(Value::as_str) != Some(PRODUCT_AUTOMATION_REPORT_SCHEMA)
+        || report.get("schema_version").and_then(Value::as_u64)
+            != Some(u64::from(REPORT_SCHEMA_VERSION))
+    {
+        return Err("import scenario used an unsupported automation report schema".to_owned());
+    }
+    let evidence = report
+        .get("import_workflow_evidence")
+        .ok_or_else(|| "import scenario is missing import workflow evidence".to_owned())?;
+    let stages = evidence
+        .get("worker_emitted_stage_names")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "import scenario is missing emitted stage names".to_owned())?;
+    for required in [
+        "planning-and-preflight",
+        "source-revalidation",
+        "checkpoint-open-or-resume",
+        "base-production",
+        "pyramid-production",
+        "source-scientific-identity",
+        "shard-publication",
+        "staged-structure-validation",
+        "staged-exact-validation",
+        "staged-scientific-validation",
+        "commit",
+    ] {
+        if !stages.iter().any(|stage| stage.as_str() == Some(required)) {
+            return Err(format!(
+                "import scenario did not emit required named stage {required:?}"
+            ));
+        }
+    }
+    let projected_stage_count = evidence
+        .get("projected_named_stage_observations")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let cancelled_runs = evidence
+        .get("cancelled_runs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let successful_runs = evidence
+        .get("successful_runs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let failed_runs = evidence
+        .get("failed_runs")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let published_events = evidence
+        .get("published_events")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let resumed_work_units = evidence
+        .get("maximum_resumed_work_units")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let peak_working_bytes = evidence
+        .get("maximum_peak_working_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let elapsed_ms = evidence
+        .get("maximum_elapsed_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let projected_elapsed_ms = evidence
+        .get("maximum_projected_elapsed_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if projected_stage_count < 2
+        || cancelled_runs < 1
+        || successful_runs < 1
+        || failed_runs != 0
+        || published_events < successful_runs
+        || resumed_work_units < IMPORT_DURABLE_PREFIX_WORK_UNITS
+        || peak_working_bytes > IMPORT_WORKING_MEMORY_BYTES
+        || elapsed_ms == 0
+        || projected_elapsed_ms == 0
+    {
+        return Err(format!(
+            "import scenario evidence failed: projected_stages={projected_stage_count}, cancelled={cancelled_runs}, successful={successful_runs}, failed={failed_runs}, published_events={published_events}, resumed={resumed_work_units}, peak_working_bytes={peak_working_bytes}, elapsed_ms={elapsed_ms}, projected_elapsed_ms={projected_elapsed_ms}"
+        ));
+    }
+    let open_ready = report
+        .get("events")
+        .and_then(Value::as_array)
+        .is_some_and(|events| {
+            events.iter().any(|event| {
+                event.get("command").and_then(Value::as_str) == Some("wait_for_imported_open_ready")
+                    && event.get("status").and_then(Value::as_str) == Some("passed")
+                    && event.pointer("/details/verified").and_then(Value::as_bool) == Some(true)
+                    && event
+                        .pointer("/details/normal_product_open_path")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            })
+        });
+    if !open_ready {
+        return Err(
+            "import scenario did not prove verified publication through the normal open path"
+                .to_owned(),
+        );
+    }
+    let transfer = evidence
+        .get("publication_to_open_ready_clock")
+        .ok_or_else(|| {
+            "import scenario is missing publication-to-open-ready transfer evidence".to_owned()
+        })?;
+    if transfer.get("status").and_then(Value::as_str) != Some(IMPORT_OPEN_READY_COMPLETE_STATUS)
+        || transfer.get("transfer_mode").and_then(Value::as_str)
+            != Some("staged_verified_capability")
+        || transfer
+            .get("included_in_primary_clock")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err("import scenario did not prove the verified capability transfer".to_owned());
+    }
+    validate_publication_currentness_execution(transfer)?;
+    for field in [
+        "source_verification_started_runs",
+        "source_verification_progress_updates",
+        "source_verification_cancelled_runs",
+        "source_verification_failed_runs",
+        "source_verification_successes",
+    ] {
+        if transfer.get(field).and_then(Value::as_u64) != Some(0) {
+            return Err(format!(
+                "import scenario unexpectedly reported nonzero {field}"
+            ));
+        }
+    }
+    Ok(evidence.clone())
+}
+
+fn validate_publication_currentness_execution(transfer: &Value) -> Result<(), String> {
+    let execution = transfer
+        .get("publication_currentness_execution")
+        .ok_or_else(|| {
+            "import scenario is missing storage publication-currentness execution evidence"
+                .to_owned()
+        })?;
+    if execution.get("contract_id").and_then(Value::as_str)
+        != Some(PUBLICATION_CURRENTNESS_CONTRACT_ID)
+    {
+        return Err(
+            "import scenario used an unknown publication-currentness execution contract".to_owned(),
+        );
+    }
+    let expected = execution
+        .get("expected_snapshot_object_reads")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "import scenario omitted expected snapshot object reads".to_owned())?;
+    let first_inventory = execution
+        .get("first_inventory_object_reads")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "import scenario omitted first-inventory object reads".to_owned())?;
+    let observed_snapshot = execution
+        .get("observed_snapshot_object_reads")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "import scenario omitted observed snapshot object reads".to_owned())?;
+    let second_inventory = execution
+        .get("second_inventory_object_reads")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "import scenario omitted second-inventory object reads".to_owned())?;
+    let observed_total = execution
+        .get("observed_total_object_reads")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "import scenario omitted total publication object reads".to_owned())?;
+    let codec_decodes = execution
+        .get("observed_codec_decode_calls")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "import scenario omitted observed publication codec decodes".to_owned())?;
+    let reconciled_total = first_inventory
+        .checked_add(observed_snapshot)
+        .and_then(|value| value.checked_add(second_inventory));
+    if expected == 0
+        || first_inventory == 0
+        || first_inventory != second_inventory
+        || observed_snapshot != expected
+        || reconciled_total != Some(observed_total)
+        || codec_decodes != 0
+    {
+        return Err(
+            "import scenario publication-currentness execution disagreed with the storage contract"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn product_validation_package_and_script(
     package: Option<&Path>,
     scenario: &ProductValidationScenario,
-) -> anyhow::Result<(PathBuf, Value)> {
+) -> anyhow::Result<(PathBuf, Value, Option<PathBuf>)> {
     match scenario {
         ProductValidationScenario::GeneratedFixtureCameraSmoke => {
             let package = match package {
@@ -1248,7 +1901,7 @@ fn product_validation_package_and_script(
                 None => default_target_fixture()?,
             };
             let script = target_fixture_camera_smoke_script(&package);
-            Ok((package, script))
+            Ok((package, script, None))
         }
         ProductValidationScenario::GeneratedFixtureRenderModes => {
             let package = match package {
@@ -1256,7 +1909,14 @@ fn product_validation_package_and_script(
                 None => default_target_fixture()?,
             };
             let script = target_fixture_render_modes_script(&package);
-            Ok((package, script))
+            Ok((package, script, None))
+        }
+        ProductValidationScenario::RepresentativeNativeNavigation => {
+            let package = package
+                .context("representative_native_navigation requires an explicit target package")?
+                .to_path_buf();
+            let script = representative_native_navigation_script(&package);
+            Ok((package, script, None))
         }
         ProductValidationScenario::B3SourceVerification => {
             let package = match package {
@@ -1264,7 +1924,21 @@ fn product_validation_package_and_script(
                 None => default_target_fixture()?,
             };
             let script = target_source_verification_script(&package);
-            Ok((package, script))
+            Ok((package.clone(), script, Some(package)))
+        }
+        ProductValidationScenario::ImportPreprocessing => {
+            let package = match package {
+                Some(package) => package.to_path_buf(),
+                None => default_target_fixture()?,
+            };
+            let fixture = prepare_import_product_fixture(scenario)?;
+            let script = import_preprocessing_script(
+                &package,
+                &fixture.source,
+                &fixture.output_parent,
+                &fixture.destination,
+            );
+            Ok((package, script, Some(fixture.source)))
         }
         ProductValidationScenario::B4ProjectPersistence => {
             let package = match package {
@@ -1274,12 +1948,70 @@ fn product_validation_package_and_script(
             let placeholder = Path::new("target/b4-project-placeholder.m4dproj");
             let checkpoint = Path::new("target/b4-checkpoint-placeholder.json");
             let script = b4_launch_one_script(&package, placeholder, checkpoint);
-            Ok((package, script))
+            Ok((package, script, None))
+        }
+        ProductValidationScenario::PreAlphaReliability => {
+            let package = match package {
+                Some(package) => package.to_path_buf(),
+                None => default_target_fixture()?,
+            };
+            let checkpoint = Path::new("target/pre-alpha-reliability-checkpoint.json");
+            let script = pre_alpha_provisional_launch_script(&package, checkpoint);
+            Ok((package, script, None))
         }
     }
 }
 
-fn dataset_runtime_limits(max_cpu_total_bytes: u64, max_resident_resources: u64) -> Value {
+struct ImportProductFixture {
+    source: PathBuf,
+    output_parent: PathBuf,
+    destination: PathBuf,
+}
+
+fn prepare_import_product_fixture(
+    scenario: &ProductValidationScenario,
+) -> anyhow::Result<ImportProductFixture> {
+    let root = product_validation_output_dir(scenario).join("public-import-fixture");
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                bail!(
+                    "owned public import fixture path is not a real directory: {}",
+                    root.display()
+                );
+            }
+            fs::remove_dir_all(&root)
+                .with_context(|| format!("failed to reset owned fixture {}", root.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect owned fixture {}", root.display()));
+        }
+    }
+    fs::create_dir(&root).with_context(|| format!("failed to create {}", root.display()))?;
+    let source = root.join("public-full-strip-source");
+    crate::import_performance::generate_t2_source(
+        &source,
+        IMPORT_FIXTURE_Z,
+        IMPORT_FIXTURE_Y,
+        IMPORT_FIXTURE_X,
+    )?;
+    let output_parent = root.join("output");
+    fs::create_dir(&output_parent)
+        .with_context(|| format!("failed to create {}", output_parent.display()))?;
+    let destination = deterministic_tiff_destination(&TiffSource::auto(&source), &output_parent);
+    Ok(ImportProductFixture {
+        source,
+        output_parent,
+        destination,
+    })
+}
+
+fn dataset_runtime_hard_safety_limits(
+    max_cpu_total_bytes: u64,
+    max_resident_resources: u64,
+) -> Value {
     let max_cpu_in_flight_decode_bytes = (max_cpu_total_bytes / 8)
         .saturating_add(PACKAGE_VALIDATION_WORKING_BYTES)
         .min(max_cpu_total_bytes);
@@ -1306,9 +2038,9 @@ fn default_target_fixture() -> anyhow::Result<PathBuf> {
 fn target_fixture_camera_smoke_script(package: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": GENERATED_FIXTURE_SCENARIO,
-        "limits": dataset_runtime_limits(128 * MIB, 128),
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -1319,27 +2051,128 @@ fn target_fixture_camera_smoke_script(package: &Path) -> Value {
             { "command": "assert", "condition": "no_render_error" },
             { "command": "set_render_mode", "mode": "mip" },
             { "command": "camera_fit_data" },
+            { "command": "set_active_tool", "tool": "inspect" },
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
             { "command": "camera_orbit", "yaw_points": 120.0, "pitch_points": 32.0 },
             { "command": "camera_pan", "x_points": 40.0, "y_points": -24.0 },
             { "command": "camera_zoom", "scroll_y_points": -120.0 },
             { "command": "sleep_frames", "frames": 2 },
             { "command": "probe_hover", "x_fraction": 0.42, "y_fraction": 0.58 },
-            { "command": "capture_screenshot", "name": "post-camera-sequence" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "post-camera-sequence" },
             { "command": "copy_diagnostics" },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
             { "command": "quit" }
         ]
     })
 }
 
+fn representative_native_navigation_script(package: &Path) -> Value {
+    let mut script = json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO,
+        "gpu_timing": false,
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(2_048 * MIB, 16_384),
+        "commands": [
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
+            { "command": "set_viewport_size", "width": GENERATED_VIEWPORT_WIDTH, "height": GENERATED_VIEWPORT_HEIGHT },
+            { "command": "set_render_target_size", "width": GENERATED_VIEWPORT_WIDTH, "height": GENERATED_VIEWPORT_HEIGHT },
+            { "command": "set_render_mode", "mode": "mip" },
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "voxel_exact" },
+            { "command": "camera_fit_data" },
+            { "command": "sleep_frames", "frames": 3 },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 60000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "representative-mip-voxel-settled" }
+        ]
+    });
+    let Value::Array(four_panel) = json!([
+            { "command": "set_viewer_layout", "layout": "four_panel" },
+            { "command": "assert", "condition": { "viewer_layout": { "layout": "four_panel" } } },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "cross_section_rotate_sequence", "panel": "xy", "samples": 24, "duration_ms": 400, "x_points_per_sample": 0.5, "y_points_per_sample": 0.125, "radians_per_point": 0.005 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "camera_zoom_sequence", "samples": 24, "duration_ms": 400, "scroll_y_points_per_sample": -1.0 },
+            { "command": "camera_orbit_sequence", "samples": 48, "duration_ms": 800, "yaw_points_per_sample": 1.0, "pitch_points_per_sample": 0.25 },
+            { "command": "cross_section_rotate_sequence", "panel": "xy", "samples": 24, "duration_ms": 400, "x_points_per_sample": 0.5, "y_points_per_sample": 0.125, "radians_per_point": 0.005 },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 60000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "assert", "condition": { "four_panel_images_distinct": { "min_different_pixels": 1 } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "representative-four-panel-3d" },
+            { "command": "capture_screenshot", "target": "xy", "name": "representative-four-panel-xy" },
+            { "command": "capture_screenshot", "target": "xz", "name": "representative-four-panel-xz" },
+            { "command": "capture_screenshot", "target": "yz", "name": "representative-four-panel-yz" }
+    ]) else {
+        unreachable!("the representative four-panel commands are an array")
+    };
+    script["commands"]
+        .as_array_mut()
+        .expect("the representative script has commands")
+        .extend(four_panel);
+    let Value::Array(smooth_and_dvr) = json!([
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "smooth_linear" },
+            { "command": "camera_orbit_sequence", "samples": 48, "duration_ms": 800, "yaw_points_per_sample": -1.0, "pitch_points_per_sample": 0.25 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "assert", "condition": { "layer_sampling": { "layer_index": 0, "sampling": "smooth_linear" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "representative-mip-smooth-settled" },
+
+            { "command": "set_render_mode", "mode": "dvr" },
+            { "command": "set_dvr_density_scale", "density_scale": 12.0 },
+            { "command": "camera_orbit_sequence", "samples": 48, "duration_ms": 800, "yaw_points_per_sample": 0.75, "pitch_points_per_sample": -0.25 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "assert", "condition": { "render_mode": { "mode": "dvr" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "representative-dvr-smooth-settled" }
+    ]) else {
+        unreachable!("the representative smooth and DVR commands are an array")
+    };
+    script["commands"]
+        .as_array_mut()
+        .expect("the representative script has commands")
+        .extend(smooth_and_dvr);
+    let Value::Array(iso_and_tail) = json!([
+            { "command": "set_render_mode", "mode": "iso" },
+            { "command": "set_layer_iso_shading", "layer_index": 0, "shading": "gradient_lighting" },
+            { "command": "set_iso_display_level", "display_level": 0.5 },
+            { "command": "camera_orbit_sequence", "samples": 48, "duration_ms": 800, "yaw_points_per_sample": -0.75, "pitch_points_per_sample": -0.25 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "assert", "condition": { "render_mode": { "mode": "iso" } } },
+            { "command": "assert", "condition": { "layer_iso_shading": { "layer_index": 0, "shading": "gradient_lighting" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "representative-iso-smooth-settled" },
+
+            { "command": "set_viewer_layout", "layout": "single3d" },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 60000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "assert", "condition": "cross_section_retired" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "representative-single3d-final" },
+            { "command": "copy_diagnostics" },
+            { "command": "quit" }
+    ]) else {
+        unreachable!("the representative ISO and closeout commands are an array")
+    };
+    script["commands"]
+        .as_array_mut()
+        .expect("the representative script has commands")
+        .extend(iso_and_tail);
+    script
+}
+
 fn target_fixture_render_modes_script(package: &Path) -> Value {
     let mut script = json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": GENERATED_RENDER_MODES_SCENARIO,
-        "limits": dataset_runtime_limits(128 * MIB, 192),
+        "gpu_timing": false,
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 192),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -1355,39 +2188,140 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
             { "command": "camera_fit_data" },
             { "command": "set_render_mode", "mode": "mip" },
             { "command": "set_layer_render_mode", "layer_index": 1, "mode": "mip" },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
             { "command": "assert", "condition": { "render_mode": { "mode": "mip" } } },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "layer_render_mode": { "layer_index": 1, "mode": "mip" } } },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
             { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
+            { "command": "set_active_tool", "tool": "inspect" },
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
+            { "command": "assert", "condition": { "pick_evidence": { "policy": "mip_argmax" } } },
             { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "generated-mip" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-mip" }
+        ]
+    });
+    let Value::Array(middle) = json!([
+            { "command": "set_projection", "projection": "perspective" },
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "smooth_linear" },
+            { "command": "set_layer_sampling", "layer_index": 1, "sampling": "smooth_linear" },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
+            { "command": "assert", "condition": { "projection": { "projection": "perspective" } } },
+            { "command": "assert", "condition": { "layer_sampling": { "layer_index": 0, "sampling": "smooth_linear" } } },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-perspective-smooth" },
             { "command": "set_render_mode", "mode": "dvr" },
             { "command": "set_layer_render_mode", "layer_index": 1, "mode": "dvr" },
             { "command": "set_dvr_density_scale", "density_scale": 12.0 },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
             { "command": "assert", "condition": { "render_mode": { "mode": "dvr" } } },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "layer_render_mode": { "layer_index": 1, "mode": "dvr" } } },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
+            { "command": "assert", "condition": { "pick_evidence": { "policy": "maximum_opacity_contribution" } } },
             { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "generated-dvr" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-dvr" }
+    ]) else {
+        unreachable!("the product validation command middle is an array")
+    };
+    script["commands"]
+        .as_array_mut()
+        .expect("the generated product validation script has commands")
+        .extend(middle);
+    let Value::Array(iso) = json!([
             { "command": "set_render_mode", "mode": "iso" },
             { "command": "set_layer_render_mode", "layer_index": 1, "mode": "iso" },
+            { "command": "set_layer_iso_shading", "layer_index": 0, "shading": "gradient_lighting" },
+            { "command": "set_layer_iso_shading", "layer_index": 1, "shading": "gradient_lighting" },
             { "command": "set_iso_display_level", "display_level": 0.05 },
+            { "command": "set_iso_light", "light": { "kind": "detached_screen", "x": 0.25, "y": -0.35 } },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
             { "command": "assert", "condition": { "render_mode": { "mode": "iso" } } },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "layer_render_mode": { "layer_index": 1, "mode": "iso" } } },
+            { "command": "assert", "condition": { "layer_iso_shading": { "layer_index": 0, "shading": "gradient_lighting" } } },
+            { "command": "assert", "condition": { "iso_light": { "light": { "kind": "detached_screen", "x": 0.25, "y": -0.35 } } } },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
             { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
+            { "command": "assert", "condition": { "pick_evidence": { "policy": "first_threshold_hit" } } },
             { "command": "copy_diagnostics" },
-            { "command": "capture_screenshot", "name": "generated-iso" }
-        ]
-    });
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-iso-detached-light" },
+            { "command": "set_iso_light", "light": { "kind": "attached_camera" } },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
+            { "command": "assert", "condition": { "iso_light": { "light": { "kind": "attached_camera" } } } },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-iso-attached-light" }
+    ]) else {
+        unreachable!("the product validation ISO commands are an array")
+    };
+    script["commands"]
+        .as_array_mut()
+        .expect("the generated product validation script has commands")
+        .extend(iso);
+    let Value::Array(mixed) = json!([
+            { "command": "set_render_mode", "mode": "mip" },
+            { "command": "set_layer_render_mode", "layer_index": 1, "mode": "dvr" },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
+            { "command": "assert", "condition": { "render_mode": { "mode": "mip" } } },
+            { "command": "assert", "condition": { "layer_render_mode": { "layer_index": 1, "mode": "dvr" } } },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "copy_diagnostics" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-mixed-mip-dvr" }
+    ]) else {
+        unreachable!("the product validation mixed commands are an array")
+    };
+    script["commands"]
+        .as_array_mut()
+        .expect("the generated product validation script has commands")
+        .extend(mixed);
     let Value::Array(tail) = json!([
+            { "command": "set_projection", "projection": "orthographic" },
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "voxel_exact" },
+            { "command": "set_layer_sampling", "layer_index": 1, "sampling": "voxel_exact" },
             { "command": "set_render_mode", "mode": "mip" },
             { "command": "set_layer_render_mode", "layer_index": 1, "mode": "mip" },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
+            { "command": "assert", "condition": { "layer_render_mode": { "layer_index": 1, "mode": "mip" } } },
+            { "command": "set_active_tool", "tool": "inspect" },
+            { "command": "assert", "condition": { "active_tool": { "tool": "inspect" } } },
+            { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
+            { "command": "assert", "condition": { "pick_evidence": { "policy": "mip_argmax" } } },
+            { "command": "set_active_tool", "tool": "crosshair" },
+            { "command": "primary_click", "x_fraction": 0.5, "y_fraction": 0.5 },
+            { "command": "assert", "condition": "crosshair_linked" },
+            { "command": "set_active_tool", "tool": "roi_box" },
+            { "command": "primary_click", "x_fraction": 0.44, "y_fraction": 0.44 },
+            { "command": "primary_click", "x_fraction": 0.56, "y_fraction": 0.56 },
+            { "command": "assert", "condition": "roi_committed" },
+            { "command": "set_active_tool", "tool": "measure_distance" },
+            { "command": "primary_click", "x_fraction": 0.46, "y_fraction": 0.5 },
+            { "command": "primary_click", "x_fraction": 0.54, "y_fraction": 0.5 },
+            { "command": "assert", "condition": "distance_committed" },
+            { "command": "set_active_tool", "tool": "navigate" },
             { "command": "set_viewer_layout", "layout": "four_panel" },
-            { "command": "sleep_frames", "frames": 8 },
             { "command": "assert", "condition": { "viewer_layout": { "layout": "four_panel" } } },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 30000 },
+            { "command": "assert", "condition": { "frame_fidelity": { "scale_level": 0, "complete": true, "exact": true } } },
             { "command": "assert", "condition": { "cross_section_panel_schedule": {
                 "panel": "xz",
                 "min_generation": 1,
@@ -1398,7 +2332,10 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
                 "min_different_pixels": 1
             } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "capture_screenshot", "name": "generated-linked-panels" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-linked-panels-3d" },
+            { "command": "capture_screenshot", "target": "xy", "name": "generated-linked-panels-xy" },
+            { "command": "capture_screenshot", "target": "xz", "name": "generated-linked-panels-xz" },
+            { "command": "capture_screenshot", "target": "yz", "name": "generated-linked-panels-yz" },
             { "command": "set_viewer_layout", "layout": "single3d" },
             { "command": "sleep_frames", "frames": 3 },
             { "command": "assert", "condition": "cross_section_retired" },
@@ -1409,9 +2346,9 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
                 "width": GENERATED_RESIZED_VIEWPORT_WIDTH,
                 "height": GENERATED_RESIZED_VIEWPORT_HEIGHT
             } } },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "capture_screenshot", "name": "generated-resized-1920x1080" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "generated-resized-1920x1080" },
             { "command": "copy_diagnostics" },
             { "command": "quit" }
     ]) else {
@@ -1427,9 +2364,9 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
 fn target_source_verification_script(package: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": B3_SOURCE_VERIFICATION_SCENARIO,
-        "limits": dataset_runtime_limits(128 * MIB, 128),
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -1437,9 +2374,9 @@ fn target_source_verification_script(package: &Path) -> Value {
             { "command": "set_render_target_size", "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT },
             { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": { "render_target_pixels": { "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT } } },
-            { "command": "capture_screenshot", "name": "b3-before-cancel-1280x720" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "b3-before-cancel-1280x720" },
             { "command": "cancel_source_verification" },
             { "command": "wait_for", "condition": "source_verification_required", "timeout_ms": 30000 },
             { "command": "assert", "condition": {
@@ -1449,9 +2386,9 @@ fn target_source_verification_script(package: &Path) -> Value {
                     "min_accepted_successes": 0
                 }
             } },
-            { "command": "assert", "condition": "nonblank_frame" },
-            { "command": "assert", "condition": { "render_target_pixels": { "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT } } },
-            { "command": "capture_screenshot", "name": "b3-after-cancel-1280x720" },
+            // Source invalidation deliberately retires verified presentation
+            // leases. Do not wait for or capture a frame until verification
+            // has re-established the runtime authority below.
             { "command": "request_source_verification" },
             { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
             { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
@@ -1462,18 +2399,185 @@ fn target_source_verification_script(package: &Path) -> Value {
                     "min_accepted_successes": 1
                 }
             } },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": { "render_target_pixels": { "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT } } },
-            { "command": "capture_screenshot", "name": "b3-after-success-1280x720" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "b3-after-success-1280x720" },
             { "command": "set_viewport_size", "width": B3_SECOND_VIEWPORT_WIDTH, "height": B3_SECOND_VIEWPORT_HEIGHT },
             { "command": "set_render_target_size", "width": B3_SECOND_VIEWPORT_WIDTH, "height": B3_SECOND_VIEWPORT_HEIGHT },
             { "command": "sleep_frames", "frames": 3 },
             { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30000 },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": { "render_target_pixels": { "width": B3_SECOND_VIEWPORT_WIDTH, "height": B3_SECOND_VIEWPORT_HEIGHT } } },
-            { "command": "capture_screenshot", "name": "b3-after-success-1920x1080" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "b3-after-success-1920x1080" },
             { "command": "copy_diagnostics" },
             { "command": "quit" }
+        ]
+    })
+}
+
+fn import_preprocessing_script(
+    startup_package: &Path,
+    source: &Path,
+    output_parent: &Path,
+    destination: &Path,
+) -> Value {
+    // The promoted fixture has 850 base-production work units. Keep the
+    // resident-record ceiling structural and finite while allowing its exact
+    // s0 cohort to settle; byte residency remains independently capped below.
+    let mut hard_safety_limits =
+        dataset_runtime_hard_safety_limits(512 * MIB, IMPORT_RESIDENT_RESOURCE_LIMIT);
+    hard_safety_limits["max_cpu_import_working_set_bytes"] = json!(IMPORT_WORKING_MEMORY_BYTES);
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": IMPORT_PREPROCESSING_SCENARIO,
+        "hard_safety_limits": hard_safety_limits,
+        "commands": [
+            { "command": "open_dataset", "path": startup_package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5_000 },
+            { "command": "set_mapped_client_pixels", "width": IMPORT_VIEWPORT_WIDTH, "height": IMPORT_VIEWPORT_HEIGHT },
+            { "command": "set_render_target_size", "width": IMPORT_VIEWPORT_WIDTH, "height": IMPORT_VIEWPORT_HEIGHT },
+            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30_000 },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30_000 },
+            { "command": "begin_tiff_import_setup", "source": source, "output_parent": output_parent },
+            { "command": "wait_for", "condition": "import_review_ready", "timeout_ms": 30_000 },
+            { "command": "start_reviewed_import", "spacing_zyx_um": [0.4, 0.2, 0.1], "time_step_seconds": null, "no_data_sentinel": 255, "working_memory_bytes": IMPORT_WORKING_MEMORY_BYTES },
+            { "command": "wait_for_import_progress", "stage": "base-production", "minimum_completed_work_units": IMPORT_DURABLE_PREFIX_WORK_UNITS, "timeout_ms": 120_000 },
+            { "command": "cancel_import" },
+            { "command": "wait_for", "condition": "import_idle", "timeout_ms": 30_000 },
+            { "command": "assert", "condition": { "import_workflow_evidence": {
+                "required_stage_names": ["planning-and-preflight", "source-revalidation", "checkpoint-open-or-resume", "base-production"],
+                "min_projected_named_stages": 1,
+                "min_cancelled_runs": 1,
+                "min_successful_runs": 0,
+                "min_resumed_work_units": 0,
+                "min_elapsed_ms": 1,
+                "min_projected_elapsed_ms": 1,
+                "max_peak_working_bytes": IMPORT_WORKING_MEMORY_BYTES
+            } } },
+            { "command": "begin_tiff_import_setup", "source": source, "output_parent": output_parent },
+            { "command": "wait_for", "condition": "import_review_ready", "timeout_ms": 30_000 },
+            { "command": "start_reviewed_import", "spacing_zyx_um": [0.4, 0.2, 0.1], "time_step_seconds": null, "no_data_sentinel": 255, "working_memory_bytes": IMPORT_WORKING_MEMORY_BYTES },
+            { "command": "wait_for_imported_open_ready", "path": destination, "timeout_ms": 180_000 },
+            { "command": "assert", "condition": { "import_workflow_evidence": {
+                "required_stage_names": [
+                    "planning-and-preflight",
+                    "source-revalidation",
+                    "checkpoint-open-or-resume",
+                    "base-production",
+                    "pyramid-production",
+                    "source-scientific-identity",
+                    "shard-publication",
+                    "staged-structure-validation",
+                    "staged-exact-validation",
+                    "staged-scientific-validation",
+                    "commit"
+                ],
+                "min_projected_named_stages": 2,
+                "min_cancelled_runs": 1,
+                "min_successful_runs": 1,
+                "min_resumed_work_units": IMPORT_DURABLE_PREFIX_WORK_UNITS,
+                "min_elapsed_ms": 1,
+                "min_projected_elapsed_ms": 1,
+                "max_peak_working_bytes": IMPORT_WORKING_MEMORY_BYTES
+            } } },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 60_000 },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 60_000 },
+            { "command": "camera_fit_data" },
+            { "command": "camera_orbit", "yaw_points": 48.0, "pitch_points": 16.0 },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 60_000 },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "import-preprocessing-open-ready-navigation" },
+            { "command": "copy_diagnostics" },
+            { "command": "quit" }
+        ]
+    })
+}
+
+fn pre_alpha_provisional_launch_script(package: &Path, checkpoint: &Path) -> Value {
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": "pre_alpha_reliability_provisional_autosave",
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
+        "commands": [
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5_000 },
+            { "command": "set_mapped_client_pixels", "width": B4_PRIMARY_CLIENT_WIDTH, "height": B4_PRIMARY_CLIENT_HEIGHT },
+            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30_000 },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30_000 },
+            { "command": "new_project" },
+            { "command": "camera_pan", "x_points": 8.0, "y_points": -4.0 },
+            { "command": "wait_for", "condition": "project_autosaved", "timeout_ms": 45_000 },
+            { "command": "wait_for", "condition": "project_store_idle", "timeout_ms": 30_000 },
+            { "command": "assert", "condition": { "project_state": {
+                "bound": true,
+                "dirty": true,
+                "lifecycle": "provisional",
+                "can_save": true,
+                "can_save_as": false,
+                "manual": false,
+                "autosave": true
+            } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "write_external_kill_checkpoint", "path": checkpoint, "stage": PRE_ALPHA_PROVISIONAL_CHECKPOINT_STAGE },
+            { "command": "hold_for_external_kill" }
+        ]
+    })
+}
+
+fn pre_alpha_recovery_launch_script(package: &Path) -> Value {
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": "pre_alpha_reliability_recover_unsaved_autosave",
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
+        "commands": [
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5_000 },
+            { "command": "set_mapped_client_pixels", "width": B4_PRIMARY_CLIENT_WIDTH, "height": B4_PRIMARY_CLIENT_HEIGHT },
+            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30_000 },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30_000 },
+            { "command": "wait_for", "condition": "unsaved_autosave_recovery_exposed", "timeout_ms": 30_000 },
+            { "command": "recover_exposed_unsaved_autosave" },
+            { "command": "wait_for", "condition": "project_store_idle", "timeout_ms": 30_000 },
+            { "command": "assert", "condition": { "project_state": {
+                "bound": true,
+                "dirty": true,
+                "lifecycle": "recovery_selected",
+                "can_save": false,
+                "can_save_as": true,
+                "manual": false,
+                "autosave": true
+            } } },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 30_000 },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "pre-alpha-recovered-unsaved-autosave" },
+            { "command": "close_project_store" },
+            { "command": "wait_for", "condition": "project_store_closed", "timeout_ms": 30_000 },
+            { "command": "quit" }
+        ]
+    })
+}
+
+fn pre_alpha_native_close_launch_script(package: &Path, checkpoint: &Path) -> Value {
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": "pre_alpha_reliability_native_close",
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
+        "commands": [
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5_000 },
+            { "command": "set_mapped_client_pixels", "width": B4_PRIMARY_CLIENT_WIDTH, "height": B4_PRIMARY_CLIENT_HEIGHT },
+            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30_000 },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30_000 },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "write_external_kill_checkpoint", "path": checkpoint, "stage": PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE },
+            { "command": "hold_for_external_kill" }
         ]
     })
 }
@@ -1481,16 +2585,16 @@ fn target_source_verification_script(package: &Path) -> Value {
 fn b4_launch_one_script(package: &Path, project: &Path, checkpoint: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "b4_project_persistence_launch_1",
-        "limits": dataset_runtime_limits(128 * MIB, 128),
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
             { "command": "set_mapped_client_pixels", "width": B4_PRIMARY_CLIENT_WIDTH, "height": B4_PRIMARY_CLIENT_HEIGHT },
             { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "new_project" },
             { "command": "initial_save_with_edit", "path": project },
             { "command": "wait_for", "condition": "project_store_idle", "timeout_ms": 30000 },
@@ -1514,7 +2618,7 @@ fn b4_launch_one_script(package: &Path, project: &Path, checkpoint: &Path) -> Va
                 "autosave": true
             } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "capture_screenshot", "name": "b4-launch-1-before-kill-1280x720" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "b4-launch-1-before-kill-1280x720" },
             { "command": "write_external_kill_checkpoint", "path": checkpoint, "stage": B4_CHECKPOINT_STAGE },
             { "command": "hold_for_external_kill" }
         ]
@@ -1524,9 +2628,9 @@ fn b4_launch_one_script(package: &Path, project: &Path, checkpoint: &Path) -> Va
 fn b4_launch_two_script(package: &Path, original: &Path, save_as: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "b4_project_persistence_launch_2",
-        "limits": dataset_runtime_limits(128 * MIB, 128),
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -1557,9 +2661,9 @@ fn b4_launch_two_script(package: &Path, original: &Path, save_as: &Path) -> Valu
                 "manual": true,
                 "autosave": false
             } } },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "capture_screenshot", "name": "b4-launch-2-recovered-save-as-1920x1080" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "b4-launch-2-recovered-save-as-1920x1080" },
             { "command": "close_project_store" },
             { "command": "wait_for", "condition": "project_store_closed", "timeout_ms": 30000 },
             { "command": "quit" }
@@ -1570,9 +2674,9 @@ fn b4_launch_two_script(package: &Path, original: &Path, save_as: &Path) -> Valu
 fn b4_launch_three_script(package: &Path, save_as: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
-        "schema_version": PRODUCT_AUTOMATION_SCHEMA_VERSION,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
         "scenario": "b4_project_persistence_launch_3",
-        "limits": dataset_runtime_limits(128 * MIB, 128),
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
@@ -1590,9 +2694,9 @@ fn b4_launch_three_script(package: &Path, save_as: &Path) -> Value {
                 "manual": true,
                 "autosave": false
             } } },
-            { "command": "assert", "condition": "nonblank_frame" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
-            { "command": "capture_screenshot", "name": "b4-launch-3-final-reopen-clean-1920x1080" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "b4-launch-3-final-reopen-clean-1920x1080" },
             { "command": "close_project_store" },
             { "command": "wait_for", "condition": "project_store_closed", "timeout_ms": 30000 },
             { "command": "quit" }
@@ -1600,14 +2704,29 @@ fn b4_launch_three_script(package: &Path, save_as: &Path) -> Value {
     })
 }
 
-fn validate_product_automation_script(script: &Value) -> anyhow::Result<()> {
+pub(crate) fn validate_product_automation_script(script: &Value) -> anyhow::Result<()> {
+    let fields = script
+        .as_object()
+        .context("automation script must be an object")?
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let allowed_fields = BTreeSet::from([
+        "schema",
+        "schema_version",
+        "scenario",
+        "gpu_timing",
+        "hard_safety_limits",
+        "commands",
+    ]);
+    if !fields.is_subset(&allowed_fields) {
+        bail!("automation script contains an unknown or removed top-level field");
+    }
     if script.get("schema").and_then(Value::as_str) != Some(PRODUCT_AUTOMATION_SCRIPT_SCHEMA) {
         bail!("automation script schema must be {PRODUCT_AUTOMATION_SCRIPT_SCHEMA}");
     }
-    if script.get("schema_version").and_then(Value::as_u64)
-        != Some(PRODUCT_AUTOMATION_SCHEMA_VERSION as u64)
-    {
-        bail!("automation script schema_version must be {PRODUCT_AUTOMATION_SCHEMA_VERSION}");
+    if script.get("schema_version").and_then(Value::as_u64) != Some(SCRIPT_SCHEMA_VERSION as u64) {
+        bail!("automation script schema_version must be {SCRIPT_SCHEMA_VERSION}");
     }
     let scenario = script
         .get("scenario")
@@ -1636,38 +2755,145 @@ fn validate_product_automation_script(script: &Value) -> anyhow::Result<()> {
     if !matches!(terminal_command, Some("quit" | "hold_for_external_kill")) {
         bail!("automation script final command must be quit or hold_for_external_kill");
     }
-    validate_product_automation_limits(script)?;
+    for command in commands {
+        let command_name = command
+            .get("command")
+            .and_then(Value::as_str)
+            .context("automation command must name its command")?;
+        if command_name == "capture_screenshot" {
+            let target = command
+                .get("target")
+                .and_then(Value::as_str)
+                .context("capture_screenshot requires an explicit target")?;
+            if !valid_product_presentation_target(target) {
+                bail!("capture_screenshot target {target:?} is invalid");
+            }
+        }
+        if command_name == "assert"
+            && command.get("condition").and_then(Value::as_str) == Some("nonblank_frame")
+        {
+            bail!("nonblank_frame was removed; use target-explicit nonblank_panel");
+        }
+        if let Some(nonblank) = command.pointer("/condition/nonblank_panel") {
+            let target = nonblank
+                .get("target")
+                .and_then(Value::as_str)
+                .context("nonblank_panel requires an explicit target")?;
+            if !valid_product_presentation_target(target) {
+                bail!("nonblank_panel target {target:?} is invalid");
+            }
+        }
+    }
+    validate_product_automation_hard_safety_limits(script)?;
     Ok(())
 }
 
-fn validate_product_automation_limits(script: &Value) -> anyhow::Result<()> {
-    let Some(limits) = script.get("limits") else {
-        return Ok(());
-    };
-    let Some(map) = limits.as_object() else {
-        bail!("automation script limits must be an object");
-    };
-    const ALLOWED_LIMITS: &[&str] = &[
-        "max_cpu_total_bytes",
-        "max_cpu_decoded_residency_bytes",
-        "max_cpu_upload_staging_bytes",
-        "max_cpu_in_flight_decode_bytes",
-        "max_cpu_metadata_and_indexes_bytes",
-        "max_cpu_queues_and_results_bytes",
-        "max_cpu_prefetch_bytes",
-        "max_cpu_import_working_set_bytes",
-        "max_runtime_queued_requests",
-        "max_runtime_in_flight_decodes",
-        "max_runtime_pending_completions",
-        "max_runtime_resident_resources",
-    ];
+fn valid_product_presentation_target(target: &str) -> bool {
+    matches!(target, "three_d" | "xy" | "xz" | "yz")
+}
+
+fn validate_product_automation_hard_safety_limits(script: &Value) -> anyhow::Result<()> {
+    let hard_safety_limits = script
+        .get("hard_safety_limits")
+        .context("automation script hard_safety_limits must be present")?;
+    canonical_product_automation_hard_safety_limits(hard_safety_limits)?;
+    Ok(())
+}
+
+pub(crate) fn canonical_product_automation_hard_safety_limits(
+    hard_safety_limits: &Value,
+) -> anyhow::Result<Value> {
+    let map = hard_safety_limits
+        .as_object()
+        .context("automation script hard_safety_limits must be an object")?;
     for (name, value) in map {
-        if !ALLOWED_LIMITS.contains(&name.as_str()) {
-            bail!("unknown automation script limit {name:?}");
+        if !PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS.contains(&name.as_str()) {
+            bail!("unknown automation script hard-safety limit {name:?}");
         }
-        if value.as_u64().is_none() {
-            bail!("automation script limit {name:?} must be an unsigned integer");
+        if !value.is_null() && value.as_u64().is_none() {
+            bail!(
+                "automation script hard-safety limit {name:?} must be null or an unsigned integer"
+            );
         }
+    }
+    let canonical = PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS
+        .into_iter()
+        .map(|name| {
+            (
+                name.to_owned(),
+                map.get(name).cloned().unwrap_or(Value::Null),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    Ok(Value::Object(canonical))
+}
+
+pub(crate) fn validate_product_automation_report_contract(
+    report: &Value,
+    script: &Value,
+    script_path: &Path,
+) -> anyhow::Result<()> {
+    validate_product_automation_script(script)?;
+    if report.get("schema").and_then(Value::as_str) != Some(PRODUCT_AUTOMATION_REPORT_SCHEMA)
+        || report.get("schema_version").and_then(Value::as_u64)
+            != Some(u64::from(REPORT_SCHEMA_VERSION))
+        || report.get("status").and_then(Value::as_str) != Some("passed")
+        || report.get("failure_reason") != Some(&Value::Null)
+    {
+        bail!("automation report schema, status, or failure contract is invalid");
+    }
+    if report.get("limits").is_some() {
+        bail!("automation report contains the removed limits field");
+    }
+    let expected_limits = canonical_product_automation_hard_safety_limits(
+        script
+            .get("hard_safety_limits")
+            .context("automation script hard_safety_limits must be present")?,
+    )?;
+    if report.get("hard_safety_limits") != Some(&expected_limits) {
+        bail!("automation report hard_safety_limits do not exactly echo the script");
+    }
+
+    let script_report = report
+        .get("script")
+        .and_then(Value::as_object)
+        .context("automation report script binding is missing")?;
+    if script_report
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != BTreeSet::from([
+            "path",
+            "schema",
+            "schema_version",
+            "scenario",
+            "command_count",
+        ])
+        || script_report.get("schema").and_then(Value::as_str)
+            != script.get("schema").and_then(Value::as_str)
+        || script_report.get("schema_version").and_then(Value::as_u64)
+            != script.get("schema_version").and_then(Value::as_u64)
+        || script_report.get("scenario").and_then(Value::as_str)
+            != script.get("scenario").and_then(Value::as_str)
+        || script_report.get("command_count").and_then(Value::as_u64)
+            != script
+                .get("commands")
+                .and_then(Value::as_array)
+                .and_then(|commands| u64::try_from(commands.len()).ok())
+    {
+        bail!("automation report script identity is invalid");
+    }
+    let reported_script_path = script_report
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .context("automation report script path is missing")?;
+    let expected_script_path =
+        fs::canonicalize(script_path).context("executed automation script path is unavailable")?;
+    let reported_script_path = fs::canonicalize(reported_script_path)
+        .context("reported automation script path is unavailable")?;
+    if reported_script_path != expected_script_path {
+        bail!("automation report script path does not match the executed script");
     }
     Ok(())
 }
@@ -1676,6 +2902,10 @@ fn validate_product_automation_limits(script: &Value) -> anyhow::Result<()> {
 enum B4Termination<'a> {
     Normal,
     ExternalSigkill {
+        checkpoint: &'a Path,
+        expected_stage: &'a str,
+    },
+    ExternalNativeClose {
         checkpoint: &'a Path,
         expected_stage: &'a str,
     },
@@ -1692,6 +2922,15 @@ struct B4AttemptSpec<'a> {
     termination: B4Termination<'a>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreAlphaAttemptSpec<'a> {
+    number: u64,
+    phase: &'a str,
+    script: &'a Value,
+    state_home: &'a Path,
+    termination: B4Termination<'a>,
+}
+
 #[derive(Debug)]
 struct B4ProcessStatus {
     timed_out: bool,
@@ -1699,6 +2938,18 @@ struct B4ProcessStatus {
     exit_success: Option<bool>,
     signal: Option<i32>,
     external_sigkill_sent: bool,
+    external_native_close_sent: bool,
+    checkpoint: Option<Value>,
+    observed_client_area_pixels: Option<Value>,
+    fullscreen_action: Option<Value>,
+    control_failure: Option<String>,
+}
+
+struct B4FinishedProcessStatus {
+    exit_status: std::process::ExitStatus,
+    timed_out: bool,
+    external_sigkill_sent: bool,
+    external_native_close_sent: bool,
     checkpoint: Option<Value>,
     observed_client_area_pixels: Option<Value>,
     fullscreen_action: Option<Value>,
@@ -1724,8 +2975,15 @@ fn run_b4_attempt(
     let source_before = SourceClosureSnapshot::capture(package);
     let started_at_epoch_ms = epoch_ms();
     let started_at = Instant::now();
-    let process_result = match &source_before {
-        Ok(_) => run_b4_product_process(B4ProductRun {
+    let progress = read_json_file(&script_path).and_then(|script| {
+        let progress_plan = ProductAutomationProgressPlan::from_script(&script)?;
+        let phase_root = fs::canonicalize(&phase_dir)
+            .context("B4 phase directory is unavailable for progress monitoring")?;
+        let progress_launch = ProductAutomationProgressLaunch::new_replacing_stale(&phase_root)?;
+        Ok((progress_plan, progress_launch))
+    });
+    let process_result = match (&source_before, progress) {
+        (Ok(_), Ok((progress_plan, progress_launch))) => run_b4_product_process(B4ProductRun {
             binary,
             package,
             script: &script_path,
@@ -1737,8 +2995,12 @@ fn run_b4_attempt(
             expected_client_width: spec.expected_client_width,
             expected_client_height: spec.expected_client_height,
             termination: spec.termination,
+            phase: spec.phase,
+            progress_plan,
+            progress_launch,
         }),
-        Err(err) => Err(anyhow::anyhow!(err.to_string())),
+        (Err(err), _) => Err(anyhow::anyhow!(err.to_string())),
+        (_, Err(err)) => Err(err),
     };
     let source_closure_evidence = source_before
         .as_ref()
@@ -1769,6 +3031,7 @@ fn run_b4_attempt(
             "exit_success": Value::Null,
             "signal": Value::Null,
             "external_sigkill_sent": false,
+            "external_native_close_sent": false,
             "checkpoint": Value::Null,
             "observed_client_area_pixels": Value::Null,
             "fullscreen_action": Value::Null,
@@ -1811,6 +3074,224 @@ fn run_b4_attempt(
     attempt
 }
 
+fn run_pre_alpha_attempt(
+    binary: &Path,
+    package: &Path,
+    run_dir: &Path,
+    spec: PreAlphaAttemptSpec<'_>,
+) -> Value {
+    let phase_dir = run_dir.join(spec.phase);
+    let automation_report_path = phase_dir.join("product-automation-report.json");
+    let stdout_path = phase_dir.join("mirante4d-app.stdout.log");
+    let stderr_path = phase_dir.join("mirante4d-app.stderr.log");
+    let script_path = spec
+        .script
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| phase_dir.join("invalid-script-path"));
+    let source_before = SourceClosureSnapshot::capture(package);
+    let started_at_epoch_ms = epoch_ms();
+    let started_at = Instant::now();
+    let progress = read_json_file(&script_path).and_then(|script| {
+        let progress_plan = ProductAutomationProgressPlan::from_script(&script)?;
+        let phase_root = fs::canonicalize(&phase_dir).context(
+            "pre-alpha reliability phase directory is unavailable for progress monitoring",
+        )?;
+        let progress_launch = ProductAutomationProgressLaunch::new_replacing_stale(&phase_root)?;
+        Ok((progress_plan, progress_launch))
+    });
+    let process_result = match (&source_before, progress) {
+        (Ok(_), Ok((progress_plan, progress_launch))) => run_b4_product_process(B4ProductRun {
+            binary,
+            package,
+            script: &script_path,
+            automation_report: &automation_report_path,
+            stdout_path: &stdout_path,
+            stderr_path: &stderr_path,
+            state_home: spec.state_home,
+            timeout: Duration::from_secs(B4_PHASE_TIMEOUT_SECS),
+            expected_client_width: B4_PRIMARY_CLIENT_WIDTH,
+            expected_client_height: B4_PRIMARY_CLIENT_HEIGHT,
+            termination: spec.termination,
+            phase: spec.phase,
+            progress_plan,
+            progress_launch,
+        }),
+        (Err(err), _) => Err(anyhow::anyhow!(err.to_string())),
+        (_, Err(err)) => Err(err),
+    };
+    let source_closure_evidence = source_before
+        .as_ref()
+        .map_err(|err| anyhow::anyhow!(err.to_string()))
+        .and_then(|before| before.compare_json(package))
+        .unwrap_or_else(|err| {
+            json!({
+                "required": true,
+                "byte_identical": Value::Null,
+                "error": err.to_string(),
+            })
+        });
+    let automation_report = if automation_report_path.exists() {
+        read_json_file(&automation_report_path).unwrap_or_else(|err| {
+            json!({
+                "status": "invalid_report",
+                "failure_reason": err.to_string(),
+            })
+        })
+    } else {
+        Value::Null
+    };
+    let process = match process_result {
+        Ok(process) => b4_process_status_json(process),
+        Err(err) => json!({
+            "timed_out": false,
+            "exit_status": Value::Null,
+            "exit_success": Value::Null,
+            "signal": Value::Null,
+            "external_sigkill_sent": false,
+            "external_native_close_sent": false,
+            "checkpoint": Value::Null,
+            "observed_client_area_pixels": Value::Null,
+            "fullscreen_action": Value::Null,
+            "control_failure": format!("pre-alpha reliability process runner failed: {err}"),
+        }),
+    };
+    let stderr_evidence = pre_alpha_stderr_evidence(&stderr_path).unwrap_or_else(|err| {
+        json!({
+            "checked": false,
+            "panic_free": Value::Null,
+            "error": err.to_string(),
+        })
+    });
+    let recovery_store_evidence = pre_alpha_recovery_store_evidence(spec.state_home)
+        .unwrap_or_else(|err| {
+            json!({
+                "checked": false,
+                "error": err.to_string(),
+            })
+        });
+    let mut attempt = json!({
+        "attempt": spec.number,
+        "phase": spec.phase,
+        "retry_index": 0,
+        "status": "pending",
+        "failure_reason": Value::Null,
+        "started_at_epoch_ms": started_at_epoch_ms,
+        "finished_at_epoch_ms": epoch_ms(),
+        "duration_ms": duration_ms(started_at.elapsed()),
+        "script": script_path,
+        "automation_report_path": automation_report_path,
+        "stdout": stdout_path,
+        "stderr": stderr_path,
+        "state_home": spec.state_home,
+        "requested_client_area_pixels": {
+            "width": B4_PRIMARY_CLIENT_WIDTH,
+            "height": B4_PRIMARY_CLIENT_HEIGHT,
+        },
+        "process": process,
+        "automation_report": automation_report,
+        "source_closure_evidence": source_closure_evidence,
+        "stderr_evidence": stderr_evidence,
+        "recovery_store_evidence": recovery_store_evidence,
+    });
+    match validate_pre_alpha_attempt(&attempt, spec.number) {
+        Ok(()) => attempt["status"] = Value::String("passed".to_owned()),
+        Err(err) => {
+            attempt["status"] = Value::String("failed".to_owned());
+            attempt["failure_reason"] = Value::String(err.to_string());
+        }
+    }
+    attempt
+}
+
+fn pre_alpha_stderr_evidence(path: &Path) -> anyhow::Result<Value> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("pre-alpha stderr evidence is not a regular file");
+    }
+    if metadata.len() > PRE_ALPHA_STDERR_BYTES_MAX {
+        bail!(
+            "pre-alpha stderr exceeded its {}-byte evidence bound",
+            PRE_ALPHA_STDERR_BYTES_MAX
+        );
+    }
+    let stderr =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let lowercase = stderr.to_ascii_lowercase();
+    let panic_free = !lowercase.contains("panicked at")
+        && !lowercase.contains("thread 'main' panicked")
+        && !lowercase.contains("thread \"main\" panicked");
+    Ok(json!({
+        "checked": true,
+        "bytes": metadata.len(),
+        "maximum_bytes": PRE_ALPHA_STDERR_BYTES_MAX,
+        "panic_free": panic_free,
+        "matching_policy": "bounded_complete_utf8_log_has_no_rust_panic_marker",
+    }))
+}
+
+fn pre_alpha_recovery_store_evidence(state_home: &Path) -> anyhow::Result<Value> {
+    let recovery_root = state_home.join("mirante4d").join("recovery");
+    let metadata = fs::symlink_metadata(&recovery_root)
+        .with_context(|| format!("failed to inspect {}", recovery_root.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!("pre-alpha recovery root is not a real directory");
+    }
+    let mut entries = 0_usize;
+    let mut canonical_store_directories = 0_usize;
+    for entry in fs::read_dir(&recovery_root)
+        .with_context(|| format!("failed to enumerate {}", recovery_root.display()))?
+    {
+        if entries >= PRE_ALPHA_RECOVERY_ROOT_ENTRIES_MAX {
+            bail!(
+                "pre-alpha recovery root exceeded its {}-entry evidence bound",
+                PRE_ALPHA_RECOVERY_ROOT_ENTRIES_MAX
+            );
+        }
+        let entry = entry.context("failed to read a pre-alpha recovery-root entry")?;
+        entries += 1;
+        let file_type = entry
+            .file_type()
+            .context("failed to inspect a pre-alpha recovery-root entry")?;
+        let name = entry.file_name();
+        let canonical_name = name
+            .to_str()
+            .is_some_and(is_canonical_project_store_directory_name);
+        if file_type.is_dir() && canonical_name {
+            canonical_store_directories += 1;
+        } else {
+            bail!(
+                "isolated pre-alpha recovery root contains a noncanonical or non-directory entry"
+            );
+        }
+    }
+    Ok(json!({
+        "checked": true,
+        "root": recovery_root,
+        "entries": entries,
+        "canonical_store_directories": canonical_store_directories,
+        "maximum_entries": PRE_ALPHA_RECOVERY_ROOT_ENTRIES_MAX,
+        "all_entries_canonical_directories": true,
+    }))
+}
+
+fn is_canonical_project_store_directory_name(name: &str) -> bool {
+    let Some(project_id) = name.strip_suffix(".m4dproj") else {
+        return false;
+    };
+    if project_id.len() != 36 {
+        return false;
+    }
+    project_id.bytes().enumerate().all(|(index, byte)| {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+        }
+    })
+}
+
 fn b4_process_status_json(status: B4ProcessStatus) -> Value {
     json!({
         "timed_out": status.timed_out,
@@ -1818,6 +3299,7 @@ fn b4_process_status_json(status: B4ProcessStatus) -> Value {
         "exit_success": status.exit_success,
         "signal": status.signal,
         "external_sigkill_sent": status.external_sigkill_sent,
+        "external_native_close_sent": status.external_native_close_sent,
         "checkpoint": status.checkpoint,
         "observed_client_area_pixels": status.observed_client_area_pixels,
         "fullscreen_action": status.fullscreen_action,
@@ -1837,6 +3319,9 @@ struct B4ProductRun<'a> {
     expected_client_width: u32,
     expected_client_height: u32,
     termination: B4Termination<'a>,
+    phase: &'a str,
+    progress_plan: ProductAutomationProgressPlan,
+    progress_launch: ProductAutomationProgressLaunch,
 }
 
 fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStatus> {
@@ -1853,17 +3338,24 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
         .env("XDG_STATE_HOME", run.state_home)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    isolate_process_tree(&mut command);
+    run.progress_launch.apply_to_command(&mut command);
     println!("running B4 product validation phase: {:?}", command);
+    let started = Instant::now();
     let mut child = command.spawn().with_context(|| {
         format!(
             "failed to launch native app product validation binary {}",
             run.binary.display()
         )
     })?;
-    let deadline = Instant::now() + run.timeout;
+    let deadline = started + run.timeout;
+    let mut progress_monitor = run.progress_launch.monitor(run.progress_plan, started);
+    let mut next_progress_poll = started;
     let mut observed_client_area_pixels = None;
     let mut fullscreen_action = None;
     let mut checkpoint = None;
+    let mut external_native_close_sent = false;
+    let mut external_native_close_sent_at = None;
     loop {
         if observed_client_area_pixels.is_none() {
             match probe_b4_x11_client_geometry(
@@ -1878,45 +3370,63 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
                         .try_wait()
                         .context("failed to poll B4 product child after geometry failure")?
                     {
-                        return Ok(b4_finished_process_status(
+                        let progress_failure = progress_monitor
+                            .finalize_at_exit(Instant::now())
+                            .map(|failure| failure.reason_code());
+                        return Ok(b4_finished_process_status(B4FinishedProcessStatus {
                             exit_status,
-                            false,
-                            false,
+                            timed_out: false,
+                            external_sigkill_sent: false,
+                            external_native_close_sent: false,
                             checkpoint,
                             observed_client_area_pixels,
                             fullscreen_action,
-                            Some(format!("external X11 geometry observation failed: {err}")),
-                        ));
+                            control_failure: Some(progress_failure.map_or_else(
+                                || format!("external X11 geometry observation failed: {err}"),
+                                |failure| format!("automation progress protocol failed: {failure}"),
+                            )),
+                        }));
                     }
                 }
             }
         }
 
-        if let B4Termination::ExternalSigkill {
-            checkpoint: checkpoint_path,
-            expected_stage,
-        } = run.termination
+        let checkpoint_request = match run.termination {
+            B4Termination::ExternalSigkill {
+                checkpoint,
+                expected_stage,
+            }
+            | B4Termination::ExternalNativeClose {
+                checkpoint,
+                expected_stage,
+            } => Some((checkpoint, expected_stage)),
+            B4Termination::Normal => None,
+        };
+        if let Some((checkpoint_path, expected_stage)) = checkpoint_request
             && checkpoint.is_none()
             && checkpoint_path.exists()
         {
-            match read_json_file(checkpoint_path)
-                .and_then(|value| validate_b4_checkpoint(&value, expected_stage).map(|()| value))
-            {
+            match read_json_file(checkpoint_path).and_then(|value| {
+                validate_external_checkpoint_identity(&value, expected_stage).map(|()| value)
+            }) {
                 Ok(value) => checkpoint = Some(value),
                 Err(err) => {
-                    let _ = child.kill();
+                    terminate_process_tree(&mut child);
                     let exit_status = child
                         .wait()
                         .context("failed to reap B4 child after invalid checkpoint")?;
-                    return Ok(b4_finished_process_status(
+                    return Ok(b4_finished_process_status(B4FinishedProcessStatus {
                         exit_status,
-                        false,
-                        true,
-                        None,
+                        timed_out: false,
+                        external_sigkill_sent: true,
+                        external_native_close_sent: false,
+                        checkpoint: None,
                         observed_client_area_pixels,
                         fullscreen_action,
-                        Some(format!("external kill checkpoint failed validation: {err}")),
-                    ));
+                        control_failure: Some(format!(
+                            "external kill checkpoint failed validation: {err}"
+                        )),
+                    }));
                 }
             }
         }
@@ -1925,81 +3435,172 @@ fn run_b4_product_process(run: B4ProductRun<'_>) -> anyhow::Result<B4ProcessStat
             && checkpoint.is_some()
             && observed_client_area_pixels.is_some()
         {
-            child
-                .kill()
-                .context("failed to send external SIGKILL to B4 product child")?;
+            terminate_process_tree(&mut child);
             let exit_status = child
                 .wait()
                 .context("failed to reap externally killed B4 product child")?;
-            return Ok(b4_finished_process_status(
+            return Ok(b4_finished_process_status(B4FinishedProcessStatus {
                 exit_status,
-                false,
-                true,
+                timed_out: false,
+                external_sigkill_sent: true,
+                external_native_close_sent: false,
                 checkpoint,
                 observed_client_area_pixels,
                 fullscreen_action,
-                None,
-            ));
+                control_failure: None,
+            }));
+        }
+
+        if matches!(run.termination, B4Termination::ExternalNativeClose { .. })
+            && checkpoint.is_some()
+            && !external_native_close_sent
+            && let Some(observed_client) = observed_client_area_pixels.as_ref()
+        {
+            if let Err(err) = request_b4_native_x11_close(observed_client) {
+                terminate_process_tree(&mut child);
+                let exit_status = child
+                    .wait()
+                    .context("failed to reap product child after native-close request failure")?;
+                return Ok(b4_finished_process_status(B4FinishedProcessStatus {
+                    exit_status,
+                    timed_out: false,
+                    external_sigkill_sent: false,
+                    external_native_close_sent: false,
+                    checkpoint,
+                    observed_client_area_pixels,
+                    fullscreen_action,
+                    control_failure: Some(format!(
+                        "external native X11 close request failed: {err}"
+                    )),
+                }));
+            }
+            external_native_close_sent = true;
+            external_native_close_sent_at = Some(Instant::now());
         }
 
         if let Some(exit_status) = child
             .try_wait()
             .context("failed to poll B4 product validation child")?
         {
-            let early_exit = matches!(run.termination, B4Termination::ExternalSigkill { .. });
-            return Ok(b4_finished_process_status(
+            let external_native_close_completed =
+                matches!(run.termination, B4Termination::ExternalNativeClose { .. })
+                    && external_native_close_sent;
+            let early_exit = matches!(
+                run.termination,
+                B4Termination::ExternalSigkill { .. } | B4Termination::ExternalNativeClose { .. }
+            ) && !external_native_close_completed;
+            let progress_failure = (!external_native_close_completed)
+                .then(|| {
+                    progress_monitor
+                        .finalize_at_exit(Instant::now())
+                        .map(|failure| failure.reason_code())
+                })
+                .flatten();
+            return Ok(b4_finished_process_status(B4FinishedProcessStatus {
                 exit_status,
-                false,
-                false,
+                timed_out: false,
+                external_sigkill_sent: false,
+                external_native_close_sent,
                 checkpoint,
                 observed_client_area_pixels,
                 fullscreen_action,
-                early_exit.then(|| {
-                    "native app exited before the synced checkpoint and external SIGKILL".to_owned()
-                }),
-            ));
+                control_failure: progress_failure
+                    .map(|failure| format!("automation progress protocol failed: {failure}"))
+                    .or_else(|| {
+                        early_exit.then(|| {
+                            "native app exited before its synced checkpoint and external lifecycle action"
+                                .to_owned()
+                        })
+                    }),
+            }));
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
+        let now = Instant::now();
+        if external_native_close_sent_at
+            .is_some_and(|sent_at| now.duration_since(sent_at) >= NATIVE_CLOSE_EXIT_TIMEOUT)
+        {
+            terminate_process_tree(&mut child);
+            let exit_status = child
+                .wait()
+                .context("failed to reap product child after native-close exit deadline")?;
+            return Ok(b4_finished_process_status(B4FinishedProcessStatus {
+                exit_status,
+                timed_out: false,
+                external_sigkill_sent: false,
+                external_native_close_sent: true,
+                checkpoint,
+                observed_client_area_pixels,
+                fullscreen_action,
+                control_failure: Some(format!(
+                    "mapped native X11 close did not exit within {} seconds; fallback termination was failure cleanup",
+                    NATIVE_CLOSE_EXIT_TIMEOUT.as_secs()
+                )),
+            }));
+        }
+        if now >= next_progress_poll {
+            match progress_monitor.poll_at(now) {
+                ProgressMonitorAction::Continue => {}
+                ProgressMonitorAction::Emit(snapshot) => {
+                    let line =
+                        safe_automation_progress_line("product_validate_b4", run.phase, &snapshot)?;
+                    eprintln!("{line}");
+                }
+                ProgressMonitorAction::Terminate(failure) => {
+                    terminate_process_tree(&mut child);
+                    let exit_status = child
+                        .wait()
+                        .context("failed to reap B4 child after progress failure")?;
+                    return Ok(b4_finished_process_status(B4FinishedProcessStatus {
+                        exit_status,
+                        timed_out: false,
+                        external_sigkill_sent: false,
+                        external_native_close_sent,
+                        checkpoint,
+                        observed_client_area_pixels,
+                        fullscreen_action,
+                        control_failure: Some(format!(
+                            "automation progress protocol failed: {}",
+                            failure.reason_code()
+                        )),
+                    }));
+                }
+            }
+            next_progress_poll = now + FILE_POLL_INTERVAL;
+        }
+        if now >= deadline {
+            terminate_process_tree(&mut child);
             let exit_status = child
                 .wait()
                 .context("failed to reap timed-out B4 product child")?;
-            return Ok(b4_finished_process_status(
+            return Ok(b4_finished_process_status(B4FinishedProcessStatus {
                 exit_status,
-                true,
-                false,
+                timed_out: true,
+                external_sigkill_sent: false,
+                external_native_close_sent,
                 checkpoint,
                 observed_client_area_pixels,
                 fullscreen_action,
-                Some(format!(
+                control_failure: Some(format!(
                     "B4 product phase exceeded its {}-second timeout",
                     run.timeout.as_secs()
                 )),
-            ));
+            }));
         }
         thread::sleep(Duration::from_millis(100));
     }
 }
 
-fn b4_finished_process_status(
-    exit_status: std::process::ExitStatus,
-    timed_out: bool,
-    external_sigkill_sent: bool,
-    checkpoint: Option<Value>,
-    observed_client_area_pixels: Option<Value>,
-    fullscreen_action: Option<Value>,
-    control_failure: Option<String>,
-) -> B4ProcessStatus {
+fn b4_finished_process_status(finished: B4FinishedProcessStatus) -> B4ProcessStatus {
     B4ProcessStatus {
-        timed_out,
-        exit_status: Some(exit_status.to_string()),
-        exit_success: Some(exit_status.success()),
-        signal: exit_status.signal(),
-        external_sigkill_sent,
-        checkpoint,
-        observed_client_area_pixels,
-        fullscreen_action,
-        control_failure,
+        timed_out: finished.timed_out,
+        exit_status: Some(finished.exit_status.to_string()),
+        exit_success: Some(finished.exit_status.success()),
+        signal: finished.exit_status.signal(),
+        external_sigkill_sent: finished.external_sigkill_sent,
+        external_native_close_sent: finished.external_native_close_sent,
+        checkpoint: finished.checkpoint,
+        observed_client_area_pixels: finished.observed_client_area_pixels,
+        fullscreen_action: finished.fullscreen_action,
+        control_failure: finished.control_failure,
     }
 }
 
@@ -2009,9 +3610,9 @@ fn probe_b4_x11_client_geometry(
     expected_height: u32,
     fullscreen_action: &mut Option<Value>,
 ) -> anyhow::Result<Option<Value>> {
-    let search = Command::new("xdotool")
-        .args(["search", "--onlyvisible", "--pid", &pid.to_string()])
-        .output()
+    let mut search = Command::new("xdotool");
+    search.args(["search", "--onlyvisible", "--pid", &pid.to_string()]);
+    let search = run_command_with_bounded_output(&mut search, X11_AUTOMATION_OUTPUT_POLICY)
         .context("failed to run xdotool window search")?;
     if !search.status.success() {
         return Ok(None);
@@ -2026,9 +3627,9 @@ fn probe_b4_x11_client_geometry(
             continue;
         };
         let id_hex = format!("0x{window_id:x}");
-        let info = Command::new("xwininfo")
-            .args(["-id", &id_hex])
-            .output()
+        let mut info = Command::new("xwininfo");
+        info.args(["-id", &id_hex]);
+        let info = run_command_with_bounded_output(&mut info, X11_AUTOMATION_OUTPUT_POLICY)
             .context("failed to run xwininfo")?;
         if !info.status.success() {
             continue;
@@ -2051,9 +3652,9 @@ fn probe_b4_x11_client_geometry(
             && expected_height == B4_SECONDARY_CLIENT_HEIGHT
             && fullscreen_action.is_none()
         {
-            let action = Command::new("wmctrl")
-                .args(["-i", "-r", &id_hex, "-b", "add,fullscreen"])
-                .output()
+            let mut action = Command::new("wmctrl");
+            action.args(["-i", "-r", &id_hex, "-b", "add,fullscreen"]);
+            let action = run_command_with_bounded_output(&mut action, X11_AUTOMATION_OUTPUT_POLICY)
                 .context("failed to request external fullscreen through wmctrl")?;
             if action.status.success() {
                 *fullscreen_action = Some(json!({
@@ -2066,6 +3667,25 @@ fn probe_b4_x11_client_geometry(
         }
     }
     Ok(None)
+}
+
+fn request_b4_native_x11_close(observed_client: &Value) -> anyhow::Result<()> {
+    if observed_client.get("map_state").and_then(Value::as_str) != Some("is_viewable") {
+        bail!("native close requires an externally observed mapped X11 client");
+    }
+    let window_id = observed_client
+        .get("window_id")
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("0x") && value.len() > 2)
+        .context("mapped X11 client observation lacks its window ID")?;
+    let mut close = Command::new("wmctrl");
+    close.args(["-i", "-c", window_id]);
+    let output = run_command_with_bounded_output(&mut close, X11_AUTOMATION_OUTPUT_POLICY)
+        .context("failed to request mapped X11 client close through wmctrl")?;
+    if !output.status.success() {
+        bail!("wmctrl native close failed with status {}", output.status);
+    }
+    Ok(())
 }
 
 fn parse_xwininfo_client_geometry(output: &str) -> Option<(u32, u32, bool)> {
@@ -2090,13 +3710,21 @@ fn parse_xwininfo_client_geometry(output: &str) -> Option<(u32, u32, bool)> {
     Some((width, height, is_viewable))
 }
 
-fn validate_b4_checkpoint(checkpoint: &Value, expected_stage: &str) -> anyhow::Result<()> {
+fn validate_external_checkpoint_identity(
+    checkpoint: &Value,
+    expected_stage: &str,
+) -> anyhow::Result<()> {
     if checkpoint.get("schema").and_then(Value::as_str) != Some(B4_CHECKPOINT_SCHEMA)
         || checkpoint.get("schema_version").and_then(Value::as_u64) != Some(1)
         || checkpoint.get("stage").and_then(Value::as_str) != Some(expected_stage)
     {
-        bail!("B4 external-kill checkpoint identity or stage drifted");
+        bail!("external process checkpoint identity or stage drifted");
     }
+    Ok(())
+}
+
+fn validate_b4_checkpoint(checkpoint: &Value, expected_stage: &str) -> anyhow::Result<()> {
+    validate_external_checkpoint_identity(checkpoint, expected_stage)?;
     let requested_pixels = checkpoint
         .pointer("/viewport_evidence/requested_mapped_client_pixels")
         .context("B4 checkpoint lacks requested mapped-client pixels")?;
@@ -2254,9 +3882,15 @@ fn validate_b4_attempt(attempt: &Value, expected_number: u64) -> anyhow::Result<
     let automation = attempt
         .get("automation_report")
         .context("B4 normal launch lacks its automation report")?;
-    if automation.get("status").and_then(Value::as_str) != Some("passed") {
-        bail!("B4 launch {expected_number} automation did not pass");
-    }
+    let script_path = attempt
+        .get("script")
+        .and_then(Value::as_str)
+        .map(Path::new)
+        .context("B4 normal launch lacks its exact automation script path")?;
+    let script = read_json_file(script_path)
+        .context("B4 normal launch automation script could not be read")?;
+    validate_product_automation_report_contract(automation, &script, script_path)
+        .context("B4 normal launch automation report contract is invalid")?;
     let expected_width = requested.get("width").and_then(Value::as_u64);
     let expected_height = requested.get("height").and_then(Value::as_u64);
     if automation
@@ -2305,6 +3939,368 @@ fn validate_b4_aggregate_attempts(attempts: &[Value]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_pre_alpha_checkpoint(
+    checkpoint: &Value,
+    expected_stage: &str,
+    expected_number: u64,
+) -> anyhow::Result<()> {
+    validate_external_checkpoint_identity(checkpoint, expected_stage)?;
+    let requested_pixels = checkpoint
+        .pointer("/viewport_evidence/requested_mapped_client_pixels")
+        .context("pre-alpha checkpoint lacks requested mapped-client pixels")?;
+    if requested_pixels.get("width").and_then(Value::as_u64)
+        != Some(u64::from(B4_PRIMARY_CLIENT_WIDTH))
+        || requested_pixels.get("height").and_then(Value::as_u64)
+            != Some(u64::from(B4_PRIMARY_CLIENT_HEIGHT))
+    {
+        bail!("pre-alpha checkpoint mapped-client request is not exact 1280x720");
+    }
+    let state = checkpoint
+        .get("project_state")
+        .context("pre-alpha checkpoint lacks project state")?;
+    match expected_number {
+        1 => {
+            for (field, expected) in [
+                ("bound", true),
+                ("dirty", true),
+                ("can_save", true),
+                ("can_save_as", false),
+                ("manual", false),
+                ("autosave", true),
+            ] {
+                if state.get(field).and_then(Value::as_bool) != Some(expected) {
+                    bail!("pre-alpha provisional checkpoint project_state.{field} drifted");
+                }
+            }
+            if state.get("lifecycle").and_then(Value::as_str) != Some("provisional")
+                || !state.get("current_manual").is_some_and(Value::is_null)
+                || state.get("current_autosave").is_none_or(Value::is_null)
+            {
+                bail!(
+                    "pre-alpha provisional checkpoint does not retain provisional autosave-only state"
+                );
+            }
+            let current = b4_revision_fact(state.get("current_revision"), "current revision")?;
+            let autosave = b4_revision_fact(
+                checkpoint.pointer("/project_evidence/latest_autosave_captured_revision"),
+                "latest autosave captured revision",
+            )?;
+            if current != autosave {
+                bail!(
+                    "pre-alpha provisional checkpoint autosave does not capture the current revision"
+                );
+            }
+        }
+        3 => {
+            for field in ["bound", "dirty", "can_save_as", "manual", "autosave"] {
+                if state.get(field).and_then(Value::as_bool) != Some(false) {
+                    bail!("pre-alpha clean-close checkpoint project_state.{field} drifted");
+                }
+            }
+            if state.get("can_save").and_then(Value::as_bool) != Some(true) {
+                bail!("pre-alpha clean-close checkpoint project_state.can_save drifted");
+            }
+            for field in [
+                "current_revision",
+                "saved_revision",
+                "current_manual",
+                "current_autosave",
+            ] {
+                if !state.get(field).is_some_and(Value::is_null) {
+                    bail!("pre-alpha clean-close checkpoint project_state.{field} is not unbound");
+                }
+            }
+            if state.get("lifecycle").and_then(Value::as_str) != Some("unbound") {
+                bail!("pre-alpha clean-close checkpoint lifecycle is not unbound");
+            }
+        }
+        _ => bail!("pre-alpha checkpoint validation was requested for an invalid launch"),
+    }
+    Ok(())
+}
+
+fn validate_pre_alpha_attempt(attempt: &Value, expected_number: u64) -> anyhow::Result<()> {
+    if attempt.get("attempt").and_then(Value::as_u64) != Some(expected_number)
+        || attempt.get("retry_index").and_then(Value::as_u64) != Some(0)
+    {
+        bail!("pre-alpha reliability attempt identity or retry index drifted");
+    }
+    if attempt
+        .pointer("/source_closure_evidence/byte_identical")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        bail!("pre-alpha launch {expected_number} changed or failed to compare the source closure");
+    }
+    if attempt
+        .pointer("/process/timed_out")
+        .and_then(Value::as_bool)
+        != Some(false)
+        || !attempt
+            .pointer("/process/control_failure")
+            .is_some_and(Value::is_null)
+    {
+        bail!("pre-alpha launch {expected_number} process control failed");
+    }
+    if attempt
+        .pointer("/stderr_evidence/checked")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || attempt
+            .pointer("/stderr_evidence/panic_free")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        bail!("pre-alpha launch {expected_number} did not retain panic-free bounded stderr");
+    }
+    if attempt
+        .pointer("/recovery_store_evidence/checked")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || attempt
+            .pointer("/recovery_store_evidence/all_entries_canonical_directories")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        bail!("pre-alpha launch {expected_number} recovery-root evidence is invalid");
+    }
+    let requested = attempt
+        .get("requested_client_area_pixels")
+        .context("pre-alpha attempt lacks requested client pixels")?;
+    let observed = attempt
+        .pointer("/process/observed_client_area_pixels")
+        .context("pre-alpha attempt lacks externally observed client pixels")?;
+    if observed.get("width") != requested.get("width")
+        || observed.get("height") != requested.get("height")
+        || observed.get("map_state").and_then(Value::as_str) != Some("is_viewable")
+        || observed.get("observation").and_then(Value::as_str)
+            != Some("xdotool_pid_search_plus_xwininfo_client_geometry")
+    {
+        bail!("pre-alpha launch {expected_number} mapped client geometry was not externally exact");
+    }
+    let recovery_store_count = attempt
+        .pointer("/recovery_store_evidence/canonical_store_directories")
+        .and_then(Value::as_u64)
+        .context("pre-alpha attempt lacks its recovery-store count")?;
+
+    match expected_number {
+        1 => {
+            if attempt
+                .pointer("/process/external_sigkill_sent")
+                .and_then(Value::as_bool)
+                != Some(true)
+                || attempt
+                    .pointer("/process/external_native_close_sent")
+                    .and_then(Value::as_bool)
+                    != Some(false)
+                || attempt.pointer("/process/signal").and_then(Value::as_i64) != Some(9)
+                || attempt
+                    .pointer("/process/exit_success")
+                    .and_then(Value::as_bool)
+                    != Some(false)
+            {
+                bail!(
+                    "pre-alpha launch 1 was not terminated by the parent's external SIGKILL signal 9"
+                );
+            }
+            let checkpoint = attempt
+                .pointer("/process/checkpoint")
+                .context("pre-alpha launch 1 lacks its synced provisional checkpoint")?;
+            validate_pre_alpha_checkpoint(
+                checkpoint,
+                PRE_ALPHA_PROVISIONAL_CHECKPOINT_STAGE,
+                expected_number,
+            )?;
+            if recovery_store_count != 1 {
+                bail!(
+                    "pre-alpha launch 1 did not leave exactly one canonical provisional recovery store"
+                );
+            }
+        }
+        2 => {
+            if attempt
+                .pointer("/process/external_sigkill_sent")
+                .and_then(Value::as_bool)
+                != Some(false)
+                || attempt
+                    .pointer("/process/external_native_close_sent")
+                    .and_then(Value::as_bool)
+                    != Some(false)
+                || attempt
+                    .pointer("/process/exit_success")
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                || !attempt
+                    .pointer("/process/signal")
+                    .is_some_and(Value::is_null)
+            {
+                bail!("pre-alpha recovery launch did not exit normally");
+            }
+            let automation = attempt
+                .get("automation_report")
+                .context("pre-alpha recovery launch lacks its automation report")?;
+            let script_path = attempt
+                .get("script")
+                .and_then(Value::as_str)
+                .map(Path::new)
+                .context("pre-alpha recovery launch lacks its exact automation script path")?;
+            let script = read_json_file(script_path)
+                .context("pre-alpha recovery automation script could not be read")?;
+            validate_product_automation_report_contract(automation, &script, script_path)
+                .context("pre-alpha recovery automation report contract is invalid")?;
+            validate_pre_alpha_recovery_script(&script)?;
+            validate_pre_alpha_recovery_events(automation)?;
+            qualifying_nonblank_viewport_capture(Some(automation)).map_err(anyhow::Error::msg)?;
+            if automation
+                .pointer("/project_store_evidence/close_result/status")
+                .and_then(Value::as_str)
+                != Some("succeeded")
+                || automation
+                    .pointer("/project_store_evidence/actor_join/status")
+                    .and_then(Value::as_str)
+                    != Some("succeeded")
+            {
+                bail!(
+                    "pre-alpha recovery launch does not prove normal project-store Close and actor join"
+                );
+            }
+            if recovery_store_count != 1 {
+                bail!(
+                    "pre-alpha recovery launch did not retain exactly one unchanged provisional recovery store"
+                );
+            }
+        }
+        3 => {
+            if attempt
+                .pointer("/process/external_sigkill_sent")
+                .and_then(Value::as_bool)
+                != Some(false)
+                || attempt
+                    .pointer("/process/external_native_close_sent")
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                || attempt
+                    .pointer("/process/exit_success")
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                || !attempt
+                    .pointer("/process/signal")
+                    .is_some_and(Value::is_null)
+            {
+                bail!(
+                    "pre-alpha clean-close launch did not exit successfully from the external mapped X11 close"
+                );
+            }
+            let checkpoint = attempt
+                .pointer("/process/checkpoint")
+                .context("pre-alpha clean-close launch lacks its synced checkpoint")?;
+            validate_pre_alpha_checkpoint(
+                checkpoint,
+                PRE_ALPHA_NATIVE_CLOSE_CHECKPOINT_STAGE,
+                expected_number,
+            )?;
+            if recovery_store_count != 0 {
+                bail!("pre-alpha clean-close launch unexpectedly created a recovery store");
+            }
+        }
+        _ => bail!("pre-alpha reliability requires launch numbers 1 through 3"),
+    }
+    Ok(())
+}
+
+fn validate_pre_alpha_recovery_script(script: &Value) -> anyhow::Result<()> {
+    let commands = script
+        .get("commands")
+        .and_then(Value::as_array)
+        .context("pre-alpha recovery script lacks commands")?;
+    let recovery_assertion = commands
+        .iter()
+        .find_map(|command| command.pointer("/condition/project_state"))
+        .context("pre-alpha recovery script lacks its dirty recovery assertion")?;
+    for (field, expected) in [
+        ("bound", true),
+        ("dirty", true),
+        ("can_save", false),
+        ("can_save_as", true),
+        ("manual", false),
+        ("autosave", true),
+    ] {
+        if recovery_assertion.get(field).and_then(Value::as_bool) != Some(expected) {
+            bail!("pre-alpha recovery script project_state.{field} drifted");
+        }
+    }
+    if recovery_assertion.get("lifecycle").and_then(Value::as_str) != Some("recovery_selected") {
+        bail!("pre-alpha recovery script does not require recovery_selected lifecycle");
+    }
+    Ok(())
+}
+
+fn validate_pre_alpha_recovery_events(report: &Value) -> anyhow::Result<()> {
+    let events = report
+        .get("events")
+        .and_then(Value::as_array)
+        .context("pre-alpha recovery report lacks command events")?;
+    let recovery_exposed = events.iter().any(|event| {
+        event.get("command").and_then(Value::as_str) == Some("wait_for")
+            && event.get("status").and_then(Value::as_str) == Some("passed")
+            && event.pointer("/details/condition").and_then(Value::as_str)
+                == Some("unsaved_autosave_recovery_exposed")
+    });
+    if !recovery_exposed {
+        bail!("pre-alpha recovery report does not prove startup recovery exposure");
+    }
+    let normal_recovery_route = events.iter().any(|event| {
+        event.get("command").and_then(Value::as_str) == Some("recover_exposed_unsaved_autosave")
+            && event.get("status").and_then(Value::as_str) == Some("passed")
+            && event
+                .pointer("/details/startup_panel_was_open")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && event
+                .pointer("/details/normal_reducer_service_path")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && event
+                .pointer("/details/foreground_started_or_completed")
+                .and_then(Value::as_bool)
+                == Some(true)
+    });
+    if !normal_recovery_route {
+        bail!(
+            "pre-alpha recovery report does not prove the exposed locator used the normal application/service route"
+        );
+    }
+    let recovery_state_asserted = events.iter().any(|event| {
+        event.get("command").and_then(Value::as_str) == Some("assert")
+            && event.get("status").and_then(Value::as_str) == Some("passed")
+            && event.pointer("/details/condition").and_then(Value::as_str) == Some("project_state")
+    });
+    if !recovery_state_asserted {
+        bail!("pre-alpha recovery report lacks its passing dirty-state assertion");
+    }
+    Ok(())
+}
+
+fn validate_pre_alpha_attempts(attempts: &[Value]) -> anyhow::Result<()> {
+    if attempts.len() != 3 {
+        bail!("pre-alpha reliability requires exactly three retained launch attempts");
+    }
+    for (index, attempt) in attempts.iter().enumerate() {
+        let expected_number = u64::try_from(index + 1).expect("three attempts fit u64");
+        if attempt.get("status").and_then(Value::as_str) != Some("passed") {
+            bail!("pre-alpha launch {expected_number} is not passed");
+        }
+        validate_pre_alpha_attempt(attempt, expected_number)?;
+    }
+    if attempts
+        .iter()
+        .any(|attempt| attempt.get("retry_index").and_then(Value::as_u64) != Some(0))
+    {
+        bail!("pre-alpha reliability observed an automatic retry");
+    }
+    Ok(())
+}
+
 struct ProductAutomationRun<'a> {
     binary: &'a Path,
     package: &'a Path,
@@ -2313,6 +4309,9 @@ struct ProductAutomationRun<'a> {
     stdout_path: &'a Path,
     stderr_path: &'a Path,
     timeout: Duration,
+    scenario: &'a str,
+    progress_plan: ProductAutomationProgressPlan,
+    progress_launch: ProductAutomationProgressLaunch,
 }
 
 fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<ProductProcessStatus> {
@@ -2328,15 +4327,24 @@ fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<Produ
         .env("MIRANTE4D_AUTOMATION_REPORT", run.automation_report)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    println!("running product validation: {:?}", command);
+    isolate_process_tree(&mut command);
+    run.progress_launch.apply_to_command(&mut command);
+    println!(
+        "running normal-app product validation scenario {:?}",
+        run.scenario
+    );
+    let started = Instant::now();
     let mut child = command.spawn().with_context(|| {
         format!(
             "failed to launch native app product validation binary {}",
             run.binary.display()
         )
     })?;
-    let deadline = Instant::now() + run.timeout;
+    let deadline = started + run.timeout;
+    let mut progress_monitor = run.progress_launch.monitor(run.progress_plan, started);
+    let mut next_progress_poll = started;
     loop {
+        let now = Instant::now();
         if let Some(exit_status) = child
             .try_wait()
             .context("failed to poll product validation child process")?
@@ -2345,15 +4353,40 @@ fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<Produ
                 timed_out: false,
                 exit_status: Some(exit_status.to_string()),
                 exit_success: Some(exit_status.success()),
+                progress_failure_reason: progress_monitor
+                    .finalize_at_exit(now)
+                    .map(|failure| failure.reason_code()),
             });
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
+        if now >= next_progress_poll {
+            match progress_monitor.poll_at(now) {
+                ProgressMonitorAction::Continue => {}
+                ProgressMonitorAction::Emit(snapshot) => {
+                    let line =
+                        safe_automation_progress_line("product_validate", run.scenario, &snapshot)?;
+                    eprintln!("{line}");
+                }
+                ProgressMonitorAction::Terminate(failure) => {
+                    terminate_process_tree(&mut child);
+                    let exit_status = child.wait().ok();
+                    return Ok(ProductProcessStatus {
+                        timed_out: false,
+                        exit_status: exit_status.map(|status| status.to_string()),
+                        exit_success: exit_status.map(|status| status.success()),
+                        progress_failure_reason: Some(failure.reason_code()),
+                    });
+                }
+            }
+            next_progress_poll = now + FILE_POLL_INTERVAL;
+        }
+        if now >= deadline {
+            terminate_process_tree(&mut child);
             let exit_status = child.wait().ok().map(|status| status.to_string());
             return Ok(ProductProcessStatus {
                 timed_out: true,
                 exit_status,
                 exit_success: None,
+                progress_failure_reason: None,
             });
         }
         thread::sleep(Duration::from_millis(100));
@@ -2365,6 +4398,7 @@ struct ProductProcessStatus {
     timed_out: bool,
     exit_status: Option<String>,
     exit_success: Option<bool>,
+    progress_failure_reason: Option<&'static str>,
 }
 
 struct WrapperReport<'a> {
@@ -2429,6 +4463,8 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let scenario_name = report.scenario_name;
+    let claim_source = "instrumented_application_commands_internal_state_and_readback";
+    let pixel_content_observed = Value::Null;
     let b3_e1_capture_evidence = if scenario_name == B3_SOURCE_VERIFICATION_SCENARIO {
         match b3_exact_e1_capture_evidence(report.automation_report_value) {
             Ok(evidence) => evidence,
@@ -2440,6 +4476,22 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
                 "e4_product_open_satisfied": false,
                 "failure_reason": reason,
                 "captures": [],
+            }),
+        }
+    } else {
+        Value::Null
+    };
+    let import_evidence = if scenario_name == IMPORT_PREPROCESSING_SCENARIO {
+        match import_preprocessing_evidence(report.automation_report_value) {
+            Ok(evidence) => json!({
+                "required": true,
+                "accepted": true,
+                "workflow": evidence,
+            }),
+            Err(reason) => json!({
+                "required": true,
+                "accepted": false,
+                "failure_reason": reason,
             }),
         }
     } else {
@@ -2508,7 +4560,8 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
         "evidence_level": "E1",
         "claim_boundary": {
             "evidence_type": "internal_native_window_product_automation",
-            "source": "instrumented_application_commands_internal_state_and_readback",
+            "source": claim_source,
+            "pixel_content_observed": pixel_content_observed,
             "closure_authority": "integration_support_only_not_black_box_product_open",
             "e4_product_open_satisfied": false,
         },
@@ -2535,6 +4588,7 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
             "pixels_per_point": pixels_per_point,
             "render_target_pixels": render_target_pixels,
             "b3_exact_e1_capture_evidence": b3_e1_capture_evidence,
+            "import_preprocessing_evidence": import_evidence,
             "render_modes": render_modes,
         },
         "limits": {
@@ -2666,7 +4720,7 @@ fn product_validation_cross_section_panel_metrics(
 
 fn script_limit_u64(script: &Value, name: &str) -> Value {
     script
-        .get("limits")
+        .get("hard_safety_limits")
         .and_then(|limits| limits.get(name))
         .and_then(Value::as_u64)
         .map(Value::from)
@@ -2676,7 +4730,7 @@ fn script_limit_u64(script: &Value, name: &str) -> Value {
 fn script_has_any_limit(script: &Value, names: &[&str]) -> bool {
     names.iter().any(|name| {
         script
-            .get("limits")
+            .get("hard_safety_limits")
             .and_then(|limits| limits.get(name))
             .and_then(Value::as_u64)
             .is_some()

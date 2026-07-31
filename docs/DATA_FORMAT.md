@@ -44,6 +44,67 @@ OME-TIFF sources. Import never changes source data. It writes to an owned
 stage, validates the result, and publishes only to a previously absent
 destination.
 
+Imported spatial pyramids follow one deterministic geometry contract. Time is
+never reduced. Starting at S0, each spatial dimension is ceil-divided by two
+until the coarsest shape satisfies both:
+
+```text
+max(z, y, x) <= 64
+z * y * x <= 262,144 voxels per layer and timepoint
+```
+
+A small source that already satisfies both conditions remains single-scale.
+A larger or long-thin source receives however many distinct factor-two levels
+its geometry requires. The closed two-digit profile admits up to 64 levels;
+the largest possible `u64` dimension reaches the terminal contract in 59, so
+this bound covers every representable `Shape4D` rather than imposing a
+product LOD count. The terminal geometry—not an ordinal such as S6—is the
+viewer navigation-floor contract.
+
+For a reviewed `uint8` sentinel, source equality is evaluated only at LOD 0.
+Final base validity is the in-bounds Chebyshev-radius-one erosion of source
+validity (zero Z radius for 2D). Each later LOD stores the half-up mean of valid
+samples in its aligned, odd-tail-clipped factor-two parent block, marks a child
+supported when any parent is valid, and applies the same in-bounds one-voxel
+invalid dilation. A derived mean numerically equal to the source sentinel
+remains valid. Every final invalid integer sample is canonical zero. The
+sentinel recipe records these classification, dimensionality, reduction,
+rounding, support, dilation, and canonicalization facts under
+`tiff-import-u8-sentinel-guarded-pyramid` version `2.0.0`; no-sentinel recipes
+retain the existing canonical-base operation.
+
+Sentinel mean levels use an axis-aware centered OME transform. An axis reduced
+by cumulative factor `F` has scale `base_spacing * F` and translation
+`base_spacing * (F - 1) / 2`; an axis already of length one keeps factor one
+and zero translation. Existing complete packages retain their recorded arrays
+and transforms and are not reinterpreted.
+
+Incomplete imports use one current, non-portable checkpoint schema with six
+regular files: two fixed canonical-base files and four encoded-spool files.
+The canonical file stores little-endian planes; checksummed state records name
+only a durable plane prefix. Its batch triggers are 16 completed planes,
+64 MiB of pending plane bytes, and a 15-second age check. The spool uses
+payload, journal, and chained watermark durability batches triggered at 512
+work units, 64 MiB of pending encoded payload, and the same age check. A stage
+boundary or serialized decoder interval can force either authority to
+synchronize earlier. A canonical plane above 64 MiB fails the checked capacity
+boundary instead of expanding a batch. Recovery discards only an incomplete
+bounded suffix, rejects complete corruption or a wrong source/plan binding,
+and never migrates a predecessor checkpoint. Sentinel checkpoints bind the
+guarded-mean algorithm identifier, so an incomplete exact-only/point-sampled
+checkpoint is rejected and must be explicitly reset before restart. Checkpoint
+names are opened relative to a retained no-follow directory descriptor;
+canonical and spool cleanup remove a name only while it still identifies the
+exact retained file. Checkpoints are temporary implementation state, not part
+of the `.m4d` profile.
+
+Pixel and validity chunks are encoded once through the storage codec authority.
+The checkpoint-to-writer boundary validates kind, encoded/decoded length,
+checksum, single-frame extent, ordering, and profile before exact encoded bytes
+enter an outer shard. Packed-index chunks continue to be constructed at
+publication. Scientific and exact package identities retain their existing
+contracts.
+
 Scientific identity is independent of storage layout. Package identity covers
 the exact package bytes. Recipe, derivation, rights, citation, and analysis
 artifact identities remain explicit typed records rather than filenames or

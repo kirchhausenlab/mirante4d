@@ -12,8 +12,13 @@ mod workbench_inspector;
 mod workbench_viewer;
 
 pub(crate) use analysis_workspace::{show_analysis_workspace, show_analysis_workspace_window};
-pub(crate) use fidelity::show_frame_fidelity_property_rows;
-pub use fidelity::{frame_fidelity_label, iso_shading_policy_label, render_sampling_policy_label};
+pub use fidelity::{
+    Linked2dFidelityStatus, LinkedPanelFidelityStatus, frame_fidelity_label,
+    iso_shading_policy_label, linked_panel_fidelity_label, render_sampling_policy_label,
+};
+pub(crate) use fidelity::{
+    show_frame_fidelity_property_rows, show_linked_2d_fidelity_property_rows,
+};
 pub use project_dialogs::{
     DirtyProjectCloseView, DirtyProjectSaveAction, ProjectRecoveryCandidateView,
     ProjectRecoveryView,
@@ -43,14 +48,18 @@ use eframe::egui::{self, Color32, RichText};
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, CrossSectionPanelId, OperationOutcome,
     PresentationPaintRequest, PresentationSlot, PresentationSurface, PresentationViewport,
-    ProjectGenerationId, ProjectId, RenderExtent, ResourcePolicy,
+    ProjectGenerationId, ProjectId, RenderExtent, RenderIntentSample, RenderIntentTarget,
+    ResourcePolicy, VolumePickQuery,
     import_workflow::{
         ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportReviewId,
         ImportReviewSnapshot, ImportSourceDtype, ImportSourceLayout, ImportWorkflowSnapshot,
     },
-    viewer_tools::ViewerToolState,
+    viewer_tools::{ScreenPosition, ViewerTool, ViewerToolContext, ViewerToolState},
     viewport_interaction::ViewportOrbitDrag,
 };
+
+const U8_SENTINEL_POLICY_DESCRIPTION: &str =
+    "exact sentinel match + one-voxel invalid dilation at base and every LOD";
 
 /// Egui-local draft values and interaction state.
 #[derive(Debug)]
@@ -62,6 +71,7 @@ pub struct EguiUiState {
     pub viewer_tools: ViewerToolState,
     pub hovered_pixel: Option<ViewportHover>,
     pub hovered_source_readout: Option<String>,
+    pub runtime_diagnostics_open: bool,
     pub close_prompt_open: bool,
     pub allow_close_without_prompt: bool,
     pub settings_runtime_draft: ResourcePolicyDraft,
@@ -81,6 +91,7 @@ impl EguiUiState {
             viewer_tools: ViewerToolState::default(),
             hovered_pixel: None,
             hovered_source_readout: None,
+            runtime_diagnostics_open: false,
             close_prompt_open: false,
             allow_close_without_prompt: false,
             settings_runtime_draft: ResourcePolicyDraft {
@@ -92,6 +103,10 @@ impl EguiUiState {
             import_checkpoint_reset_confirmed: false,
             import_checkpoint_retry_id: None,
         }
+    }
+
+    pub fn cancel_viewport_drag(&mut self) {
+        self.viewport_orbit_drag = None;
     }
 }
 
@@ -134,6 +149,13 @@ pub struct ViewportHover {
     pub x: u64,
     pub y: u64,
     pub intensity: ViewportIntensity,
+    pub sample_kind: ViewportSampleKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewportSampleKind {
+    Voxel,
+    Interpolated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -343,6 +365,68 @@ pub struct ViewportObservation {
     render: RenderExtent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerPickPurpose {
+    Hover,
+    PrimaryClick,
+}
+
+/// One latest-only scientific 3D pick requested while laying out the viewer.
+/// The query is already bound to the displayed token/frame/extent; the native
+/// composition root remains responsible for revalidating those facts when the
+/// asynchronous result completes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewerPickRequest {
+    query: VolumePickQuery,
+    context: ViewerToolContext,
+    tool: ViewerTool,
+    purpose: ViewerPickPurpose,
+    screen_position: ScreenPosition,
+}
+
+impl ViewerPickRequest {
+    pub fn new(
+        query: VolumePickQuery,
+        context: ViewerToolContext,
+        tool: ViewerTool,
+        purpose: ViewerPickPurpose,
+        screen_position: ScreenPosition,
+    ) -> Option<Self> {
+        (tool != ViewerTool::Navigate
+            && context.timepoint == query.timepoint()
+            && context.layer == query.layer()
+            && screen_position.x.is_finite()
+            && screen_position.y.is_finite())
+        .then_some(Self {
+            query,
+            context,
+            tool,
+            purpose,
+            screen_position,
+        })
+    }
+
+    pub const fn query(self) -> VolumePickQuery {
+        self.query
+    }
+
+    pub const fn context(self) -> ViewerToolContext {
+        self.context
+    }
+
+    pub const fn tool(self) -> ViewerTool {
+        self.tool
+    }
+
+    pub const fn purpose(self) -> ViewerPickPurpose {
+        self.purpose
+    }
+
+    pub const fn screen_position(self) -> ScreenPosition {
+        self.screen_position
+    }
+}
+
 impl ViewportObservation {
     pub const fn new(
         slot: PresentationSlot,
@@ -443,6 +527,29 @@ impl CrossSectionReadoutRequest {
     }
 }
 
+/// One transient render-intent event emitted by a viewer widget.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RenderIntentInteraction {
+    Sample(RenderIntentSample),
+    Finish(RenderIntentTarget),
+}
+
+impl RenderIntentInteraction {
+    pub const fn sample(self) -> Option<RenderIntentSample> {
+        match self {
+            Self::Sample(sample) => Some(sample),
+            Self::Finish(_) => None,
+        }
+    }
+
+    pub const fn finish_target(self) -> Option<RenderIntentTarget> {
+        match self {
+            Self::Sample(_) => None,
+            Self::Finish(target) => Some(target),
+        }
+    }
+}
+
 /// Typed results emitted while egui builds one visible workbench frame.
 ///
 /// Commands retain their existing post-build batching behavior. Actions and
@@ -451,10 +558,12 @@ impl CrossSectionReadoutRequest {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkbenchUiOutput {
     pub application_commands: Vec<ApplicationCommand>,
+    pub render_intent_interactions: Vec<RenderIntentInteraction>,
     pub import_commands: Vec<ImportCommand>,
     pub actions: Vec<WorkbenchUiAction>,
     pub viewport_observations: Vec<ViewportObservation>,
     pub cross_section_readout_requests: Vec<CrossSectionReadoutRequest>,
+    pub viewer_pick_request: Option<ViewerPickRequest>,
     pub render_requests: Vec<RenderUiRequest>,
     pub presentation_paints: Vec<EguiPresentationPaint>,
     pub rerender_requested: bool,
@@ -675,7 +784,7 @@ pub(crate) fn show_import_workflow_window(
                     }
                     ImportWorkflowSnapshot::Importing(import) => {
                         ui.horizontal(|ui| {
-                            if !matches!(import.progress, ImportProgressSnapshot::Finished) {
+                            if !matches!(import.progress, ImportProgressSnapshot::Published) {
                                 ui.add(egui::Spinner::new());
                             }
                             status_badge(
@@ -690,6 +799,7 @@ pub(crate) fn show_import_workflow_window(
                         });
                         property_row(ui, "destination", &import.destination);
                         property_row(ui, "progress", import_progress_message(import.progress));
+                        property_row(ui, "elapsed", format_import_elapsed(import.elapsed_ms));
                         if let Some(progress) = import_progress_fraction(import.progress) {
                             ui.add(egui::ProgressBar::new(progress).show_percentage());
                         }
@@ -886,6 +996,11 @@ fn show_import_review(
                 *sentinel = value as u8;
             }
         });
+        property_row(
+            ui,
+            "selected no-data policy",
+            U8_SENTINEL_POLICY_DESCRIPTION,
+        );
     } else if !sentinel_supported {
         property_row(ui, "no-data sentinel", "available only for uint8 sources");
     }
@@ -961,30 +1076,42 @@ fn import_source_dtype_label(dtype: ImportSourceDtype) -> &'static str {
 fn import_progress_message(progress: ImportProgressSnapshot) -> String {
     match progress {
         ImportProgressSnapshot::Preparing => "Preparing import".to_owned(),
-        ImportProgressSnapshot::Producing {
-            completed_work_units,
-            total_work_units,
-        } => format!("Building package {completed_work_units}/{total_work_units}"),
-        ImportProgressSnapshot::HashingScience => "Checking scientific content".to_owned(),
-        ImportProgressSnapshot::Publishing => "Validating and publishing package".to_owned(),
-        ImportProgressSnapshot::Finished => "Import finished".to_owned(),
+        ImportProgressSnapshot::Stage {
+            name,
+            completed_work_units: Some(completed_work_units),
+            total_work_units: Some(total_work_units),
+        } => format!("{name} {completed_work_units}/{total_work_units}"),
+        ImportProgressSnapshot::Stage { name, .. } => name.to_owned(),
+        ImportProgressSnapshot::Published => {
+            "Verified package published; opening dataset".to_owned()
+        }
     }
 }
 
 fn import_progress_fraction(progress: ImportProgressSnapshot) -> Option<f32> {
     match progress {
-        ImportProgressSnapshot::Preparing => None,
-        ImportProgressSnapshot::Producing {
-            completed_work_units,
-            total_work_units,
-        } if total_work_units > 0 => Some(
-            (0.05 + 0.70 * (completed_work_units as f32 / total_work_units as f32))
-                .clamp(0.05, 0.75),
-        ),
-        ImportProgressSnapshot::Producing { .. } => None,
-        ImportProgressSnapshot::HashingScience => Some(0.80),
-        ImportProgressSnapshot::Publishing => Some(0.90),
-        ImportProgressSnapshot::Finished => Some(1.0),
+        ImportProgressSnapshot::Stage {
+            completed_work_units: Some(completed_work_units),
+            total_work_units: Some(total_work_units),
+            ..
+        } if total_work_units > 0 => {
+            Some((completed_work_units as f32 / total_work_units as f32).clamp(0.0, 1.0))
+        }
+        ImportProgressSnapshot::Preparing
+        | ImportProgressSnapshot::Stage { .. }
+        | ImportProgressSnapshot::Published => None,
+    }
+}
+
+fn format_import_elapsed(elapsed_ms: u64) -> String {
+    let total_seconds = elapsed_ms / 1_000;
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
     }
 }
 
@@ -1255,6 +1382,7 @@ mod tests {
         );
         assert!(state.viewport_orbit_drag.is_none());
         assert!(state.analysis_filter.is_empty());
+        assert!(!state.runtime_diagnostics_open);
         assert!(!state.close_prompt_open);
         assert!(!state.analysis_workspace_open);
         assert!(state.import_review.is_none());
@@ -1265,6 +1393,7 @@ mod tests {
     fn workbench_output_contains_only_typed_ui_results() {
         let output = WorkbenchUiOutput {
             application_commands: vec![ApplicationCommand::SetPlaybackActive(true)],
+            render_intent_interactions: Vec::new(),
             import_commands: vec![ImportCommand::CancelImport],
             actions: vec![
                 WorkbenchUiAction::OpenDatasetDialog,
@@ -1287,6 +1416,7 @@ mod tests {
             ],
             viewport_observations: Vec::new(),
             cross_section_readout_requests: Vec::new(),
+            viewer_pick_request: None,
             render_requests: Vec::new(),
             presentation_paints: Vec::new(),
             rerender_requested: true,
@@ -1325,6 +1455,7 @@ mod tests {
         assert!(output.rerender_requested);
         assert!(!output.texture_refresh_requested);
     }
+
     use mirante4d_application::{PresentationSurface, PresentationViewport};
 
     #[test]
@@ -1371,6 +1502,27 @@ mod tests {
     }
 
     #[test]
+    fn sentinel_import_review_states_the_guarded_policy() {
+        let mut draft = import_draft(0.5);
+        draft.no_data_sentinel = Some(255);
+        let harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut ImportWindowHarnessState| {
+                    state.commands =
+                        show_import_workflow_window(ui.ctx(), &mut state.ui, &state.snapshot);
+                },
+                ImportWindowHarnessState {
+                    ui: EguiUiState::new(256, 128),
+                    snapshot: import_review(12, draft),
+                    commands: Vec::new(),
+                },
+            );
+
+        harness.get_by_label(U8_SENTINEL_POLICY_DESCRIPTION);
+    }
+
+    #[test]
     fn checkpoint_restart_requires_confirmation_and_emits_retry_identity() {
         let mut harness = Harness::builder()
             .with_size(egui::vec2(800.0, 500.0))
@@ -1407,22 +1559,49 @@ mod tests {
     }
 
     #[test]
-    fn import_progress_is_coarse_and_monotonic() {
+    fn import_progress_is_stage_local_and_never_fabricates_a_global_fraction() {
         assert_eq!(
-            import_progress_fraction(ImportProgressSnapshot::Producing {
-                completed_work_units: 5,
-                total_work_units: 10,
+            import_progress_message(ImportProgressSnapshot::Stage {
+                name: "base-production",
+                completed_work_units: Some(5),
+                total_work_units: Some(10),
             }),
-            Some(0.4)
-        );
-        assert!(
-            import_progress_fraction(ImportProgressSnapshot::HashingScience)
-                < import_progress_fraction(ImportProgressSnapshot::Publishing)
+            "base-production 5/10"
         );
         assert_eq!(
-            import_progress_fraction(ImportProgressSnapshot::Finished),
-            Some(1.0)
+            import_progress_fraction(ImportProgressSnapshot::Stage {
+                name: "base-production",
+                completed_work_units: Some(5),
+                total_work_units: Some(10),
+            }),
+            Some(0.5)
         );
+        assert_eq!(
+            import_progress_message(ImportProgressSnapshot::Stage {
+                name: "source-scientific-identity",
+                completed_work_units: Some(0),
+                total_work_units: None,
+            }),
+            "source-scientific-identity"
+        );
+        assert_eq!(
+            import_progress_fraction(ImportProgressSnapshot::Stage {
+                name: "source-scientific-identity",
+                completed_work_units: Some(0),
+                total_work_units: None,
+            }),
+            None
+        );
+        assert_eq!(
+            import_progress_fraction(ImportProgressSnapshot::Published),
+            None
+        );
+        assert_eq!(
+            import_progress_message(ImportProgressSnapshot::Published),
+            "Verified package published; opening dataset"
+        );
+        assert_eq!(format_import_elapsed(7_000), "0:07");
+        assert_eq!(format_import_elapsed(3_661_000), "1:01:01");
     }
 
     #[test]

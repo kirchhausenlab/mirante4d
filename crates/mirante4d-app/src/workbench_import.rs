@@ -1,6 +1,13 @@
 use super::*;
 
 impl MiranteWorkbenchApp {
+    fn bind_import_worker_completion_repaint(&mut self, ctx: &egui::Context) {
+        let completion_ctx = ctx.clone();
+        self.import
+            .workers
+            .set_completion_wake(move || completion_ctx.request_repaint());
+    }
+
     pub(super) fn import_tiff_directory_from_dialog(&mut self, ctx: &egui::Context) {
         if self.import.workers.status().is_active() {
             tracing::info!("TIFF import workflow is already running");
@@ -48,7 +55,8 @@ impl MiranteWorkbenchApp {
         output_parent: PathBuf,
         ctx: &egui::Context,
     ) {
-        let destination = tiff_destination(&source, &output_parent);
+        self.bind_import_worker_completion_repaint(ctx);
+        let destination = deterministic_tiff_destination(&source, &output_parent);
         if let Err(error) = self.enter_tiff_import_setup_waiting_state(source, destination) {
             self.import.problem = Some(error.to_string());
             tracing::error!(%error, "TIFF inspection could not start");
@@ -125,6 +133,7 @@ impl MiranteWorkbenchApp {
                 self.import.workers.cancel_inspection();
             }
             ImportCommand::Start { review_id, draft } => {
+                self.bind_import_worker_completion_repaint(ctx);
                 match self.import.start_options(review_id, draft) {
                     Ok(Some(options)) => {
                         self.start_import_task(review_id, options);
@@ -151,6 +160,7 @@ impl MiranteWorkbenchApp {
                 self.import.checkpoint_retry = None;
             }
             ImportCommand::ResetCheckpointAndRestart { retry_id } => {
+                self.bind_import_worker_completion_repaint(ctx);
                 self.reset_invalid_checkpoint_and_restart(retry_id);
             }
         }
@@ -205,15 +215,35 @@ impl MiranteWorkbenchApp {
             review_id,
             token,
             destination,
+            source_fingerprint: _,
+            reviewed_source_bytes: _,
             retry_options,
+            elapsed: _,
             outcome,
         } = *completion;
         match outcome {
-            ImportWorkerOutcome::Finished(Ok(receipt)) => {
+            ImportWorkerOutcome::Finished(Ok(published)) => {
                 self.import.checkpoint_retry = None;
                 self.import.problem = None;
+                if !same_existing_import_destination(published.destination(), &destination) {
+                    self.complete_background_operation(
+                        token,
+                        OperationCompletion::Failed(OperationFailureCode::ImportExecutionFailed),
+                    );
+                    self.import.problem = Some(
+                        "The published package authority did not match the reviewed destination. The package was not opened."
+                            .to_owned(),
+                    );
+                    tracing::error!(
+                        reviewed_destination = %destination.display(),
+                        published_destination = %published.destination().display(),
+                        "published import destination binding mismatch"
+                    );
+                    ctx.request_repaint();
+                    return;
+                }
                 if self.complete_background_operation(token, OperationCompletion::Succeeded) {
-                    self.finish_successful_import(receipt, destination, ctx);
+                    self.finish_successful_import(published, destination, ctx);
                 }
             }
             ImportWorkerOutcome::Finished(Err(ImportError::Cancelled)) => {
@@ -256,11 +286,12 @@ impl MiranteWorkbenchApp {
 
     pub(super) fn finish_successful_import(
         &mut self,
-        receipt: ImportReceipt,
+        published: PublishedImport,
         destination: PathBuf,
         ctx: &egui::Context,
     ) {
-        let open_started = match self.open_or_queue_dataset_path(destination.clone(), Some(ctx)) {
+        let receipt = published.receipt().clone();
+        let open_started = match self.open_or_queue_imported_dataset(published, Some(ctx)) {
             Ok(open_started) => open_started,
             Err(error) => {
                 self.import.problem = Some(format!(
@@ -316,6 +347,12 @@ impl MiranteWorkbenchApp {
             }
         }
     }
+}
+
+fn same_existing_import_destination(left: &Path, right: &Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    left == right
 }
 
 fn import_failure_code(error: &ImportError) -> OperationFailureCode {

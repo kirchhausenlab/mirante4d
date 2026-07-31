@@ -3,12 +3,6 @@
 The current checkpoint lives in [planning/NOW.md](planning/NOW.md). This file
 contains unresolved work only.
 
-## Product Maintenance
-
-- Expose packaged unsaved-autosave recovery in its owning application package.
-- Repair the inherited clean-state X11/Winit shutdown panic in its owning
-  application package.
-
 ## Deferred
 
 - Select and publish full microscopy datasets through the separate

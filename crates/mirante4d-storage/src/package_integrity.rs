@@ -3,9 +3,15 @@ use std::collections::BTreeMap;
 use mirante4d_identity::{ExactBytesDigest, IdentityHashError, PackageId};
 use thiserror::Error;
 
-use crate::package_read::{LocalBrickRead, PackageReadError, read_local_brick};
+use crate::package_read::{
+    DirectPayloadFactsAuthority, LocalBrickRead, LocalDirectBrickRead, LocalDirectBrickReadError,
+    PackageReadError, read_local_brick_reusing, read_local_brick_reusing_for_scientific_scan,
+    read_local_brick_reusing_in_transaction, read_local_brick_reusing_into_sink_in_transaction,
+};
 use crate::package_structure::{PackageStructureError, PackageStructureReport};
-use crate::range_io::{LocalObjectHashError, LocalObjectSnapshot};
+use crate::range_io::{
+    LocalCurrentnessBatch, LocalObjectGeneration, LocalObjectHashError, LocalObjectSnapshot,
+};
 use crate::{
     DatasetProfileAdmission, DirectoryInventoryError, LocalPackageCatalog, LocalPackageReader,
     ManifestRoot, PackageObjectDescriptor, PackagePath, PackedIndexCoordinates, RangeReadError,
@@ -52,6 +58,10 @@ impl ExactPackageCapability {
         &self.catalog
     }
 
+    pub(crate) const fn catalog_mut(&mut self) -> &mut LocalPackageCatalog {
+        &mut self.catalog
+    }
+
     pub const fn objects_hashed(&self) -> u64 {
         self.proof.objects_hashed
     }
@@ -80,16 +90,182 @@ impl ExactPackageCapability {
         coordinates: PackedIndexCoordinates,
         mut is_cancelled: impl FnMut() -> bool,
     ) -> Result<LocalBrickRead, PackageReadError> {
-        self.proof
-            .revalidate_authority(self.catalog.reader(), &mut is_cancelled)
-            .map_err(map_snapshot_read_error)?;
         if is_cancelled() {
             return Err(PackageReadError::Cancelled);
         }
 
         let plan = self.catalog.plan_brick_storage(coordinates)?;
-        let read = read_local_brick(self.catalog.reader(), self.catalog.descriptors(), plan)?;
+        let read =
+            read_local_brick_reusing(self.catalog.reader(), self.catalog.descriptors(), plan)?;
+        self.validate_cached_brick_snapshots(&read, &mut is_cancelled)?;
+        self.proof
+            .revalidate_authority_cached(self.catalog.reader(), &mut is_cancelled)
+            .map_err(map_snapshot_read_error)?;
+        Ok(read)
+    }
+
+    pub(crate) fn begin_runtime_read_cohort(
+        &self,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<LocalCurrentnessBatch<'_>, PackageReadError> {
+        let mut transaction = self
+            .catalog
+            .reader()
+            .begin_cached_read_transaction_with_capacity(self.runtime_read_object_capacity())?;
+        for snapshot in &self.proof.authority_snapshots {
+            if is_cancelled() {
+                return Err(PackageReadError::Cancelled);
+            }
+            transaction.validate_snapshot(snapshot)?;
+        }
+        Ok(transaction)
+    }
+
+    pub(crate) fn runtime_read_object_capacity(&self) -> usize {
+        self.catalog.runtime_read_object_capacity()
+    }
+
+    pub(crate) fn read_brick_into_sink_in_cohort(
+        &self,
+        coordinates: PackedIndexCoordinates,
+        sink: &mut dyn mirante4d_dataset::ReservedDecodeSink,
+        transaction: &mut LocalCurrentnessBatch<'_>,
+        facts_authority: DirectPayloadFactsAuthority,
+    ) -> Result<LocalDirectBrickRead, LocalDirectBrickReadError> {
+        if sink.is_cancelled() {
+            return Err(LocalDirectBrickReadError::Package(
+                PackageReadError::Cancelled,
+            ));
+        }
+        let plan = self.catalog.plan_brick_storage(coordinates)?;
+        let read = read_local_brick_reusing_into_sink_in_transaction(
+            self.catalog.reader(),
+            self.catalog.descriptors(),
+            plan,
+            sink,
+            transaction,
+            facts_authority,
+        )?;
+        self.validate_cached_snapshots(read.object_snapshots(), &mut || sink.is_cancelled())
+            .map_err(LocalDirectBrickReadError::Package)?;
+        Ok(read)
+    }
+
+    pub(crate) fn read_brick_in_cohort(
+        &self,
+        coordinates: PackedIndexCoordinates,
+        transaction: &mut LocalCurrentnessBatch<'_>,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<LocalBrickRead, PackageReadError> {
+        if is_cancelled() {
+            return Err(PackageReadError::Cancelled);
+        }
+        let plan = self.catalog.plan_brick_storage(coordinates)?;
+        let read = read_local_brick_reusing_in_transaction(
+            self.catalog.reader(),
+            self.catalog.descriptors(),
+            plan,
+            transaction,
+            DirectPayloadFactsAuthority::VerifiedPackedRecord,
+        )?;
+        self.validate_cached_brick_snapshots(&read, &mut is_cancelled)?;
+        Ok(read)
+    }
+
+    pub(crate) fn validate_cached_brick_in_cohort(
+        &self,
+        read: &LocalBrickRead,
+        transaction: &mut LocalCurrentnessBatch<'_>,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<(), PackageReadError> {
+        self.validate_cached_brick_snapshots(read, &mut is_cancelled)?;
         for snapshot in read.object_snapshots() {
+            if is_cancelled() {
+                return Err(PackageReadError::Cancelled);
+            }
+            transaction.validate_snapshot(snapshot)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn revalidate_cached_brick(
+        &self,
+        read: &LocalBrickRead,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<(), PackageReadError> {
+        self.revalidate_cached_snapshots(read.object_snapshots(), &mut is_cancelled)
+    }
+
+    pub(crate) fn revalidate_cached_snapshots(
+        &self,
+        snapshots: &[LocalObjectSnapshot],
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<(), PackageReadError> {
+        self.catalog
+            .reader()
+            .revalidate_cached_snapshots(snapshots)?;
+        self.validate_cached_snapshots(snapshots, &mut is_cancelled)?;
+        self.proof
+            .revalidate_authority_cached(self.catalog.reader(), &mut is_cancelled)
+            .map_err(map_snapshot_read_error)
+    }
+
+    pub(crate) fn validate_promotion_observations(
+        &self,
+        observations: &[Option<LocalObjectGeneration>],
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<(), PackageReadError> {
+        if observations.len() != self.catalog.descriptors().len() {
+            return Err(RangeReadError::ObjectChanged {
+                path: "<manifest closure>".to_owned(),
+            }
+            .into());
+        }
+        self.proof
+            .revalidate_authority_cached(self.catalog.reader(), &mut is_cancelled)
+            .map_err(map_snapshot_read_error)?;
+        let mut observations_batch = self.catalog.reader().begin_cached_snapshot_revalidation()?;
+        for (descriptor, observed) in self.catalog.descriptors().iter().zip(observations) {
+            let Some(observed) = observed else {
+                continue;
+            };
+            if is_cancelled() {
+                return Err(PackageReadError::Cancelled);
+            }
+            let Some(expected) = self.proof.object_snapshots.get(descriptor.path()) else {
+                return Err(RangeReadError::ObjectChanged {
+                    path: descriptor.path().to_string(),
+                }
+                .into());
+            };
+            if expected.generation() != *observed {
+                return Err(RangeReadError::ObjectChanged {
+                    path: descriptor.path().to_string(),
+                }
+                .into());
+            }
+            observations_batch.validate_snapshot(expected)?;
+        }
+        observations_batch.finish_snapshot();
+        self.proof
+            .revalidate_authority_cached(self.catalog.reader(), &mut is_cancelled)
+            .map_err(map_snapshot_read_error)
+    }
+
+    fn validate_cached_brick_snapshots(
+        &self,
+        read: &LocalBrickRead,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<(), PackageReadError> {
+        self.validate_cached_snapshots(read.object_snapshots(), is_cancelled)
+    }
+
+    fn validate_cached_snapshots(
+        &self,
+        snapshots: &[LocalObjectSnapshot],
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<(), PackageReadError> {
+        for snapshot in snapshots {
             if is_cancelled() {
                 return Err(PackageReadError::Cancelled);
             }
@@ -105,12 +281,8 @@ impl ExactPackageCapability {
                 }
                 .into());
             }
-            self.catalog.reader().revalidate_snapshot(snapshot)?;
         }
-        self.proof
-            .revalidate_authority(self.catalog.reader(), &mut is_cancelled)
-            .map_err(map_snapshot_read_error)?;
-        Ok(read)
+        Ok(())
     }
 
     pub(crate) fn begin_scientific_scan(
@@ -133,7 +305,15 @@ impl ExactPackageCapability {
         coordinates: PackedIndexCoordinates,
     ) -> Result<LocalBrickRead, PackageReadError> {
         let plan = self.catalog.plan_brick_storage(coordinates)?;
-        let read = read_local_brick(self.catalog.reader(), self.catalog.descriptors(), plan)?;
+        // The scan already authenticates the complete authority/object set at
+        // its boundaries. Reuse generation-bound handles and decoded indexes
+        // between bricks; each returned component is still revalidated and
+        // compared with the exact proof below.
+        let read = read_local_brick_reusing_for_scientific_scan(
+            self.catalog.reader(),
+            self.catalog.descriptors(),
+            plan,
+        )?;
         for snapshot in read.object_snapshots() {
             let Some(expected) = self.proof.object_snapshots.get(snapshot.path()) else {
                 return Err(RangeReadError::ObjectChanged {
@@ -147,7 +327,6 @@ impl ExactPackageCapability {
                 }
                 .into());
             }
-            self.catalog.reader().revalidate_snapshot(snapshot)?;
         }
         Ok(read)
     }
@@ -238,6 +417,30 @@ impl PackageIntegrityProof {
                 .revalidate_snapshot(snapshot)
                 .map_err(SnapshotValidationError::Range)?;
         }
+        if is_cancelled() {
+            Err(SnapshotValidationError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn revalidate_authority_cached(
+        &self,
+        reader: &LocalPackageReader,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<(), SnapshotValidationError> {
+        let mut batch = reader
+            .begin_cached_snapshot_revalidation()
+            .map_err(SnapshotValidationError::Range)?;
+        for snapshot in &self.authority_snapshots {
+            if is_cancelled() {
+                return Err(SnapshotValidationError::Cancelled);
+            }
+            batch
+                .validate_snapshot(snapshot)
+                .map_err(SnapshotValidationError::Range)?;
+        }
+        batch.finish_snapshot();
         if is_cancelled() {
             Err(SnapshotValidationError::Cancelled)
         } else {
