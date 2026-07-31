@@ -3824,7 +3824,12 @@ mod tests {
         .unwrap();
 
         runtime
-            .submit(request(key(199_999, 1), RequestPriority::Analysis, 1, 0))
+            // Keep the ledger/worker blocker in the same foreground class as
+            // the targets. It is already inside its source call before the
+            // targets are submitted, so it cannot join their cohorts, while
+            // equal priority prevents the unrelated foreground-preemption
+            // path from adding a timing-dependent blocker retry.
+            .submit(request(key(199_999, 1), RequestPriority::CurrentView, 1, 0))
             .unwrap();
         control.wait_for_blocker();
         for index in 0..TARGETS {
