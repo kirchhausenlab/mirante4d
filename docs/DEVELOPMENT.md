@@ -10,7 +10,7 @@ Mirante4D currently develops and packages on Linux x86_64.
    sudo apt-get update
    sudo apt-get install -y build-essential pkg-config python3 libgtk-3-dev \
      libudev-dev libxcb-render0-dev libxcb-shape0-dev \
-     libxcb-xfixes0-dev libxkbcommon-dev
+     libxcb-xfixes0-dev libxkbcommon-dev libx11-dev
    ```
 
 2. Install Rust through `rustup` and clone the repository. The checkout selects
