@@ -19,7 +19,9 @@ use crate::{
 const FILE_DESCRIPTOR_SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
 
 // Descriptor authorities are fixed and phase-scoped:
-// - canonical cache (2) + spool owner (directory + 4 files) = 7 resident;
+// - current canonical cache (directory + 2 files), one decode-ahead cache
+//   (directory + 2 files), and the spool owner (directory + 4 files) = 11
+//   resident;
 // - checkpoint recovery can clone at most 2 files at once;
 // - positional readers are one canonical and one spool handle shared by all
 //   workers; a worker task opens no per-task descriptor;
@@ -32,7 +34,7 @@ const FILE_DESCRIPTOR_SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
 // These maxima are deliberately summed even though their phases cannot all
 // overlap. Any authority that adds a descriptor must update this admission
 // contract and its pressure test.
-const CHECKPOINT_RESIDENT_FILE_DESCRIPTORS_MAX: u64 = 7;
+const CHECKPOINT_RESIDENT_FILE_DESCRIPTORS_MAX: u64 = 11;
 const CHECKPOINT_RECOVERY_CLONES_MAX: u64 = 2;
 const PHASE_SHARED_WORKER_READER_FILE_DESCRIPTORS_MAX: u64 = 2;
 const WORKER_TASK_FILE_DESCRIPTORS_MAX: u64 = 0;
@@ -367,7 +369,7 @@ fn linux_process_high_water_rss_bytes() -> Option<u64> {
         .and_then(|kib| kib.checked_mul(1024))
 }
 
-fn owned_regular_file_bytes(path: &Path) -> Result<u64, ImportError> {
+pub(crate) fn owned_regular_file_bytes(path: &Path) -> Result<u64, ImportError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -437,7 +439,7 @@ mod tests {
 
     #[test]
     fn descriptor_structural_admission_bound_is_below_the_product_gate() {
-        assert_eq!(IMPORT_OPEN_FILE_DESCRIPTOR_STRUCTURAL_BOUND, 35);
+        assert_eq!(IMPORT_OPEN_FILE_DESCRIPTOR_STRUCTURAL_BOUND, 39);
         assert_eq!(WORKER_TASK_FILE_DESCRIPTORS_MAX, 0);
         const { assert!(IMPORT_OPEN_FILE_DESCRIPTOR_STRUCTURAL_BOUND <= 64) };
         assert_eq!(

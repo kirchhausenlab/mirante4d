@@ -128,6 +128,9 @@ impl MiranteWorkbenchApp {
                 WorkbenchUiAction::OpenDatasetDialog => {
                     self.open_native_from_dialog(ui.ctx());
                 }
+                WorkbenchUiAction::PreprocessDataset => {
+                    self.begin_preprocessing_setup(ui.ctx());
+                }
                 WorkbenchUiAction::NewProject => self.new_current_project(),
                 WorkbenchUiAction::OpenProjectDialog => {
                     self.open_session_from_dialog(ui.ctx());
@@ -140,12 +143,6 @@ impl MiranteWorkbenchApp {
                 }
                 WorkbenchUiAction::OpenProjectRecovery => {
                     self.open_project_recovery_panel();
-                }
-                WorkbenchUiAction::ImportTiffDirectoryDialog => {
-                    self.import_tiff_directory_from_dialog(ui.ctx());
-                }
-                WorkbenchUiAction::ImportTiffFileDialog => {
-                    self.import_tiff_file_from_dialog(ui.ctx());
                 }
                 WorkbenchUiAction::CopySelectedAnalysisCsv => {
                     let snapshot = self.application.snapshot();
@@ -422,7 +419,7 @@ impl MiranteWorkbenchApp {
                 let demand_plan_required = match sample.target() {
                     RenderIntentTarget::ThreeD => !resident_camera,
                     RenderIntentTarget::CrossSection(_) => {
-                        !resident_plane || self.resident_cross_section_requires_planning()
+                        self.resident_cross_section_requires_planning()
                     }
                 };
                 if demand_plan_required {

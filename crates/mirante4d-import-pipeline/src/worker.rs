@@ -4,18 +4,25 @@ use mirante4d_dataset::CpuByteLedger;
 
 use crate::{
     ImportCancellation, ImportError, ImportEvent, ImportOptions, PublishedImport, TiffInspection,
-    TiffSource, import_tiff, inspect_tiff_cancellable,
+    TiffInspectionProgress, TiffSource, import_tiff, inspect_tiff_cancellable_with_progress,
 };
 
 /// Starts one bounded TIFF inspection worker owned by the import pipeline.
 pub fn spawn_tiff_inspection_worker(
     source: TiffSource,
     cancellation: ImportCancellation,
+    progress: impl FnMut(TiffInspectionProgress) + Send + 'static,
     completion: impl FnOnce(Result<TiffInspection, ImportError>) + Send + 'static,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("mirante4d-tiff-inspection".to_owned())
-        .spawn(move || completion(inspect_tiff_cancellable(source, &cancellation)))
+        .spawn(move || {
+            completion(inspect_tiff_cancellable_with_progress(
+                source,
+                &cancellation,
+                progress,
+            ));
+        })
         .expect("failed to start the TIFF inspection worker")
 }
 

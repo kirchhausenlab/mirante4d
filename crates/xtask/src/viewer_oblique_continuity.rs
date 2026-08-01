@@ -4435,7 +4435,7 @@ mod tests {
 
     #[test]
     fn linked_status_requires_truthful_exact_scale_for_every_panel() {
-        let exact_s0_panel = 0_u64 | (1 << 12) | (1 << 14);
+        let exact_s0_panel = (1 << 12) | (1 << 14);
         let exact_s0 = LinkedLodStatus::decode(
             exact_s0_panel | (exact_s0_panel << 16) | (exact_s0_panel << 32),
         );

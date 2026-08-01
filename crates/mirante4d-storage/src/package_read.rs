@@ -122,7 +122,7 @@ impl LocalDirectBrickRead {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DirectPayloadFactsAuthority {
     ScanDecoded,
-    VerifiedPackedRecord,
+    PublishedPackedRecord,
 }
 
 pub(crate) enum LocalDirectBrickReadError {
@@ -364,11 +364,23 @@ pub(crate) fn read_local_brick_reusing_into_sink_in_transaction(
     let scan_facts = facts_authority == DirectPayloadFactsAuthority::ScanDecoded;
     let mut metrics = packed.metrics;
     let mut used_objects = vec![packed.snapshot];
-    // Provisional facts must see validity before the pixel stream. A verified
-    // capability already proved the record, so it retains the raw component
-    // and decodes it directly into the final validity span after the values.
+    // An admitted source derives facts from validity before the pixel stream.
+    // An importer-published capability already checked the record, so it
+    // retains the raw component and decodes it directly into the final
+    // validity span after the values.
     let mut validity_raw = None;
-    let validity_payload = if explicit_validity && record.statistics().valid_voxel_count() > 0 {
+    // An admitted external package has not proved its packed statistics. On
+    // that path (`ScanDecoded`) the record's zero-validity hint must not
+    // suppress a physically present validity payload read: decode it and
+    // compare authoritative facts. A canonical all-invalid brick has no
+    // validity payload, so there is no hidden payload to suppress.
+    let untrusted_validity_probe = scan_facts
+        && explicit_validity
+        && record.statistics().valid_voxel_count() == 0
+        && plan.validity_shard_listed() == Some(true);
+    let validity_payload = if explicit_validity
+        && (record.statistics().valid_voxel_count() > 0 || untrusted_validity_probe)
+    {
         let path = plan
             .validity_shard_path()
             .ok_or(PackageReadError::PackedRecordValidityMismatch)?;
@@ -398,16 +410,18 @@ pub(crate) fn read_local_brick_reusing_into_sink_in_transaction(
             )?;
             metrics.add(validity.metrics)?;
             used_objects.push(validity.snapshot);
-            Some(
-                validity
-                    .payload
-                    .ok_or_else(|| PackageReadError::MissingRequiredInnerPayload {
+            match validity.payload {
+                Some(payload) => Some(payload.into_vec()),
+                None if record.statistics().valid_voxel_count() == 0 => None,
+                None => {
+                    return Err(PackageReadError::MissingRequiredInnerPayload {
                         component: "validity",
                         path: path.to_string(),
                         chunk_index: usize::try_from(chunk_index).unwrap_or(usize::MAX),
-                    })?
-                    .into_vec(),
-            )
+                    }
+                    .into());
+                }
+            }
         } else {
             let raw = read_raw_component_in_transaction(
                 descriptor,
@@ -560,7 +574,7 @@ pub(crate) fn read_local_brick_reusing_into_sink_in_transaction(
         }
         finish_authoritative_payload_facts(authoritative, record, dtype, logical_capacity)?
     } else {
-        payload_facts_from_verified_record(record, dtype, logical_capacity)?
+        payload_facts_from_published_record(record, dtype, logical_capacity)?
     };
 
     if explicit_validity {
@@ -656,6 +670,7 @@ pub(crate) fn read_local_brick_reusing_into_sink_in_transaction(
         plan.pixel_kind(),
         !record.pixel_payload_present()
             && (!explicit_validity || record.statistics().valid_voxel_count() == 0),
+        untrusted_validity_probe,
         metrics,
     )?;
     Ok(LocalDirectBrickRead {
@@ -793,7 +808,21 @@ fn read_local_brick_components(
         None
     };
 
-    let validity_payload = if explicit_validity && record.statistics().valid_voxel_count() > 0 {
+    let scan_facts = matches!(
+        facts_authority,
+        Some(DirectPayloadFactsAuthority::ScanDecoded)
+    );
+    // The ordinary admitted path cannot use an all-invalid hint to suppress a
+    // validity payload that is physically present. Canonical all-invalid
+    // records have no corresponding payload; that absence remains a format
+    // fact rather than work that can be decoded.
+    let untrusted_validity_probe = scan_facts
+        && explicit_validity
+        && record.statistics().valid_voxel_count() == 0
+        && plan.validity_shard_listed() == Some(true);
+    let validity_payload = if explicit_validity
+        && (record.statistics().valid_voxel_count() > 0 || untrusted_validity_probe)
+    {
         let path = plan
             .validity_shard_path()
             .ok_or(PackageReadError::PackedRecordValidityMismatch)?;
@@ -820,16 +849,17 @@ fn read_local_brick_components(
         let validity = read_component(reader, descriptor, kind, chunk_index, transaction)?;
         metrics.add(validity.metrics)?;
         used_objects.push(validity.snapshot);
-        Some(
-            validity
-                .payload
-                .ok_or_else(|| PackageReadError::MissingRequiredInnerPayload {
+        match validity.payload {
+            Some(payload) => Some(payload.into_vec()),
+            None if scan_facts && record.statistics().valid_voxel_count() == 0 => None,
+            None => {
+                return Err(PackageReadError::MissingRequiredInnerPayload {
                     component: "validity",
                     path: path.to_string(),
                     chunk_index: usize::try_from(chunk_index).unwrap_or(usize::MAX),
-                })?
-                .into_vec(),
-        )
+                });
+            }
+        }
     } else {
         None
     };
@@ -844,8 +874,8 @@ fn read_local_brick_components(
                 pixel_payload.as_deref(),
                 validity_payload.as_deref(),
             ),
-            DirectPayloadFactsAuthority::VerifiedPackedRecord => {
-                payload_facts_from_verified_record(record, dtype, logical_capacity)
+            DirectPayloadFactsAuthority::PublishedPackedRecord => {
+                payload_facts_from_published_record(record, dtype, logical_capacity)
             }
         })
         .transpose()?;
@@ -853,6 +883,7 @@ fn read_local_brick_components(
     enforce_amplification(
         plan.pixel_kind(),
         pixel_payload.is_none() && validity_payload.is_none(),
+        untrusted_validity_probe,
         metrics,
     )?;
     Ok(LocalBrickRead {
@@ -1098,12 +1129,13 @@ fn authoritative_sample_is_valid(
     if !record.explicit_validity() {
         return Ok(true);
     }
-    if record.statistics().valid_voxel_count() == 0 {
+    // A missing explicit-validity inner is the profile's canonical all-zero
+    // fill representation. Packed statistics are merely a claim on admitted
+    // external packages, so they must never decide sample validity while the
+    // decoded payload is being checked.
+    let Some(bits) = validity else {
         return Ok(false);
-    }
-    let bits = validity.ok_or(PackageReadError::DecodedPayloadInvariant {
-        component: "validity",
-    })?;
+    };
     let byte = bits
         .get(sample_index / 8)
         .ok_or(PackageReadError::DecodedPayloadInvariant {
@@ -1182,7 +1214,7 @@ fn finish_authoritative_payload_facts(
     })
 }
 
-fn payload_facts_from_verified_record(
+fn payload_facts_from_published_record(
     record: PackedIndexRecord,
     dtype: IntensityDType,
     logical_samples: u64,
@@ -1339,9 +1371,10 @@ impl ReadMetrics {
 fn enforce_amplification(
     pixel_kind: ShardProfileKind,
     all_payloads_elided: bool,
+    untrusted_validity_probe: bool,
     metrics: ReadMetrics,
 ) -> Result<(), PackageReadError> {
-    if all_payloads_elided {
+    if all_payloads_elided && !untrusted_validity_probe {
         check_limit(
             "cold range requests",
             u64::from(metrics.range_requests),
@@ -1587,6 +1620,46 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_explicit_validity_uses_the_payload_or_its_canonical_zero_fill() {
+        let kind = ShardProfileKind::Pixel2dUint8;
+        let mut pixel = vec![0; kind.decoded_inner_bytes()];
+        pixel[..3].copy_from_slice(&[2, 0, 7]);
+        let declared_all_invalid = test_record(
+            IntensityDType::Uint8,
+            crate::PackedIndexStatistics::new(0, 0, None),
+            true,
+        );
+
+        let all_invalid = compute_authoritative_payload_facts(
+            declared_all_invalid,
+            IntensityDType::Uint8,
+            kind,
+            [1, 1, 3],
+            Some(&pixel),
+            None,
+        )
+        .unwrap();
+        assert!(!all_invalid.any_valid());
+        assert!(!all_invalid.all_valid());
+
+        let mut contradictory_validity =
+            vec![0; ShardProfileKind::Validity2d.decoded_inner_bytes()];
+        contradictory_validity[0] = 0b0000_0001;
+        assert_eq!(
+            compute_authoritative_payload_facts(
+                declared_all_invalid,
+                IntensityDType::Uint8,
+                kind,
+                [1, 1, 3],
+                Some(&pixel),
+                Some(&contradictory_validity),
+            ),
+            Err(PackageReadError::PackedStatisticsMismatch),
+            "a zero-validity packed claim must not hide a physically present valid bit"
+        );
+    }
+
+    #[test]
     fn amplification_checker_accepts_exact_limits_and_rejects_one_above() {
         let maximum = amplification_2d(IntensityDType::Uint8);
         let exact = ReadMetrics {
@@ -1633,13 +1706,14 @@ mod tests {
             decoded_bytes: ELIDED_ALL_FILL_AMPLIFICATION.decoded_bytes_max,
         };
         assert_eq!(
-            enforce_amplification(ShardProfileKind::Pixel2dUint8, true, elided),
+            enforce_amplification(ShardProfileKind::Pixel2dUint8, true, false, elided),
             Ok(())
         );
         assert!(matches!(
             enforce_amplification(
                 ShardProfileKind::Pixel2dUint8,
                 true,
+                false,
                 ReadMetrics {
                     decoded_bytes: ELIDED_ALL_FILL_AMPLIFICATION.decoded_bytes_max + 1,
                     ..elided
@@ -1650,5 +1724,19 @@ mod tests {
                 ..
             })
         ));
+        assert_eq!(
+            enforce_amplification(
+                ShardProfileKind::Pixel2dUint8,
+                true,
+                true,
+                ReadMetrics {
+                    range_requests: ELIDED_ALL_FILL_AMPLIFICATION.cold_range_requests_max + 1,
+                    encoded_bytes_read: elided.encoded_bytes_read,
+                    decoded_bytes: elided.decoded_bytes,
+                },
+            ),
+            Ok(()),
+            "an untrusted fill probe uses the ordinary bounded-read budget"
+        );
     }
 }

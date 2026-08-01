@@ -13,7 +13,7 @@ use mirante4d_dataset::{
 };
 use mirante4d_domain::{
     CameraView, IsoShadingPolicy, LogicalLayerKey, Projection, RenderState, SamplingPolicy,
-    ScaleLevel, Shape3D,
+    ScaleLevel, Shape3D, TimeIndex,
 };
 use mirante4d_project_model::ViewState;
 use mirante4d_render_api::{
@@ -70,6 +70,10 @@ pub(crate) struct ProgressiveDatasetDemandPlan {
 
 pub(crate) struct ProgressiveDatasetDemandPlanning {
     pub(crate) plan: ProgressiveDatasetDemandPlan,
+    /// Number of requested future timepoints admitted at the selected stable
+    /// playback rung. This can be shorter than the desired one-second tail,
+    /// but never shorter than the required startup runway.
+    pub(crate) playback_timepoint_count: usize,
     pub(crate) candidates_visited: usize,
     pub(crate) reuse_envelope: Option<SemanticCameraReuseEnvelope>,
     pub(crate) scratch_charges: Vec<Box<dyn CpuByteLease>>,
@@ -589,6 +593,7 @@ pub(crate) struct PreparedProgressiveDatasetDemandPlan {
     pub(crate) coarse: Option<PreparedDatasetDemandPlan>,
     pub(crate) navigation_candidates: Vec<PreparedDatasetDemandPlan>,
     pub(crate) reuse_envelope: Option<SemanticCameraReuseEnvelope>,
+    pub(crate) playback_timepoint_count: usize,
 }
 
 impl PreparedProgressiveDatasetDemandPlan {
@@ -598,6 +603,7 @@ impl PreparedProgressiveDatasetDemandPlan {
     ) -> anyhow::Result<(Self, usize)> {
         let ProgressiveDatasetDemandPlanning {
             plan,
+            playback_timepoint_count,
             candidates_visited,
             reuse_envelope,
             scratch_charges,
@@ -621,6 +627,7 @@ impl PreparedProgressiveDatasetDemandPlan {
                 .map(|plan| PreparedDatasetDemandPlan::from_plan_accounted(plan, reservations))
                 .collect::<anyhow::Result<Vec<_>>>()?,
             reuse_envelope,
+            playback_timepoint_count,
         };
         drop(scratch_charges);
         Ok((prepared, candidates_visited))
@@ -716,6 +723,10 @@ pub(crate) struct DatasetDemandPlanLimits {
     /// CPU decode residency is a separate bounded streaming working set and
     /// must never silently force a coarser semantic scale.
     pub(crate) max_gpu_payload_bytes: u64,
+    /// Playback is the exceptional full-volume multi-timepoint cohort. Its
+    /// decoded bodies remain CPU-authoritative until the window rolls, so the
+    /// exact aggregate must also fit the dataset CPU ledger.
+    pub(crate) max_playback_decoded_bytes: u64,
 }
 
 impl DatasetDemandPlanLimits {
@@ -728,7 +739,13 @@ impl DatasetDemandPlanLimits {
             max_candidates_per_layer,
             max_resources,
             max_gpu_payload_bytes,
+            max_playback_decoded_bytes: u64::MAX,
         }
+    }
+
+    pub(crate) const fn with_playback_decoded_capacity(mut self, bytes: u64) -> Self {
+        self.max_playback_decoded_bytes = bytes;
+        self
     }
 }
 
@@ -745,6 +762,7 @@ enum DatasetDemandCapacityDimension {
     Candidates,
     Resources,
     GpuPayloadBytes,
+    PlaybackDecodedBytes,
     ScratchBytes,
 }
 
@@ -809,6 +827,24 @@ impl DatasetDemandPlanCapacityError {
             excess,
         }
     }
+
+    fn for_playback_decoded_usage(
+        limits: DatasetDemandPlanLimits,
+        target: &'static str,
+        selected_scale: Option<ScaleLevel>,
+        required_bytes: u64,
+    ) -> Self {
+        Self {
+            limits,
+            selected_scale,
+            target,
+            excess: Some(DatasetDemandCapacityExcess {
+                dimension: DatasetDemandCapacityDimension::PlaybackDecodedBytes,
+                required: required_bytes,
+                available: limits.max_playback_decoded_bytes,
+            }),
+        }
+    }
 }
 
 impl fmt::Display for DatasetDemandPlanCapacityError {
@@ -828,6 +864,9 @@ impl fmt::Display for DatasetDemandPlanCapacityError {
                 DatasetDemandCapacityDimension::Candidates => "planning candidates",
                 DatasetDemandCapacityDimension::Resources => "resources",
                 DatasetDemandCapacityDimension::GpuPayloadBytes => "GPU payload bytes",
+                DatasetDemandCapacityDimension::PlaybackDecodedBytes => {
+                    "playback decoded-residency bytes"
+                }
                 DatasetDemandCapacityDimension::ScratchBytes => "planning scratch bytes",
             };
             return write!(
@@ -947,7 +986,8 @@ pub(crate) fn plan_current_3d(
         selected,
         viewport,
         limits,
-        None,
+        &[],
+        0,
         &[],
         None,
         None,
@@ -1021,9 +1061,18 @@ fn projected_current_3d_levels(
         .layer(view.active_layer())
         .ok_or_else(|| anyhow::anyhow!("active layer is absent from the dataset catalog"))?;
     let camera = CameraFrame::new(*view.camera(), presentation)?;
-    let ideal_active = select_volume_level(active, camera, viewport)?;
-    let active_level = playback_level(active, ideal_active, playback_active);
-    let mut playback_downshifted = active_level != ideal_active;
+    let four_panel_playback =
+        playback_active && view.layout() == mirante4d_domain::ViewerLayout::FourPanel;
+    let ideal_active = if four_panel_playback {
+        active
+            .scales()
+            .map(|scale| scale.level())
+            .min()
+            .ok_or_else(|| anyhow::anyhow!("the active layer has no catalog scale"))?
+    } else {
+        select_volume_level(active, camera, viewport)?
+    };
+    let active_level = ideal_active;
     let mut layer_scales = BTreeMap::new();
     let mut ideal_layer_scales = BTreeMap::new();
     for view_layer in view.layers().iter().filter(|layer| layer.visible()) {
@@ -1034,11 +1083,17 @@ fn projected_current_3d_levels(
                 key.ordinal()
             )
         })?;
-        let ideal = select_volume_level(layer, camera, viewport)?;
-        let selected = playback_level(layer, ideal, playback_active);
-        playback_downshifted |= selected != ideal;
+        let ideal = if four_panel_playback {
+            layer
+                .scales()
+                .map(|scale| scale.level())
+                .min()
+                .ok_or_else(|| anyhow::anyhow!("a visible layer has no catalog scale"))?
+        } else {
+            select_volume_level(layer, camera, viewport)?
+        };
         ideal_layer_scales.insert(key, ideal);
-        layer_scales.insert(key, selected);
+        layer_scales.insert(key, ideal);
     }
     Ok(SelectedCurrent3dLevels {
         camera,
@@ -1046,30 +1101,15 @@ fn projected_current_3d_levels(
         layer_scales,
         ideal_active_level: ideal_active,
         ideal_layer_scales,
-        playback_downshifted,
+        playback_downshifted: false,
     })
-}
-
-fn playback_level(
-    layer: &mirante4d_dataset::DatasetLayer,
-    ideal: ScaleLevel,
-    playback_active: bool,
-) -> ScaleLevel {
-    if !playback_active {
-        return ideal;
-    }
-    layer
-        .scales()
-        .map(|scale| scale.level())
-        .filter(|level| *level > ideal)
-        .min()
-        .unwrap_or(ideal)
 }
 
 struct AdaptiveCurrent3dPlanning {
     target: DatasetDemandPlanning,
     floor: DatasetDemandPlanning,
     navigation_candidates: Vec<DatasetDemandPlan>,
+    playback_timepoint_count: usize,
 }
 
 pub(crate) fn coarsest_visible_layer_scales(
@@ -1121,13 +1161,13 @@ fn current_plan_union_usage(
     obligated_resources: &[BrickKey],
     floor: &DatasetDemandPlan,
     target: &DatasetDemandPlan,
-    next_playback_timepoint: Option<mirante4d_domain::TimeIndex>,
-) -> anyhow::Result<(usize, u64)> {
+    playback_timepoints: &[TimeIndex],
+) -> anyhow::Result<(usize, u64, u64)> {
     let mut keys = BTreeSet::new();
     keys.extend(obligated_resources.iter().copied());
     keys.extend(floor.resources.iter().copied());
     keys.extend(target.resources.iter().copied());
-    if let Some(timepoint) = next_playback_timepoint {
+    for &timepoint in playback_timepoints {
         keys.extend(
             target
                 .resources
@@ -1145,13 +1185,17 @@ fn current_plan_union_usage(
         );
     }
     let mut payload_bytes = 0_u64;
+    let mut decoded_bytes = 0_u64;
     for key in &keys {
         let descriptor = catalog.resource_payload_descriptor(*key)?;
         payload_bytes = payload_bytes
             .checked_add(mirante4d_render_wgpu::payload_allocation_bytes(descriptor)?)
             .ok_or_else(|| anyhow::anyhow!("global GPU payload accounting overflow"))?;
+        decoded_bytes = decoded_bytes
+            .checked_add(descriptor.byte_len())
+            .ok_or_else(|| anyhow::anyhow!("global decoded payload accounting overflow"))?;
     }
-    Ok((keys.len(), payload_bytes))
+    Ok((keys.len(), payload_bytes, decoded_bytes))
 }
 
 fn current_plan_union_fits(
@@ -1159,17 +1203,19 @@ fn current_plan_union_fits(
     obligated_resources: &[BrickKey],
     floor: &DatasetDemandPlan,
     target: &DatasetDemandPlan,
-    next_playback_timepoint: Option<mirante4d_domain::TimeIndex>,
+    playback_timepoints: &[TimeIndex],
     limits: DatasetDemandPlanLimits,
 ) -> anyhow::Result<bool> {
-    let (resources, payload_bytes) = current_plan_union_usage(
+    let (resources, payload_bytes, decoded_bytes) = current_plan_union_usage(
         catalog,
         obligated_resources,
         floor,
         target,
-        next_playback_timepoint,
+        playback_timepoints,
     )?;
-    Ok(resources <= limits.max_resources && payload_bytes <= limits.max_gpu_payload_bytes)
+    Ok(resources <= limits.max_resources
+        && payload_bytes <= limits.max_gpu_payload_bytes
+        && decoded_bytes <= limits.max_playback_decoded_bytes)
 }
 
 fn retryable_refinement_capacity(error: &PlanAttemptError) -> bool {
@@ -1397,7 +1443,7 @@ fn adopt_navigation_ladder_baseline(
     baseline: &NavigationLadderBaseline,
     limits: DatasetDemandPlanLimits,
     playback_downshifted: bool,
-    next_playback_timepoint: Option<mirante4d_domain::TimeIndex>,
+    playback_timepoints: &[TimeIndex],
     obligated_resources: &[BrickKey],
     scratch_ledger: Option<&dyn CpuByteLedger>,
 ) -> PlanAttemptResult<Option<(DatasetDemandPlanning, Vec<DatasetDemandPlan>)>> {
@@ -1528,16 +1574,18 @@ fn adopt_navigation_ladder_baseline(
         let previous_payload_bytes = aggregate.plan.payload_bytes;
         aggregate.plan.resources.extend(missing);
         aggregate.plan.payload_bytes = next_payload_bytes;
-        let (global_resources, global_payload_bytes) = current_plan_union_usage(
-            catalog,
-            obligated_resources,
-            &aggregate.plan,
-            &aggregate.plan,
-            next_playback_timepoint,
-        )
-        .map_err(PlanAttemptError::Other)?;
+        let (global_resources, global_payload_bytes, global_decoded_bytes) =
+            current_plan_union_usage(
+                catalog,
+                obligated_resources,
+                &aggregate.plan,
+                &aggregate.plan,
+                playback_timepoints,
+            )
+            .map_err(PlanAttemptError::Other)?;
         if global_resources > limits.max_resources
             || global_payload_bytes > limits.max_gpu_payload_bytes
+            || global_decoded_bytes > limits.max_playback_decoded_bytes
         {
             aggregate.plan.resources.truncate(previous_resource_count);
             aggregate.plan.payload_bytes = previous_payload_bytes;
@@ -1712,8 +1760,9 @@ fn plan_full_volume_navigation_ladder(
     catalog: &DatasetCatalog,
     view: &ViewState,
     terminal: DatasetDemandPlanning,
+    finest_layer_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
     limits: DatasetDemandPlanLimits,
-    next_playback_timepoint: Option<mirante4d_domain::TimeIndex>,
+    playback_timepoints: &[TimeIndex],
     obligated_resources: &[BrickKey],
     scratch_ledger: Option<&dyn CpuByteLedger>,
     cancelled: &mut impl FnMut() -> bool,
@@ -1738,9 +1787,13 @@ fn plan_full_volume_navigation_ladder(
                     layer.ordinal()
                 )
             })?;
-            if let Some(finer) =
-                next_finer_catalog_level(catalog, layer, current, ScaleLevel::BASE)?
-            {
+            let finest = finest_layer_scales.get(&layer).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "visible layer {} has no navigation-ladder quality ceiling",
+                    layer.ordinal()
+                )
+            })?;
+            if let Some(finer) = next_finer_catalog_level(catalog, layer, current, finest)? {
                 next_scales.insert(layer, finer);
                 advanced = true;
             }
@@ -1813,15 +1866,17 @@ fn plan_full_volume_navigation_ladder(
         let previous_payload_bytes = aggregate.plan.payload_bytes;
         aggregate.plan.resources.extend(missing);
         aggregate.plan.payload_bytes = next_payload_bytes;
-        let (global_resources, global_payload_bytes) = current_plan_union_usage(
-            catalog,
-            obligated_resources,
-            &aggregate.plan,
-            &aggregate.plan,
-            next_playback_timepoint,
-        )?;
+        let (global_resources, global_payload_bytes, global_decoded_bytes) =
+            current_plan_union_usage(
+                catalog,
+                obligated_resources,
+                &aggregate.plan,
+                &aggregate.plan,
+                playback_timepoints,
+            )?;
         if global_resources > limits.max_resources
             || global_payload_bytes > limits.max_gpu_payload_bytes
+            || global_decoded_bytes > limits.max_playback_decoded_bytes
         {
             aggregate.plan.resources.truncate(previous_resource_count);
             aggregate.plan.payload_bytes = previous_payload_bytes;
@@ -1953,7 +2008,8 @@ fn plan_adaptive_current_3d_exact(
     ideal: SelectedCurrent3dLevels,
     viewport: RenderExtent,
     limits: DatasetDemandPlanLimits,
-    next_playback_timepoint: Option<mirante4d_domain::TimeIndex>,
+    playback_timepoints: &[TimeIndex],
+    playback_required_timepoint_count: usize,
     obligated_resources: &[BrickKey],
     navigation_ladder_baseline: Option<&NavigationLadderBaseline>,
     scratch_ledger: Option<&dyn CpuByteLedger>,
@@ -1962,6 +2018,18 @@ fn plan_adaptive_current_3d_exact(
     if cancelled() {
         return Ok(None);
     }
+    let playback_required_timepoint_count = if playback_timepoints.is_empty() {
+        0
+    } else {
+        playback_required_timepoint_count
+            .max(1)
+            .min(playback_timepoints.len())
+    };
+    // Spatial quality is selected against the desired one-second runway when
+    // the coarsest body can support it. The short startup runway is the
+    // bounded fallback for a machine that cannot retain the full desired
+    // window even at the terminal scale.
+    let startup_timepoints = &playback_timepoints[..playback_required_timepoint_count];
     let baseline_ladder = navigation_ladder_baseline
         .map(|baseline| {
             adopt_navigation_ladder_baseline(
@@ -1970,7 +2038,7 @@ fn plan_adaptive_current_3d_exact(
                 baseline,
                 limits,
                 ideal.playback_downshifted,
-                next_playback_timepoint,
+                startup_timepoints,
                 obligated_resources,
                 scratch_ledger,
             )
@@ -2028,8 +2096,9 @@ fn plan_adaptive_current_3d_exact(
             catalog,
             view,
             terminal,
+            &ideal.layer_scales,
             limits,
-            next_playback_timepoint,
+            startup_timepoints,
             obligated_resources,
             scratch_ledger,
             cancelled,
@@ -2040,24 +2109,35 @@ fn plan_adaptive_current_3d_exact(
         ladder
     };
     let mut selected_scales = floor.plan.layer_scales.clone();
-    let (floor_union_resources, floor_union_payload_bytes) = current_plan_union_usage(
-        catalog,
-        obligated_resources,
-        &floor.plan,
-        &floor.plan,
-        next_playback_timepoint,
-    )?;
+    let (floor_union_resources, floor_union_payload_bytes, floor_union_decoded_bytes) =
+        current_plan_union_usage(
+            catalog,
+            obligated_resources,
+            &floor.plan,
+            &floor.plan,
+            startup_timepoints,
+        )?;
     if floor_union_resources > limits.max_resources
         || floor_union_payload_bytes > limits.max_gpu_payload_bytes
+        || floor_union_decoded_bytes > limits.max_playback_decoded_bytes
     {
-        return Err(DatasetDemandPlanCapacityError::for_global_usage(
-            limits,
-            "3D",
-            Some(floor.plan.scale),
-            floor_union_resources,
-            floor_union_payload_bytes,
-        )
-        .into());
+        let error = if floor_union_decoded_bytes > limits.max_playback_decoded_bytes {
+            DatasetDemandPlanCapacityError::for_playback_decoded_usage(
+                limits,
+                "3D",
+                Some(floor.plan.scale),
+                floor_union_decoded_bytes,
+            )
+        } else {
+            DatasetDemandPlanCapacityError::for_global_usage(
+                limits,
+                "3D",
+                Some(floor.plan.scale),
+                floor_union_resources,
+                floor_union_payload_bytes,
+            )
+        };
+        return Err(error.into());
     }
 
     let mut layer_priority = view
@@ -2148,7 +2228,7 @@ fn plan_adaptive_current_3d_exact(
                 obligated_resources,
                 &floor.plan,
                 &trial.plan,
-                next_playback_timepoint,
+                &[],
                 limits,
             )? {
                 break;
@@ -2158,7 +2238,7 @@ fn plan_adaptive_current_3d_exact(
             selected_is_floor = false;
         }
     }
-    let target = if selected_is_floor {
+    let mut target = if selected_is_floor {
         DatasetDemandPlanning {
             plan: floor.plan.clone(),
             candidates_visited: 0,
@@ -2169,10 +2249,85 @@ fn plan_adaptive_current_3d_exact(
     } else {
         target.expect("a non-floor adaptive selection owns its accepted plan")
     };
+    let mut playback_timepoint_count = 0;
+    if !startup_timepoints.is_empty() {
+        let mut playback_target = None;
+        let mut selected_window_count = 0;
+        // Smooth cadence has priority over a finer rung. First select the
+        // finest complete body that can retain the desired one-second window;
+        // only machines that cannot hold even the coarsest desired window
+        // fall back to the smaller mandatory startup runway.
+        for selection_timepoints in [playback_timepoints, startup_timepoints] {
+            for candidate in navigation_candidates.iter().rev() {
+                let mut trial = DatasetDemandPlanning {
+                    plan: candidate.clone(),
+                    candidates_visited: 0,
+                    guard_retained: false,
+                    plane_reuse_envelope: None,
+                    scratch_charges: Vec::new(),
+                };
+                if let Err(error) = retain_navigation_ladder_in_target(
+                    catalog,
+                    &floor.plan,
+                    &mut trial,
+                    limits,
+                    scratch_ledger,
+                ) {
+                    if retryable_refinement_capacity(&error) {
+                        continue;
+                    }
+                    match error {
+                        PlanAttemptError::Cancelled => return Ok(None),
+                        PlanAttemptError::Other(error) => return Err(error),
+                        PlanAttemptError::Capacity(_) => {
+                            unreachable!("retryable playback capacity was handled above")
+                        }
+                    }
+                }
+                if current_plan_union_fits(
+                    catalog,
+                    obligated_resources,
+                    &floor.plan,
+                    &trial.plan,
+                    selection_timepoints,
+                    limits,
+                )? {
+                    playback_target = Some(trial);
+                    selected_window_count = selection_timepoints.len();
+                    break;
+                }
+            }
+            if playback_target.is_some() {
+                break;
+            }
+        }
+        target = playback_target.ok_or_else(|| {
+            anyhow::anyhow!(
+                "the coarsest complete playback body cannot fit the required startup runway"
+            )
+        })?;
+        playback_timepoint_count = selected_window_count;
+        for candidate_count in selected_window_count.saturating_add(1)..=playback_timepoints.len() {
+            if !current_plan_union_fits(
+                catalog,
+                obligated_resources,
+                &floor.plan,
+                &target.plan,
+                &playback_timepoints[..candidate_count],
+                limits,
+            )? {
+                break;
+            }
+            playback_timepoint_count = candidate_count;
+        }
+    }
+    target.plan.playback_downshifted =
+        !startup_timepoints.is_empty() && target.plan.layer_scales != ideal.ideal_layer_scales;
     Ok(Some(AdaptiveCurrent3dPlanning {
         target,
         floor,
         navigation_candidates,
+        playback_timepoint_count,
     }))
 }
 
@@ -2228,6 +2383,8 @@ pub(crate) fn plan_progressive_current_3d_cancellable(
         viewport,
         limits,
         playback_active,
+        &[],
+        0,
         None,
         &[],
         None,
@@ -2260,6 +2417,8 @@ pub(crate) fn plan_guarded_progressive_current_3d_cancellable(
         viewport,
         limits,
         playback_active,
+        &[],
+        0,
         None,
         &[],
         None,
@@ -2276,7 +2435,9 @@ pub(crate) fn plan_guarded_progressive_current_3d_with_obligations_cancellable(
     viewport: RenderExtent,
     limits: DatasetDemandPlanLimits,
     playback_active: bool,
-    next_playback_timepoint: Option<mirante4d_domain::TimeIndex>,
+    playback_timepoints: &[TimeIndex],
+    playback_required_timepoint_count: usize,
+    fixed_playback_layer_scales: Option<&BTreeMap<LogicalLayerKey, ScaleLevel>>,
     obligated_resources: &[BrickKey],
     navigation_ladder_baseline: Option<&NavigationLadderBaseline>,
     scratch_ledger: Option<&dyn CpuByteLedger>,
@@ -2292,7 +2453,9 @@ pub(crate) fn plan_guarded_progressive_current_3d_with_obligations_cancellable(
         viewport,
         limits,
         playback_active,
-        next_playback_timepoint,
+        playback_timepoints,
+        playback_required_timepoint_count,
+        fixed_playback_layer_scales,
         obligated_resources,
         navigation_ladder_baseline,
         scratch_ledger,
@@ -2313,7 +2476,9 @@ pub(crate) fn plan_guarded_progressive_current_3d_with_obligations_cancellable(
                 viewport,
                 limits,
                 playback_active,
-                next_playback_timepoint,
+                playback_timepoints,
+                playback_required_timepoint_count,
+                fixed_playback_layer_scales,
                 obligated_resources,
                 navigation_ladder_baseline,
                 scratch_ledger,
@@ -2334,7 +2499,9 @@ fn plan_progressive_current_3d_with_visibility_cancellable(
     viewport: RenderExtent,
     limits: DatasetDemandPlanLimits,
     playback_active: bool,
-    next_playback_timepoint: Option<mirante4d_domain::TimeIndex>,
+    playback_timepoints: &[TimeIndex],
+    playback_required_timepoint_count: usize,
+    fixed_playback_layer_scales: Option<&BTreeMap<LogicalLayerKey, ScaleLevel>>,
     obligated_resources: &[BrickKey],
     navigation_ladder_baseline: Option<&NavigationLadderBaseline>,
     scratch_ledger: Option<&dyn CpuByteLedger>,
@@ -2353,13 +2520,26 @@ fn plan_progressive_current_3d_with_visibility_cancellable(
         limits,
         playback_active,
     )?;
+    let mut selected = ideal.clone();
+    if let Some(fixed) = fixed_playback_layer_scales {
+        if !playback_active {
+            anyhow::bail!("a fixed playback scale map requires active playback");
+        }
+        validate_fixed_playback_layer_scales(catalog, view, fixed)?;
+        selected.active_level = *fixed
+            .get(&view.active_layer())
+            .ok_or_else(|| anyhow::anyhow!("fixed playback scale map omits the active layer"))?;
+        selected.layer_scales = fixed.clone();
+        selected.playback_downshifted = selected.layer_scales != selected.ideal_layer_scales;
+    }
     let Some(mut adaptive) = plan_adaptive_current_3d_exact(
         catalog,
         view,
-        ideal.clone(),
+        selected,
         viewport,
         limits,
-        next_playback_timepoint,
+        playback_timepoints,
+        playback_required_timepoint_count,
         obligated_resources,
         navigation_ladder_baseline,
         scratch_ledger,
@@ -2368,12 +2548,23 @@ fn plan_progressive_current_3d_with_visibility_cancellable(
     else {
         return Ok(None);
     };
+    if let Some(fixed) = fixed_playback_layer_scales
+        && &adaptive.target.plan.layer_scales != fixed
+    {
+        anyhow::bail!(
+            "the admitted playback session scale map no longer fits its fixed resource ceilings"
+        );
+    }
     if cancelled() {
         return Ok(None);
     }
 
+    let playback_timepoints = &playback_timepoints[..adaptive
+        .playback_timepoint_count
+        .min(playback_timepoints.len())];
     let mut guard_adopted = false;
-    if let Some(guard_camera) = visibility_camera
+    if !playback_active
+        && let Some(guard_camera) = visibility_camera
         && adaptive.floor.plan.resources != adaptive.target.plan.resources
     {
         let guarded_target = plan_current_3d_configuration(
@@ -2408,7 +2599,7 @@ fn plan_progressive_current_3d_with_visibility_cancellable(
                         obligated_resources,
                         &adaptive.floor.plan,
                         &target.plan,
-                        next_playback_timepoint,
+                        playback_timepoints,
                         limits,
                     )? =>
             {
@@ -2460,10 +2651,43 @@ fn plan_progressive_current_3d_with_visibility_cancellable(
             coarse: coarse_plan,
             navigation_candidates,
         },
+        playback_timepoint_count: playback_timepoints.len(),
         candidates_visited,
         reuse_envelope,
         scratch_charges,
     }))
+}
+
+fn validate_fixed_playback_layer_scales(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    fixed: &BTreeMap<LogicalLayerKey, ScaleLevel>,
+) -> anyhow::Result<()> {
+    let visible = view.layers().iter().filter(|layer| layer.visible()).count();
+    if fixed.len() != visible {
+        anyhow::bail!("fixed playback scale map does not match the visible layer set");
+    }
+    for layer in view.layers().iter().filter(|layer| layer.visible()) {
+        let key = layer.layer_key();
+        let level = fixed.get(&key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "fixed playback scale map omits visible layer {}",
+                key.ordinal()
+            )
+        })?;
+        if catalog
+            .layer(key)
+            .and_then(|layer| layer.scale(*level))
+            .is_none()
+        {
+            anyhow::bail!(
+                "fixed playback scale {} is absent from visible layer {}",
+                level.get(),
+                key.ordinal(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn plan_visibility_specs(
@@ -2633,6 +2857,64 @@ pub(crate) fn plan_cross_section_navigation_floor_cancellable(
         ),
         Err(PlanAttemptError::Other(error)) => Err(error),
     }
+}
+
+/// Builds the fixed-scale, geometry-independent linked body owned by a
+/// four-panel playback contract. The 3D target already obligates this exact
+/// full-volume resource set, so adding a linked wrapper changes neither the
+/// renderer-global resource union nor temporal residency.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_cross_section_playback_body_cancellable(
+    catalog: &DatasetCatalog,
+    view: &ViewState,
+    panel: PanelId,
+    layer_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
+    limits: DatasetDemandPlanLimits,
+    obligated_resources: &[BrickKey],
+    scratch_ledger: Option<&dyn CpuByteLedger>,
+    cancelled: &mut impl FnMut() -> bool,
+) -> anyhow::Result<Option<DatasetDemandPlanning>> {
+    let planning = match plan_full_volume_navigation_floor(
+        catalog,
+        view,
+        layer_scales,
+        limits,
+        false,
+        scratch_ledger,
+        cancelled,
+    ) {
+        Ok(planning) => planning,
+        Err(PlanAttemptError::Cancelled) => return Ok(None),
+        Err(PlanAttemptError::Capacity(excess)) => {
+            let active_level = layer_scales
+                .get(&view.active_layer())
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("the playback scale map omits the active layer"))?;
+            return Err(
+                DatasetDemandPlanCapacityError::at_selected_scale_with_excess(
+                    limits,
+                    panel_capacity_target(panel),
+                    active_level,
+                    excess,
+                )
+                .into(),
+            );
+        }
+        Err(PlanAttemptError::Other(error)) => return Err(error),
+    };
+    let (resources, payload_bytes) =
+        cross_plan_union_usage(catalog, obligated_resources, &planning.plan)?;
+    if resources > limits.max_resources || payload_bytes > limits.max_gpu_payload_bytes {
+        return Err(DatasetDemandPlanCapacityError::for_global_usage(
+            limits,
+            panel_capacity_target(panel),
+            Some(planning.plan.scale),
+            resources,
+            payload_bytes,
+        )
+        .into());
+    }
+    Ok(Some(planning))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3387,7 +3669,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use mirante4d_dataset::{
-        DatasetLayer, DatasetScale, DatasetSourceId, ResourceValidity, ScientificIdentityStatus,
+        ContentAddressStatus, DatasetLayer, DatasetScale, DatasetSourceId, ResourceValidity,
     };
     use mirante4d_domain::{
         CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer, GridToWorld,
@@ -3540,7 +3822,7 @@ mod tests {
         let shape = Shape3D::new(3, 3, 3).unwrap();
         let catalog = DatasetCatalog::new(
             "irregular-bitmask",
-            ScientificIdentityStatus::Unverified(DatasetSourceId::new(7)),
+            ContentAddressStatus::SessionLocal(DatasetSourceId::new(7)),
             vec![
                 DatasetLayer::new(
                     active,
@@ -3940,7 +4222,7 @@ mod tests {
         .unwrap();
         let catalog = DatasetCatalog::new(
             "independent projected LOD",
-            ScientificIdentityStatus::Unverified(DatasetSourceId::new(1)),
+            ContentAddressStatus::SessionLocal(DatasetSourceId::new(1)),
             vec![active_layer, sheared_layer],
         )
         .unwrap();
@@ -4044,8 +4326,157 @@ mod tests {
 
         assert_eq!(one_x.scale, ScaleLevel::new(2));
         assert_eq!(two_x.scale, ScaleLevel::BASE);
-        assert_eq!(playback.scale, ScaleLevel::new(2));
-        assert!(playback.playback_downshifted);
+        assert_eq!(playback.scale, ScaleLevel::BASE);
+        assert!(!playback.playback_downshifted);
+    }
+
+    #[test]
+    fn exact_playback_window_cost_allows_lower_fps_to_select_a_finer_stable_body() {
+        let active = LogicalLayerKey::new(0);
+        let catalog = DatasetCatalog::new(
+            "playback-window-cost",
+            ContentAddressStatus::SessionLocal(DatasetSourceId::new(9)),
+            vec![
+                DatasetLayer::new_multiscale(
+                    active,
+                    "movie",
+                    365,
+                    IntensityDType::Uint16,
+                    vec![
+                        DatasetScale::new(
+                            ScaleLevel::BASE,
+                            Shape3D::new(128, 128, 128).unwrap(),
+                            GridToWorld::identity(),
+                            ResourceValidity::AllValid,
+                        ),
+                        DatasetScale::new(
+                            ScaleLevel::new(2),
+                            Shape3D::new(32, 32, 32).unwrap(),
+                            GridToWorld::scale(4.0, 4.0, 4.0).unwrap(),
+                            ResourceValidity::AllValid,
+                        ),
+                    ],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let view = ViewState::new(
+            vec![view_layer(active)],
+            active,
+            TimeIndex::new(0),
+            CameraView::new(
+                Projection::Orthographic,
+                WorldPoint3::new(64.0, 64.0, 64.0).unwrap(),
+                UnitQuaternion::identity(),
+                0.5,
+                320.0,
+                200.0,
+            )
+            .unwrap(),
+            ViewerLayout::Single3d,
+            CrossSectionView::new(
+                WorldPoint3::new(64.0, 64.0, 64.0).unwrap(),
+                UnitQuaternion::identity(),
+                1.0,
+                1.0,
+            )
+            .unwrap(),
+            IsoLightState::attached_camera(),
+        )
+        .unwrap();
+        let presentation = PresentationViewport::new(512.0, 512.0).unwrap();
+        let extent = RenderExtent::new(512, 512).unwrap();
+        let limits = DatasetDemandPlanLimits::new(4_096, 4_096, 64 * 1_048_576);
+        let plan_for = |view: &ViewState, count: u64| {
+            let timepoints = (1..=count).map(TimeIndex::new).collect::<Vec<_>>();
+            plan_guarded_progressive_current_3d_with_obligations_cancellable(
+                &catalog,
+                view,
+                presentation,
+                extent,
+                limits,
+                true,
+                &timepoints,
+                timepoints.len(),
+                None,
+                &[],
+                None,
+                None,
+                || false,
+            )
+            .unwrap()
+            .expect("the synchronous playback plan cannot be cancelled")
+            .plan
+        };
+
+        let twelve_fps = plan_for(&view, 12);
+        let twenty_four_fps = plan_for(&view, 24);
+        assert_eq!(twelve_fps.target.scale, ScaleLevel::BASE);
+        assert!(!twelve_fps.target.playback_downshifted);
+        assert_eq!(twenty_four_fps.target.scale, ScaleLevel::new(2));
+        assert!(twenty_four_fps.target.playback_downshifted);
+        assert!(twenty_four_fps.target.covers_full_volume);
+
+        let desired_timepoints = (1..=24).map(TimeIndex::new).collect::<Vec<_>>();
+        let bounded_tail = plan_guarded_progressive_current_3d_with_obligations_cancellable(
+            &catalog,
+            &view,
+            presentation,
+            extent,
+            limits,
+            true,
+            &desired_timepoints,
+            6,
+            None,
+            &[],
+            None,
+            None,
+            || false,
+        )
+        .unwrap()
+        .expect("the synchronous playback plan cannot be cancelled");
+        assert_eq!(bounded_tail.plan.target.scale, ScaleLevel::new(2));
+        assert_eq!(
+            bounded_tail.playback_timepoint_count,
+            desired_timepoints.len(),
+            "the desired rolling runway takes priority over a finer but unsustainable body"
+        );
+
+        let moved_camera = CameraView::new(
+            Projection::Orthographic,
+            WorldPoint3::new(12.0, 109.0, 37.0).unwrap(),
+            UnitQuaternion::new_xyzw(0.31, -0.23, 0.17, 0.91).unwrap(),
+            0.08,
+            320.0,
+            200.0,
+        )
+        .unwrap();
+        let moved_view = ViewState::new(
+            view.layers().to_vec(),
+            view.active_layer(),
+            view.timepoint(),
+            moved_camera,
+            view.layout(),
+            *view.cross_section(),
+            *view.iso_light(),
+        )
+        .unwrap();
+        let moved_twelve_fps = plan_for(&moved_view, 12);
+        assert!(moved_twelve_fps.target.covers_full_volume);
+        assert_eq!(
+            moved_twelve_fps.target.layer_scales, twelve_fps.target.layer_scales,
+            "camera motion cannot change the playback body's selected LOD"
+        );
+        assert_eq!(
+            moved_twelve_fps.target.playback_resource_count,
+            twelve_fps.target.playback_resource_count
+        );
+        assert_eq!(
+            &moved_twelve_fps.target.resources[..moved_twelve_fps.target.playback_resource_count],
+            &twelve_fps.target.resources[..twelve_fps.target.playback_resource_count],
+            "playback prefetch is a full-volume temporal body, not a camera-visible body"
+        );
     }
 
     #[test]
@@ -4135,7 +4566,7 @@ mod tests {
         let layer_key = LogicalLayerKey::new(0);
         let catalog = DatasetCatalog::new(
             "installed-navigation-floor",
-            ScientificIdentityStatus::Unverified(DatasetSourceId::new(73)),
+            ContentAddressStatus::SessionLocal(DatasetSourceId::new(73)),
             vec![
                 DatasetLayer::new_multiscale(
                     layer_key,
@@ -4275,7 +4706,7 @@ mod tests {
             &baseline,
             limits,
             false,
-            None,
+            &[],
             &[],
             None,
         )
@@ -4417,7 +4848,7 @@ mod tests {
         let other = LogicalLayerKey::new(1);
         let catalog = DatasetCatalog::new(
             "incompatible-dvr-grids",
-            ScientificIdentityStatus::Unverified(DatasetSourceId::new(1)),
+            ContentAddressStatus::SessionLocal(DatasetSourceId::new(1)),
             vec![
                 multiscale_layer(active, ScaleLevel::new(2)),
                 multiscale_layer_with_coarse_shape(
@@ -4461,7 +4892,7 @@ mod tests {
         let shape = Shape3D::new(64, 16_384, 16_384).unwrap();
         let catalog = DatasetCatalog::new(
             "large-camera-guard-grid",
-            ScientificIdentityStatus::Unverified(DatasetSourceId::new(44)),
+            ContentAddressStatus::SessionLocal(DatasetSourceId::new(44)),
             vec![
                 DatasetLayer::new_multiscale(
                     layer_key,
@@ -4604,7 +5035,7 @@ mod tests {
         let layer_key = LogicalLayerKey::new(0);
         let catalog = DatasetCatalog::new(
             "plane-guard-capacity-fallback",
-            ScientificIdentityStatus::Unverified(DatasetSourceId::new(45)),
+            ContentAddressStatus::SessionLocal(DatasetSourceId::new(45)),
             vec![
                 DatasetLayer::new_multiscale(
                     layer_key,
@@ -4718,7 +5149,7 @@ mod tests {
         let other = LogicalLayerKey::new(1);
         let catalog = DatasetCatalog::new(
             "heterogeneous-scales",
-            ScientificIdentityStatus::Unverified(DatasetSourceId::new(1)),
+            ContentAddressStatus::SessionLocal(DatasetSourceId::new(1)),
             vec![
                 multiscale_layer(active, ScaleLevel::new(2)),
                 multiscale_layer(other, ScaleLevel::new(7)),

@@ -25,6 +25,71 @@ exceptions have one separate tool-owned
 ## Plans
 
 The
+[preprocessing bounded temporal pipeline](plans/active/PREPROCESSING_BOUNDED_TEMPORAL_PIPELINE.md)
+is the owner-approved, not-yet-implemented follow-on for overlapping one
+canonical production/commit unit with at most two resource-admitted
+decode-ahead caches. It preserves package bytes, scientific order, the single
+spool/writer authority, incremental capacity, cancellation/resume, and the
+current width-one behavior when surplus resources are unavailable. Deeper
+pass fusion, pyramid DAG scheduling, parallel publication, codec changes, and
+a generic workflow engine are explicitly outside the plan.
+
+The
+[large-dataset preprocessing and storage cutover](plans/active/LARGE_DATASET_PREPROCESSING_AND_STORAGE_CUTOVER.md)
+is implemented and automated-verified in the current working tree. It
+replaces fixture-calibrated aggregate DS admission, the complete decoded-base
+checkpoint, and duplicate dataset-scale encoded staging with compositional
+storage safety, bounded temporal/slab production, one resumable final-layout
+stage, and per-unit placement-aware free-space accounting. The complete
+package ceiling is non-reserved guidance; capacity pauses retain the stage and
+offer Resume. It retains the current
+scientific, no-data, source-safety, validation, and atomic-publication
+contracts. Owner product validation on representative long local sources is
+still pending, so no current throughput qualification is attached.
+
+The
+[preprocessing application and importer cutover](plans/active/PREPROCESSING_APPLICATION_AND_IMPORTER_CUTOVER.md)
+is implemented and automated-verified for dataset-optional native startup, an
+explicit per-channel TIFF source manifest, bounded metadata-only setup
+inspection, decode-once throughput, automatic process-level import resource
+allocation, and the deletion of layout guessing and the import working-memory
+selector. Owner real-display validation of the new setup workflow remains
+pending.
+
+The
+[viewer composed-presentation scheduler cutover](plans/active/VIEWER_COMPOSED_PRESENTATION_SCHEDULER_CUTOVER.md)
+is implemented, automated-verified, and owner product-validated. It replaces
+the former composite display-generation gate with independent temporal,
+3D-spatial, linked-spatial, and retained-quality coordinates; assembles
+complete logical four-panel transactions over prepared/reused physical deltas;
+and retains the playback front until direct stationary refinement is ready.
+The renderer retains its one GPU submission and texture authority.
+
+The
+[viewer playback-session and source-integrity cutover](plans/active/VIEWER_PLAYBACK_SESSION_AND_SOURCE_INTEGRITY_CUTOVER.md)
+remains the implemented handoff for fixed-LOD temporal sessions, bounded slot
+residency, fast ordinary source admission, lazy per-read integrity, and the
+explicit optional package self-consistency audit. Its earlier presentation-
+independence closeout was withdrawn after owner observation and is superseded
+by the implemented composed-presentation correction above.
+
+The
+[time-series import profile correction plan](plans/active/TIME_SERIES_IMPORT_PROFILE_CORRECTION.md)
+is the completed handoff for restoring large-time-axis TIFF preprocessing
+after the geometry-derived pyramid cutover. Pyramid/profile accounting now
+shares one geometry authority, concrete import failures remain actionable,
+and the normal preprocessing/open workflow has been owner product-validated.
+Its fixture-calibrated aggregate-envelope policy is superseded by the approved
+large-dataset cutover above; its geometry and diagnostic corrections remain.
+
+The
+[generalized no-data import plan](plans/active/GENERALIZED_NO_DATA_IMPORT.md)
+is the completed, automated-verified handoff for typed automatic sentinel
+detection and six-connected spatial-mask reconstruction from the first source
+volume, exact non-dilating constant-Z-plane masking, and one validity-aware
+pyramid path across every admitted TIFF dtype.
+
+The
 [pre-alpha reliability and packaging plan](plans/active/PRE_ALPHA_RELIABILITY_AND_PACKAGING.md)
 is the completed handoff for publishing the rendering checkpoint, making
 native clean shutdown single-owner, exposing earlier-launch provisional
@@ -110,8 +175,10 @@ The development-simplification and viewer-recovery program completed on
 history retains the completed plan, and the verified external recovery bundle
 preserves the unpublished research spike.
 
-The viewer performance refactor closed on 2026-07-31 after final owner
-product validation. No rendering-performance package remains active.
+The spatial viewer performance refactor closed on 2026-07-31 after final owner
+product validation. The fixed playback-session and source-integrity work is
+implemented, and its separate composed-presentation correction closed on
+2026-08-01 after automated verification and owner product validation.
 Smooth-linear sampling remains supported with a known fine-scale refinement
 cost relative to voxel-exact; any optimization or removal is a separate
 future product decision.

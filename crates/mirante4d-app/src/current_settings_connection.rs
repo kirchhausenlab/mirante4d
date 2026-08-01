@@ -362,17 +362,17 @@ mod tests {
     };
 
     use mirante4d_application::{
-        ApplicationState, MAX_PENDING_EVENTS, SourceSessionGeneration, UnboundWorkspace,
+        ApplicationState, ContentAddressOrigin, MAX_PENDING_EVENTS, SourceSessionGeneration,
+        UnboundWorkspace,
     };
-    use mirante4d_dataset::{
-        DatasetCatalog, DatasetLayer, DatasetSourceId, ScientificIdentityStatus,
-    };
+    use mirante4d_dataset::{ContentAddressStatus, DatasetCatalog, DatasetLayer, DatasetSourceId};
     use mirante4d_domain::{
         CameraView, CrossSectionView, DisplayWindow, GridToWorld, IntensityDType, IsoLightState,
         LayerTransfer, LogicalLayerKey, Opacity, Projection, RenderState, RgbColor, SamplingPolicy,
         Shape4D, TimeIndex, TransferCurve, UnitQuaternion, ViewerLayout, WorldPoint3,
     };
-    use mirante4d_project_model::{LayerViewState, ProjectId, ViewState};
+    use mirante4d_identity::ScientificContentId;
+    use mirante4d_project_model::{DatasetReference, LayerViewState, ProjectId, ViewState};
     use mirante4d_settings::{GIB, RejectedFileDisposition};
     use tempfile::tempdir;
 
@@ -415,7 +415,7 @@ mod tests {
     fn application() -> ApplicationState {
         let catalog = DatasetCatalog::new(
             "settings-connection-test",
-            ScientificIdentityStatus::Unverified(DatasetSourceId::new(1)),
+            ContentAddressStatus::SessionLocal(DatasetSourceId::new(1)),
             vec![
                 DatasetLayer::new(
                     LogicalLayerKey::new(0),
@@ -431,9 +431,22 @@ mod tests {
         .unwrap();
         let workspace =
             UnboundWorkspace::new(ProjectId::from_bytes([7; 16]), view(), Vec::new()).unwrap();
+        let dataset = DatasetReference::new(
+            ScientificContentId::parse(&format!(
+                "{}{}",
+                ScientificContentId::PREFIX,
+                "7".repeat(64)
+            ))
+            .unwrap(),
+            None,
+            None,
+            None,
+        );
         ApplicationState::new_unbound(
             SourceSessionGeneration::new(1),
             catalog,
+            dataset,
+            ContentAddressOrigin::DeclaredByPackage,
             workspace,
             ResourcePolicy::default(),
         )

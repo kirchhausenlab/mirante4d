@@ -1,9 +1,8 @@
 //! Product-to-renderer intent translation.
 
 use glam::DQuat;
-use mirante4d_application::{ApplicationSnapshot, WorkspaceSnapshot};
+use mirante4d_application::ApplicationSnapshot;
 use mirante4d_domain::{CameraView, CrossSectionView, UnitQuaternion};
-use mirante4d_project_model::ViewState;
 use mirante4d_render_api::{
     FrameIdentity, LayerRenderIntent, MAX_RENDER_REQUIREMENTS, PresentationViewport, RenderExtent,
     RenderIntent, RenderRequirements, RenderViewIntent,
@@ -34,8 +33,8 @@ pub(crate) fn volume_intent(
         snapshot,
         frame,
         RenderViewIntent::volume(
-            camera_override.unwrap_or(*application_view(snapshot).camera()),
-            *application_view(snapshot).iso_light(),
+            camera_override.unwrap_or(*snapshot.view().camera()),
+            *snapshot.view().iso_light(),
         ),
         presentation,
         extent,
@@ -77,7 +76,7 @@ fn build_intent(
     presentation: PresentationViewport,
     extent: RenderExtent,
 ) -> anyhow::Result<Option<RenderIntent>> {
-    let view = application_view(snapshot);
+    let view = snapshot.view();
     let layers = view
         .layers()
         .iter()
@@ -111,12 +110,5 @@ fn panel_relative_orientation(panel: PanelId) -> Option<DQuat> {
         PanelId::Xz => Some(DQuat::from_rotation_x(std::f64::consts::FRAC_PI_2)),
         PanelId::Yz => Some(DQuat::from_rotation_y(std::f64::consts::FRAC_PI_2)),
         PanelId::ThreeD => None,
-    }
-}
-
-fn application_view(snapshot: &ApplicationSnapshot) -> &ViewState {
-    match snapshot.workspace() {
-        WorkspaceSnapshot::Unbound { workspace } => workspace.view(),
-        WorkspaceSnapshot::Bound { project, .. } => project.view(),
     }
 }

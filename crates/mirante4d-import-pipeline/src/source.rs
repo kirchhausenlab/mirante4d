@@ -1,16 +1,15 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{BufReader, Read, Seek, SeekFrom},
+    io::{BufReader, Read, Seek},
     mem::size_of,
     os::unix::{
         ffi::OsStrExt,
         fs::{FileExt, MetadataExt, OpenOptionsExt},
     },
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
-use mirante4d_dataset::CpuByteLedger;
+use mirante4d_dataset::{CpuByteLease, CpuByteLedger, CpuLedgerCategory};
 use mirante4d_domain::{IntensityDType, Shape4D};
 use mirante4d_identity::{Sha256Digest, Sha256Hasher};
 use quick_xml::{
@@ -24,16 +23,22 @@ use tiff::{
 };
 
 use crate::{
-    ImportCancellation, ImportError, SourceLayout, TiffInspection, TiffSource,
+    ImportCancellation, ImportError, NoDataPolicy, NoDataValueRule, TiffChannelSource,
+    TiffChannelSourceKind, TiffInspection, TiffInspectionProgress, TiffSource,
     canonical_cache::CanonicalBaseCache,
-    model::{InspectedSourceFile, SourceFileGeneration},
+    model::{
+        InspectedSourceFile, ResolvedAutomaticNoDataMask, ResolvedNoDataPolicy,
+        ResolvedNoDataValue, SourceFileGeneration,
+    },
     ordered_workers::{OrderedWorkerDiagnostics, OrderedWorkerPolicy, run_ordered},
 };
 
 const HASH_READ_BYTES: usize = 64 * 1024;
 const MAX_ENCODED_CHUNK_OVERHEAD_BYTES: usize = 64 * 1024;
-// Keep source discovery within the portable provenance record's bounded file list.
-const MAX_SOURCE_FILES: usize = 4_096;
+// One explicit channel may contain a substantial plane/time series. This is
+// an inventory-memory safety bound, not a filename/provenance convention.
+// The aggregate retained path-byte authority is checked independently.
+const MAX_SOURCE_FILES: usize = 65_536;
 // Retained source paths are exact-fit before this is calculated. Eight text
 // copies cover the reviewed index plus the largest simultaneous read_dir,
 // discovered-layout, accepted-inventory, and error-path views. The per-file
@@ -100,6 +105,14 @@ pub(crate) struct SourceDecodeReport {
     pub(crate) peak_reorder_results: usize,
 }
 
+pub(crate) struct NoDataDetectionReport {
+    pub(crate) policy: ResolvedNoDataPolicy,
+    pub(crate) counters: SourceReadCounters,
+    pub(crate) peak_transient_bytes: u64,
+    pub(crate) completed_planes: u64,
+    pub(crate) resident_mask_lease: Option<Box<dyn CpuByteLease>>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SourceRevalidationCounters {
     pub(crate) source_bytes_read: u64,
@@ -122,7 +135,6 @@ struct TiffFileFacts {
     maximum_decoded_chunk_bytes: u64,
     maximum_encoded_chunk_bytes: u64,
     bytes: u64,
-    sha256: Sha256Digest,
     generation: SourceFileGeneration,
 }
 
@@ -147,20 +159,6 @@ struct OmeTiffDataFacts {
     plane_count: Option<u64>,
 }
 
-#[derive(Debug)]
-struct DirectCandidate {
-    path: PathBuf,
-    relative_name: String,
-    channel_label: Option<u64>,
-    time_label: Option<u64>,
-}
-
-#[derive(Debug)]
-enum DirectoryLayout {
-    Direct(Vec<PathBuf>),
-    ChannelFolders(Vec<(PathBuf, Vec<PathBuf>)>),
-}
-
 pub(crate) fn inspect(source: TiffSource) -> Result<TiffInspection, ImportError> {
     inspect_cancellable(source, &ImportCancellation::new())
 }
@@ -169,349 +167,89 @@ pub(crate) fn inspect_cancellable(
     source: TiffSource,
     cancellation: &ImportCancellation,
 ) -> Result<TiffInspection, ImportError> {
-    check_cancelled(cancellation)?;
-    let metadata = match fs::symlink_metadata(&source.path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ImportError::MissingSource(source.path));
-        }
-        Err(source_error) => {
-            return Err(io_error("inspect source", &source.path, source_error));
-        }
-    };
-
-    if metadata.file_type().is_symlink() {
-        return Err(ImportError::UnsupportedSource(
-            "the selected TIFF source root must not be a symbolic link".to_owned(),
-        ));
-    }
-
-    if metadata.is_file() {
-        if !is_tiff_path(&source.path) {
-            return Err(ImportError::UnsupportedSource(
-                "a single source must have a .tif or .tiff extension".to_owned(),
-            ));
-        }
-        if source.layout == SourceLayout::ChannelFoldersOfPlanes {
-            return Err(ImportError::UnsupportedSource(
-                "channel-folder layout requires a directory source".to_owned(),
-            ));
-        }
-        return inspect_single_file(source, cancellation);
-    }
-
-    if !metadata.is_dir() {
-        return Err(ImportError::UnsupportedSource(
-            "the selected source is neither a regular TIFF file nor a directory".to_owned(),
-        ));
-    }
-
-    let discovered = discover_directory_layout(&source.path, cancellation)?;
-    match (source.layout, discovered) {
-        (SourceLayout::Auto | SourceLayout::MultipageStacks, DirectoryLayout::Direct(paths)) => {
-            inspect_direct_stacks(source, paths, cancellation)
-        }
-        (
-            SourceLayout::Auto | SourceLayout::ChannelFoldersOfPlanes,
-            DirectoryLayout::ChannelFolders(folders),
-        ) => inspect_channel_folders(source, folders, cancellation),
-        (SourceLayout::MultipageStacks, DirectoryLayout::ChannelFolders(_)) => {
-            Err(ImportError::UnsupportedSource(
-                "multipage-stack layout does not accept channel folders".to_owned(),
-            ))
-        }
-        (SourceLayout::ChannelFoldersOfPlanes, DirectoryLayout::Direct(_)) => {
-            Err(ImportError::UnsupportedSource(
-                "channel-folder layout does not accept direct TIFF files".to_owned(),
-            ))
-        }
-    }
+    inspect_cancellable_with_progress(source, cancellation, |_| {})
 }
 
-fn inspect_single_file(
+pub(crate) fn inspect_cancellable_with_progress(
     source: TiffSource,
     cancellation: &ImportCancellation,
+    mut progress: impl FnMut(TiffInspectionProgress),
 ) -> Result<TiffInspection, ImportError> {
     check_cancelled(cancellation)?;
-    let relative_name = relative_name_for_file(&source.path, &source.path)?;
-    let facts = inspect_file(&source.path, cancellation)?;
-    let shape = shape4d(1, facts.pages, facts.height, facts.width)?;
-    let files = vec![InspectedSourceFile {
-        path: source.path.clone(),
-        relative_name,
-        channel: 0,
-        timepoint: 0,
-        first_z: 0,
-        planes: facts.pages,
-        bytes: facts.bytes,
-        sha256: facts.sha256,
-        generation: facts.generation,
-    }];
-    check_cancelled(cancellation)?;
-    finish_inspection(
-        source,
-        SourceLayout::MultipageStacks,
-        shape,
-        1,
-        facts.dtype,
-        facts.ome_spacing_zyx_um,
-        facts.maximum_decoded_chunk_bytes,
-        facts.maximum_encoded_chunk_bytes,
-        files,
-    )
-}
-
-fn inspect_direct_stacks(
-    source: TiffSource,
-    paths: Vec<PathBuf>,
-    cancellation: &ImportCancellation,
-) -> Result<TiffInspection, ImportError> {
-    let mut candidates = Vec::with_capacity(paths.len());
-    for path in paths {
-        check_cancelled(cancellation)?;
-        let relative_name = relative_name_for_file(&source.path, &path)?;
-        let filename = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| {
-                ImportError::UnsupportedSource("source TIFF names must be valid UTF-8".to_owned())
-            })?
-            .to_owned();
-        candidates.push(DirectCandidate {
-            path,
-            relative_name,
-            channel_label: parse_unique_numeric_token(&filename, &["channel", "ch"], "channel")?,
-            time_label: parse_unique_numeric_token(
-                &filename,
-                &["stack", "time", "t"],
-                "timepoint",
-            )?,
-        });
-    }
-    candidates.sort_by(|left, right| left.relative_name.cmp(&right.relative_name));
-
-    let channel_labels =
-        consistent_optional_labels(&candidates, |candidate| candidate.channel_label, "channel")?;
-    let time_labels =
-        consistent_optional_labels(&candidates, |candidate| candidate.time_label, "timepoint")?;
-    if candidates.len() > 1 && channel_labels.is_none() && time_labels.is_none() {
-        return Err(ImportError::AmbiguousSource(
-            "multiple direct TIFF stacks need channel (ch/channel) or timepoint (t/stack/time) numeric filename tokens"
-                .to_owned(),
-        ));
-    }
-
-    let channel_values = sorted_axis_values(channel_labels.as_deref());
-    let time_values = sorted_axis_values(time_labels.as_deref());
-    let channel_ordinals = ordinal_map(&channel_values)?;
-    let time_ordinals = ordinal_map(&time_values)?;
-    let channels = u32::try_from(channel_values.len()).map_err(|_| ImportError::Overflow)?;
-    let timepoints = u64::try_from(time_values.len()).map_err(|_| ImportError::Overflow)?;
-
-    let mut assigned = Vec::with_capacity(candidates.len());
-    let mut occupied = BTreeSet::new();
-    for candidate in candidates {
-        let channel_label = candidate.channel_label.unwrap_or(0);
-        let time_label = candidate.time_label.unwrap_or(0);
-        let channel = *channel_ordinals
-            .get(&channel_label)
-            .expect("the ordinal map contains every observed channel label");
-        let timepoint = u64::from(
-            *time_ordinals
-                .get(&time_label)
-                .expect("the ordinal map contains every observed time label"),
-        );
-        if !occupied.insert((channel, timepoint)) {
-            return Err(ImportError::AmbiguousSource(format!(
-                "more than one direct TIFF stack maps to channel label {channel_label} and timepoint label {time_label}"
-            )));
-        }
-        assigned.push((channel, timepoint, candidate));
-    }
-
-    let expected_assignments = usize::try_from(
-        u64::from(channels)
-            .checked_mul(timepoints)
-            .ok_or(ImportError::Overflow)?,
-    )
-    .map_err(|_| ImportError::Overflow)?;
-    if occupied.len() != expected_assignments {
-        return Err(ImportError::AmbiguousSource(
-            "direct TIFF stack tokens do not form one complete channel-by-timepoint grid"
-                .to_owned(),
-        ));
-    }
-    assigned.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then(left.1.cmp(&right.1))
-            .then(left.2.relative_name.cmp(&right.2.relative_name))
-    });
-
-    let mut common: Option<(u64, u64, u64, IntensityDType)> = None;
-    let mut spacing = SpacingAccumulator::default();
-    let mut maximum_decoded_chunk_bytes = 0;
-    let mut maximum_encoded_chunk_bytes = 0;
-    let mut files = Vec::with_capacity(assigned.len());
-    for (channel, timepoint, candidate) in assigned {
-        check_cancelled(cancellation)?;
-        let facts = inspect_file(&candidate.path, cancellation)?;
-        check_common_stack_facts(
-            &candidate.relative_name,
-            &mut common,
-            facts.width,
-            facts.height,
-            facts.pages,
-            facts.dtype,
-        )?;
-        spacing.push(&candidate.relative_name, facts.ome_spacing_zyx_um)?;
-        maximum_decoded_chunk_bytes =
-            maximum_decoded_chunk_bytes.max(facts.maximum_decoded_chunk_bytes);
-        maximum_encoded_chunk_bytes =
-            maximum_encoded_chunk_bytes.max(facts.maximum_encoded_chunk_bytes);
-        files.push(InspectedSourceFile {
-            path: candidate.path,
-            relative_name: candidate.relative_name,
-            channel,
-            timepoint,
-            first_z: 0,
-            planes: facts.pages,
-            bytes: facts.bytes,
-            sha256: facts.sha256,
-            generation: facts.generation,
-        });
-    }
-    let (width, height, pages, dtype) = common.expect("directory discovery rejects no files");
-    let shape = shape4d(timepoints, pages, height, width)?;
-    check_cancelled(cancellation)?;
-    finish_inspection(
-        source,
-        SourceLayout::MultipageStacks,
-        shape,
-        channels,
-        dtype,
-        spacing.finish()?,
-        maximum_decoded_chunk_bytes,
-        maximum_encoded_chunk_bytes,
-        files,
-    )
-}
-
-fn inspect_channel_folders(
-    source: TiffSource,
-    mut folders: Vec<(PathBuf, Vec<PathBuf>)>,
-    cancellation: &ImportCancellation,
-) -> Result<TiffInspection, ImportError> {
-    folders.sort_by(|left, right| {
-        relative_name_for_directory(&source.path, &left.0)
-            .unwrap_or_default()
-            .cmp(&relative_name_for_directory(&source.path, &right.0).unwrap_or_default())
-    });
-
-    let mut folder_records = Vec::with_capacity(folders.len());
-    for (folder, mut planes) in folders {
-        check_cancelled(cancellation)?;
-        let relative_folder = relative_name_for_directory(&source.path, &folder)?;
-        let folder_name = folder
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| {
-                ImportError::UnsupportedSource(
-                    "channel folder names must be valid UTF-8".to_owned(),
-                )
-            })?;
-        let label = parse_unique_numeric_token(folder_name, &["channel", "ch"], "channel")?;
-        planes.sort_by(|left, right| {
-            relative_name_for_file(&source.path, left)
-                .unwrap_or_default()
-                .cmp(&relative_name_for_file(&source.path, right).unwrap_or_default())
-        });
-        folder_records.push((relative_folder, label, planes));
-    }
-
-    let mut expected_plane_names = None;
-    for (relative_folder, _, planes) in &folder_records {
-        let plane_names = planes
-            .iter()
-            .map(|path| {
-                path.file_name()
-                    .and_then(|value| value.to_str())
-                    .map(ToOwned::to_owned)
-                    .ok_or_else(|| {
-                        ImportError::UnsupportedSource(
-                            "channel-plane filenames must be valid UTF-8".to_owned(),
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if let Some(expected) = &expected_plane_names {
-            if &plane_names != expected {
-                return Err(ImportError::AmbiguousSource(format!(
-                    "channel folder {relative_folder:?} does not contain the same plane filenames as the other channels"
-                )));
-            }
-        } else {
-            expected_plane_names = Some(plane_names);
-        }
-    }
-
-    let labels = consistent_folder_labels(&folder_records)?;
-    let channel_values = match labels {
-        Some(labels) => sorted_axis_values(Some(&labels)),
-        None => (0..folder_records.len())
-            .map(|index| u64::try_from(index).map_err(|_| ImportError::Overflow))
-            .collect::<Result<Vec<_>, _>>()?,
-    };
-    if channel_values.len() != folder_records.len() {
-        return Err(ImportError::AmbiguousSource(
-            "more than one channel folder has the same channel numeric token".to_owned(),
-        ));
-    }
-    let channel_ordinals = ordinal_map(&channel_values)?;
-    let channels = u32::try_from(channel_values.len()).map_err(|_| ImportError::Overflow)?;
-
-    let mut common_plane: Option<(u64, u64, IntensityDType)> = None;
-    let mut expected_planes = None;
+    let mut dataset_shape: Option<Shape4D> = None;
+    let mut dataset_dtype: Option<IntensityDType> = None;
     let mut spacing = SpacingAccumulator::default();
     let mut maximum_decoded_chunk_bytes = 0;
     let mut maximum_encoded_chunk_bytes = 0;
     let mut files = Vec::new();
-    for (folder_index, (_relative_folder, label, planes)) in folder_records.into_iter().enumerate()
-    {
-        check_cancelled(cancellation)?;
-        let channel_label =
-            label.unwrap_or(u64::try_from(folder_index).map_err(|_| ImportError::Overflow)?);
-        let channel = *channel_ordinals
-            .get(&channel_label)
-            .expect("the channel ordinal map contains every channel folder");
-        let plane_count = u64::try_from(planes.len()).map_err(|_| ImportError::Overflow)?;
-        if let Some(expected) = expected_planes {
-            if plane_count != expected {
-                return Err(ImportError::AmbiguousSource(format!(
-                    "channel {channel} contains {plane_count} planes, expected {expected}"
-                )));
-            }
-        } else {
-            expected_planes = Some(plane_count);
-        }
+    let inventories = source
+        .channels()
+        .iter()
+        .map(|channel| explicit_channel_inventory(channel, cancellation))
+        .collect::<Result<Vec<_>, _>>()?;
+    let total_files = inventories.iter().try_fold(0_u64, |total, inventory| {
+        total
+            .checked_add(u64::try_from(inventory.len()).map_err(|_| ImportError::Overflow)?)
+            .ok_or(ImportError::Overflow)
+    })?;
+    progress(TiffInspectionProgress {
+        inspected_files: 0,
+        total_files,
+    });
 
-        for (z, path) in planes.into_iter().enumerate() {
+    for (channel_index, (channel, paths)) in source.channels().iter().zip(inventories).enumerate() {
+        check_cancelled(cancellation)?;
+        let channel_ordinal = u32::try_from(channel_index).map_err(|_| ImportError::Overflow)?;
+        let mut channel_common: Option<(u64, u64, u64, IntensityDType)> = None;
+        for (ordinal, path) in paths.into_iter().enumerate() {
             check_cancelled(cancellation)?;
-            let relative_name = relative_name_for_file(&source.path, &path)?;
             let facts = inspect_file(&path, cancellation)?;
-            if facts.pages != 1 {
-                return Err(ImportError::UnsupportedSource(format!(
-                    "channel-folder TIFF {relative_name:?} has {} pages; every plane file must contain exactly one page",
+            let logical_pages = match channel.kind() {
+                TiffChannelSourceKind::FolderOf2dTiffs if facts.pages != 1 => {
+                    return Err(ImportError::UnsupportedSource(format!(
+                        "TIFF {path:?} has {} pages, but a folder of 2D TIFFs requires exactly one page per file",
+                        facts.pages
+                    )));
+                }
+                TiffChannelSourceKind::FolderOf2dTiffs => 1,
+                TiffChannelSourceKind::Single3dTiff | TiffChannelSourceKind::FolderOf3dTiffs => {
                     facts.pages
-                )));
-            }
-            check_common_plane_facts(
-                &relative_name,
-                &mut common_plane,
+                }
+            };
+            let expected = channel_common.get_or_insert((
                 facts.width,
                 facts.height,
+                logical_pages,
                 facts.dtype,
-            )?;
+            ));
+            if *expected != (facts.width, facts.height, logical_pages, facts.dtype) {
+                return Err(ImportError::UnsupportedSource(format!(
+                    "TIFF {path:?} has shape/dtype x{} y{} z{} {:?}, expected x{} y{} z{} {:?}",
+                    facts.width,
+                    facts.height,
+                    logical_pages,
+                    facts.dtype,
+                    expected.0,
+                    expected.1,
+                    expected.2,
+                    expected.3,
+                )));
+            }
+            let ordinal = u64::try_from(ordinal).map_err(|_| ImportError::Overflow)?;
+            let (timepoint, first_z) = match channel.kind() {
+                TiffChannelSourceKind::Single3dTiff => (0, 0),
+                TiffChannelSourceKind::FolderOf3dTiffs => (ordinal, 0),
+                TiffChannelSourceKind::FolderOf2dTiffs => (0, ordinal),
+            };
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    ImportError::UnsupportedSource(format!(
+                        "TIFF filename {path:?} must be valid UTF-8"
+                    ))
+                })?;
+            let relative_name = format!("channel-{channel_ordinal:08}/{file_name}");
             spacing.push(&relative_name, facts.ome_spacing_zyx_um)?;
             maximum_decoded_chunk_bytes =
                 maximum_decoded_chunk_bytes.max(facts.maximum_decoded_chunk_bytes);
@@ -520,32 +258,75 @@ fn inspect_channel_folders(
             files.push(InspectedSourceFile {
                 path,
                 relative_name,
-                channel,
-                timepoint: 0,
-                first_z: u64::try_from(z).map_err(|_| ImportError::Overflow)?,
-                planes: 1,
+                channel: channel_ordinal,
+                timepoint,
+                first_z,
+                planes: facts.pages,
                 bytes: facts.bytes,
-                sha256: facts.sha256,
                 generation: facts.generation,
             });
+            progress(TiffInspectionProgress {
+                inspected_files: u64::try_from(files.len()).map_err(|_| ImportError::Overflow)?,
+                total_files,
+            });
+        }
+        let (width, height, pages, dtype) =
+            channel_common.expect("explicit source inventory rejects an empty channel");
+        let channel_shape = match channel.kind() {
+            TiffChannelSourceKind::Single3dTiff => shape4d(1, pages, height, width)?,
+            TiffChannelSourceKind::FolderOf3dTiffs => {
+                let timepoints = files
+                    .iter()
+                    .filter(|file| file.channel == channel_ordinal)
+                    .count();
+                shape4d(
+                    u64::try_from(timepoints).map_err(|_| ImportError::Overflow)?,
+                    pages,
+                    height,
+                    width,
+                )?
+            }
+            TiffChannelSourceKind::FolderOf2dTiffs => {
+                let depth = files
+                    .iter()
+                    .filter(|file| file.channel == channel_ordinal)
+                    .count();
+                shape4d(
+                    1,
+                    u64::try_from(depth).map_err(|_| ImportError::Overflow)?,
+                    height,
+                    width,
+                )?
+            }
+        };
+        if let Some(expected) = dataset_shape {
+            if expected != channel_shape {
+                return Err(ImportError::UnsupportedSource(format!(
+                    "channel {:?} has logical shape {:?}, expected {:?}",
+                    channel.label(),
+                    channel_shape.dimensions(),
+                    expected.dimensions()
+                )));
+            }
+        } else {
+            dataset_shape = Some(channel_shape);
+        }
+        if let Some(expected) = dataset_dtype {
+            if expected != dtype {
+                return Err(ImportError::UnsupportedSource(format!(
+                    "channel {:?} has dtype {dtype:?}, expected {expected:?}; mixed channel dtypes are not supported by the current package writer",
+                    channel.label()
+                )));
+            }
+        } else {
+            dataset_dtype = Some(dtype);
         }
     }
-    files.sort_by(|left, right| {
-        left.channel
-            .cmp(&right.channel)
-            .then(left.first_z.cmp(&right.first_z))
-            .then(left.relative_name.cmp(&right.relative_name))
-    });
-    let (width, height, dtype) = common_plane.expect("directory discovery rejects no files");
-    let z = expected_planes.expect("directory discovery rejects empty channel folders");
-    let shape = shape4d(1, z, height, width)?;
-    check_cancelled(cancellation)?;
+
     finish_inspection(
         source,
-        SourceLayout::ChannelFoldersOfPlanes,
-        shape,
-        channels,
-        dtype,
+        dataset_shape.expect("a source manifest always has a channel"),
+        dataset_dtype.expect("a source manifest always has a channel"),
         spacing.finish()?,
         maximum_decoded_chunk_bytes,
         maximum_encoded_chunk_bytes,
@@ -553,19 +334,170 @@ fn inspect_channel_folders(
     )
 }
 
+pub(crate) fn combine_channel_inspections(
+    inspections: Vec<TiffInspection>,
+) -> Result<TiffInspection, ImportError> {
+    if inspections.is_empty() || inspections.len() > 64 {
+        return Err(ImportError::InvalidRequest(
+            "channel validation requires one through 64 inspected rows",
+        ));
+    }
+    let expected_shape = inspections[0].shape;
+    let expected_dtype = inspections[0].dtype;
+    let expected_spacing = inspections[0].ome_spacing_zyx_um;
+    let mut channels = Vec::with_capacity(inspections.len());
+    let mut files = Vec::new();
+    let mut maximum_decoded_chunk_bytes = 0;
+    let mut maximum_encoded_chunk_bytes = 0;
+    for (channel_index, inspection) in inspections.into_iter().enumerate() {
+        if inspection.channels != 1 || inspection.source.channels().len() != 1 {
+            return Err(ImportError::InvalidRequest(
+                "only independently inspected one-channel rows may be combined",
+            ));
+        }
+        if inspection.shape != expected_shape {
+            return Err(ImportError::UnsupportedSource(format!(
+                "channel {:?} has logical shape {:?}, expected {:?}",
+                inspection.channel_labels[0],
+                inspection.shape.dimensions(),
+                expected_shape.dimensions(),
+            )));
+        }
+        if inspection.dtype != expected_dtype {
+            return Err(ImportError::UnsupportedSource(format!(
+                "channel {:?} has dtype {:?}, expected {:?}; mixed channel dtypes are not supported by the current package writer",
+                inspection.channel_labels[0], inspection.dtype, expected_dtype,
+            )));
+        }
+        if inspection.ome_spacing_zyx_um != expected_spacing {
+            return Err(ImportError::UnsupportedSource(format!(
+                "OME physical spacing in channel {:?} conflicts with the other channels",
+                inspection.channel_labels[0],
+            )));
+        }
+        let channel = u32::try_from(channel_index).map_err(|_| ImportError::Overflow)?;
+        channels.push(inspection.source.channels()[0].clone());
+        maximum_decoded_chunk_bytes =
+            maximum_decoded_chunk_bytes.max(inspection.maximum_decoded_chunk_bytes);
+        maximum_encoded_chunk_bytes =
+            maximum_encoded_chunk_bytes.max(inspection.maximum_encoded_chunk_bytes);
+        for mut file in inspection.files {
+            file.channel = channel;
+            let file_name = file
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    ImportError::UnsupportedSource(format!(
+                        "TIFF filename {:?} must be valid UTF-8",
+                        file.path
+                    ))
+                })?;
+            file.relative_name = format!("channel-{channel:08}/{file_name}");
+            files.push(file);
+        }
+    }
+    finish_inspection(
+        TiffSource::new(channels).map_err(ImportError::InvalidRequest)?,
+        expected_shape,
+        expected_dtype,
+        expected_spacing,
+        maximum_decoded_chunk_bytes,
+        maximum_encoded_chunk_bytes,
+        files,
+    )
+}
+
+pub(crate) fn relabel_channel_inspection(
+    inspection: TiffInspection,
+    label: &str,
+) -> Result<TiffInspection, ImportError> {
+    if inspection.channels != 1 || inspection.source.channels().len() != 1 {
+        return Err(ImportError::InvalidRequest(
+            "only a one-channel inspection can be relabelled",
+        ));
+    }
+    let previous = &inspection.source.channels()[0];
+    let channel = TiffChannelSource::new(label, previous.path(), previous.kind())
+        .map_err(ImportError::InvalidRequest)?;
+    finish_inspection(
+        TiffSource::new(vec![channel]).map_err(ImportError::InvalidRequest)?,
+        inspection.shape,
+        inspection.dtype,
+        inspection.ome_spacing_zyx_um,
+        inspection.maximum_decoded_chunk_bytes,
+        inspection.maximum_encoded_chunk_bytes,
+        inspection.files,
+    )
+}
+
+fn explicit_channel_inventory(
+    channel: &TiffChannelSource,
+    cancellation: &ImportCancellation,
+) -> Result<Vec<PathBuf>, ImportError> {
+    check_cancelled(cancellation)?;
+    let path = channel.path();
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ImportError::MissingSource(path.to_path_buf()));
+        }
+        Err(source) => return Err(io_error("inspect channel source", path, source)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(ImportError::UnsupportedSource(format!(
+            "channel source {path:?} must not be a symbolic link"
+        )));
+    }
+    if channel.kind() == TiffChannelSourceKind::Single3dTiff {
+        ensure_regular_tiff_file(path)?;
+        return Ok(vec![path.to_path_buf()]);
+    }
+    if !metadata.is_dir() {
+        return Err(ImportError::UnsupportedSource(format!(
+            "channel source {path:?} must be a directory for {:?}",
+            channel.kind()
+        )));
+    }
+    let mut paths = Vec::new();
+    let directory =
+        fs::read_dir(path).map_err(|source| io_error("list source directory", path, source))?;
+    for entry in directory {
+        check_cancelled(cancellation)?;
+        let entry =
+            entry.map_err(|source| io_error("read source directory entry", path, source))?;
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|source| io_error("inspect channel source entry", &entry_path, source))?;
+        if file_type.is_file() && !file_type.is_symlink() && is_tiff_path(&entry_path) {
+            paths.push(entry_path);
+            if paths.len() > MAX_SOURCE_FILES {
+                return Err(ImportError::UnsupportedSource(format!(
+                    "channel source contains more than {MAX_SOURCE_FILES} TIFF files"
+                )));
+            }
+        }
+    }
+    paths.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+    if paths.is_empty() {
+        return Err(ImportError::UnsupportedSource(format!(
+            "channel source {path:?} contains no immediate TIFF files"
+        )));
+    }
+    Ok(paths)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finish_inspection(
-    mut source: TiffSource,
-    layout: SourceLayout,
+    source: TiffSource,
     shape: Shape4D,
-    channels: u32,
     dtype: IntensityDType,
     ome_spacing_zyx_um: Option<[f64; 3]>,
     maximum_decoded_chunk_bytes: u64,
     maximum_encoded_chunk_bytes: u64,
     mut files: Vec<InspectedSourceFile>,
 ) -> Result<TiffInspection, ImportError> {
-    source.path.shrink_to_fit();
     files.shrink_to_fit();
     for file in &mut files {
         file.path.shrink_to_fit();
@@ -575,10 +507,11 @@ fn finish_inspection(
     let source_bytes = files.iter().try_fold(0_u64, |total, file| {
         total.checked_add(file.bytes).ok_or(ImportError::Overflow)
     })?;
+    let channels = u32::try_from(source.channels().len()).map_err(|_| ImportError::Overflow)?;
+    let channel_labels = source.channel_labels().map(ToOwned::to_owned).collect();
     let source_fingerprint = aggregate_fingerprint(
-        layout,
+        &source,
         shape,
-        channels,
         dtype,
         ome_spacing_zyx_um,
         source_bytes,
@@ -588,9 +521,9 @@ fn finish_inspection(
         source,
         files,
         source_index_working_bytes,
-        layout,
         shape,
         channels,
+        channel_labels,
         dtype,
         ome_spacing_zyx_um,
         source_bytes,
@@ -604,8 +537,16 @@ fn source_index_working_bytes(
     source: &TiffSource,
     files: &[InspectedSourceFile],
 ) -> Result<u64, ImportError> {
-    let root_bytes = u64::try_from(source.path.as_os_str().as_bytes().len())
-        .map_err(|_| ImportError::Overflow)?;
+    let root_bytes = source.channels().iter().try_fold(0_u64, |total, channel| {
+        let path_bytes = u64::try_from(channel.path().as_os_str().as_bytes().len())
+            .map_err(|_| ImportError::Overflow)?;
+        let label_bytes =
+            u64::try_from(channel.label().len()).map_err(|_| ImportError::Overflow)?;
+        total
+            .checked_add(path_bytes)
+            .and_then(|value| value.checked_add(label_bytes))
+            .ok_or(ImportError::Overflow)
+    })?;
     let text_bytes = files.iter().try_fold(root_bytes, |total, file| {
         let path_bytes = u64::try_from(file.path.as_os_str().as_bytes().len())
             .map_err(|_| ImportError::Overflow)?;
@@ -653,7 +594,9 @@ pub(crate) fn revalidate(
     recorded.sort_by(|left, right| left.1.relative_name.cmp(&right.1.relative_name));
 
     if current_files.len() != recorded.len() {
-        return Err(ImportError::SourceChanged(inspection.source.path.clone()));
+        return Err(ImportError::SourceChanged(
+            inspection.source.primary_path().to_path_buf(),
+        ));
     }
 
     let mut counters = SourceRevalidationCounters {
@@ -672,47 +615,33 @@ pub(crate) fn revalidate(
         if relative_name != expected.relative_name || path != expected.path {
             return Err(ImportError::SourceChanged(path));
         }
-        let before = source_file_generation(&path)?;
-        if before != expected.generation {
+        let current = source_file_generation(&path)?;
+        if current != expected.generation {
             return Err(ImportError::SourceChanged(path));
         }
-        let (bytes, sha256) = hash_file_cancellable(&path, cancellation)?;
-        let after = source_file_generation(&path)?;
-        counters.source_bytes_read = counters
-            .source_bytes_read
-            .checked_add(bytes)
-            .ok_or(ImportError::Overflow)?;
-        counters.tiff_open_count = counters
-            .tiff_open_count
-            .checked_add(1)
-            .ok_or(ImportError::Overflow)?;
-        if before != after
-            || after != expected.generation
-            || bytes != expected.bytes
-            || sha256 != expected.sha256
-        {
-            return Err(ImportError::SourceChanged(path));
-        }
-        counters.generation.files[recorded_index] = after;
+        counters.generation.files[recorded_index] = current;
     }
 
     let source_bytes = inspection.files.iter().try_fold(0_u64, |total, file| {
         total.checked_add(file.bytes).ok_or(ImportError::Overflow)
     })?;
     if source_bytes != inspection.source_bytes {
-        return Err(ImportError::SourceChanged(inspection.source.path.clone()));
+        return Err(ImportError::SourceChanged(
+            inspection.source.primary_path().to_path_buf(),
+        ));
     }
     let fingerprint = aggregate_fingerprint(
-        inspection.layout,
+        &inspection.source,
         inspection.shape,
-        inspection.channels,
         inspection.dtype,
         inspection.ome_spacing_zyx_um,
         source_bytes,
         &inspection.files,
     )?;
     if fingerprint != inspection.source_fingerprint {
-        return Err(ImportError::SourceChanged(inspection.source.path.clone()));
+        return Err(ImportError::SourceChanged(
+            inspection.source.primary_path().to_path_buf(),
+        ));
     }
     Ok(counters)
 }
@@ -733,7 +662,9 @@ pub(crate) fn capture_generation(
     let mut recorded = inspection.files.iter().enumerate().collect::<Vec<_>>();
     recorded.sort_by(|left, right| left.1.relative_name.cmp(&right.1.relative_name));
     if current_files.len() != recorded.len() {
-        return Err(ImportError::SourceChanged(inspection.source.path.clone()));
+        return Err(ImportError::SourceChanged(
+            inspection.source.primary_path().to_path_buf(),
+        ));
     }
     let mut generation = SourceGeneration {
         files: inspection
@@ -758,6 +689,877 @@ pub(crate) fn capture_generation(
     Ok(generation)
 }
 
+/// Resolves first-volume no-data facts from the durable canonical cache.
+/// TIFF payloads have already been decoded exactly once before this boundary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_no_data_policy_from_cache(
+    inspection: &TiffInspection,
+    canonical: &crate::canonical_cache::CanonicalBaseReader,
+    checkpoint_directory: &Path,
+    request: Option<NoDataPolicy>,
+    ledger: &dyn CpuByteLedger,
+    cancellation: &ImportCancellation,
+    mut plane_completed: impl FnMut(u64, Option<u64>),
+) -> Result<NoDataDetectionReport, ImportError> {
+    check_cancelled(cancellation)?;
+    let depth = inspection.shape.z();
+    let Some(request) = request else {
+        return Ok(NoDataDetectionReport {
+            policy: ResolvedNoDataPolicy::all_valid(depth),
+            counters: SourceReadCounters::default(),
+            peak_transient_bytes: 0,
+            completed_planes: 0,
+            resident_mask_lease: None,
+        });
+    };
+    let automatic = request.value_rule() == Some(NoDataValueRule::Automatic);
+    let mut resolved_value = match request.value_rule() {
+        Some(NoDataValueRule::ManualUint8(value)) => {
+            if inspection.dtype != IntensityDType::Uint8 {
+                return Err(ImportError::InvalidRequest(
+                    "manual no-data values are supported only for uint8 TIFF input",
+                ));
+            }
+            Some(ResolvedNoDataValue::Uint8(value))
+        }
+        Some(NoDataValueRule::Automatic) | None => None,
+    };
+    if !automatic && !request.hides_constant_z_planes() {
+        return Ok(NoDataDetectionReport {
+            policy: ResolvedNoDataPolicy::new(
+                Some(request),
+                resolved_value,
+                None,
+                Vec::new(),
+                depth,
+            )
+            .map_err(ImportError::InvalidRequest)?,
+            counters: SourceReadCounters::default(),
+            peak_transient_bytes: 0,
+            completed_planes: 0,
+            resident_mask_lease: None,
+        });
+    }
+
+    let width = inspection.shape.x();
+    let height = inspection.shape.y();
+    let plane_bytes = width
+        .checked_mul(height)
+        .and_then(|samples| samples.checked_mul(u64::from(inspection.dtype.bytes_per_sample())))
+        .ok_or(ImportError::Overflow)?;
+    let detector_bytes = if automatic {
+        automatic_discovery_detector_bytes(width, height).ok_or(ImportError::Overflow)?
+    } else {
+        0
+    };
+    let transient_bytes = plane_bytes
+        .checked_add(detector_bytes)
+        .and_then(|value| {
+            value.checked_add(if automatic {
+                automatic_reconstruction_transient_bytes([depth, height, width])?
+            } else {
+                0
+            })
+        })
+        .ok_or(ImportError::Overflow)?;
+    let _transient_lease =
+        ledger.try_acquire(CpuLedgerCategory::ImportWorkingSet, transient_bytes.max(1))?;
+    let mut plane = vec![0_u8; usize::try_from(plane_bytes).map_err(|_| ImportError::Overflow)?];
+    let mut detector = automatic
+        .then(|| UniformCubeDetector::new(width, height))
+        .transpose()?;
+    let mut constant_z_planes = Vec::new();
+    let mut completed_planes = 0_u64;
+    for z in 0..depth {
+        check_cancelled(cancellation)?;
+        canonical.read_region_into(0, 0, [z, 0, 0], [1, height, width], &mut plane)?;
+        let constant = request.hides_constant_z_planes()
+            && plane_is_exactly_constant(&plane, inspection.dtype)?;
+        if constant {
+            constant_z_planes.push(z);
+            if let Some(detector) = detector.as_mut() {
+                detector.break_z_continuity();
+            }
+        } else if automatic
+            && resolved_value.is_none()
+            && let Some(bits) = detector
+                .as_mut()
+                .expect("automatic mode owns a detector")
+                .scan_plane(&plane, inspection.dtype, cancellation)?
+        {
+            resolved_value = Some(resolved_value_from_bits(inspection.dtype, bits));
+            if !request.hides_constant_z_planes() {
+                completed_planes = completed_planes
+                    .checked_add(1)
+                    .ok_or(ImportError::Overflow)?;
+                plane_completed(completed_planes, None);
+                break;
+            }
+        }
+        completed_planes = completed_planes
+            .checked_add(1)
+            .ok_or(ImportError::Overflow)?;
+        plane_completed(completed_planes, (!automatic).then_some(depth));
+    }
+
+    let automatic_mask = if automatic {
+        match resolved_value {
+            Some(value) => {
+                let mut equal = PackedBits::new([depth, height, width])?;
+                let mut seed_endpoints = PackedBits::new([depth, height, width])?;
+                let mut seed_detector = FixedValueSeedDetector::new(width, height)?;
+                for z in 0..depth {
+                    check_cancelled(cancellation)?;
+                    canonical.read_region_into(0, 0, [z, 0, 0], [1, height, width], &mut plane)?;
+                    if constant_z_planes.binary_search(&z).is_ok() {
+                        seed_detector.break_z_continuity();
+                    } else {
+                        seed_detector.scan_plane_packed(
+                            z,
+                            &plane,
+                            inspection.dtype,
+                            value.canonical_bits(),
+                            &mut equal,
+                            &mut seed_endpoints,
+                            cancellation,
+                        )?;
+                    }
+                    completed_planes = completed_planes
+                        .checked_add(1)
+                        .ok_or(ImportError::Overflow)?;
+                    plane_completed(completed_planes, None);
+                }
+                let packed = reconstruct_seeded_runs(
+                    [depth, height, width],
+                    &equal,
+                    &seed_endpoints,
+                    checkpoint_directory,
+                    cancellation,
+                )?;
+                Some(
+                    ResolvedAutomaticNoDataMask::new([depth, height, width], packed)
+                        .map_err(ImportError::InvalidRequest)?,
+                )
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let resident_mask_lease = automatic_mask
+        .as_ref()
+        .map(|mask| ledger.try_acquire(CpuLedgerCategory::ImportWorkingSet, mask.resident_bytes()))
+        .transpose()?;
+    Ok(NoDataDetectionReport {
+        policy: ResolvedNoDataPolicy::new(
+            Some(request),
+            resolved_value,
+            automatic_mask,
+            constant_z_planes,
+            depth,
+        )
+        .map_err(ImportError::InvalidRequest)?,
+        counters: SourceReadCounters::default(),
+        peak_transient_bytes: transient_bytes,
+        completed_planes,
+        resident_mask_lease,
+    })
+}
+
+struct PackedBits {
+    shape: [u64; 3],
+    row_bytes: u64,
+    len: u64,
+    bytes: Vec<u8>,
+}
+
+impl PackedBits {
+    fn new(shape: [u64; 3]) -> Result<Self, ImportError> {
+        let len = shape
+            .into_iter()
+            .try_fold(1_u64, |product, value| product.checked_mul(value))
+            .ok_or(ImportError::Overflow)?;
+        let row_bytes = shape[2].div_ceil(8);
+        let bytes = shape[0]
+            .checked_mul(shape[1])
+            .and_then(|rows| rows.checked_mul(row_bytes))
+            .ok_or(ImportError::Overflow)?;
+        Ok(Self {
+            shape,
+            row_bytes,
+            len,
+            bytes: vec![0; usize::try_from(bytes).map_err(|_| ImportError::Overflow)?],
+        })
+    }
+
+    fn get(&self, index: u64) -> bool {
+        let Some((byte, bit)) = self.bit_position(index) else {
+            return false;
+        };
+        self.bytes[byte] & (1 << bit) != 0
+    }
+
+    fn set(&mut self, index: u64) -> Result<(), ImportError> {
+        let (byte, bit) = self.bit_position(index).ok_or(ImportError::Overflow)?;
+        self.bytes[byte] |= 1 << bit;
+        Ok(())
+    }
+
+    fn bit_position(&self, index: u64) -> Option<(usize, u64)> {
+        if index >= self.len {
+            return None;
+        }
+        let plane = self.shape[1].checked_mul(self.shape[2])?;
+        let z = index / plane;
+        let within = index % plane;
+        let y = within / self.shape[2];
+        let x = within % self.shape[2];
+        let byte = z
+            .checked_mul(self.shape[1])?
+            .checked_add(y)?
+            .checked_mul(self.row_bytes)?
+            .checked_add(x / 8)?;
+        Some((usize::try_from(byte).ok()?, x % 8))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EqualRun {
+    z: u64,
+    y: u64,
+    x_start: u64,
+    x_end: u64,
+}
+
+fn reconstruct_seeded_runs(
+    shape: [u64; 3],
+    equal: &PackedBits,
+    seeds: &PackedBits,
+    checkpoint_directory: &Path,
+    cancellation: &ImportCancellation,
+) -> Result<Vec<u8>, ImportError> {
+    let mut visited = PackedBits::new(shape)?;
+    let mut stack = BoundedRunStack::new(checkpoint_directory)?;
+    let row_stride = shape[2];
+    let plane_stride = shape[1]
+        .checked_mul(shape[2])
+        .ok_or(ImportError::Overflow)?;
+    for seed in 0..seeds.len {
+        if !seeds.get(seed) {
+            continue;
+        }
+        check_cancelled(cancellation)?;
+        if !equal.get(seed) || visited.get(seed) {
+            continue;
+        }
+        let z = seed / plane_stride;
+        let row_offset = seed % plane_stride;
+        let y = row_offset / row_stride;
+        let x = row_offset % row_stride;
+        push_equal_run(shape, equal, &mut visited, &mut stack, z, y, x)?;
+        while let Some(run) = stack.pop()? {
+            if stack
+                .processed
+                .is_multiple_of(RECONSTRUCTION_CANCEL_INTERVAL)
+            {
+                check_cancelled(cancellation)?;
+            }
+            for (neighbor_z, neighbor_y) in [
+                run.y.checked_sub(1).map(|y| (run.z, y)),
+                (run.y + 1 < shape[1]).then_some((run.z, run.y + 1)),
+                run.z.checked_sub(1).map(|z| (z, run.y)),
+                (run.z + 1 < shape[0]).then_some((run.z + 1, run.y)),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let mut x = run.x_start;
+                while x <= run.x_end {
+                    let index = linear_index(shape, neighbor_z, neighbor_y, x)?;
+                    if equal.get(index) && !visited.get(index) {
+                        let added = push_equal_run(
+                            shape,
+                            equal,
+                            &mut visited,
+                            &mut stack,
+                            neighbor_z,
+                            neighbor_y,
+                            x,
+                        )?;
+                        x = added.x_end.saturating_add(1);
+                    } else {
+                        x = x.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    stack.finish()?;
+    Ok(visited.bytes)
+}
+
+fn push_equal_run(
+    shape: [u64; 3],
+    equal: &PackedBits,
+    visited: &mut PackedBits,
+    stack: &mut BoundedRunStack,
+    z: u64,
+    y: u64,
+    x: u64,
+) -> Result<EqualRun, ImportError> {
+    let mut x_start = x;
+    while x_start > 0 {
+        let candidate = linear_index(shape, z, y, x_start - 1)?;
+        if !equal.get(candidate) || visited.get(candidate) {
+            break;
+        }
+        x_start -= 1;
+    }
+    let mut x_end = x;
+    while x_end + 1 < shape[2] {
+        let candidate = linear_index(shape, z, y, x_end + 1)?;
+        if !equal.get(candidate) || visited.get(candidate) {
+            break;
+        }
+        x_end += 1;
+    }
+    for current in x_start..=x_end {
+        visited.set(linear_index(shape, z, y, current)?)?;
+    }
+    let run = EqualRun {
+        z,
+        y,
+        x_start,
+        x_end,
+    };
+    stack.push(run)?;
+    Ok(run)
+}
+
+/// LIFO frontier with a fixed RAM window and a checkpoint-owned spill file.
+/// The file is transient: canonical cache state is the resumable authority,
+/// so an interrupted reconstruction safely starts this frontier again.
+struct BoundedRunStack {
+    path: PathBuf,
+    file: File,
+    device: u64,
+    inode: u64,
+    memory: Vec<EqualRun>,
+    disk_runs: u64,
+    processed: u64,
+}
+
+impl BoundedRunStack {
+    fn new(checkpoint_directory: &Path) -> Result<Self, ImportError> {
+        let path = checkpoint_directory.join(RECONSTRUCTION_RUN_SPOOL_NAME);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                fs::remove_file(&path).map_err(|source| {
+                    io_error("remove stale automatic-mask run spool", &path, source)
+                })?;
+            }
+            Ok(_) => {
+                return Err(ImportError::InvalidCheckpoint(
+                    "automatic-mask run spool is not a regular owned file".to_owned(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(io_error("inspect automatic-mask run spool", &path, source));
+            }
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(
+                i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
+                    .expect("O_NOFOLLOW is representable as a platform open flag"),
+            )
+            .open(&path)
+            .map_err(|source| io_error("create automatic-mask run spool", &path, source))?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| io_error("inspect automatic-mask run spool", &path, source))?;
+        Ok(Self {
+            path,
+            file,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            memory: Vec::with_capacity(RECONSTRUCTION_RUNS_IN_MEMORY),
+            disk_runs: 0,
+            processed: 0,
+        })
+    }
+
+    fn push(&mut self, run: EqualRun) -> Result<(), ImportError> {
+        if self.memory.len() == RECONSTRUCTION_RUNS_IN_MEMORY {
+            self.flush_memory()?;
+        }
+        self.memory.push(run);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Result<Option<EqualRun>, ImportError> {
+        if self.memory.is_empty() && self.disk_runs != 0 {
+            self.refill_memory()?;
+        }
+        let run = self.memory.pop();
+        if run.is_some() {
+            self.processed = self.processed.checked_add(1).ok_or(ImportError::Overflow)?;
+        }
+        Ok(run)
+    }
+
+    fn flush_memory(&mut self) -> Result<(), ImportError> {
+        let initial_disk_runs = self.disk_runs;
+        let mut bytes = [0_u8; RECONSTRUCTION_IO_BUFFER_BYTES];
+        for (batch_index, runs) in self.memory.chunks(RECONSTRUCTION_IO_RUNS).enumerate() {
+            let used = runs
+                .len()
+                .checked_mul(RECONSTRUCTION_RUN_RECORD_BYTES_USIZE)
+                .ok_or(ImportError::Overflow)?;
+            for (run_index, run) in runs.iter().enumerate() {
+                let record_start = run_index * RECONSTRUCTION_RUN_RECORD_BYTES_USIZE;
+                for (value_index, value) in [run.z, run.y, run.x_start, run.x_end]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let start = record_start + value_index * size_of::<u64>();
+                    bytes[start..start + size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            let batch_runs = u64::try_from(batch_index)
+                .map_err(|_| ImportError::Overflow)?
+                .checked_mul(
+                    u64::try_from(RECONSTRUCTION_IO_RUNS).map_err(|_| ImportError::Overflow)?,
+                )
+                .ok_or(ImportError::Overflow)?;
+            let offset = initial_disk_runs
+                .checked_add(batch_runs)
+                .and_then(|runs| runs.checked_mul(RECONSTRUCTION_RUN_RECORD_BYTES))
+                .ok_or(ImportError::Overflow)?;
+            self.file
+                .write_all_at(&bytes[..used], offset)
+                .map_err(|source| io_error("spill automatic-mask runs", &self.path, source))?;
+        }
+        self.disk_runs = self
+            .disk_runs
+            .checked_add(u64::try_from(self.memory.len()).map_err(|_| ImportError::Overflow)?)
+            .ok_or(ImportError::Overflow)?;
+        self.memory.clear();
+        Ok(())
+    }
+
+    fn refill_memory(&mut self) -> Result<(), ImportError> {
+        let count = self
+            .disk_runs
+            .min(u64::try_from(RECONSTRUCTION_RUNS_IN_MEMORY).expect("run bound fits u64"));
+        let first = self.disk_runs - count;
+        let mut bytes = [0_u8; RECONSTRUCTION_IO_BUFFER_BYTES];
+        let mut loaded = 0_u64;
+        while loaded < count {
+            let batch_count = (count - loaded)
+                .min(u64::try_from(RECONSTRUCTION_IO_RUNS).map_err(|_| ImportError::Overflow)?);
+            let used = usize::try_from(
+                batch_count
+                    .checked_mul(RECONSTRUCTION_RUN_RECORD_BYTES)
+                    .ok_or(ImportError::Overflow)?,
+            )
+            .map_err(|_| ImportError::Overflow)?;
+            let offset = first
+                .checked_add(loaded)
+                .and_then(|runs| runs.checked_mul(RECONSTRUCTION_RUN_RECORD_BYTES))
+                .ok_or(ImportError::Overflow)?;
+            self.file
+                .read_exact_at(&mut bytes[..used], offset)
+                .map_err(|source| io_error("read automatic-mask run spool", &self.path, source))?;
+            for record in bytes[..used].chunks_exact(RECONSTRUCTION_RUN_RECORD_BYTES_USIZE) {
+                let decode = |offset: usize| {
+                    u64::from_le_bytes(
+                        record[offset..offset + size_of::<u64>()]
+                            .try_into()
+                            .expect("fixed run record"),
+                    )
+                };
+                self.memory.push(EqualRun {
+                    z: decode(0),
+                    y: decode(8),
+                    x_start: decode(16),
+                    x_end: decode(24),
+                });
+            }
+            loaded = loaded
+                .checked_add(batch_count)
+                .ok_or(ImportError::Overflow)?;
+        }
+        self.file
+            .set_len(
+                first
+                    .checked_mul(RECONSTRUCTION_RUN_RECORD_BYTES)
+                    .ok_or(ImportError::Overflow)?,
+            )
+            .map_err(|source| io_error("truncate automatic-mask run spool", &self.path, source))?;
+        self.disk_runs = first;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), ImportError> {
+        if self.disk_runs != 0 || !self.memory.is_empty() {
+            return Err(ImportError::InvalidCheckpoint(
+                "automatic-mask run reconstruction ended with pending work".to_owned(),
+            ));
+        }
+        self.remove_owned()
+    }
+
+    fn remove_owned(&mut self) -> Result<(), ImportError> {
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(io_error(
+                    "inspect automatic-mask run spool for cleanup",
+                    &self.path,
+                    source,
+                ));
+            }
+        };
+        if metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+        {
+            fs::remove_file(&self.path).map_err(|source| {
+                io_error("remove automatic-mask run spool", &self.path, source)
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BoundedRunStack {
+    fn drop(&mut self) {
+        let _ = self.remove_owned();
+    }
+}
+
+fn linear_index(shape: [u64; 3], z: u64, y: u64, x: u64) -> Result<u64, ImportError> {
+    z.checked_mul(shape[1])
+        .and_then(|value| value.checked_add(y))
+        .and_then(|value| value.checked_mul(shape[2]))
+        .and_then(|value| value.checked_add(x))
+        .ok_or(ImportError::Overflow)
+}
+
+pub(crate) fn automatic_mask_packed_bytes(shape_zyx: [u64; 3]) -> Option<u64> {
+    shape_zyx[0]
+        .checked_mul(shape_zyx[1])?
+        .checked_mul(shape_zyx[2].div_ceil(8))
+}
+
+pub(crate) fn automatic_discovery_detector_bytes(width: u64, height: u64) -> Option<u64> {
+    width
+        .checked_mul(height)?
+        .checked_add(width)?
+        .checked_mul(8)
+}
+
+pub(crate) fn automatic_reconstruction_transient_bytes(shape_zyx: [u64; 3]) -> Option<u64> {
+    if shape_zyx
+        .iter()
+        .any(|dimension| *dimension < u64::from(AUTOMATIC_NO_DATA_BLOCK_EDGE))
+    {
+        return Some(0);
+    }
+    // Exact-value, seed-endpoint, and visited/final-mask bitsets plus the
+    // fixed in-memory window of the disk-backed run frontier.
+    automatic_mask_packed_bytes(shape_zyx)?
+        .checked_mul(3)?
+        .checked_add(
+            u64::try_from(RECONSTRUCTION_RUNS_IN_MEMORY)
+                .ok()?
+                .checked_mul(RECONSTRUCTION_RUN_RECORD_BYTES)?,
+        )
+        .and_then(|bytes| bytes.checked_add(RECONSTRUCTION_IO_BUFFER_BYTES as u64))
+}
+
+pub(crate) fn automatic_reconstruction_spool_bytes(shape_zyx: [u64; 3]) -> Option<u64> {
+    if shape_zyx
+        .iter()
+        .any(|dimension| *dimension < u64::from(AUTOMATIC_NO_DATA_BLOCK_EDGE))
+    {
+        return Some(0);
+    }
+    // An exact-value component can contribute at most ceil(X / 2) disjoint
+    // runs per Y/Z row. Each run is pushed once because it is marked visited
+    // before entering the frontier.
+    shape_zyx[0]
+        .checked_mul(shape_zyx[1])?
+        .checked_mul(shape_zyx[2].div_ceil(2))?
+        .checked_mul(RECONSTRUCTION_RUN_RECORD_BYTES)
+}
+
+const AUTOMATIC_NO_DATA_BLOCK_EDGE: u32 = 5;
+const RECONSTRUCTION_CANCEL_INTERVAL: u64 = 65_536;
+const RECONSTRUCTION_RUNS_IN_MEMORY: usize = 4_096;
+const RECONSTRUCTION_RUN_RECORD_BYTES: u64 = 32;
+const RECONSTRUCTION_RUN_RECORD_BYTES_USIZE: usize = RECONSTRUCTION_RUN_RECORD_BYTES as usize;
+const RECONSTRUCTION_IO_RUNS: usize = 64;
+const RECONSTRUCTION_IO_BUFFER_BYTES: usize =
+    RECONSTRUCTION_IO_RUNS * RECONSTRUCTION_RUN_RECORD_BYTES_USIZE;
+const RECONSTRUCTION_RUN_SPOOL_NAME: &str = "automatic-mask-runs";
+
+struct UniformCubeDetector {
+    width: usize,
+    height: usize,
+    vertical_value: Vec<u32>,
+    vertical_count: Vec<u32>,
+    depth_value: Vec<u32>,
+    depth_count: Vec<u32>,
+}
+
+/// Marks one deterministic endpoint for every exact-value `5 x 5 x 5`
+/// seed in a complete first-volume scan.
+///
+/// A single marked voxel is sufficient: reconstruction floods the entire
+/// six-connected exact-value component containing that endpoint. Running
+/// counts are capped at the seed edge, so the detector needs one byte per
+/// plane sample plus one byte per row sample.
+struct FixedValueSeedDetector {
+    width: usize,
+    height: usize,
+    vertical_count: Vec<u8>,
+    depth_count: Vec<u8>,
+}
+
+impl FixedValueSeedDetector {
+    fn new(width: u64, height: u64) -> Result<Self, ImportError> {
+        let width = usize::try_from(width).map_err(|_| ImportError::Overflow)?;
+        let height = usize::try_from(height).map_err(|_| ImportError::Overflow)?;
+        let plane = width.checked_mul(height).ok_or(ImportError::Overflow)?;
+        Ok(Self {
+            width,
+            height,
+            vertical_count: vec![0; width],
+            depth_count: vec![0; plane],
+        })
+    }
+
+    fn break_z_continuity(&mut self) {
+        self.depth_count.fill(0);
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the detector boundary names each separately bounded source/mask authority"
+    )]
+    fn scan_plane_packed(
+        &mut self,
+        z: u64,
+        plane_le: &[u8],
+        dtype: IntensityDType,
+        target_bits: u32,
+        equal: &mut PackedBits,
+        seeds: &mut PackedBits,
+        cancellation: &ImportCancellation,
+    ) -> Result<(), ImportError> {
+        let sample_width = usize::from(dtype.bytes_per_sample());
+        let plane_samples = self
+            .width
+            .checked_mul(self.height)
+            .ok_or(ImportError::Overflow)?;
+        if plane_le.len()
+            != plane_samples
+                .checked_mul(sample_width)
+                .ok_or(ImportError::Overflow)?
+        {
+            return Err(ImportError::InvalidRequest(
+                "automatic no-data reconstruction received a malformed canonical plane",
+            ));
+        }
+        let global_start = z
+            .checked_mul(u64::try_from(plane_samples).map_err(|_| ImportError::Overflow)?)
+            .ok_or(ImportError::Overflow)?;
+        let edge =
+            u8::try_from(AUTOMATIC_NO_DATA_BLOCK_EDGE).expect("automatic no-data edge fits u8");
+        self.vertical_count.fill(0);
+        for y in 0..self.height {
+            let mut horizontal_count = 0_u8;
+            for x in 0..self.width {
+                let local = y
+                    .checked_mul(self.width)
+                    .and_then(|value| value.checked_add(x))
+                    .ok_or(ImportError::Overflow)?;
+                if u64::try_from(local)
+                    .map_err(|_| ImportError::Overflow)?
+                    .is_multiple_of(RECONSTRUCTION_CANCEL_INTERVAL)
+                {
+                    check_cancelled(cancellation)?;
+                }
+                let exact = sample_bits(plane_le, dtype, local)? == target_bits;
+                if exact {
+                    equal.set(
+                        global_start
+                            .checked_add(u64::try_from(local).map_err(|_| ImportError::Overflow)?)
+                            .ok_or(ImportError::Overflow)?,
+                    )?;
+                    horizontal_count = horizontal_count.saturating_add(1).min(edge);
+                } else {
+                    horizontal_count = 0;
+                }
+                if horizontal_count >= edge {
+                    self.vertical_count[x] = self.vertical_count[x].saturating_add(1).min(edge);
+                } else {
+                    self.vertical_count[x] = 0;
+                }
+                if self.vertical_count[x] >= edge {
+                    self.depth_count[local] = self.depth_count[local].saturating_add(1).min(edge);
+                } else {
+                    self.depth_count[local] = 0;
+                }
+                if self.depth_count[local] >= edge {
+                    seeds.set(
+                        global_start
+                            .checked_add(u64::try_from(local).map_err(|_| ImportError::Overflow)?)
+                            .ok_or(ImportError::Overflow)?,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl UniformCubeDetector {
+    fn new(width: u64, height: u64) -> Result<Self, ImportError> {
+        let width = usize::try_from(width).map_err(|_| ImportError::Overflow)?;
+        let height = usize::try_from(height).map_err(|_| ImportError::Overflow)?;
+        let plane = width.checked_mul(height).ok_or(ImportError::Overflow)?;
+        Ok(Self {
+            width,
+            height,
+            vertical_value: vec![0; width],
+            vertical_count: vec![0; width],
+            depth_value: vec![0; plane],
+            depth_count: vec![0; plane],
+        })
+    }
+
+    fn break_z_continuity(&mut self) {
+        self.depth_count.fill(0);
+    }
+
+    fn scan_plane(
+        &mut self,
+        plane_le: &[u8],
+        dtype: IntensityDType,
+        cancellation: &ImportCancellation,
+    ) -> Result<Option<u32>, ImportError> {
+        let expected = self
+            .width
+            .checked_mul(self.height)
+            .and_then(|value| value.checked_mul(usize::from(dtype.bytes_per_sample())))
+            .ok_or(ImportError::Overflow)?;
+        if plane_le.len() != expected {
+            return Err(ImportError::InvalidRequest(
+                "automatic no-data detector received a malformed plane",
+            ));
+        }
+        self.vertical_count.fill(0);
+        let edge = AUTOMATIC_NO_DATA_BLOCK_EDGE;
+        for y in 0..self.height {
+            let mut horizontal_value = 0_u32;
+            let mut horizontal_count = 0_u32;
+            for x in 0..self.width {
+                let index = y
+                    .checked_mul(self.width)
+                    .and_then(|value| value.checked_add(x))
+                    .ok_or(ImportError::Overflow)?;
+                if u64::try_from(index)
+                    .map_err(|_| ImportError::Overflow)?
+                    .is_multiple_of(RECONSTRUCTION_CANCEL_INTERVAL)
+                {
+                    check_cancelled(cancellation)?;
+                }
+                let value = sample_bits(plane_le, dtype, index)?;
+                if x > 0 && value == horizontal_value {
+                    horizontal_count = horizontal_count.saturating_add(1);
+                } else {
+                    horizontal_value = value;
+                    horizontal_count = 1;
+                }
+                let patch = if horizontal_count >= edge {
+                    if y > 0 && self.vertical_count[x] != 0 && self.vertical_value[x] == value {
+                        self.vertical_count[x] = self.vertical_count[x].saturating_add(1);
+                    } else {
+                        self.vertical_value[x] = value;
+                        self.vertical_count[x] = 1;
+                    }
+                    self.vertical_count[x] >= edge
+                } else {
+                    self.vertical_count[x] = 0;
+                    false
+                };
+                if patch {
+                    if self.depth_count[index] != 0 && self.depth_value[index] == value {
+                        self.depth_count[index] = self.depth_count[index].saturating_add(1);
+                    } else {
+                        self.depth_value[index] = value;
+                        self.depth_count[index] = 1;
+                    }
+                    if self.depth_count[index] >= edge {
+                        return Ok(Some(value));
+                    }
+                } else {
+                    self.depth_count[index] = 0;
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn plane_is_exactly_constant(plane_le: &[u8], dtype: IntensityDType) -> Result<bool, ImportError> {
+    let width = usize::from(dtype.bytes_per_sample());
+    let mut samples = plane_le.chunks_exact(width);
+    let Some(first) = samples.next() else {
+        return Err(ImportError::InvalidRequest(
+            "constant-plane detection requires a nonempty plane",
+        ));
+    };
+    if !samples.remainder().is_empty() {
+        return Err(ImportError::InvalidRequest(
+            "constant-plane detection received partial sample bytes",
+        ));
+    }
+    Ok(samples.all(|sample| sample == first))
+}
+
+fn sample_bits(plane_le: &[u8], dtype: IntensityDType, index: usize) -> Result<u32, ImportError> {
+    let width = usize::from(dtype.bytes_per_sample());
+    let start = index.checked_mul(width).ok_or(ImportError::Overflow)?;
+    let sample = plane_le
+        .get(start..start + width)
+        .ok_or(ImportError::InvalidRequest(
+            "automatic no-data detector indexed outside its plane",
+        ))?;
+    Ok(match dtype {
+        IntensityDType::Uint8 => u32::from(sample[0]),
+        IntensityDType::Uint16 => u32::from(u16::from_le_bytes([sample[0], sample[1]])),
+        IntensityDType::Float32 => u32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]),
+    })
+}
+
+const fn resolved_value_from_bits(dtype: IntensityDType, bits: u32) -> ResolvedNoDataValue {
+    match dtype {
+        IntensityDType::Uint8 => ResolvedNoDataValue::Uint8(bits as u8),
+        IntensityDType::Uint16 => ResolvedNoDataValue::Uint16(bits as u16),
+        IntensityDType::Float32 => ResolvedNoDataValue::Float32Bits(bits),
+    }
+}
+
 /// Decodes the inspected source exactly once in native strip/tile order into
 /// the durable canonical base checkpoint.
 ///
@@ -766,20 +1568,50 @@ pub(crate) fn capture_generation(
 /// is read once. The source files remain immutable and are strongly checked
 /// again by the pipeline before publication.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn decode_canonical_into_cache(
     inspection: &TiffInspection,
     generation: &SourceGeneration,
     cache: &mut CanonicalBaseCache,
     maximum_decoded_chunk_bytes: u64,
-    working_memory_bytes: u64,
+    managed_capacity_bytes: u64,
     resident_working_bytes: u64,
     ledger: &dyn CpuByteLedger,
     cancellation: &ImportCancellation,
+    plane_completed: impl FnMut(u64, u64),
+) -> Result<SourceDecodeReport, ImportError> {
+    decode_canonical_into_cache_with_parallelism_limit(
+        inspection,
+        generation,
+        cache,
+        maximum_decoded_chunk_bytes,
+        managed_capacity_bytes,
+        resident_working_bytes,
+        ledger,
+        cancellation,
+        crate::ordered_workers::system_parallelism(),
+        plane_completed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_canonical_into_cache_with_parallelism_limit(
+    inspection: &TiffInspection,
+    generation: &SourceGeneration,
+    cache: &mut CanonicalBaseCache,
+    maximum_decoded_chunk_bytes: u64,
+    managed_capacity_bytes: u64,
+    resident_working_bytes: u64,
+    ledger: &dyn CpuByteLedger,
+    cancellation: &ImportCancellation,
+    parallelism_limit: usize,
     mut plane_completed: impl FnMut(u64, u64),
 ) -> Result<SourceDecodeReport, ImportError> {
     check_cancelled(cancellation)?;
     if generation.files.len() != inspection.files.len() {
-        return Err(ImportError::SourceChanged(inspection.source.path.clone()));
+        return Err(ImportError::SourceChanged(
+            inspection.source.primary_path().to_path_buf(),
+        ));
     }
     let mut ordered = inspection.files.iter().enumerate().collect::<Vec<_>>();
     ordered.sort_by(|left, right| {
@@ -860,8 +1692,9 @@ pub(crate) fn decode_canonical_into_cache(
         .and_then(|value| value.checked_add(plane_bytes))
         .and_then(|value| value.checked_add(SOURCE_TASK_METADATA_BYTES_MAX))
         .ok_or(ImportError::Overflow)?;
-    let parallel_policy = OrderedWorkerPolicy::for_system(
-        working_memory_bytes,
+    let parallel_policy = OrderedWorkerPolicy::for_system_with_parallelism_limit(
+        parallelism_limit,
+        managed_capacity_bytes,
         resident_working_bytes,
         parallel_charge,
     )
@@ -917,10 +1750,10 @@ pub(crate) fn decode_canonical_into_cache(
         let combined = resident_working_bytes
             .checked_add(serial_charge)
             .ok_or(ImportError::Overflow)?;
-        if combined > working_memory_bytes {
-            return Err(ImportError::WorkingMemoryExceeded {
+        if combined > managed_capacity_bytes {
+            return Err(ImportError::ManagedCapacityInsufficient {
                 required_bytes: combined,
-                budget_bytes: working_memory_bytes,
+                capacity_bytes: managed_capacity_bytes,
             });
         }
         let _lease = ledger.try_acquire(
@@ -948,6 +1781,148 @@ pub(crate) fn decode_canonical_into_cache(
     }
     cache.commit_pending()?;
     Ok(report)
+}
+
+/// Decodes exactly one reviewed `(channel, timepoint)` volume into a local
+/// `T=1,C=1` canonical cache while preserving the explicit source manifest's
+/// Z/file order. This is the temporal production boundary used by the
+/// importer; total movie length cannot increase decoded checkpoint payload.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_canonical_volume_into_cache(
+    inspection: &TiffInspection,
+    generation: &SourceGeneration,
+    channel: u32,
+    timepoint: u64,
+    cache: &mut CanonicalBaseCache,
+    maximum_decoded_chunk_bytes: u64,
+    managed_capacity_bytes: u64,
+    resident_working_bytes: u64,
+    ledger: &dyn CpuByteLedger,
+    cancellation: &ImportCancellation,
+    parallelism_limit: usize,
+    plane_completed: impl FnMut(u64, u64),
+) -> Result<SourceDecodeReport, ImportError> {
+    if channel >= inspection.channels || timepoint >= inspection.shape.t() {
+        return Err(ImportError::InvalidRequest(
+            "canonical volume coordinate is outside the inspected source",
+        ));
+    }
+    if generation.files.len() != inspection.files.len() {
+        return Err(ImportError::SourceChanged(
+            inspection.source.primary_path().to_path_buf(),
+        ));
+    }
+    let mut files = Vec::new();
+    let mut generations = Vec::new();
+    let mut source_bytes = 0_u64;
+    for (index, file) in inspection.files.iter().enumerate() {
+        if file.channel != channel || file.timepoint != timepoint {
+            continue;
+        }
+        let mut local = file.clone();
+        local.channel = 0;
+        local.timepoint = 0;
+        source_bytes = source_bytes
+            .checked_add(local.bytes)
+            .ok_or(ImportError::Overflow)?;
+        files.push(local);
+        generations.push(
+            *generation
+                .files
+                .get(index)
+                .ok_or_else(|| ImportError::SourceChanged(file.path.clone()))?,
+        );
+    }
+    if files.is_empty() {
+        return Err(ImportError::UnsupportedSource(
+            "the reviewed source manifest does not cover a requested volume".to_owned(),
+        ));
+    }
+    let local = TiffInspection {
+        source: inspection.source.clone(),
+        files,
+        source_index_working_bytes: inspection.source_index_working_bytes,
+        shape: Shape4D::new(
+            1,
+            inspection.shape.z(),
+            inspection.shape.y(),
+            inspection.shape.x(),
+        )
+        .map_err(|_| ImportError::Overflow)?,
+        channels: 1,
+        channel_labels: vec![
+            inspection.channel_labels
+                [usize::try_from(channel).map_err(|_| ImportError::Overflow)?]
+            .clone(),
+        ],
+        dtype: inspection.dtype,
+        ome_spacing_zyx_um: inspection.ome_spacing_zyx_um,
+        source_bytes,
+        source_fingerprint: inspection.source_fingerprint,
+        maximum_decoded_chunk_bytes: inspection.maximum_decoded_chunk_bytes,
+        maximum_encoded_chunk_bytes: inspection.maximum_encoded_chunk_bytes,
+    };
+    decode_canonical_into_cache_with_parallelism_limit(
+        &local,
+        &SourceGeneration { files: generations },
+        cache,
+        maximum_decoded_chunk_bytes,
+        managed_capacity_bytes,
+        resident_working_bytes,
+        ledger,
+        cancellation,
+        parallelism_limit,
+        plane_completed,
+    )
+}
+
+/// Conservative transient byte ceiling for one canonical temporal/channel
+/// decode. Decode-ahead admission uses the larger serial/parallel route so a
+/// speculative lane can never borrow bytes protected for current-unit
+/// progress merely because the source happens to choose a different TIFF
+/// layout at runtime.
+pub(crate) fn canonical_volume_decode_transient_bytes(
+    inspection: &TiffInspection,
+) -> Result<u64, ImportError> {
+    let row_bytes = inspection
+        .shape
+        .x()
+        .checked_mul(u64::from(inspection.dtype.bytes_per_sample()))
+        .ok_or(ImportError::Overflow)?;
+    let plane_bytes = inspection
+        .shape
+        .y()
+        .checked_mul(row_bytes)
+        .ok_or(ImportError::Overflow)?;
+    let maximum_file_pages = inspection
+        .files
+        .iter()
+        .map(|file| file.planes)
+        .max()
+        .unwrap_or(1);
+    let common = inspection
+        .maximum_decoded_chunk_bytes
+        .checked_add(inspection.maximum_encoded_chunk_bytes)
+        .and_then(|value| value.checked_add(SOURCE_DECODE_FIXED_OVERHEAD_BYTES_MAX))
+        .ok_or(ImportError::Overflow)?;
+    let serial = common
+        .checked_add(retained_decoder_bytes(maximum_file_pages).ok_or(ImportError::Overflow)?)
+        .and_then(|value| {
+            value.checked_add(if maximum_file_pages > 1 {
+                SOURCE_SERIAL_TRANSITION_BYTES_MAX
+            } else {
+                0
+            })
+        })
+        .and_then(|value| value.checked_add(row_bytes))
+        .and_then(|value| value.checked_add(SOURCE_TASK_METADATA_BYTES_MAX))
+        .ok_or(ImportError::Overflow)?;
+    let parallel = common
+        .checked_add(retained_decoder_bytes(1).ok_or(ImportError::Overflow)?)
+        .and_then(|value| value.checked_add(plane_bytes))
+        .and_then(|value| value.checked_add(SOURCE_TASK_METADATA_BYTES_MAX))
+        .ok_or(ImportError::Overflow)?;
+    Ok(serial.max(parallel))
 }
 
 #[derive(Clone, Copy)]
@@ -1265,9 +2240,9 @@ fn decode_page_into_cache<R: Read + Seek>(
             let required_bytes =
                 u64::try_from(layout.complete_len).map_err(|_| ImportError::Overflow)?;
             if required_bytes > maximum_decoded_chunk_bytes {
-                return Err(ImportError::WorkingMemoryExceeded {
+                return Err(ImportError::ManagedCapacityInsufficient {
                     required_bytes,
-                    budget_bytes: maximum_decoded_chunk_bytes,
+                    capacity_bytes: maximum_decoded_chunk_bytes,
                 });
             }
             let (data_width, data_height) = decoder.chunk_data_dimensions(chunk_index);
@@ -1280,9 +2255,9 @@ fn decode_page_into_cache<R: Read + Seek>(
                 .ok_or(ImportError::Overflow)?;
             let actual_bytes = decoded_result_bytes(&decoded)?;
             if actual_bytes > maximum_decoded_chunk_bytes {
-                return Err(ImportError::WorkingMemoryExceeded {
+                return Err(ImportError::ManagedCapacityInsufficient {
                     required_bytes: actual_bytes,
-                    budget_bytes: maximum_decoded_chunk_bytes,
+                    capacity_bytes: maximum_decoded_chunk_bytes,
                 });
             }
             counters.decoded_bytes = counters
@@ -1345,9 +2320,9 @@ fn decode_page_into_plane<R: Read + Seek>(
             let required_bytes =
                 u64::try_from(layout.complete_len).map_err(|_| ImportError::Overflow)?;
             if required_bytes > maximum_decoded_chunk_bytes {
-                return Err(ImportError::WorkingMemoryExceeded {
+                return Err(ImportError::ManagedCapacityInsufficient {
                     required_bytes,
-                    budget_bytes: maximum_decoded_chunk_bytes,
+                    capacity_bytes: maximum_decoded_chunk_bytes,
                 });
             }
             let (data_width, data_height) = decoder.chunk_data_dimensions(chunk_index);
@@ -1360,9 +2335,9 @@ fn decode_page_into_plane<R: Read + Seek>(
                 .ok_or(ImportError::Overflow)?;
             let actual_bytes = decoded_result_bytes(&decoded)?;
             if actual_bytes > maximum_decoded_chunk_bytes {
-                return Err(ImportError::WorkingMemoryExceeded {
+                return Err(ImportError::ManagedCapacityInsufficient {
                     required_bytes: actual_bytes,
-                    budget_bytes: maximum_decoded_chunk_bytes,
+                    capacity_bytes: maximum_decoded_chunk_bytes,
                 });
             }
             counters.decoded_bytes = counters
@@ -2150,15 +3125,10 @@ fn inspect_file(
             break;
         }
     }
-    decoder
-        .inner()
-        .seek(SeekFrom::Start(0))
-        .map_err(|source| io_error("rewind source for inspection hash", path, source))?;
-    let (bytes, sha256) = hash_reader_cancellable(path, decoder.inner(), cancellation)?;
     check_cancelled(cancellation)?;
     let opened_after = source_file_generation_from_open_file(path, decoder.inner().get_ref())?;
     let path_after = source_file_generation(path)?;
-    if before != opened_after || before != path_after || before.bytes != bytes {
+    if before != opened_after || before != path_after {
         return Err(ImportError::SourceChanged(path.to_path_buf()));
     }
     let (width, height, dtype) = expected.expect("a TIFF decoder always exposes one image");
@@ -2177,8 +3147,7 @@ fn inspect_file(
         ome_spacing_zyx_um,
         maximum_decoded_chunk_bytes,
         maximum_encoded_chunk_bytes,
-        bytes,
-        sha256,
+        bytes: before.bytes,
         generation: before,
     })
 }
@@ -2280,206 +3249,28 @@ fn validate_current_page<R: Read + Seek>(
     Ok(())
 }
 
-fn hash_file_cancellable(
-    path: &Path,
-    cancellation: &ImportCancellation,
-) -> Result<(u64, Sha256Digest), ImportError> {
-    let before = source_file_generation(path)?;
-    let mut file = open_source_file(path, "open source for hashing")?;
-    if source_file_generation_from_open_file(path, &file)? != before {
-        return Err(ImportError::SourceChanged(path.to_path_buf()));
-    }
-    let result = hash_reader_cancellable(path, &mut file, cancellation)?;
-    if source_file_generation_from_open_file(path, &file)? != before
-        || source_file_generation(path)? != before
-    {
-        return Err(ImportError::SourceChanged(path.to_path_buf()));
-    }
-    Ok(result)
-}
-
-fn hash_reader_cancellable(
-    path: &Path,
-    mut reader: impl Read,
-    cancellation: &ImportCancellation,
-) -> Result<(u64, Sha256Digest), ImportError> {
-    let mut buffer = [0_u8; HASH_READ_BYTES];
-    let mut bytes = 0_u64;
-    let mut hasher = Sha256Hasher::new();
-    loop {
-        check_cancelled(cancellation)?;
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|source| io_error("hash source", path, source))?;
-        check_cancelled(cancellation)?;
-        if read == 0 {
-            break;
-        }
-        bytes = bytes
-            .checked_add(u64::try_from(read).map_err(|_| ImportError::Overflow)?)
-            .ok_or(ImportError::Overflow)?;
-        hasher.update(&buffer[..read]);
-    }
-    Ok((bytes, hasher.finalize()))
-}
-
-fn discover_directory_layout(
-    root: &Path,
-    cancellation: &ImportCancellation,
-) -> Result<DirectoryLayout, ImportError> {
-    let mut direct = Vec::new();
-    let mut folders = Vec::new();
-    for entry in read_directory(root, cancellation)? {
-        check_cancelled(cancellation)?;
-        let file_type = entry
-            .file_type()
-            .map_err(|source| io_error("inspect source entry", &entry.path(), source))?;
-        let path = entry.path();
-        if file_type.is_symlink() {
-            return Err(ImportError::UnsupportedSource(format!(
-                "source entry {path:?} must not be a symbolic link"
-            )));
-        }
-        if file_type.is_file() {
-            if !is_tiff_path(&path) {
-                return Err(ImportError::UnsupportedSource(format!(
-                    "source directory contains non-TIFF file {path:?}"
-                )));
-            }
-            direct.push(path);
-        } else if file_type.is_dir() {
-            folders.push(path);
-        } else {
-            return Err(ImportError::UnsupportedSource(format!(
-                "source entry {path:?} is not a regular file or directory"
-            )));
-        }
-    }
-    if direct.is_empty() && folders.is_empty() {
-        return Err(ImportError::UnsupportedSource(
-            "source directory contains no TIFF files or channel folders".to_owned(),
-        ));
-    }
-    if !direct.is_empty() && !folders.is_empty() {
-        return Err(ImportError::AmbiguousSource(
-            "direct TIFF stacks are mixed with channel folders".to_owned(),
-        ));
-    }
-    if !direct.is_empty() {
-        if direct.len() > MAX_SOURCE_FILES {
-            return Err(ImportError::UnsupportedSource(format!(
-                "source contains more than {MAX_SOURCE_FILES} TIFF files"
-            )));
-        }
-        direct.sort();
-        return Ok(DirectoryLayout::Direct(direct));
-    }
-
-    let mut total = 0_usize;
-    let mut channel_folders = Vec::with_capacity(folders.len());
-    for folder in folders {
-        check_cancelled(cancellation)?;
-        let mut planes = Vec::new();
-        for entry in read_directory(&folder, cancellation)? {
-            check_cancelled(cancellation)?;
-            let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .map_err(|source| io_error("inspect channel-folder entry", &path, source))?;
-            if file_type.is_symlink() || file_type.is_dir() {
-                return Err(ImportError::UnsupportedSource(format!(
-                    "channel folder {folder:?} must be non-recursive and contain only regular TIFF planes"
-                )));
-            }
-            if !file_type.is_file() || !is_tiff_path(&path) {
-                return Err(ImportError::UnsupportedSource(format!(
-                    "channel folder {folder:?} contains non-TIFF entry {path:?}"
-                )));
-            }
-            planes.push(path);
-            total = total.checked_add(1).ok_or(ImportError::Overflow)?;
-            if total > MAX_SOURCE_FILES {
-                return Err(ImportError::UnsupportedSource(format!(
-                    "source contains more than {MAX_SOURCE_FILES} TIFF files"
-                )));
-            }
-        }
-        if planes.is_empty() {
-            return Err(ImportError::UnsupportedSource(format!(
-                "channel folder {folder:?} contains no TIFF planes"
-            )));
-        }
-        planes.sort();
-        channel_folders.push((folder, planes));
-    }
-    channel_folders.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(DirectoryLayout::ChannelFolders(channel_folders))
-}
-
-fn read_directory(
-    path: &Path,
-    cancellation: &ImportCancellation,
-) -> Result<Vec<fs::DirEntry>, ImportError> {
-    let directory =
-        fs::read_dir(path).map_err(|source| io_error("list source directory", path, source))?;
-    let mut entries = Vec::new();
-    for entry in directory {
-        check_cancelled(cancellation)?;
-        entries
-            .push(entry.map_err(|source| io_error("read source directory entry", path, source))?);
-        if entries.len() > MAX_SOURCE_FILES {
-            return Err(ImportError::UnsupportedSource(format!(
-                "source directory contains more than {MAX_SOURCE_FILES} entries"
-            )));
-        }
-    }
-    Ok(entries)
-}
-
 fn enumerate_accepted_layout_files(
     inspection: &TiffInspection,
     cancellation: &ImportCancellation,
 ) -> Result<Vec<(String, PathBuf)>, ImportError> {
     check_cancelled(cancellation)?;
-    let root_metadata = fs::symlink_metadata(&inspection.source.path)
-        .map_err(|_| ImportError::SourceChanged(inspection.source.path.clone()))?;
-    if root_metadata.file_type().is_symlink() {
-        return Err(ImportError::SourceChanged(inspection.source.path.clone()));
-    }
-    if root_metadata.is_file() {
-        if inspection.layout != SourceLayout::MultipageStacks || inspection.files.len() != 1 {
-            return Err(ImportError::SourceChanged(inspection.source.path.clone()));
+    let mut files = Vec::with_capacity(inspection.files.len());
+    for (channel_index, channel) in inspection.source.channels().iter().enumerate() {
+        let paths =
+            explicit_channel_inventory(channel, cancellation).map_err(|error| match error {
+                ImportError::Cancelled => ImportError::Cancelled,
+                _ => ImportError::SourceChanged(channel.path().to_path_buf()),
+            })?;
+        let channel = u32::try_from(channel_index).map_err(|_| ImportError::Overflow)?;
+        for path in paths {
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| ImportError::SourceChanged(path.clone()))?;
+            files.push((format!("channel-{channel:08}/{file_name}"), path));
         }
-        let relative = relative_name_for_file(&inspection.source.path, &inspection.source.path)
-            .map_err(|_| ImportError::SourceChanged(inspection.source.path.clone()))?;
-        return Ok(vec![(relative, inspection.source.path.clone())]);
-    }
-    if !root_metadata.is_dir() {
-        return Err(ImportError::SourceChanged(inspection.source.path.clone()));
-    }
-    let discovered = match discover_directory_layout(&inspection.source.path, cancellation) {
-        Ok(discovered) => discovered,
-        Err(ImportError::Cancelled) => return Err(ImportError::Cancelled),
-        Err(_) => return Err(ImportError::SourceChanged(inspection.source.path.clone())),
-    };
-    let paths = match (inspection.layout, discovered) {
-        (SourceLayout::MultipageStacks, DirectoryLayout::Direct(paths)) => paths,
-        (SourceLayout::ChannelFoldersOfPlanes, DirectoryLayout::ChannelFolders(folders)) => {
-            folders.into_iter().flat_map(|(_, planes)| planes).collect()
-        }
-        _ => return Err(ImportError::SourceChanged(inspection.source.path.clone())),
-    };
-    let mut files = Vec::with_capacity(paths.len());
-    for path in paths {
-        check_cancelled(cancellation)?;
-        let relative = relative_name_for_file(&inspection.source.path, &path)
-            .map_err(|_| ImportError::SourceChanged(path.clone()))?;
-        files.push((relative, path));
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
-    if files.windows(2).any(|window| window[0].0 == window[1].0) {
-        return Err(ImportError::SourceChanged(inspection.source.path.clone()));
-    }
     Ok(files)
 }
 
@@ -2500,184 +3291,6 @@ fn is_tiff_path(path: &Path) -> bool {
         .is_some_and(|extension| {
             extension.eq_ignore_ascii_case("tif") || extension.eq_ignore_ascii_case("tiff")
         })
-}
-
-fn relative_name_for_file(root: &Path, path: &Path) -> Result<String, ImportError> {
-    if root == path && root.is_file() {
-        let name = path.file_name().ok_or_else(|| {
-            ImportError::UnsupportedSource("single TIFF path has no file name".to_owned())
-        })?;
-        return path_components_to_string(Path::new(name));
-    }
-    let relative = path.strip_prefix(root).map_err(|_| {
-        ImportError::UnsupportedSource("source TIFF escaped its selected root".to_owned())
-    })?;
-    path_components_to_string(relative)
-}
-
-fn relative_name_for_directory(root: &Path, path: &Path) -> Result<String, ImportError> {
-    let relative = path.strip_prefix(root).map_err(|_| {
-        ImportError::UnsupportedSource("source folder escaped its selected root".to_owned())
-    })?;
-    path_components_to_string(relative)
-}
-
-fn path_components_to_string(path: &Path) -> Result<String, ImportError> {
-    let mut components = Vec::new();
-    for component in path.components() {
-        let Component::Normal(component) = component else {
-            return Err(ImportError::UnsupportedSource(
-                "source-relative names may contain only normal path components".to_owned(),
-            ));
-        };
-        components.push(component.to_str().ok_or_else(|| {
-            ImportError::UnsupportedSource("source names must be valid UTF-8".to_owned())
-        })?);
-    }
-    if components.is_empty() {
-        return Err(ImportError::UnsupportedSource(
-            "source-relative name must not be empty".to_owned(),
-        ));
-    }
-    Ok(components.join("/"))
-}
-
-fn parse_unique_numeric_token(
-    filename: &str,
-    tokens: &[&str],
-    axis: &str,
-) -> Result<Option<u64>, ImportError> {
-    let lowercase = filename.to_ascii_lowercase();
-    let bytes = lowercase.as_bytes();
-    let mut matches = Vec::new();
-    for index in 0..bytes.len() {
-        if index > 0 && bytes[index - 1].is_ascii_alphanumeric() {
-            continue;
-        }
-        for token in tokens {
-            let token_bytes = token.as_bytes();
-            if !bytes[index..].starts_with(token_bytes) {
-                continue;
-            }
-            let mut digit_start = index + token_bytes.len();
-            while digit_start < bytes.len()
-                && matches!(bytes[digit_start], b'_' | b'-' | b'=' | b'.' | b' ')
-            {
-                digit_start += 1;
-            }
-            let mut end = digit_start;
-            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            if end == digit_start || (end < bytes.len() && bytes[end].is_ascii_alphanumeric()) {
-                continue;
-            }
-            let value = lowercase[digit_start..end].parse::<u64>().map_err(|_| {
-                ImportError::AmbiguousSource(format!(
-                    "{axis} numeric token in filename {filename:?} is out of range"
-                ))
-            })?;
-            matches.push(value);
-        }
-    }
-    if matches.len() > 1 {
-        return Err(ImportError::AmbiguousSource(format!(
-            "filename {filename:?} contains more than one {axis} numeric token"
-        )));
-    }
-    Ok(matches.into_iter().next())
-}
-
-fn consistent_optional_labels(
-    candidates: &[DirectCandidate],
-    label: impl Fn(&DirectCandidate) -> Option<u64>,
-    axis: &str,
-) -> Result<Option<Vec<u64>>, ImportError> {
-    let labels = candidates.iter().map(label).collect::<Vec<_>>();
-    let present = labels.iter().filter(|label| label.is_some()).count();
-    if present != 0 && present != labels.len() {
-        return Err(ImportError::AmbiguousSource(format!(
-            "{axis} tokens are present in only some direct TIFF filenames"
-        )));
-    }
-    Ok((present != 0).then(|| labels.into_iter().flatten().collect()))
-}
-
-fn consistent_folder_labels(
-    folders: &[(String, Option<u64>, Vec<PathBuf>)],
-) -> Result<Option<Vec<u64>>, ImportError> {
-    let labels = folders
-        .iter()
-        .map(|(_, label, _)| *label)
-        .collect::<Vec<_>>();
-    let present = labels.iter().filter(|label| label.is_some()).count();
-    if present != 0 && present != labels.len() {
-        return Err(ImportError::AmbiguousSource(
-            "channel numeric tokens are present in only some channel-folder names".to_owned(),
-        ));
-    }
-    Ok((present != 0).then(|| labels.into_iter().flatten().collect()))
-}
-
-fn sorted_axis_values(labels: Option<&[u64]>) -> Vec<u64> {
-    let mut values = labels.map_or_else(|| vec![0], ToOwned::to_owned);
-    values.sort_unstable();
-    values.dedup();
-    values
-}
-
-fn ordinal_map(values: &[u64]) -> Result<BTreeMap<u64, u32>, ImportError> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(ordinal, value)| {
-            Ok((
-                *value,
-                u32::try_from(ordinal).map_err(|_| ImportError::Overflow)?,
-            ))
-        })
-        .collect()
-}
-
-fn check_common_stack_facts(
-    relative_name: &str,
-    common: &mut Option<(u64, u64, u64, IntensityDType)>,
-    width: u64,
-    height: u64,
-    pages: u64,
-    dtype: IntensityDType,
-) -> Result<(), ImportError> {
-    let facts = (width, height, pages, dtype);
-    if let Some(expected) = *common {
-        if facts != expected {
-            return Err(ImportError::UnsupportedSource(format!(
-                "direct TIFF stack {relative_name:?} does not match the common dimensions, page count, and dtype"
-            )));
-        }
-    } else {
-        *common = Some(facts);
-    }
-    Ok(())
-}
-
-fn check_common_plane_facts(
-    relative_name: &str,
-    common: &mut Option<(u64, u64, IntensityDType)>,
-    width: u64,
-    height: u64,
-    dtype: IntensityDType,
-) -> Result<(), ImportError> {
-    let facts = (width, height, dtype);
-    if let Some(expected) = *common {
-        if facts != expected {
-            return Err(ImportError::UnsupportedSource(format!(
-                "TIFF plane {relative_name:?} does not match the common dimensions and dtype"
-            )));
-        }
-    } else {
-        *common = Some(facts);
-    }
-    Ok(())
 }
 
 #[derive(Default)]
@@ -3104,9 +3717,8 @@ fn physical_size_to_um(value: f64, unit: &str) -> Option<f64> {
 
 #[allow(clippy::too_many_arguments)]
 fn aggregate_fingerprint(
-    layout: SourceLayout,
+    source: &TiffSource,
     shape: Shape4D,
-    channels: u32,
     dtype: IntensityDType,
     ome_spacing_zyx_um: Option<[f64; 3]>,
     source_bytes: u64,
@@ -3121,16 +3733,29 @@ fn aggregate_fingerprint(
             .then(left.relative_name.cmp(&right.relative_name))
     });
     let mut hasher = Sha256Hasher::new();
-    hasher.update(b"mirante4d-import-source-v1\0");
-    hasher.update([match layout {
-        SourceLayout::Auto => 0,
-        SourceLayout::MultipageStacks => 1,
-        SourceLayout::ChannelFoldersOfPlanes => 2,
-    }]);
+    hasher.update(b"mirante4d-import-structural-source-manifest-v2\0");
     for dimension in shape.dimensions() {
         hasher.update(dimension.to_le_bytes());
     }
-    hasher.update(channels.to_le_bytes());
+    hasher.update(
+        u32::try_from(source.channels().len())
+            .map_err(|_| ImportError::Overflow)?
+            .to_le_bytes(),
+    );
+    for channel in source.channels() {
+        let label = channel.label().as_bytes();
+        hasher.update(
+            u64::try_from(label.len())
+                .map_err(|_| ImportError::Overflow)?
+                .to_le_bytes(),
+        );
+        hasher.update(label);
+        hasher.update([match channel.kind() {
+            TiffChannelSourceKind::Single3dTiff => 1,
+            TiffChannelSourceKind::FolderOf3dTiffs => 2,
+            TiffChannelSourceKind::FolderOf2dTiffs => 3,
+        }]);
+    }
     hasher.update([match dtype {
         IntensityDType::Uint8 => 1,
         IntensityDType::Uint16 => 2,
@@ -3164,7 +3789,12 @@ fn aggregate_fingerprint(
         hasher.update(file.first_z.to_le_bytes());
         hasher.update(file.planes.to_le_bytes());
         hasher.update(file.bytes.to_le_bytes());
-        hasher.update(file.sha256.as_bytes());
+        hasher.update(file.generation.device.to_le_bytes());
+        hasher.update(file.generation.inode.to_le_bytes());
+        hasher.update(file.generation.modified_seconds.to_le_bytes());
+        hasher.update(file.generation.modified_nanoseconds.to_le_bytes());
+        hasher.update(file.generation.changed_seconds.to_le_bytes());
+        hasher.update(file.generation.changed_nanoseconds.to_le_bytes());
     }
     Ok(hasher.finalize())
 }
@@ -3307,7 +3937,7 @@ impl<R: Seek> Seek for CountingReader<R> {
 mod tests {
     use std::{
         fs::{self, File, OpenOptions},
-        io::{Cursor, Write},
+        io::Write,
         path::Path,
         sync::{Arc, Mutex},
     };
@@ -3344,6 +3974,285 @@ mod tests {
             assert_eq!(category, CpuLedgerCategory::ImportWorkingSet);
             Ok(Box::new(TestLease(bytes)))
         }
+    }
+
+    fn encode_detector_plane(dtype: IntensityDType, values: &[u32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| match dtype {
+                IntensityDType::Uint8 => vec![*value as u8],
+                IntensityDType::Uint16 => (*value as u16).to_le_bytes().to_vec(),
+                IntensityDType::Float32 => value.to_le_bytes().to_vec(),
+            })
+            .collect()
+    }
+
+    fn naive_uniform_cube(volume: &[u32], shape: [usize; 3]) -> Option<u32> {
+        if shape.iter().any(|dimension| *dimension < 5) {
+            return None;
+        }
+        for z in 0..=shape[0] - 5 {
+            for y in 0..=shape[1] - 5 {
+                for x in 0..=shape[2] - 5 {
+                    let expected = volume[(z * shape[1] + y) * shape[2] + x];
+                    let uniform = (z..z + 5).all(|zz| {
+                        (y..y + 5).all(|yy| {
+                            (x..x + 5)
+                                .all(|xx| volume[(zz * shape[1] + yy) * shape[2] + xx] == expected)
+                        })
+                    });
+                    if uniform {
+                        return Some(expected);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn rolling_uniform_cube_detector_matches_brute_force_for_every_dtype() {
+        let shape = [7_usize, 8_usize, 9_usize];
+        for dtype in [
+            IntensityDType::Uint8,
+            IntensityDType::Uint16,
+            IntensityDType::Float32,
+        ] {
+            for seed in 0_u32..12 {
+                let modulus = match dtype {
+                    IntensityDType::Uint8 => 251,
+                    IntensityDType::Uint16 => 65_521,
+                    IntensityDType::Float32 => 0x007f_ffff,
+                };
+                let mut volume = (0..shape.iter().product::<usize>())
+                    .map(|index| {
+                        let mixed = (index as u32)
+                            .wrapping_mul(1_664_525)
+                            .wrapping_add(seed.wrapping_mul(1_013_904_223));
+                        match dtype {
+                            IntensityDType::Float32 => 0x3f00_0000 | (mixed % modulus),
+                            _ => mixed % modulus,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if seed % 2 == 0 {
+                    let value = match dtype {
+                        IntensityDType::Float32 => 1.25_f32.to_bits(),
+                        _ => 37,
+                    };
+                    for z in 1..6 {
+                        for y in 2..7 {
+                            for x in 3..8 {
+                                volume[(z * shape[1] + y) * shape[2] + x] = value;
+                            }
+                        }
+                    }
+                }
+                let expected = naive_uniform_cube(&volume, shape);
+                let mut detector =
+                    UniformCubeDetector::new(shape[2] as u64, shape[1] as u64).unwrap();
+                let cancellation = ImportCancellation::new();
+                let mut actual = None;
+                for z in 0..shape[0] {
+                    let start = z * shape[1] * shape[2];
+                    let end = start + shape[1] * shape[2];
+                    actual = detector
+                        .scan_plane(
+                            &encode_detector_plane(dtype, &volume[start..end]),
+                            dtype,
+                            &cancellation,
+                        )
+                        .unwrap();
+                    if actual.is_some() {
+                        break;
+                    }
+                }
+                assert_eq!(actual, expected, "dtype={dtype:?} seed={seed}");
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruction_memory_is_three_packed_bitsets() {
+        assert_eq!(
+            automatic_reconstruction_transient_bytes([5, 5, 5]),
+            Some(
+                5 * 5 * 3
+                    + RECONSTRUCTION_RUNS_IN_MEMORY as u64 * RECONSTRUCTION_RUN_RECORD_BYTES
+                    + RECONSTRUCTION_IO_BUFFER_BYTES as u64
+            )
+        );
+        let wide_shape = [5, 65_536, 13_108];
+        let voxels = wide_shape.into_iter().product::<u64>();
+        assert!(voxels > u64::from(u32::MAX) + 1);
+        assert_eq!(
+            automatic_reconstruction_transient_bytes(wide_shape),
+            automatic_mask_packed_bytes(wide_shape)
+                .and_then(|bytes| bytes.checked_mul(3))
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        RECONSTRUCTION_RUNS_IN_MEMORY as u64 * RECONSTRUCTION_RUN_RECORD_BYTES,
+                    )
+                })
+                .and_then(|bytes| bytes.checked_add(RECONSTRUCTION_IO_BUFFER_BYTES as u64))
+        );
+        assert_eq!(
+            automatic_reconstruction_transient_bytes([4, 99, 99]),
+            Some(0)
+        );
+        assert_eq!(
+            automatic_reconstruction_spool_bytes([5, 7, 9]),
+            Some(5 * 7 * 5 * RECONSTRUCTION_RUN_RECORD_BYTES)
+        );
+        assert_eq!(automatic_reconstruction_spool_bytes([4, 99, 99]), Some(0));
+    }
+
+    #[test]
+    fn reconstruction_frontier_spills_and_preserves_lifo_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut stack = BoundedRunStack::new(temp.path()).unwrap();
+        let total = RECONSTRUCTION_RUNS_IN_MEMORY + RECONSTRUCTION_IO_RUNS + 17;
+        for index in 0..total {
+            let index = index as u64;
+            stack
+                .push(EqualRun {
+                    z: index,
+                    y: index + 1,
+                    x_start: index + 2,
+                    x_end: index + 3,
+                })
+                .unwrap();
+        }
+        assert!(temp.path().join(RECONSTRUCTION_RUN_SPOOL_NAME).exists());
+        for expected in (0..total as u64).rev() {
+            assert_eq!(
+                stack.pop().unwrap(),
+                Some(EqualRun {
+                    z: expected,
+                    y: expected + 1,
+                    x_start: expected + 2,
+                    x_end: expected + 3,
+                })
+            );
+        }
+        assert_eq!(stack.pop().unwrap(), None);
+        stack.finish().unwrap();
+        assert!(!temp.path().join(RECONSTRUCTION_RUN_SPOOL_NAME).exists());
+    }
+
+    #[test]
+    fn detector_uses_exact_float_bits_and_constant_plane_test_is_exact() {
+        let mut volume = vec![1.0_f32.to_bits(); 5 * 5 * 5];
+        volume[62] = f32::from_bits(1.0_f32.to_bits() + 1).to_bits();
+        let mut detector = UniformCubeDetector::new(5, 5).unwrap();
+        let cancellation = ImportCancellation::new();
+        let mut found = None;
+        for plane in volume.chunks_exact(25) {
+            found = detector
+                .scan_plane(
+                    &encode_detector_plane(IntensityDType::Float32, plane),
+                    IntensityDType::Float32,
+                    &cancellation,
+                )
+                .unwrap();
+        }
+        assert_eq!(found, None);
+        assert!(plane_is_exactly_constant(&[7_u8; 25], IntensityDType::Uint8).unwrap());
+        let mut nonconstant = vec![0_u8; 50];
+        nonconstant[49] = 1;
+        assert!(!plane_is_exactly_constant(&nonconstant, IntensityDType::Uint16).unwrap());
+    }
+
+    #[test]
+    fn policy_resolution_reads_only_the_first_float_volume() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("float-series");
+        fs::create_dir(&source).unwrap();
+        let shape = [6_usize, 6_usize, 6_usize];
+        let mut first = vec![0.0_f32; shape.iter().product()];
+        for z in 1..shape[0] {
+            for y in 0..shape[1] {
+                for x in 0..shape[2] {
+                    first[(z * shape[1] + y) * shape[2] + x] = if y < 5 && x < 5 {
+                        42.25
+                    } else {
+                        (z * 100 + y * 10 + x) as f32
+                    };
+                }
+            }
+        }
+        let mut second = (0..shape.iter().product())
+            .map(|index| index as f32 + 0.5)
+            .collect::<Vec<_>>();
+        second[2 * shape[1] * shape[2]..3 * shape[1] * shape[2]].fill(99.0);
+        for (timepoint, values) in [(0, &first), (1, &second)] {
+            let file = File::create(source.join(format!("sample_time{timepoint}.tif"))).unwrap();
+            let mut encoder = TiffEncoder::new(file).unwrap();
+            for plane in values.chunks_exact(shape[1] * shape[2]) {
+                encoder
+                    .write_image::<colortype::Gray32Float>(shape[2] as u32, shape[1] as u32, plane)
+                    .unwrap();
+            }
+        }
+
+        let inspection = inspect(
+            TiffSource::new(vec![
+                TiffChannelSource::folder_of_3d("channel 1", &source).unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(inspection.shape.t(), 2);
+        let generation = capture_generation(&inspection, &ImportCancellation::new()).unwrap();
+        let checkpoint = root.path().join("canonical");
+        fs::create_dir(&checkpoint).unwrap();
+        let mut cache = CanonicalBaseCache::open_or_create(
+            &checkpoint,
+            crate::canonical_cache::CanonicalCacheBinding::new(
+                Sha256Digest::parse(&"2".repeat(64)).unwrap(),
+                inspection.source_fingerprint,
+            ),
+            inspection.shape,
+            inspection.channels,
+            inspection.dtype,
+        )
+        .unwrap();
+        decode_canonical_into_cache(
+            &inspection,
+            &generation,
+            &mut cache,
+            inspection.maximum_decoded_chunk_bytes,
+            256 * 1024 * 1024,
+            inspection.source_index_working_bytes,
+            &TestLedger,
+            &ImportCancellation::new(),
+            |_, _| {},
+        )
+        .unwrap();
+        let request = NoDataPolicy::new(Some(NoDataValueRule::Automatic), true);
+        let report = resolve_no_data_policy_from_cache(
+            &inspection,
+            &cache.reader().unwrap(),
+            &checkpoint,
+            Some(request),
+            &TestLedger,
+            &ImportCancellation::new(),
+            |_, _| {},
+        )
+        .unwrap();
+
+        assert_eq!(report.completed_planes, 12);
+        assert_eq!(report.policy.request(), Some(request));
+        assert_eq!(report.policy.constant_z_planes(), [0]);
+        assert_eq!(
+            report.policy.value(),
+            Some(ResolvedNoDataValue::Float32Bits(42.25_f32.to_bits()))
+        );
+        let mask = report.policy.automatic_mask().unwrap();
+        assert_eq!(mask.shape_zyx(), [6, 6, 6]);
+        assert_eq!(mask.masked_voxels(), 125);
+        assert!(mask.contains(5, 4, 4));
+        assert!(!mask.contains(5, 5, 5));
     }
 
     #[derive(Default)]
@@ -3405,42 +4314,13 @@ mod tests {
         }
     }
 
-    struct CancelAfterFirstRead {
-        source: Cursor<Vec<u8>>,
-        cancellation: ImportCancellation,
-    }
-
-    impl std::io::Read for CancelAfterFirstRead {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            let read = std::io::Read::read(&mut self.source, buffer)?;
-            if read > 0 {
-                self.cancellation.cancel();
-            }
-            Ok(read)
-        }
-    }
-
-    #[test]
-    fn source_hashing_stops_between_bounded_reads() {
-        let cancellation = ImportCancellation::new();
-        let reader = CancelAfterFirstRead {
-            source: Cursor::new(vec![7; HASH_READ_BYTES * 2]),
-            cancellation: cancellation.clone(),
-        };
-        assert!(matches!(
-            hash_reader_cancellable(Path::new("source.tif"), reader, &cancellation),
-            Err(ImportError::Cancelled)
-        ));
-    }
-
     #[test]
     fn single_stack_inspection_and_canonical_decode_are_exact_and_bounded() {
         let temporary = tempdir().unwrap();
         let path = temporary.path().join("stack.tif");
         write_u16_stack(&path, 4, 3, 2, true).unwrap();
 
-        let inspection = inspect(TiffSource::auto(&path)).unwrap();
-        assert_eq!(inspection.layout, SourceLayout::MultipageStacks);
+        let inspection = inspect(TiffSource::single_3d(&path)).unwrap();
         assert_eq!(inspection.shape.dimensions(), [1, 2, 3, 4]);
         assert_eq!(inspection.channels, 1);
         assert_eq!(inspection.dtype, IntensityDType::Uint16);
@@ -3448,15 +4328,9 @@ mod tests {
         assert_eq!(inspection.files[0].planes, 2);
         assert_eq!(inspection.source_bytes, fs::metadata(&path).unwrap().len());
         assert_eq!(inspection.maximum_decoded_chunk_bytes, 8);
-        assert_eq!(
-            inspection.files[0].sha256,
-            hash_file_cancellable(&path, &ImportCancellation::new())
-                .unwrap()
-                .1
-        );
         let revalidation = revalidate(&inspection, &ImportCancellation::new()).unwrap();
-        assert_eq!(revalidation.source_bytes_read, inspection.source_bytes);
-        assert_eq!(revalidation.tiff_open_count, 1);
+        assert_eq!(revalidation.source_bytes_read, 0);
+        assert_eq!(revalidation.tiff_open_count, 0);
 
         let cancellation = ImportCancellation::new();
         cancellation.cancel();
@@ -3553,9 +4427,9 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             error,
-            ImportError::WorkingMemoryExceeded {
+            ImportError::ManagedCapacityInsufficient {
                 required_bytes: 8,
-                budget_bytes: 7
+                capacity_bytes: 7
             }
         ));
 
@@ -3610,7 +4484,7 @@ mod tests {
         let path = temporary.path().join("stack.tif");
         let backup = temporary.path().join("stack-original.tif");
         write_u16_stack(&path, 4, 3, 1, true).unwrap();
-        let inspection = inspect(TiffSource::auto(&path)).unwrap();
+        let inspection = inspect(TiffSource::single_3d(&path)).unwrap();
         fs::rename(&path, &backup).unwrap();
         fs::copy(&backup, &path).unwrap();
 
@@ -3652,43 +4526,55 @@ mod tests {
     }
 
     #[test]
-    fn direct_stack_tokens_form_a_dense_deterministic_mapping_without_absolute_paths() {
+    fn explicit_channels_ignore_filename_tokens_and_bind_relative_structure() {
         let first = tempdir().unwrap();
         let second = tempdir().unwrap();
         let first_root = first.path().join("source");
         let second_root = second.path().join("source");
         fs::create_dir(&first_root).unwrap();
         fs::create_dir(&second_root).unwrap();
-        for (filename, base) in [
-            ("sample_ch10_time9.tif", 190),
-            ("sample_ch2_time5.tif", 25),
-            ("sample_ch10_time5.tif", 150),
-            ("sample_ch2_time9.tif", 29),
-        ] {
-            write_u16_stack_with_base(&first_root.join(filename), 2, 2, 1, false, base).unwrap();
-            fs::copy(first_root.join(filename), second_root.join(filename)).unwrap();
+        for root in [&first_root, &second_root] {
+            let red = root.join("red");
+            let green = root.join("green");
+            fs::create_dir(&red).unwrap();
+            fs::create_dir(&green).unwrap();
+            for (folder, files) in [
+                (&red, [("zebra.tif", 90), ("alpha.tif", 50)]),
+                (&green, [("unrelated-b.tif", 190), ("unrelated-a.tif", 150)]),
+            ] {
+                for (filename, base) in files {
+                    write_u16_stack_with_base(&folder.join(filename), 2, 2, 1, false, base)
+                        .unwrap();
+                }
+            }
         }
-
-        let first_inspection = inspect(TiffSource::auto(&first_root)).unwrap();
-        let second_inspection = inspect(TiffSource::auto(&second_root)).unwrap();
+        let manifest = |root: &Path| {
+            TiffSource::new(vec![
+                TiffChannelSource::folder_of_3d("red", root.join("red")).unwrap(),
+                TiffChannelSource::folder_of_3d("green", root.join("green")).unwrap(),
+            ])
+            .unwrap()
+        };
+        let first_inspection = inspect(manifest(&first_root)).unwrap();
+        let second_inspection = inspect(manifest(&second_root)).unwrap();
         assert_eq!(first_inspection.shape.dimensions(), [2, 1, 2, 2]);
         assert_eq!(first_inspection.channels, 2);
-        assert_eq!(
+        assert_ne!(
             first_inspection.source_fingerprint,
             second_inspection.source_fingerprint
         );
         let mapping = first_inspection
             .files
             .iter()
-            .map(|file| (file.relative_name.as_str(), file.channel, file.timepoint))
-            .collect::<BTreeSet<_>>();
-        assert!(mapping.contains(&("sample_ch2_time5.tif", 0, 0)));
-        assert!(mapping.contains(&("sample_ch2_time9.tif", 0, 1)));
-        assert!(mapping.contains(&("sample_ch10_time5.tif", 1, 0)));
-        assert!(mapping.contains(&("sample_ch10_time9.tif", 1, 1)));
+            .map(|file| (file.channel, file.timepoint, file.path.file_name().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(mapping[0].2, "alpha.tif");
+        assert_eq!(mapping[1].2, "zebra.tif");
+        assert_eq!(mapping[2].2, "unrelated-a.tif");
+        assert_eq!(mapping[3].2, "unrelated-b.tif");
         revalidate(&first_inspection, &ImportCancellation::new()).unwrap();
 
-        write_u16_stack(&first_root.join("sample_ch2_time11.tif"), 2, 2, 1, false).unwrap();
+        write_u16_stack(&first_root.join("red").join("new.tif"), 2, 2, 1, false).unwrap();
         assert!(matches!(
             revalidate(&first_inspection, &ImportCancellation::new()),
             Err(ImportError::SourceChanged(_))
@@ -3696,28 +4582,16 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_direct_grouping_and_duplicate_tokens_are_rejected() {
+    fn explicit_folder_of_3d_accepts_arbitrary_filenames() {
         let temporary = tempdir().unwrap();
         write_u16_stack(&temporary.path().join("alpha.tif"), 2, 2, 1, false).unwrap();
         write_u16_stack(&temporary.path().join("beta.tif"), 2, 2, 1, false).unwrap();
-        assert!(matches!(
-            inspect(TiffSource::auto(temporary.path())),
-            Err(ImportError::AmbiguousSource(_))
-        ));
-
-        let duplicate = tempdir().unwrap();
-        write_u16_stack(
-            &duplicate.path().join("sample_ch1_channel2_t0.tif"),
-            2,
-            2,
-            1,
-            false,
-        )
+        let source = TiffSource::new(vec![
+            TiffChannelSource::folder_of_3d("signal", temporary.path()).unwrap(),
+        ])
         .unwrap();
-        assert!(matches!(
-            inspect(TiffSource::auto(duplicate.path())),
-            Err(ImportError::AmbiguousSource(_))
-        ));
+        let inspection = inspect(source).unwrap();
+        assert_eq!(inspection.shape.t(), 2);
     }
 
     #[test]
@@ -3732,11 +4606,17 @@ mod tests {
             write_u16_stack_with_base(&folder.join("z01.tif"), 3, 2, 1, false, base + 10).unwrap();
         }
 
-        let inspection = inspect(TiffSource::auto(temporary.path())).unwrap();
-        assert_eq!(inspection.layout, SourceLayout::ChannelFoldersOfPlanes);
+        let inspection = inspect(
+            TiffSource::new(vec![
+                TiffChannelSource::folder_of_2d("channel two", &channel_two).unwrap(),
+                TiffChannelSource::folder_of_2d("channel five", &channel_five).unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(inspection.shape.dimensions(), [1, 2, 2, 3]);
         assert_eq!(inspection.channels, 2);
-        assert!(inspection.files[0].relative_name.starts_with("channel2/"));
+        assert_eq!(inspection.channel_labels, ["channel two", "channel five"]);
 
         let checkpoint = tempdir().unwrap();
         let generation = capture_generation(&inspection, &ImportCancellation::new()).unwrap();
@@ -3775,10 +4655,15 @@ mod tests {
 
         let nested = temporary.path().join("channel2").join("nested");
         fs::create_dir(&nested).unwrap();
-        assert!(matches!(
-            inspect(TiffSource::auto(temporary.path())),
-            Err(ImportError::UnsupportedSource(_))
-        ));
+        let reinspection = inspect(
+            TiffSource::new(vec![
+                TiffChannelSource::folder_of_2d("channel two", &channel_two).unwrap(),
+                TiffChannelSource::folder_of_2d("channel five", &channel_five).unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reinspection.shape, inspection.shape);
     }
 
     #[test]
@@ -3798,7 +4683,13 @@ mod tests {
             )
             .unwrap();
         }
-        let inspection = inspect(TiffSource::auto(&source)).unwrap();
+        let inspection = inspect(
+            TiffSource::new(vec![
+                TiffChannelSource::folder_of_2d("channel 1", &channel).unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
         let generation = revalidate(&inspection, &ImportCancellation::new())
             .unwrap()
             .generation;
@@ -3863,34 +4754,13 @@ mod tests {
     }
 
     #[test]
-    fn channel_folders_require_matching_plane_filenames() {
-        let temporary = tempdir().unwrap();
-        let channel_zero = temporary.path().join("channel0");
-        let channel_one = temporary.path().join("channel1");
-        fs::create_dir(&channel_zero).unwrap();
-        fs::create_dir(&channel_one).unwrap();
-        for filename in ["z00.tif", "z01.tif"] {
-            write_u16_stack(&channel_zero.join(filename), 2, 2, 1, false).unwrap();
-        }
-        for filename in ["z00.tif", "z02.tif"] {
-            write_u16_stack(&channel_one.join(filename), 2, 2, 1, false).unwrap();
-        }
-
-        assert!(matches!(
-            inspect(TiffSource::auto(temporary.path())),
-            Err(ImportError::AmbiguousSource(message))
-                if message.contains("same plane filenames")
-        ));
-    }
-
-    #[test]
     fn complete_ome_spacing_is_canonical_zyx_and_nonfinite_f32_is_rejected_on_decode() {
         let temporary = tempdir().unwrap();
         let path = temporary.path().join("float.ome.tif");
         let description = r#"<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"><Image ID="Image:0"><Pixels DimensionOrder="XYZCT" Type="float" SizeX="2" SizeY="2" SizeZ="1" SizeC="1" SizeT="1" PhysicalSizeX="200" PhysicalSizeXUnit="nm" PhysicalSizeY="0.3" PhysicalSizeYUnit="um" PhysicalSizeZ="0.0007" PhysicalSizeZUnit="mm"><TiffData IFD="0" PlaneCount="1"/></Pixels></Image></OME>"#;
         write_f32(&path, &[1.0, f32::NAN, -0.0, 4.0], Some(description)).unwrap();
 
-        let inspection = inspect(TiffSource::auto(&path)).unwrap();
+        let inspection = inspect(TiffSource::single_3d(&path)).unwrap();
         assert_eq!(inspection.dtype, IntensityDType::Float32);
         assert_eq!(inspection.ome_spacing_zyx_um, Some([0.7, 0.3, 0.2]));
         let generation = capture_generation(&inspection, &ImportCancellation::new()).unwrap();
@@ -3930,7 +4800,7 @@ mod tests {
         let accepted_description =
             simple_ome_description(3, 2, 2, 1, 1, "IFD=\"0\" PlaneCount=\"2\"");
         write_u16_stack_with_description(&accepted, 3, 2, 2, &accepted_description).unwrap();
-        let inspection = inspect(TiffSource::auto(&accepted)).unwrap();
+        let inspection = inspect(TiffSource::single_3d(&accepted)).unwrap();
         assert_eq!(inspection.shape.dimensions(), [1, 2, 2, 3]);
 
         for (name, description) in [
@@ -3962,7 +4832,7 @@ mod tests {
             let path = temporary.path().join(format!("{name}.ome.tif"));
             write_u16_stack_with_description(&path, 3, 2, 2, &description).unwrap();
             assert!(matches!(
-                inspect(TiffSource::auto(path)),
+                inspect(TiffSource::single_3d(path)),
                 Err(ImportError::UnsupportedSource(_))
             ));
         }
@@ -4004,7 +4874,7 @@ mod tests {
             let path = temporary.path().join(format!("{name}.ome.tif"));
             write_u16_stack_with_description(&path, 3, 2, 1, &description).unwrap();
             assert!(matches!(
-                inspect(TiffSource::auto(path)),
+                inspect(TiffSource::single_3d(path)),
                 Err(ImportError::UnsupportedSource(_))
             ));
         }
@@ -4020,7 +4890,7 @@ mod tests {
             .write_image::<colortype::RGB8>(2, 1, &[1, 2, 3, 4, 5, 6])
             .unwrap();
         assert!(matches!(
-            inspect(TiffSource::auto(path)),
+            inspect(TiffSource::single_3d(path)),
             Err(ImportError::UnsupportedSource(_))
         ));
     }
@@ -4034,7 +4904,7 @@ mod tests {
             .collect::<Vec<_>>();
         write_tiled_u8(&path, 19, 17, 16, 16, &values).unwrap();
 
-        let inspection = inspect(TiffSource::auto(&path)).unwrap();
+        let inspection = inspect(TiffSource::single_3d(&path)).unwrap();
         assert_eq!(inspection.shape.dimensions(), [1, 1, 17, 19]);
         assert_eq!(inspection.dtype, IntensityDType::Uint8);
         assert_eq!(inspection.maximum_decoded_chunk_bytes, 16 * 16);
@@ -4060,7 +4930,7 @@ mod tests {
         image.rows_per_strip(2).unwrap();
         image.write_data(&values).unwrap();
 
-        let inspection = inspect(TiffSource::auto(&path)).unwrap();
+        let inspection = inspect(TiffSource::single_3d(&path)).unwrap();
         assert_eq!(inspection.shape.dimensions(), [1, 1, 4, 8]);
         assert_eq!(inspection.dtype, IntensityDType::Uint8);
         assert_eq!(inspection.maximum_decoded_chunk_bytes, 16);
@@ -4094,7 +4964,7 @@ mod tests {
             image.rows_per_strip(2).unwrap();
             image.write_data(&values).unwrap();
 
-            let inspection = inspect(TiffSource::auto(&path)).unwrap();
+            let inspection = inspect(TiffSource::single_3d(&path)).unwrap();
             let (report, canonical) = decode_fixture(&inspection, binding);
             assert_eq!(report.counters.native_chunk_decode_count, 2);
             assert_eq!(report.counters.decoded_bytes, 32);
@@ -4116,7 +4986,7 @@ mod tests {
         image.write_data(&values).unwrap();
         patch_classic_le_compression(&path, 0x80b2);
 
-        let inspection = inspect(TiffSource::auto(&path)).unwrap();
+        let inspection = inspect(TiffSource::single_3d(&path)).unwrap();
         let (report, canonical) = decode_fixture(&inspection, '1');
         assert_eq!(report.counters.native_chunk_decode_count, 2);
         assert_eq!(canonical, values);
@@ -4143,7 +5013,7 @@ mod tests {
             fs::copy(&base, &path).unwrap();
             patch_classic_le_compression(&path, compression);
             assert!(matches!(
-                inspect(TiffSource::auto(&path)),
+                inspect(TiffSource::single_3d(&path)),
                 Err(ImportError::UnsupportedSource(message))
                     if message.contains(&compression.to_string())
             ));
@@ -4256,7 +5126,7 @@ mod tests {
         let values = [0x0102, 0x1122, 0x3344, 0x5566, 0x7788, 0x99aa];
         write_big_endian_striped_u16(&path, 3, 2, 1, &values).unwrap();
 
-        let inspection = inspect(TiffSource::auto(&path)).unwrap();
+        let inspection = inspect(TiffSource::single_3d(&path)).unwrap();
         assert_eq!(inspection.shape.dimensions(), [1, 1, 2, 3]);
         assert_eq!(inspection.dtype, IntensityDType::Uint16);
         assert_eq!(inspection.maximum_decoded_chunk_bytes, 6);
@@ -4285,7 +5155,7 @@ mod tests {
         image.rows_per_strip(1).unwrap();
         image.write_data(&values).unwrap();
 
-        let inspection = inspect(TiffSource::auto(&path)).unwrap();
+        let inspection = inspect(TiffSource::single_3d(&path)).unwrap();
         let (report, canonical) = decode_fixture(&inspection, 'f');
         assert_eq!(report.counters.native_chunk_decode_count, 2);
         assert_eq!(

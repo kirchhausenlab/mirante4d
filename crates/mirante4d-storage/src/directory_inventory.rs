@@ -13,10 +13,10 @@ use crate::{
     StorageProfileError, profile_limits,
 };
 
-const GLOBAL_OBJECTS_MAX: u64 = profile_limits(ProfileKind::Ds4).total_physical_objects;
-const GLOBAL_DIRECTORIES_MAX: u64 = profile_limits(ProfileKind::Ds4).directories;
+const GLOBAL_OBJECTS_MAX: u64 = profile_limits(ProfileKind::Current).total_physical_objects;
+const GLOBAL_DIRECTORIES_MAX: u64 = profile_limits(ProfileKind::Current).directories;
 const GLOBAL_DIRECTORY_FAN_OUT_MAX: u64 =
-    profile_limits(ProfileKind::Ds4).maximum_directory_fan_out;
+    profile_limits(ProfileKind::Current).maximum_directory_fan_out;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExpectedFileRole {

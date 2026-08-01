@@ -15,6 +15,9 @@ use crate::{
         CompletedCoordinatedValidationCapture, ProductLayerRequirementFacts,
         install_if_current_texture_revision,
     },
+    presentation_scheduler::{
+        PresentationTransaction, TargetAvailability, assemble_logical_targets,
+    },
     product_render_intent::{ProductRenderRequest, cross_section_intent, volume_intent},
     viewer_layout::PanelId,
     volume_presentation::{
@@ -32,8 +35,9 @@ use mirante4d_render_api::{
     RenderExtent, RenderRequirements, RenderViewIntent,
 };
 use mirante4d_render_wgpu::{
-    CoordinatedFrameExecutionReport, CoordinatedTargetLayout, CoordinatedTargetRequest,
-    CpuFrameTiming, RetainedFrameRenderPolicy, VolumeColorSchedule, WgpuRenderRuntimeError,
+    CoordinatedFrameExecutionReport, CoordinatedPublicationGroup, CoordinatedTargetLayout,
+    CoordinatedTargetRequest, CpuFrameTiming, RetainedFrameRenderPolicy, VolumeColorSchedule,
+    WgpuRenderRuntimeError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +281,7 @@ struct CoordinatedOwnedRequest {
     volume_schedule: VolumeColorSchedule,
     volume_profile: Option<VolumeWorkloadProfile>,
     render_policy: RetainedFrameRenderPolicy,
+    atomic_publication_group: Option<CoordinatedPublicationGroup>,
     cross_section: Option<(u64, CrossSectionPanelScheduleState)>,
     staged_3d_refinement: bool,
 }
@@ -704,20 +709,6 @@ impl MiranteWorkbenchApp {
         self.render_coordination.invalidate_cross_sections();
     }
 
-    pub(crate) fn clear_product_presentations(&mut self) {
-        if let Some(product) = self.native_presentation.product_gpu.as_mut() {
-            for target in PresentationTarget::ALL {
-                product.clear_validation_capture(target);
-            }
-        }
-        for slot in PresentationSlot::ALL {
-            self.render_coordination.clear_presented_frame(slot);
-        }
-        self.viewer_render_failure_latch = None;
-        self.render_coordination.frame_fidelity.display_freshness =
-            DisplayedFrameFreshness::Unknown;
-    }
-
     /// Hard source-generation boundary. Unlike ordinary presentation
     /// deactivation, this also retires shared GPU residency and asynchronous
     /// source-scoped tickets before the replacement runtime is installed.
@@ -816,11 +807,14 @@ impl MiranteWorkbenchApp {
         target_available: bool,
         snapshot: &ApplicationSnapshot,
         gesture: Option<mirante4d_application::RenderGestureId>,
-    ) -> anyhow::Result<(VolumeRenderPlanSource, VolumeWorkloadProfile)> {
+    ) -> anyhow::Result<Option<(VolumeRenderPlanSource, VolumeWorkloadProfile)>> {
         let mut candidates =
             Vec::with_capacity(self.navigation_render_plans.len().saturating_add(1));
         let active_layer = application_view(snapshot).active_layer();
         for (index, plan) in self.navigation_render_plans.iter().enumerate() {
+            if plan.requirements.timepoint() != application_view(snapshot).timepoint() {
+                continue;
+            }
             let profile = VolumeWorkloadProfile::from_view(
                 snapshot.catalog(),
                 application_view(snapshot),
@@ -895,10 +889,11 @@ impl MiranteWorkbenchApp {
             .iter()
             .map(|(_, candidate)| candidate.clone())
             .collect::<Vec<_>>();
-        let choice = self
-            .volume_presentation
-            .select_preview_profile(target_profile, &preview_candidates, gesture)
-            .ok_or_else(|| anyhow::anyhow!("3D preview candidate selection was empty"))?;
+        let choice = self.volume_presentation.select_preview_profile(
+            target_profile,
+            &preview_candidates,
+            gesture,
+        );
         let facts = self.volume_presentation.latest_candidate_facts();
         self.render_coordination
             .frame_fidelity
@@ -935,10 +930,18 @@ impl MiranteWorkbenchApp {
             .three_d_preview_uses_emergency_floor = facts.iter().any(|candidate| {
             candidate.disposition == VolumePreviewCandidateDisposition::SelectedTerminalEmergency
         });
+        let Some(choice) = choice else {
+            // A temporal cutover can briefly have neither a current-timepoint
+            // navigation body nor an uploadable target. The already-published
+            // predecessor is the correct presentation in that state. Absence
+            // of a successor preview is ordinary readiness backpressure, not
+            // a renderer failure and not permission to expose an empty frame.
+            return Ok(None);
+        };
         let (source, _) = candidates
             .get(choice.candidate_index())
             .expect("a selected preview index belongs to its bounded candidate set");
-        Ok((*source, choice.into_profile()))
+        Ok(Some((*source, choice.into_profile())))
     }
 
     #[allow(
@@ -958,6 +961,7 @@ impl MiranteWorkbenchApp {
         cross_section: Option<(u64, CrossSectionPanelScheduleState)>,
         staged_3d_refinement: bool,
         navigation_candidate: Option<usize>,
+        transaction: Option<&PresentationTransaction>,
     ) -> anyhow::Result<Option<CoordinatedOwnedRequest>> {
         if staged_3d_refinement && navigation_candidate.is_some() {
             anyhow::bail!("a staged fine frame cannot also bind the navigation ladder");
@@ -979,10 +983,13 @@ impl MiranteWorkbenchApp {
         let base = RenderIntentBase::from_snapshot(snapshot);
         let active_intent_target = self.render_intent_mailbox.active_target(base);
         let durable_camera = *application_view(snapshot).camera();
+        let transaction_camera = transaction
+            .filter(|transaction| transaction.contains(PresentationTarget::ThreeD))
+            .map(PresentationTransaction::camera);
         let resident_camera = (panel == PanelId::ThreeD)
             .then(|| self.render_intent_mailbox.renderable_camera(base))
             .flatten();
-        let camera_override = resident_camera.or_else(|| {
+        let camera_override = transaction_camera.or(resident_camera).or_else(|| {
             (panel == PanelId::ThreeD
                 && staged_3d_refinement
                 && active_intent_target == Some(RenderIntentTarget::ThreeD))
@@ -1010,23 +1017,57 @@ impl MiranteWorkbenchApp {
             }
             prepared
         };
+        if let Some(contract) = self.playback_session.contract()
+            && prepared.layer_scales.as_ref() != contract.layer_scales().as_ref()
+        {
+            anyhow::bail!("a playing target attempted to escape the immutable playback scale map");
+        }
+        if transaction.is_some_and(PresentationTransaction::is_retained_quality)
+            && application_view(snapshot)
+                .layers()
+                .iter()
+                .filter(|layer| layer.visible())
+                .any(|layer| !prepared.layer_scales.contains_key(&layer.layer_key()))
+        {
+            // Playback-scope retirement can briefly leave an installed scope
+            // handle with no stationary scale map. That is not an empty
+            // scientific target: it is an unmaterialized quality successor.
+            // Refuse to construct the member so fixed-target assembly retains
+            // the playback front until the ordinary stationary plan arrives.
+            return Ok(None);
+        }
+        // A temporal transition deliberately retains the predecessor's
+        // pixels while the successor body is staged. That retained body is
+        // paintable evidence only: it must never be rebound to the new
+        // timepoint's render intent through the camera-navigation fast path.
+        // Waiting here is a normal transitional state, not a renderer fault.
+        if prepared.requirements.timepoint() != application_view(snapshot).timepoint() {
+            return Ok(None);
+        }
         let durable_cross_section = *application_view(snapshot).cross_section();
         let linked_interaction_active = active_intent_target
             .is_some_and(|target| matches!(target, RenderIntentTarget::CrossSection(_)));
         let cross_section_view = panel.cross_section_panel().map(|_| {
-            if linked_interaction_active {
+            if let Some(transaction) = transaction {
+                transaction.cross_section()
+            } else if linked_interaction_active {
                 self.render_intent_mailbox
                     .effective_cross_section(base, durable_cross_section)
             } else {
                 durable_cross_section
             }
         });
-        let mailbox = self.render_intent_mailbox.snapshot();
-        let frame = if panel == PanelId::ThreeD {
-            mailbox.three_d_revision
-        } else {
-            mailbox.linked_2d_revision
-        };
+        let frame = transaction.map_or_else(
+            || {
+                let mailbox = self.render_intent_mailbox.snapshot();
+                if panel == PanelId::ThreeD {
+                    mailbox.three_d_revision
+                } else {
+                    mailbox.linked_2d_revision
+                }
+            },
+            |transaction| transaction.expected_revision(panel.presentation_slot()),
+        );
         let Some(intent) = build_product_intent(
             snapshot,
             frame,
@@ -1039,6 +1080,16 @@ impl MiranteWorkbenchApp {
         else {
             return Ok(None);
         };
+        if let Some(transaction) = transaction
+            && (transaction.source_generation() != snapshot.source_generation()
+                || transaction.timepoint() != application_view(snapshot).timepoint()
+                || !transaction.contains(panel.presentation_slot())
+                || intent.frame() != transaction.expected_revision(panel.presentation_slot()))
+        {
+            anyhow::bail!(
+                "a composed presentation request escaped its semantic transaction cutoff"
+            );
+        }
         let requirements = prepared.requirements.bind(&intent)?;
         let existing_presentation = self
             .render_coordination
@@ -1059,6 +1110,16 @@ impl MiranteWorkbenchApp {
         } else {
             retained_frame_render_policy(true, existing_presentation)
         };
+        // The exact atomic group is derived only after fixed-shape logical
+        // assembly has distinguished prepared targets from compatible reused
+        // fronts. Until then, transaction membership is enough to require
+        // hidden exact rendering for every prepared member.
+        let atomic_publication_group = None;
+        let render_policy = if transaction.is_some() {
+            RetainedFrameRenderPolicy::ExactFrameOnly
+        } else {
+            render_policy
+        };
         Ok(Some(CoordinatedOwnedRequest {
             target: panel.presentation_slot(),
             panel,
@@ -1075,6 +1136,7 @@ impl MiranteWorkbenchApp {
             volume_schedule,
             volume_profile,
             render_policy,
+            atomic_publication_group,
             cross_section,
             staged_3d_refinement,
         }))
@@ -1094,6 +1156,60 @@ impl MiranteWorkbenchApp {
                     && frame.progress().completeness() == RenderFrameCompleteness::Exact
             })
             .cloned()
+    }
+
+    fn transaction_target_is_compatibly_reusable(
+        &self,
+        transaction: &PresentationTransaction,
+        target: PresentationTarget,
+    ) -> bool {
+        let surface = self.render_coordination.surface(target);
+        let Some(frame) = surface.presented_frame() else {
+            return false;
+        };
+        if frame.target() != target
+            || frame.timepoint() != transaction.timepoint()
+            || frame.frame() != transaction.expected_revision(target)
+            || surface.render_viewport() != Some(frame.extent())
+            || frame.progress().completeness() != RenderFrameCompleteness::Exact
+        {
+            return false;
+        }
+        let expected = if let Some(contract) = transaction.temporal_contract() {
+            Some(contract.layer_scales().as_ref())
+        } else {
+            let scope = match target {
+                PresentationTarget::ThreeD => {
+                    if self.dataset.staging_current_refinement()
+                        && self
+                            .prepared_scope_render_plans
+                            .contains_key(&SCOPE_CURRENT_3D_REFINEMENT)
+                    {
+                        SCOPE_CURRENT_3D_REFINEMENT
+                    } else {
+                        SCOPE_CURRENT_3D
+                    }
+                }
+                PresentationTarget::Xy => SCOPE_CROSS_SECTION_XY,
+                PresentationTarget::Xz => SCOPE_CROSS_SECTION_XZ,
+                PresentationTarget::Yz => SCOPE_CROSS_SECTION_YZ,
+            };
+            self.prepared_scope_render_plans
+                .get(&scope)
+                .filter(|plan| plan.requirements.timepoint() == transaction.timepoint())
+                .map(|plan| plan.layer_scales.as_ref())
+        };
+        let Some(expected) = expected else {
+            return false;
+        };
+        expected.iter().all(|(layer, scale)| {
+            frame
+                .progress()
+                .coverage()
+                .layer_coverages()
+                .find(|coverage| coverage.layer() == *layer)
+                .is_some_and(|coverage| coverage.scale() == Some(*scale) && !coverage.is_mixed())
+        })
     }
 
     fn coordinated_active_target(
@@ -1504,14 +1620,64 @@ impl MiranteWorkbenchApp {
         }
 
         let snapshot = self.application.snapshot();
+        let presentation_transaction = self.presentation_scheduler.transaction(
+            &snapshot,
+            &self.playback_session,
+            &self.render_intent_mailbox,
+        );
+        let playback_contract_active = self.playback_session.contract().is_some();
+        let retained_quality_handoff = presentation_transaction
+            .as_ref()
+            .is_some_and(PresentationTransaction::is_retained_quality);
+        if retained_quality_handoff {
+            let full_layout =
+                application_view(&snapshot).layout() == CanonicalViewerLayout::FourPanel;
+            let stationary_plan_current = demand_currentness.current_3d
+                && (!full_layout || demand_currentness.cross_sections);
+            let stationary_plan_renderable = demand_renderability.current_3d
+                && (!full_layout || demand_renderability.cross_sections);
+            if !stationary_plan_current || !stationary_plan_renderable {
+                // Stop retires the playback planning signature before the
+                // ordinary stationary signature is installed. During that
+                // bounded handoff, prepared scope maps can still describe the
+                // old fixed playback scale. They are neither changed work nor
+                // reusable proof for the desired stationary transaction.
+                // Keep the coherent playback front authoritative until the
+                // complete current stationary plan exists for the layout.
+                self.observe_coordinated_display_milestones(false);
+                self.record_current_layout_presentation_if_complete();
+                return Ok(DisplayRefreshWorkTiming::new(
+                    DisplayRenderTiming {
+                        path: DisplayRefreshPath::UiBackground,
+                        render_ms: 0.0,
+                        gpu_upload_ms: None,
+                        gpu_compute_ms: None,
+                        egui_texture_ms: 0.0,
+                    },
+                    visible_brick_request_ms,
+                ));
+            }
+        }
         let mut requests = Vec::with_capacity(4);
         let base = RenderIntentBase::from_snapshot(&snapshot);
         let resident_camera = self.render_intent_mailbox.renderable_camera(base);
+        let effective_timepoint = application_view(&snapshot).timepoint();
+        let current_scope_matches_timepoint = self
+            .prepared_scope_render_plans
+            .get(&SCOPE_CURRENT_3D)
+            .is_some_and(|plan| plan.requirements.timepoint() == effective_timepoint);
+        let navigation_ladder_matches_timepoint = self
+            .navigation_render_plans
+            .first()
+            .is_some_and(|plan| plan.requirements.timepoint() == effective_timepoint);
         let resident_target_body = resident_camera
             .is_some_and(|camera| self.resident_camera_target_body_is_complete(camera));
         let resident_navigation_intent = resident_camera.is_some()
             && (resident_target_body
-                || (self.dataset.scope_is_installed(SCOPE_CURRENT_3D)
+                || (!playback_contract_active
+                    && current_scope_matches_timepoint
+                    && navigation_ladder_matches_timepoint
+                    && self.dataset.scope_is_installed(SCOPE_CURRENT_3D)
                     && self.navigation_render_plans.first().is_some_and(|plan| {
                         first_useful_resources_complete_with_renderer(
                             &self.dataset,
@@ -1519,7 +1685,24 @@ impl MiranteWorkbenchApp {
                             plan,
                         )
                     })));
-        if (demand_currentness.current_3d || resident_navigation_intent) && !current_3d_is_empty {
+        let transaction_requires_three_d = presentation_transaction
+            .as_ref()
+            .is_some_and(|transaction| transaction.contains(PresentationTarget::ThreeD));
+        let transaction_reuses_three_d =
+            presentation_transaction
+                .as_ref()
+                .is_some_and(|transaction| {
+                    self.transaction_target_is_compatibly_reusable(
+                        transaction,
+                        PresentationTarget::ThreeD,
+                    )
+                });
+        if (transaction_requires_three_d
+            || demand_currentness.current_3d
+            || resident_navigation_intent)
+            && !current_3d_is_empty
+            && !(presentation_transaction.is_some() && transaction_reuses_three_d)
+        {
             let retained_complete = self
                 .render_coordination
                 .surface(PresentationTarget::ThreeD)
@@ -1536,8 +1719,11 @@ impl MiranteWorkbenchApp {
             // submit the navigation scope first. Once that exact frame is
             // current, the next refresh may work on the refinement without
             // making interaction wait behind it.
-            let navigation_frame_pending = !resident_target_body
+            let navigation_frame_pending = !playback_contract_active
+                && !resident_target_body
                 && self.dataset.staging_current_refinement()
+                && current_scope_matches_timepoint
+                && navigation_ladder_matches_timepoint
                 && self.dataset.scope_is_installed(SCOPE_CURRENT_3D)
                 && self.render_coordination.frame_fidelity.display_freshness
                     != DisplayedFrameFreshness::Current;
@@ -1553,22 +1739,38 @@ impl MiranteWorkbenchApp {
             };
             let output_extent = self.render_coordination.render_viewport;
             let mailbox = self.render_intent_mailbox.snapshot();
-            let frame = mailbox.three_d_revision;
+            let frame = presentation_transaction
+                .as_ref()
+                .map_or(mailbox.three_d_revision, |transaction| {
+                    transaction.expected_revision(PresentationTarget::ThreeD)
+                });
             let preview_gesture = matches!(mailbox.active_target, Some(RenderIntentTarget::ThreeD))
                 .then_some(mailbox.active_gesture)
                 .flatten();
             let durable_camera = *application_view(&snapshot).camera();
-            let workload_camera = resident_camera.unwrap_or_else(|| {
-                if self.render_intent_mailbox.active_target(base)
-                    == Some(RenderIntentTarget::ThreeD)
-                {
-                    self.render_intent_mailbox
-                        .effective_camera(base, durable_camera)
-                } else {
-                    durable_camera
-                }
-            });
-            let target_uses_navigation_ladder = !resident_target_body
+            let workload_camera = presentation_transaction
+                .as_ref()
+                .filter(|transaction| transaction.contains(PresentationTarget::ThreeD))
+                .map(PresentationTransaction::camera)
+                .or(resident_camera)
+                .unwrap_or_else(|| {
+                    if self.render_intent_mailbox.active_target(base)
+                        == Some(RenderIntentTarget::ThreeD)
+                    {
+                        self.render_intent_mailbox
+                            .effective_camera(base, durable_camera)
+                    } else {
+                        durable_camera
+                    }
+                });
+            let seek_handoff = self
+                .render_coordination
+                .surface(PresentationTarget::ThreeD)
+                .presented_frame()
+                .is_some_and(|frame| frame.timepoint() != effective_timepoint);
+            let target_uses_navigation_ladder = !playback_contract_active
+                && !retained_quality_handoff
+                && !resident_target_body
                 && (navigation_frame_pending
                     || (resident_camera.is_some() && !staged_3d_refinement));
 
@@ -1594,7 +1796,7 @@ impl MiranteWorkbenchApp {
                     workload_camera,
                     output_extent,
                 )?;
-                let (preview_source, preview_profile) = self.select_volume_preview(
+                let Some((preview_source, preview_profile)) = self.select_volume_preview(
                     match target_profile_source {
                         VolumeRenderPlanSource::Scope(scope) => scope,
                         VolumeRenderPlanSource::Navigation(_) => SCOPE_CURRENT_3D,
@@ -1603,7 +1805,19 @@ impl MiranteWorkbenchApp {
                     false,
                     &snapshot,
                     preview_gesture,
-                )?;
+                )?
+                else {
+                    return Ok(DisplayRefreshWorkTiming::new(
+                        DisplayRenderTiming {
+                            path: DisplayRefreshPath::UiBackground,
+                            render_ms: 0.0,
+                            gpu_upload_ms: None,
+                            gpu_compute_ms: None,
+                            egui_texture_ms: 0.0,
+                        },
+                        visible_brick_request_ms,
+                    ));
+                };
                 let replace = self.volume_presentation.preview_needs_replacement(
                     frame,
                     &preview_profile,
@@ -1624,7 +1838,68 @@ impl MiranteWorkbenchApp {
                     workload_camera,
                     output_extent,
                 )?;
-                if preview_gesture.is_none()
+                if playback_contract_active {
+                    // The session contract selected this complete full-volume
+                    // body before Playing began. Camera work composes against
+                    // that same body directly; the ordinary navigation
+                    // preview selector is forbidden because it can choose a
+                    // different ladder rung and create a coarse flash.
+                    (
+                        VolumeRenderPlanSource::Scope(scope),
+                        output_extent,
+                        VolumeColorSchedule::Direct,
+                        target_profile,
+                        staged_3d_refinement,
+                        false,
+                    )
+                } else if retained_quality_handoff {
+                    // Stopping playback changes only the desired quality.
+                    // Keep the already-visible playback front authoritative
+                    // while the stationary exact candidate is recorded into
+                    // private refinement storage; never route this transition
+                    // through a coarser navigation rung.
+                    let strip_height = self
+                        .volume_presentation
+                        .refinement_strip_height(frame, &target_profile);
+                    (
+                        VolumeRenderPlanSource::Scope(scope),
+                        output_extent,
+                        VolumeColorSchedule::AtomicRefinement {
+                            strip_height_pixels: strip_height,
+                        },
+                        target_profile,
+                        staged_3d_refinement,
+                        false,
+                    )
+                } else if seek_handoff && preview_gesture.is_none() {
+                    // A recorded-timepoint change keeps the predecessor
+                    // visible while the complete successor is rendered into
+                    // hidden atomic-refinement storage. Showing a spatial
+                    // preview of the successor first would add an avoidable
+                    // visual transition while the camera is settled.
+                    //
+                    // During an active camera gesture the opposite rule is
+                    // required: every new camera sample invalidates a private
+                    // exact image, so insisting on atomic refinement would
+                    // starve temporal publication until input stopped. The
+                    // ordinary complete navigation preview below is instead
+                    // published with the linked targets for that timepoint;
+                    // spatial refinement remains independent and resumes
+                    // after the gesture settles.
+                    let strip_height = self
+                        .volume_presentation
+                        .refinement_strip_height(frame, &target_profile);
+                    (
+                        VolumeRenderPlanSource::Scope(scope),
+                        output_extent,
+                        VolumeColorSchedule::AtomicRefinement {
+                            strip_height_pixels: strip_height,
+                        },
+                        target_profile,
+                        staged_3d_refinement,
+                        false,
+                    )
+                } else if preview_gesture.is_none()
                     && self.volume_presentation.direct_is_safe(&target_profile)
                 {
                     (
@@ -1636,13 +1911,25 @@ impl MiranteWorkbenchApp {
                         false,
                     )
                 } else {
-                    let (preview_source, preview_profile) = self.select_volume_preview(
+                    let Some((preview_source, preview_profile)) = self.select_volume_preview(
                         scope,
                         &target_profile,
                         true,
                         &snapshot,
                         preview_gesture,
-                    )?;
+                    )?
+                    else {
+                        return Ok(DisplayRefreshWorkTiming::new(
+                            DisplayRenderTiming {
+                                path: DisplayRefreshPath::UiBackground,
+                                render_ms: 0.0,
+                                gpu_upload_ms: None,
+                                gpu_compute_ms: None,
+                                egui_texture_ms: 0.0,
+                            },
+                            visible_brick_request_ms,
+                        ));
+                    };
                     let replace = self.volume_presentation.preview_needs_replacement(
                         frame,
                         &preview_profile,
@@ -1707,6 +1994,10 @@ impl MiranteWorkbenchApp {
                     || self.render_coordination.frame_fidelity.display_freshness
                         != DisplayedFrameFreshness::Current
                     || self.coordinated_target_needs_execution(PresentationTarget::ThreeD));
+            let needs_execution = needs_execution
+                || presentation_transaction
+                    .as_ref()
+                    .is_some_and(|transaction| transaction.contains(PresentationTarget::ThreeD));
             let (request_scope, navigation_candidate) = match request_source {
                 VolumeRenderPlanSource::Scope(scope) => (scope, None),
                 VolumeRenderPlanSource::Navigation(index) => (SCOPE_CURRENT_3D, Some(index)),
@@ -1724,8 +2015,10 @@ impl MiranteWorkbenchApp {
                     None,
                     request_staged_refinement,
                     navigation_candidate,
+                    presentation_transaction.as_ref(),
                 )?
-                && !self.adopt_retained_exact_request(&request)?
+                && (presentation_transaction.is_some()
+                    || !self.adopt_retained_exact_request(&request)?)
             {
                 requests.push(request);
             }
@@ -1733,7 +2026,33 @@ impl MiranteWorkbenchApp {
 
         if application_view(&snapshot).layout() == CanonicalViewerLayout::FourPanel {
             for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
-                if !demand_renderability.cross_section(panel) {
+                let transaction_requires_panel = presentation_transaction
+                    .as_ref()
+                    .is_some_and(|transaction| transaction.contains(panel.presentation_slot()));
+                let transaction_reuses_panel =
+                    presentation_transaction
+                        .as_ref()
+                        .is_some_and(|transaction| {
+                            self.transaction_target_is_compatibly_reusable(
+                                transaction,
+                                panel.presentation_slot(),
+                            )
+                        });
+                if transaction_requires_panel && transaction_reuses_panel {
+                    continue;
+                }
+                // A playback-stop handoff is a quality-only transaction. Its
+                // retained front remains the visible authority until the
+                // ordinary stationary planner has produced a current body
+                // for every linked target. A transiently empty or stale scope
+                // during playback-scope teardown is not a new empty image.
+                if retained_quality_handoff
+                    && (!demand_currentness.cross_section(panel)
+                        || !demand_renderability.cross_section(panel))
+                {
+                    continue;
+                }
+                if !transaction_requires_panel && !demand_renderability.cross_section(panel) {
                     continue;
                 }
                 let scope = cross_section_scope(panel)?;
@@ -1741,7 +2060,9 @@ impl MiranteWorkbenchApp {
                     .prepared_scope_render_plans
                     .get(&scope)
                     .ok_or_else(|| anyhow::anyhow!("linked scope has no prepared render plan"))?;
-                if !self.cross_section_panel_needs_display_render(panel, &prepared.requirements) {
+                if !transaction_requires_panel
+                    && !self.cross_section_panel_needs_display_render(panel, &prepared.requirements)
+                {
                     continue;
                 }
                 let priority = self.dataset.scope_gpu_priority_handle(scope);
@@ -1780,10 +2101,12 @@ impl MiranteWorkbenchApp {
                     true,
                 )?
                 .schedule;
-                if !demand_currentness.cross_section(panel) {
+                if !transaction_requires_panel && !demand_currentness.cross_section(panel) {
                     schedule = schedule.provisional();
                 }
-                if schedule.status == CrossSectionPanelScheduleStatus::Empty {
+                if schedule.status == CrossSectionPanelScheduleStatus::Empty
+                    && !transaction_requires_panel
+                {
                     self.clear_cross_section_product_presentation(panel);
                     if !self
                         .render_coordination
@@ -1797,7 +2120,10 @@ impl MiranteWorkbenchApp {
                     }
                     continue;
                 }
-                if !schedule.is_renderable() {
+                if !schedule.is_renderable()
+                    && (!transaction_requires_panel
+                        || schedule.status != CrossSectionPanelScheduleStatus::Empty)
+                {
                     continue;
                 }
                 let surface = self.render_coordination.surface(panel.presentation_slot());
@@ -1819,10 +2145,88 @@ impl MiranteWorkbenchApp {
                     Some((surface.generation(), schedule)),
                     false,
                     None,
-                )? && !self.adopt_retained_exact_request(&request)?
+                    presentation_transaction.as_ref(),
+                )? && (presentation_transaction.is_some()
+                    || !self.adopt_retained_exact_request(&request)?)
                 {
                     requests.push(request);
                 }
+            }
+        }
+
+        let logical_transaction = if let Some(transaction) = presentation_transaction.as_ref() {
+            let mut availability = TargetAvailability::new();
+            for request in &requests {
+                availability.mark_prepared(request.target);
+            }
+            for target in PresentationTarget::ALL {
+                if transaction.contains(target)
+                    && self.transaction_target_is_compatibly_reusable(transaction, target)
+                {
+                    availability.mark_reusable(target);
+                }
+            }
+            match assemble_logical_targets(transaction.target_set(), availability) {
+                Ok(logical) => Some(logical),
+                Err(_) => {
+                    // A physical planning delta may be partial while one
+                    // target's stationary or temporal body is still being
+                    // prepared. That is ordinary readiness backpressure. The
+                    // complete retained front stays visible and no variable-
+                    // length request list is submitted as a logical frame.
+                    self.observe_coordinated_display_milestones(false);
+                    self.record_current_layout_presentation_if_complete();
+                    return Ok(DisplayRefreshWorkTiming::new(
+                        DisplayRenderTiming {
+                            path: DisplayRefreshPath::UiBackground,
+                            render_ms: 0.0,
+                            gpu_upload_ms: None,
+                            gpu_compute_ms: None,
+                            egui_texture_ms: 0.0,
+                        },
+                        visible_brick_request_ms,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(logical) = logical_transaction.as_ref() {
+            let physical_targets = logical.physical_targets();
+            debug_assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.target)
+                    .collect::<Vec<_>>(),
+                physical_targets,
+                "the physical request projection must match fixed-shape logical assembly"
+            );
+            let Some(publication_group) = logical.physical_publication_group() else {
+                // Every logical member is already an exact compatible front.
+                // No renderer submission can add evidence; complete the
+                // semantic transaction directly instead of leaving it
+                // reserved forever or manufacturing GPU work.
+                let transaction = presentation_transaction
+                    .as_ref()
+                    .expect("a logical transaction retains its semantic cutoff");
+                self.complete_presentation_transaction(&snapshot, transaction);
+                self.observe_coordinated_display_milestones(false);
+                self.record_current_layout_presentation_if_complete();
+                return Ok(DisplayRefreshWorkTiming::new(
+                    DisplayRenderTiming {
+                        path: DisplayRefreshPath::UiBackground,
+                        render_ms: 0.0,
+                        gpu_upload_ms: None,
+                        gpu_compute_ms: None,
+                        egui_texture_ms: 0.0,
+                    },
+                    visible_brick_request_ms,
+                ));
+            };
+            for request in &mut requests {
+                request.atomic_publication_group = Some(publication_group);
+                request.render_policy = RetainedFrameRenderPolicy::ExactFrameOnly;
             }
         }
 
@@ -1907,7 +2311,6 @@ impl MiranteWorkbenchApp {
             && self.staged_3d_promotion_payloads_ready())
         .then(|| self.prepare_coordinated_staged_current_promotion())
         .transpose()?;
-        self.note_viewer_render_submission();
         #[cfg(test)]
         {
             self.product_render_attempts = self.product_render_attempts.saturating_add(1);
@@ -1915,7 +2318,7 @@ impl MiranteWorkbenchApp {
         let borrowed = requests
             .iter()
             .map(|request| {
-                CoordinatedTargetRequest::new(
+                let borrowed = CoordinatedTargetRequest::new(
                     request.target,
                     &request.request.intent,
                     &request.request.requirements,
@@ -1931,7 +2334,10 @@ impl MiranteWorkbenchApp {
                 )
                 .with_hidden_promotion_authorized(
                     !request.staged_3d_refinement || prepared_staged_promotion.is_some(),
-                )
+                );
+                request.atomic_publication_group.map_or(borrowed, |group| {
+                    borrowed.with_atomic_publication_group(group)
+                })
             })
             .collect::<Vec<_>>();
         let placement_target_group = match (
@@ -2044,6 +2450,8 @@ impl MiranteWorkbenchApp {
             &requests,
             &report,
             prepared_staged_promotion,
+            presentation_transaction.as_ref(),
+            logical_transaction.is_some(),
         );
         let refill_admission = self.retire_coordinated_gpu_resident_payloads(&report) > 0;
         if refill_admission {
@@ -2092,6 +2500,8 @@ impl MiranteWorkbenchApp {
         requests: &[CoordinatedOwnedRequest],
         report: &CoordinatedFrameExecutionReport,
         prepared_staged_promotion: Option<PreparedCoordinatedStagedPromotion>,
+        transaction: Option<&PresentationTransaction>,
+        logical_transaction_assembled: bool,
     ) {
         let any_target_presented = report.targets().iter().any(|target| target.presented());
         if let Some(timing) = report.cpu_timing() {
@@ -2288,6 +2698,38 @@ impl MiranteWorkbenchApp {
         if any_target_presented && self.dataset.last_plan_error().is_none() {
             self.render_coordination.frame_fidelity.last_failure_kind = None;
             self.render_coordination.frame_fidelity.last_capacity_error = None;
+        }
+        if let Some(transaction) = transaction
+            && any_target_presented
+            && logical_transaction_assembled
+        {
+            // The renderer's atomic group is the publication proof: if any
+            // member was presented, every required member was exact or
+            // already exact in that same cutoff. Advance only the temporal
+            // cursor here; spatial mailboxes remain independently latest-only.
+            self.complete_presentation_transaction(snapshot, transaction);
+        }
+    }
+
+    fn complete_presentation_transaction(
+        &mut self,
+        snapshot: &ApplicationSnapshot,
+        transaction: &PresentationTransaction,
+    ) {
+        if transaction.temporal_contract().is_some() {
+            self.playback_session.mark_ready(transaction.timepoint());
+            self.playback_session.observe_readiness(
+                transaction.timepoint(),
+                snapshot.timepoint_count(),
+                true,
+                false,
+            );
+        }
+        let spatial_followup_required =
+            transaction.spatial_followup_required(self.render_intent_mailbox.snapshot());
+        self.presentation_scheduler.complete(transaction);
+        if spatial_followup_required {
+            self.render_coordination.request_refresh();
         }
     }
 

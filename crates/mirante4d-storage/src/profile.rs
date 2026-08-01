@@ -1,4 +1,4 @@
-use crate::ProfileLimits;
+use crate::{PROFILE_PYRAMID_SCALE_COUNT_MAX, ProfileLimits};
 
 /// Exact experimental compatibility tuple accepted for WP-10A.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,11 +73,10 @@ impl StorageShape {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProfileKind {
-    Ds0,
-    Ds1,
-    Ds2,
-    Ds3,
-    Ds4,
+    /// The sole compositional safety contract for the active experimental
+    /// package format. This is not a dataset-size class calibrated from a
+    /// representative acquisition.
+    Current,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,81 +96,25 @@ impl ScaleCountRule {
 impl ProfileKind {
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Ds0 => "DS-0",
-            Self::Ds1 => "DS-1",
-            Self::Ds2 => "DS-2",
-            Self::Ds3 => "DS-3",
-            Self::Ds4 => "DS-4",
+            Self::Current => "M4D-COMPOSITIONAL-1",
         }
     }
 }
 
 pub const fn profile_limits(profile: ProfileKind) -> ProfileLimits {
     match profile {
-        ProfileKind::Ds0 => ProfileLimits::new(
-            ScaleCountRule::Maximum(64),
-            Some(67_108_864),
-            4_096,
-            64,
-            64,
-            7,
-            256,
-            1,
-            1_024,
-            512,
-            64,
-        ),
-        ProfileKind::Ds1 => ProfileLimits::new(
-            ScaleCountRule::Maximum(64),
+        ProfileKind::Current => ProfileLimits::new(
+            ScaleCountRule::Maximum(PROFILE_PYRAMID_SCALE_COUNT_MAX),
             None,
-            3_314,
-            76,
-            76,
-            5,
-            256,
-            1,
-            1_024,
-            512,
-            32,
-        ),
-        ProfileKind::Ds2 => ProfileLimits::new(
-            ScaleCountRule::Maximum(64),
-            None,
-            2_048,
-            32,
-            32,
-            1,
-            256,
-            1,
-            1_024,
-            512,
-            64,
-        ),
-        ProfileKind::Ds3 => ProfileLimits::new(
-            ScaleCountRule::Maximum(64),
-            None,
-            109_196,
-            2_014,
-            2_014,
-            12,
-            256,
-            3,
-            8_192,
-            1_024,
-            32,
-        ),
-        ProfileKind::Ds4 => ProfileLimits::new(
-            ScaleCountRule::Maximum(64),
-            None,
-            86_870,
-            5_475,
-            5_475,
-            8,
-            256,
-            6,
-            16_384,
-            14_336,
-            512,
+            crate::COMPOSITIONAL_LOGICAL_BRICKS_MAX,
+            crate::COMPOSITIONAL_SHARDS_PER_COMPONENT_MAX,
+            crate::COMPOSITIONAL_SHARDS_PER_COMPONENT_MAX,
+            crate::COMPOSITIONAL_SHARDS_PER_COMPONENT_MAX,
+            crate::COMPOSITIONAL_ZARR_METADATA_OBJECTS_MAX,
+            crate::MANIFEST_PAGE_REFERENCES_MAX,
+            crate::COMPOSITIONAL_PHYSICAL_OBJECTS_MAX,
+            crate::COMPOSITIONAL_DIRECTORIES_MAX,
+            crate::COMPOSITIONAL_DIRECTORY_FAN_OUT_MAX,
         ),
     }
 }
@@ -194,14 +137,9 @@ mod tests {
         assert_eq!(StorageShape::PIXEL_3D.outer_tczyx, [1, 1, 256, 256, 256]);
         assert_eq!(INNER_CODECS[1], "zstd level 3 checksum false");
         assert_eq!(INDEX_LOCATION, "end");
-        for profile in [
-            ProfileKind::Ds0,
-            ProfileKind::Ds1,
-            ProfileKind::Ds2,
-            ProfileKind::Ds3,
-            ProfileKind::Ds4,
-        ] {
-            assert_eq!(profile_limits(profile).scales.maximum(), 64);
-        }
+        assert_eq!(
+            profile_limits(ProfileKind::Current).scales.maximum(),
+            PROFILE_PYRAMID_SCALE_COUNT_MAX
+        );
     }
 }

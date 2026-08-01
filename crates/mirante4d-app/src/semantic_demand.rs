@@ -3430,12 +3430,12 @@ mod tests {
                 for x in 0..grid_xyz[0] {
                     let index_xyz = [x, y, z];
                     let mut support = [[0.0; 2]; 3];
-                    for axis in 0..3 {
+                    for (axis, axis_support) in support.iter_mut().enumerate() {
                         let origin = index_xyz[axis].saturating_mul(resource_xyz[axis]);
                         let end = origin
                             .saturating_add(resource_xyz[axis])
                             .min(volume_xyz[axis]);
-                        support[axis] = [
+                        *axis_support = [
                             origin.saturating_sub(halo_voxels) as f64 - 0.5,
                             end.saturating_add(halo_voxels).min(volume_xyz[axis]) as f64 - 0.5,
                         ];
@@ -3455,14 +3455,14 @@ mod tests {
                             y: f64::from(extent.height_pixels() - 1),
                         },
                     ];
-                    for axis in 0..3 {
+                    for (axis, axis_support) in support.iter().enumerate() {
                         polygon = oracle_clip_parameter_half_space(
                             polygon,
                             plane_origin,
                             step_x,
                             step_y,
                             axis,
-                            support[axis][0],
+                            axis_support[0],
                             true,
                         );
                         polygon = oracle_clip_parameter_half_space(
@@ -3471,7 +3471,7 @@ mod tests {
                             step_x,
                             step_y,
                             axis,
-                            support[axis][1],
+                            axis_support[1],
                             false,
                         );
                     }

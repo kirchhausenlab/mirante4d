@@ -20,11 +20,10 @@ pub const MAX_LAYER_LABEL_BYTES: usize = 256;
 pub const MAX_DATASET_LAYERS: usize = 4_096;
 pub const MAX_SCALES_PER_LAYER: usize = 64;
 
-/// Opaque identity for one opened source before its scientific content has
-/// been verified.
+/// Opaque identity for one concrete source-open session.
 ///
 /// The composition owner assigns a fresh value for every open. It is neither a
-/// path, package identity, cache key, nor substitute scientific identity.
+/// path, package identity, durable cache key, nor content address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DatasetSourceId(u64);
 
@@ -40,15 +39,14 @@ impl DatasetSourceId {
 
 /// Identity carried by a semantic resource request.
 ///
-/// Unverified sources are addressable only within their exact open session.
-/// A source opened from an existing verification capability may use the
-/// stable scientific content identity. An already-open source instead keeps
-/// its opaque session identity through proof-backed in-place verification so
-/// issued leases remain reusable; the two variants never compare equal.
+/// Ordinary external package opens are addressable only within their exact
+/// source session, even when their manifest declares a content address. A
+/// source handed directly across the import publication boundary may instead
+/// use its computed content address. The two variants never compare equal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DatasetResourceIdentity {
-    Unverified(DatasetSourceId),
-    Verified(ScientificContentId),
+    SessionLocal(DatasetSourceId),
+    ContentAddress(ScientificContentId),
 }
 
 /// A non-empty, axis-aligned `z,y,x` region at one multiscale level.
@@ -118,10 +116,11 @@ impl ResourceRegion {
 
 /// Canonical logical identity for one decoded multiscale brick.
 ///
-/// Before verification the key is stable only within its exact opened source;
-/// afterward it is rooted in scientific content. Physical package identity,
-/// paths, arrays, chunks, shards, and codec details are intentionally absent.
-/// The exact logical region, including its shape, remains part of the key.
+/// A session-local key is stable only within its exact opened source; a
+/// content-addressed key is rooted in canonical content. Physical package
+/// identity, paths, arrays, chunks, shards, and codec details are
+/// intentionally absent. The exact logical region, including its shape,
+/// remains part of the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BrickKey {
     identity: DatasetResourceIdentity,
@@ -552,9 +551,10 @@ pub trait CpuByteLease: Send + Sync {
 
 /// Dependency-inverted admission boundary for the sole CPU byte ledger.
 ///
-/// Implementations must reject zero-byte requests, enforce the category and
-/// total caps, and return a lease whose category and byte count exactly match
-/// the request. Dropping the lease releases the charge.
+/// Implementations must reject zero-byte requests, enforce their one managed
+/// total, and return a lease whose category and byte count exactly match the
+/// request. Categories are accounting labels, not independent hard walls.
+/// Dropping the lease releases the charge.
 pub trait CpuByteLedger: Send + Sync {
     fn try_acquire(
         &self,
@@ -567,6 +567,13 @@ pub trait CpuByteLedger: Send + Sync {
     /// ledgers that have no observable capacity changes may retain zero.
     fn capacity_epoch(&self) -> u64 {
         0
+    }
+
+    /// Complete managed-byte ceiling behind this authority.
+    ///
+    /// Implementations used only for focused tests may retain `u64::MAX`.
+    fn capacity_bytes(&self) -> u64 {
+        u64::MAX
     }
 }
 
@@ -772,45 +779,41 @@ pub enum DatasetSourceFault {
     },
 }
 
-/// Whether the catalog has been bound to verified scientific content.
+/// Whether a catalog exposes a durable content address or only a session-local
+/// identifier.
 ///
-/// `Unverified` carries only the opaque identity of this exact open. In
-/// particular, a package slug, path, manifest value, or cache digest cannot be
-/// represented as a verified scientific identity through this type.
-///
-/// This checkpoint-A value records a classification; constructing it is not a
-/// verifier capability and does not authorize application attachment. The
-/// verifier-owned admission route is introduced by WP-08, while the WP-07B
-/// application boundary intentionally exposes no public verification command.
+/// This is an address classification, not authenticity or package-integrity
+/// evidence. A package-declared content address can therefore be represented
+/// without claiming that an external authority endorsed the data.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScientificIdentityStatus {
-    Unverified(DatasetSourceId),
-    Verified(ScientificContentId),
+pub enum ContentAddressStatus {
+    SessionLocal(DatasetSourceId),
+    ContentAddress(ScientificContentId),
 }
 
-impl ScientificIdentityStatus {
-    pub const fn is_verified(&self) -> bool {
-        matches!(self, Self::Verified(_))
+impl ContentAddressStatus {
+    pub const fn has_content_address(&self) -> bool {
+        matches!(self, Self::ContentAddress(_))
     }
 
-    pub const fn verified_id(&self) -> Option<&ScientificContentId> {
+    pub const fn content_address(&self) -> Option<&ScientificContentId> {
         match self {
-            Self::Unverified(_) => None,
-            Self::Verified(identity) => Some(identity),
+            Self::SessionLocal(_) => None,
+            Self::ContentAddress(identity) => Some(identity),
         }
     }
 
     pub const fn source_id(&self) -> Option<DatasetSourceId> {
         match self {
-            Self::Unverified(source_id) => Some(*source_id),
-            Self::Verified(_) => None,
+            Self::SessionLocal(source_id) => Some(*source_id),
+            Self::ContentAddress(_) => None,
         }
     }
 
     pub const fn resource_identity(&self) -> DatasetResourceIdentity {
         match self {
-            Self::Unverified(source_id) => DatasetResourceIdentity::Unverified(*source_id),
-            Self::Verified(identity) => DatasetResourceIdentity::Verified(*identity),
+            Self::SessionLocal(source_id) => DatasetResourceIdentity::SessionLocal(*source_id),
+            Self::ContentAddress(identity) => DatasetResourceIdentity::ContentAddress(*identity),
         }
     }
 }
@@ -986,7 +989,7 @@ impl DatasetLayer {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DatasetCatalog {
     label: String,
-    scientific_identity: ScientificIdentityStatus,
+    content_address_status: ContentAddressStatus,
     resource_identity: DatasetResourceIdentity,
     layers: BTreeMap<LogicalLayerKey, DatasetLayer>,
 }
@@ -994,16 +997,21 @@ pub struct DatasetCatalog {
 impl DatasetCatalog {
     pub fn new(
         label: impl AsRef<str>,
-        scientific_identity: ScientificIdentityStatus,
+        content_address_status: ContentAddressStatus,
         layers: Vec<DatasetLayer>,
     ) -> Result<Self, DatasetCatalogError> {
-        let resource_identity = scientific_identity.resource_identity();
-        Self::new_with_resource_identity(label, scientific_identity, resource_identity, layers)
+        let resource_identity = content_address_status.resource_identity();
+        Self::new_with_resource_identity(label, content_address_status, resource_identity, layers)
     }
 
-    fn new_with_resource_identity(
+    /// Builds a catalog whose durable content address and live resource-key
+    /// identity are deliberately independent. Ordinary structurally admitted
+    /// packages use their declared content address for projects and analysis
+    /// while keeping session-local resource keys; a publication capability
+    /// may use the content address for both.
+    pub fn new_with_resource_identity(
         label: impl AsRef<str>,
-        scientific_identity: ScientificIdentityStatus,
+        content_address_status: ContentAddressStatus,
         resource_identity: DatasetResourceIdentity,
         layers: Vec<DatasetLayer>,
     ) -> Result<Self, DatasetCatalogError> {
@@ -1030,43 +1038,23 @@ impl DatasetCatalog {
 
         Ok(Self {
             label,
-            scientific_identity,
+            content_address_status,
             resource_identity,
             layers: by_key,
         })
-    }
-
-    /// Reclassifies the scientific identity without invalidating semantic
-    /// resource keys already issued for this exact open session.
-    ///
-    /// This is a classification operation, not proof of verification. The
-    /// verifier/application boundary remains responsible for admitting the
-    /// supplied status. Keeping the opaque runtime identity stable allows a
-    /// successfully verified local source to retain decoded and GPU-resident
-    /// data after an equivalent, fail-closed source-generation proof.
-    pub fn with_scientific_identity(
-        &self,
-        scientific_identity: ScientificIdentityStatus,
-    ) -> Result<Self, DatasetCatalogError> {
-        Self::new_with_resource_identity(
-            &self.label,
-            scientific_identity,
-            self.resource_identity,
-            self.layers.values().cloned().collect(),
-        )
     }
 
     pub fn label(&self) -> &str {
         &self.label
     }
 
-    pub const fn scientific_identity(&self) -> &ScientificIdentityStatus {
-        &self.scientific_identity
+    pub const fn content_address_status(&self) -> &ContentAddressStatus {
+        &self.content_address_status
     }
 
-    /// Identity used only to correlate semantic resources inside this exact
-    /// runtime. It may remain provisional after scientific verification so
-    /// already-issued leases and GPU residency do not need to be re-keyed.
+    /// Identity used to correlate semantic resources inside this exact
+    /// runtime. An ordinary package open deliberately remains session-local;
+    /// importer-published handoff may use the computed content address.
     pub const fn resource_identity(&self) -> DatasetResourceIdentity {
         self.resource_identity
     }
@@ -1230,7 +1218,7 @@ mod tests {
     fn catalog_is_keyed_and_iterated_by_logical_layer_key() {
         let catalog = DatasetCatalog::new(
             "experiment",
-            ScientificIdentityStatus::Unverified(source_id()),
+            ContentAddressStatus::SessionLocal(source_id()),
             vec![layer(7, "green"), layer(2, "red"), layer(5, "green")],
         )
         .unwrap();
@@ -1255,7 +1243,7 @@ mod tests {
         assert!(
             DatasetCatalog::new(
                 "experiment",
-                ScientificIdentityStatus::Unverified(source_id()),
+                ContentAddressStatus::SessionLocal(source_id()),
                 vec![layer(0, "channel"), layer(1, "channel")],
             )
             .is_ok()
@@ -1264,7 +1252,7 @@ mod tests {
         assert_eq!(
             DatasetCatalog::new(
                 "experiment",
-                ScientificIdentityStatus::Unverified(source_id()),
+                ContentAddressStatus::SessionLocal(source_id()),
                 vec![layer(3, "first"), layer(3, "second")],
             ),
             Err(DatasetCatalogError::DuplicateLayerKey { ordinal: 3 })
@@ -1272,46 +1260,37 @@ mod tests {
     }
 
     #[test]
-    fn identity_status_cannot_confuse_unverified_catalogs_with_verified_content() {
-        let unverified = DatasetCatalog::new(
+    fn content_address_status_does_not_confuse_session_and_durable_resource_keys() {
+        let session_local = DatasetCatalog::new(
             "experiment",
-            ScientificIdentityStatus::Unverified(source_id()),
+            ContentAddressStatus::SessionLocal(source_id()),
             vec![layer(0, "channel")],
         )
         .unwrap();
-        assert!(!unverified.scientific_identity().is_verified());
-        assert_eq!(unverified.scientific_identity().verified_id(), None);
+        assert!(!session_local.content_address_status().has_content_address());
         assert_eq!(
-            unverified.resource_identity(),
-            DatasetResourceIdentity::Unverified(source_id())
+            session_local.content_address_status().content_address(),
+            None
+        );
+        assert_eq!(
+            session_local.resource_identity(),
+            DatasetResourceIdentity::SessionLocal(source_id())
         );
 
         let identity = ScientificContentId::parse(ZERO_SCIENTIFIC_ID).unwrap();
-        let verified = DatasetCatalog::new(
+        let content_addressed = DatasetCatalog::new(
             "experiment",
-            ScientificIdentityStatus::Verified(identity),
+            ContentAddressStatus::ContentAddress(identity),
             vec![layer(0, "channel")],
         )
         .unwrap();
         assert_eq!(
-            verified.scientific_identity().verified_id(),
+            content_addressed.content_address_status().content_address(),
             Some(&identity)
         );
         assert_eq!(
-            verified.resource_identity(),
-            DatasetResourceIdentity::Verified(identity)
-        );
-
-        let promoted = unverified
-            .with_scientific_identity(ScientificIdentityStatus::Verified(identity))
-            .unwrap();
-        assert_eq!(
-            promoted.scientific_identity().verified_id(),
-            Some(&identity)
-        );
-        assert_eq!(
-            promoted.resource_identity(),
-            DatasetResourceIdentity::Unverified(source_id())
+            content_addressed.resource_identity(),
+            DatasetResourceIdentity::ContentAddress(identity)
         );
     }
 
@@ -1336,7 +1315,7 @@ mod tests {
         assert_eq!(
             DatasetCatalog::new(
                 "experiment",
-                ScientificIdentityStatus::Unverified(source_id()),
+                ContentAddressStatus::SessionLocal(source_id()),
                 Vec::new(),
             ),
             Err(DatasetCatalogError::EmptyCatalog)
@@ -1344,7 +1323,7 @@ mod tests {
         assert_eq!(
             DatasetCatalog::new(
                 " ",
-                ScientificIdentityStatus::Unverified(source_id()),
+                ContentAddressStatus::SessionLocal(source_id()),
                 vec![layer(0, "channel")],
             ),
             Err(DatasetCatalogError::EmptyLabel {
@@ -1369,7 +1348,7 @@ mod tests {
         assert_eq!(
             DatasetCatalog::new(
                 oversized,
-                ScientificIdentityStatus::Unverified(source_id()),
+                ContentAddressStatus::SessionLocal(source_id()),
                 vec![layer(0, "channel")],
             ),
             Err(DatasetCatalogError::LabelTooLong {
@@ -1384,7 +1363,7 @@ mod tests {
         assert_eq!(
             DatasetCatalog::new(
                 "experiment",
-                ScientificIdentityStatus::Unverified(source_id()),
+                ContentAddressStatus::SessionLocal(source_id()),
                 layers,
             ),
             Err(DatasetCatalogError::TooManyLayers {
@@ -1424,7 +1403,7 @@ mod tests {
         Arc::new(
             DatasetCatalog::new(
                 "experiment",
-                ScientificIdentityStatus::Verified(identity),
+                ContentAddressStatus::ContentAddress(identity),
                 vec![layer],
             )
             .unwrap(),
@@ -1433,7 +1412,7 @@ mod tests {
 
     fn resource_key(identity: ScientificContentId) -> BrickKey {
         BrickKey::new(
-            DatasetResourceIdentity::Verified(identity),
+            DatasetResourceIdentity::ContentAddress(identity),
             LogicalLayerKey::new(3),
             TimeIndex::new(1),
             ScaleLevel::new(1),
@@ -1449,7 +1428,7 @@ mod tests {
         let key = resource_key(identity);
         let equal = resource_key(identity);
         let different_scale = BrickKey::new(
-            DatasetResourceIdentity::Verified(identity),
+            DatasetResourceIdentity::ContentAddress(identity),
             key.layer(),
             key.timepoint(),
             ScaleLevel::BASE,
@@ -1459,7 +1438,10 @@ mod tests {
         assert_eq!(key, equal);
         assert_ne!(key, different_scale);
         assert_eq!(HashSet::from([key, equal]).len(), 1);
-        assert_eq!(key.identity(), DatasetResourceIdentity::Verified(identity));
+        assert_eq!(
+            key.identity(),
+            DatasetResourceIdentity::ContentAddress(identity)
+        );
         assert_eq!(key.region().origin(), [0, 1, 1]);
         assert_eq!(key.region().end_exclusive(), [1, 2, 3]);
     }
@@ -1720,7 +1702,7 @@ mod tests {
         );
 
         let base_key = BrickKey::new(
-            DatasetResourceIdentity::Verified(identity),
+            DatasetResourceIdentity::ContentAddress(identity),
             key.layer(),
             key.timepoint(),
             ScaleLevel::BASE,
@@ -1732,7 +1714,7 @@ mod tests {
         );
 
         let wrong_identity = BrickKey::new(
-            DatasetResourceIdentity::Verified(scientific_id('3')),
+            DatasetResourceIdentity::ContentAddress(scientific_id('3')),
             key.layer(),
             key.timepoint(),
             key.scale(),
@@ -1743,19 +1725,19 @@ mod tests {
             Err(ResourceContractError::ResourceIdentityMismatch)
         );
 
-        let unverified = DatasetCatalog::new(
+        let session_local = DatasetCatalog::new(
             "experiment",
-            ScientificIdentityStatus::Unverified(source_id()),
+            ContentAddressStatus::SessionLocal(source_id()),
             vec![layer(3, "channel")],
         )
         .unwrap();
         assert_eq!(
-            unverified.validate_resource_key(key),
+            session_local.validate_resource_key(key),
             Err(ResourceContractError::ResourceIdentityMismatch)
         );
 
         let late = BrickKey::new(
-            DatasetResourceIdentity::Verified(identity),
+            DatasetResourceIdentity::ContentAddress(identity),
             key.layer(),
             TimeIndex::new(3),
             key.scale(),
@@ -1770,7 +1752,7 @@ mod tests {
         );
 
         let unknown_layer = BrickKey::new(
-            DatasetResourceIdentity::Verified(identity),
+            DatasetResourceIdentity::ContentAddress(identity),
             LogicalLayerKey::new(99),
             key.timepoint(),
             key.scale(),
@@ -1782,7 +1764,7 @@ mod tests {
         );
 
         let unknown_scale = BrickKey::new(
-            DatasetResourceIdentity::Verified(identity),
+            DatasetResourceIdentity::ContentAddress(identity),
             key.layer(),
             key.timepoint(),
             ScaleLevel::new(99),
@@ -1794,7 +1776,7 @@ mod tests {
         );
 
         let outside = BrickKey::new(
-            DatasetResourceIdentity::Verified(identity),
+            DatasetResourceIdentity::ContentAddress(identity),
             key.layer(),
             key.timepoint(),
             key.scale(),
@@ -2180,24 +2162,24 @@ mod tests {
     }
 
     #[test]
-    fn unverified_source_identity_supports_bootstrap_decode_without_a_fake_scientific_id() {
+    fn session_local_resource_identity_supports_decode_without_a_content_address() {
         let source_id = DatasetSourceId::new(17);
         let template = multiscale_catalog(scientific_id('4'));
         let catalog = Arc::new(
             DatasetCatalog::new(
-                "unverified",
-                ScientificIdentityStatus::Unverified(source_id),
+                "session-local",
+                ContentAddressStatus::SessionLocal(source_id),
                 template.layers().cloned().collect(),
             )
             .unwrap(),
         );
-        let verified_key = resource_key(scientific_id('4'));
+        let content_addressed_key = resource_key(scientific_id('4'));
         let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(source_id),
-            verified_key.layer(),
-            verified_key.timepoint(),
-            verified_key.scale(),
-            verified_key.region(),
+            DatasetResourceIdentity::SessionLocal(source_id),
+            content_addressed_key.layer(),
+            content_addressed_key.timepoint(),
+            content_addressed_key.scale(),
+            content_addressed_key.region(),
         );
         let source = FormulaSource { catalog, fill: 9 };
 

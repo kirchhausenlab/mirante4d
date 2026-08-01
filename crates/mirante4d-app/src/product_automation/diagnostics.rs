@@ -1,7 +1,7 @@
 use mirante4d_dataset::CpuLedgerCategory;
 use mirante4d_dataset_runtime::DatasetRuntimeDiagnostics;
 use mirante4d_render_wgpu::WgpuRenderRuntimeDiagnostics;
-use mirante4d_storage::{LocalDatasetSourceDiagnostics, LocalPackageReadDiagnostics};
+use mirante4d_storage::LocalDatasetSourceDiagnostics;
 use serde_json::{Value, json};
 
 pub(crate) fn dataset_runtime_diagnostics_json(diagnostics: DatasetRuntimeDiagnostics) -> Value {
@@ -123,45 +123,6 @@ pub(crate) fn local_dataset_source_diagnostics_json(
             "codec_decoded_bytes": diagnostics.reader.codec_decoded_bytes,
             "codec_decode_time_ns": diagnostics.reader.codec_decode_time_ns,
         },
-    })
-}
-
-pub(crate) fn local_package_read_diagnostics_json(
-    diagnostics: LocalPackageReadDiagnostics,
-) -> Value {
-    json!({
-        "current_open_object_handles": diagnostics.open_object_handles_current,
-        "peak_open_object_handles": diagnostics.open_object_handles_peak,
-        "object_handle_cache_current": diagnostics.object_handle_cache_entries,
-        "object_handle_cache_peak": diagnostics.object_handle_cache_peak_entries,
-        "object_open_operations": diagnostics.object_open_operations,
-        "object_open_time_ns": diagnostics.object_open_time_ns,
-        "object_handle_cache_hits": diagnostics.object_handle_cache_hits,
-        "object_handle_cache_misses": diagnostics.object_handle_cache_misses,
-        "object_handle_cache_evictions": diagnostics.object_handle_cache_evictions,
-        "object_handle_cache_lock_acquisitions": diagnostics.object_handle_cache_lock_acquisitions,
-        "object_handle_cache_lock_contentions": diagnostics.object_handle_cache_lock_contentions,
-        "object_handle_cache_lock_wait_time_ns": diagnostics.object_handle_cache_lock_wait_time_ns,
-        "shard_index_cache_hits": diagnostics.shard_index_cache_hits,
-        "shard_index_cache_misses": diagnostics.shard_index_cache_misses,
-        "shard_index_decode_operations": diagnostics.shard_index_decode_operations,
-        "packed_inner_cache_hits": diagnostics.packed_inner_cache_hits,
-        "packed_inner_cache_misses": diagnostics.packed_inner_cache_misses,
-        "currentness": {
-            "pre_use_batches": diagnostics.currentness_pre_use_batches,
-            "post_use_batches": diagnostics.currentness_post_use_batches,
-            "snapshot_batches": diagnostics.currentness_snapshot_batches,
-            "root_metadata_checks": diagnostics.currentness_root_metadata_checks,
-            "named_object_resolutions": diagnostics.currentness_named_object_resolutions,
-            "object_fd_metadata_checks": diagnostics.currentness_object_fd_metadata_checks,
-            "time_ns": diagnostics.currentness_time_ns,
-        },
-        "physical_range_read_operations": diagnostics.physical_range_read_operations,
-        "physical_encoded_bytes_read": diagnostics.physical_encoded_bytes_read,
-        "physical_range_read_time_ns": diagnostics.physical_range_read_time_ns,
-        "codec_decode_operations": diagnostics.codec_decode_operations,
-        "codec_decoded_bytes": diagnostics.codec_decoded_bytes,
-        "codec_decode_time_ns": diagnostics.codec_decode_time_ns,
     })
 }
 

@@ -33,15 +33,15 @@ use mirante4d_render_api::{
 };
 
 use super::{
-    CoordinatedFrameExecutionReport, CoordinatedLayoutReport, CoordinatedTargetExecutionReport,
-    CoordinatedTargetLayout, CoordinatedTargetLayoutState, CoordinatedTargetRequest,
-    CoordinatedValidationCaptureTicket, CpuFrameTiming, GpuFrameTiming, GpuResidencyEvictionEvent,
-    GpuTimingTicket, MAX_CONTROL_UPLOAD_BYTES, MAX_PAYLOAD_UPLOAD_BYTES, MAX_RENDER_HEIGHT_PIXELS,
-    MAX_RENDER_WIDTH_PIXELS, MAX_UPLOADS, PipelineCapability, PipelineCompilationFailureCause,
-    PipelineReadiness, RendererDeviceGeneration, RetainedFrameRenderPolicy, TargetTextureRevision,
-    ValidationCapture, ValidationCaptureTicket, VolumeColorSchedule, VolumeRefinementProgress,
-    WgpuRenderRuntimeConfig, WgpuRenderRuntimeDiagnostics, WgpuRenderRuntimeError,
-    payload_allocation_bytes,
+    CoordinatedFrameExecutionReport, CoordinatedLayoutReport, CoordinatedPublicationGroup,
+    CoordinatedTargetExecutionReport, CoordinatedTargetLayout, CoordinatedTargetLayoutState,
+    CoordinatedTargetRequest, CoordinatedValidationCaptureTicket, CpuFrameTiming, GpuFrameTiming,
+    GpuResidencyEvictionEvent, GpuTimingTicket, MAX_CONTROL_UPLOAD_BYTES, MAX_PAYLOAD_UPLOAD_BYTES,
+    MAX_RENDER_HEIGHT_PIXELS, MAX_RENDER_WIDTH_PIXELS, MAX_UPLOADS, PipelineCapability,
+    PipelineCompilationFailureCause, PipelineReadiness, RendererDeviceGeneration,
+    RetainedFrameRenderPolicy, TargetTextureRevision, ValidationCapture, ValidationCaptureTicket,
+    VolumeColorSchedule, VolumeRefinementProgress, WgpuRenderRuntimeConfig,
+    WgpuRenderRuntimeDiagnostics, WgpuRenderRuntimeError, payload_allocation_bytes,
 };
 use crate::global_residency::{
     DirectoryAdmission, DirectoryPublication, DirectoryRemoval, GlobalResidencyDirectory,
@@ -655,6 +655,21 @@ const fn retained_frame_policy_allows_render(
         RetainedFrameRenderPolicy::ExactFrameOnly => {
             matches!(completeness, Some(FrameCompleteness::Exact))
         }
+    }
+}
+
+const fn coordinated_progress_satisfies_group(
+    group: CoordinatedPublicationGroup,
+    completeness: FrameCompleteness,
+) -> bool {
+    if group.exact_required() {
+        matches!(completeness, FrameCompleteness::Exact)
+    } else {
+        // A progress value exists only after the full first-useful fallback
+        // cohort is available. `Progressive` here means finer scientific
+        // resources remain pending; it does not mean the visible fallback
+        // has holes.
+        true
     }
 }
 
@@ -7314,6 +7329,50 @@ impl Runtime {
     /// residency freshness; unrelated global-directory changes may have
     /// occurred. This path performs no requirement walk, lease validation,
     /// allocator clone, eviction planning, or payload copy.
+    fn coordinated_atomic_publication_group(
+        &self,
+        requests: &[CoordinatedTargetRequest<'_>],
+    ) -> Result<Option<CoordinatedPublicationGroup>, WgpuRenderRuntimeError> {
+        let group = requests
+            .first()
+            .and_then(|request| request.atomic_publication_group());
+        for request in requests {
+            if request.atomic_publication_group() != group {
+                return Err(WgpuRenderRuntimeError::InvalidCoordinatedPublicationGroup);
+            }
+        }
+        let Some(group) = group else {
+            return Ok(None);
+        };
+        let required_policy = if group.exact_required() {
+            RetainedFrameRenderPolicy::ExactFrameOnly
+        } else {
+            RetainedFrameRenderPolicy::EveryUsefulFrame
+        };
+        if group.is_empty()
+            || requests.iter().any(|request| {
+                !group.contains(request.target()) || request.render_policy() != required_policy
+            })
+        {
+            return Err(WgpuRenderRuntimeError::InvalidCoordinatedPublicationGroup);
+        }
+        let timepoint = requests
+            .first()
+            .expect("an atomic group has at least one supplied member")
+            .intent()
+            .timepoint();
+        if requests
+            .iter()
+            .any(|request| request.intent().timepoint() != timepoint)
+            || PresentationTarget::ALL.into_iter().any(|target| {
+                group.contains(target) && !self.frame_coordinator.slot(target).desired
+            })
+        {
+            return Err(WgpuRenderRuntimeError::InvalidCoordinatedPublicationGroup);
+        }
+        Ok(Some(group))
+    }
+
     fn coordinated_request_order<'a>(
         &self,
         active_target: PresentationTarget,
@@ -7374,6 +7433,60 @@ impl Runtime {
         }
         debug_assert_eq!(ordered.len(), requests.len());
         Ok(ordered)
+    }
+
+    fn coordinated_plan_is_already_ready(
+        &self,
+        group: CoordinatedPublicationGroup,
+        plan: CoordinatedExecutionPlan<'_>,
+    ) -> bool {
+        let Ok(front) = self.frame_coordinator.front_token(plan.request.target()) else {
+            return false;
+        };
+        let presentation = self
+            .frame_coordinator
+            .presentations
+            .get(&front)
+            .expect("a coordinated front token owns one presentation");
+        presentation.last_rendered_frame == Some(plan.request.intent().frame())
+            && presentation.display.extent == plan.request.intent().extent()
+            && presentation.last_progress.as_ref().is_some_and(|progress| {
+                coordinated_progress_satisfies_group(group, progress.completeness())
+            })
+            && presentation
+                .last_rendered_requirements
+                .as_ref()
+                .is_some_and(|rendered| {
+                    rendered.shares_resources_with(plan.request.requirements())
+                        && rendered.prefetch_promoted()
+                            == plan.request.requirements().prefetch_promoted()
+                })
+            && !presentation.rendered_residency_freshness.requires_refresh()
+    }
+
+    fn coordinated_atomic_publication_ready(
+        &self,
+        group: CoordinatedPublicationGroup,
+        plans: &[CoordinatedExecutionPlan<'_>],
+        color_passes: &[CoordinatedColorPass<'_>],
+    ) -> bool {
+        PresentationTarget::ALL.into_iter().all(|target| {
+            if !group.contains(target) {
+                return true;
+            }
+            let Some(plan) = plans
+                .iter()
+                .copied()
+                .find(|plan| plan.request.target() == target)
+            else {
+                return false;
+            };
+            color_passes.iter().any(|pass| {
+                pass.plan.request.target() == target
+                    && coordinated_progress_satisfies_group(group, pass.progress.completeness())
+                    && pass.publishes_frame
+            }) || self.coordinated_plan_is_already_ready(group, plan)
+        })
     }
 
     fn presentation_matches_coordinated_request(
@@ -7697,6 +7810,7 @@ impl Runtime {
         if !self.residency.catalog_is_active(catalog) {
             return Err(WgpuRenderRuntimeError::PayloadContractMismatch);
         }
+        let atomic_publication_group = self.coordinated_atomic_publication_group(targets)?;
         let ordered = self.coordinated_request_order(active_target, targets)?;
         for request in &ordered {
             self.validate_coordinated_request_contract(catalog, *request)?;
@@ -8160,6 +8274,15 @@ impl Runtime {
                     return Err(WgpuRenderRuntimeError::HiddenRefinementFailed);
                 }
             }
+        }
+        if atomic_publication_group.is_some_and(|group| {
+            !self.coordinated_atomic_publication_ready(group, &plans, &color_passes)
+        }) {
+            // Residency and private refinement above are productive even when
+            // another visible target is not ready. Dropping the public color
+            // passes here preserves the predecessor textures; every exact
+            // member will be reconsidered together on the next cutoff.
+            color_passes.clear();
         }
         let display_peak_bytes = self
             .active_display_bytes()
@@ -10570,9 +10693,8 @@ const fn align_copy(bytes: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use mirante4d_dataset::{
-        DatasetLayer, DatasetResourceIdentity, DatasetScale, DatasetSourceId,
+        ContentAddressStatus, DatasetLayer, DatasetResourceIdentity, DatasetScale, DatasetSourceId,
         ResourcePayloadDescriptor, ResourcePayloadFacts, ResourceRegion, ResourceValidity,
-        ScientificIdentityStatus,
     };
     use mirante4d_domain::{
         CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer, GridToWorld,
@@ -10589,7 +10711,7 @@ mod tests {
 
     fn key(layer: u32, scale: u32, origin_x: u64, width: u64) -> BrickKey {
         BrickKey::new(
-            DatasetResourceIdentity::Unverified(DatasetSourceId::new(1)),
+            DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(1)),
             LogicalLayerKey::new(layer),
             TimeIndex::new(0),
             ScaleLevel::new(scale),
@@ -10608,7 +10730,7 @@ mod tests {
     fn frame_intent(frame: u64, layer: LogicalLayerKey) -> RenderIntent {
         RenderIntent::new(
             FrameIdentity::new(frame),
-            DatasetResourceIdentity::Unverified(DatasetSourceId::new(1)),
+            DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(1)),
             TimeIndex::new(0),
             RenderViewIntent::cross_section(
                 CrossSectionView::new(
@@ -10653,7 +10775,7 @@ mod tests {
     fn volume_intent_with_layers(layers: Vec<LayerRenderIntent>) -> RenderIntent {
         RenderIntent::new(
             FrameIdentity::new(1),
-            DatasetResourceIdentity::Unverified(DatasetSourceId::new(1)),
+            DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(1)),
             TimeIndex::new(0),
             RenderViewIntent::volume(
                 CameraView::new(
@@ -10797,7 +10919,7 @@ mod tests {
         let shape = Shape3D::new(8, 8, 8).unwrap();
         let catalog = DatasetCatalog::new(
             "whole-volume-fast-path",
-            ScientificIdentityStatus::Unverified(DatasetSourceId::new(1)),
+            ContentAddressStatus::SessionLocal(DatasetSourceId::new(1)),
             vec![
                 DatasetLayer::new(
                     layer,
@@ -10890,7 +11012,7 @@ mod tests {
 
         let authored_cross_section = RenderIntent::new(
             FrameIdentity::new(1),
-            DatasetResourceIdentity::Unverified(DatasetSourceId::new(1)),
+            DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(1)),
             TimeIndex::new(0),
             RenderViewIntent::cross_section(
                 CrossSectionView::new(WorldPoint3::origin(), UnitQuaternion::identity(), 1.0, 1.0)
@@ -10926,7 +11048,7 @@ mod tests {
 
         let catalog = DatasetCatalog::new(
             "canonical-DVR-control",
-            ScientificIdentityStatus::Unverified(DatasetSourceId::new(1)),
+            ContentAddressStatus::SessionLocal(DatasetSourceId::new(1)),
             vec![
                 DatasetLayer::new_multiscale(
                     LogicalLayerKey::new(3),
@@ -11350,7 +11472,7 @@ mod tests {
         let body = PreparedResourceBody::new(canonical.into(), vec![first, guard].into(), None)
             .expect("test prepared body is valid");
         let prepared = PreparedRenderRequirements::new_with_required_prefix(
-            DatasetResourceIdentity::Unverified(DatasetSourceId::new(1)),
+            DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(1)),
             TimeIndex::new(0),
             vec![LogicalLayerKey::new(8)],
             body,
@@ -11489,6 +11611,30 @@ mod tests {
         assert!(!retained_frame_policy_allows_render(
             RetainedFrameRenderPolicy::ExactFrameOnly,
             None,
+        ));
+    }
+
+    #[test]
+    fn coordinated_first_useful_groups_accept_safe_fallbacks_while_exact_groups_do_not() {
+        assert!(coordinated_progress_satisfies_group(
+            CoordinatedPublicationGroup::FULL_LAYOUT_FIRST_USEFUL,
+            FrameCompleteness::Progressive,
+        ));
+        assert!(coordinated_progress_satisfies_group(
+            CoordinatedPublicationGroup::FULL_LAYOUT_FIRST_USEFUL,
+            FrameCompleteness::Complete,
+        ));
+        assert!(coordinated_progress_satisfies_group(
+            CoordinatedPublicationGroup::FULL_LAYOUT_FIRST_USEFUL,
+            FrameCompleteness::Exact,
+        ));
+        assert!(!coordinated_progress_satisfies_group(
+            CoordinatedPublicationGroup::FULL_LAYOUT,
+            FrameCompleteness::Complete,
+        ));
+        assert!(coordinated_progress_satisfies_group(
+            CoordinatedPublicationGroup::FULL_LAYOUT,
+            FrameCompleteness::Exact,
         ));
     }
 

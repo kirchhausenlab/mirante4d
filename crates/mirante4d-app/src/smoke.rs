@@ -92,6 +92,8 @@ pub fn run_headless_smoke(
     let mut application = ApplicationState::new_unbound(
         SourceSessionGeneration::new(1),
         opened.catalog.as_ref().clone(),
+        opened.source_reference.clone(),
+        opened.content_address_origin,
         opened.workspace.clone(),
         resource_policy,
     )
@@ -273,13 +275,16 @@ fn load_current_requirements(
         std::thread::yield_now();
     };
     let PreparedVisibleDemand {
-        current_3d,
-        cross_sections,
+        targets,
         renderer_requirement_update,
         renderer_requirement_payload_bytes: _,
         post_refinement_promotion_update,
         candidates_visited: _,
     } = prepared;
+    let (current_3d, cross_sections, temporal_frame_contract) = targets.into_parts();
+    if temporal_frame_contract.is_some() {
+        anyhow::bail!("headless non-playback planning unexpectedly produced a temporal frame");
+    }
     if !cross_sections.is_empty() {
         anyhow::bail!("headless single-view planning unexpectedly produced linked-panel demand");
     }

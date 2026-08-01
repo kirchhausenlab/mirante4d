@@ -319,8 +319,8 @@ impl eframe::App for MiranteWorkbenchApp {
         let settings_ui_view = self.settings_ui_view();
         let dataset_open_pending = self.pending_dataset_open.is_some();
         let project_status_message = self.project_status_message.clone();
-        let source_verification_available = self
-            .source_verification_service
+        let package_integrity_audit_available = self
+            .package_integrity_audit_service
             .as_ref()
             .is_some_and(|service| service.active_token().is_none());
         let runtime_diagnostics_view =
@@ -331,16 +331,21 @@ impl eframe::App for MiranteWorkbenchApp {
         let mut application_commands = Vec::new();
         workbench_playback_runtime::enqueue_playback_command_if_due(
             &application_snapshot,
+            &mut self.playback_session,
             &self.dataset,
+            &self.render_coordination,
+            &self.native_presentation,
             &mut application_commands,
             ui.ctx(),
         );
 
         let active_layer_histogram_for_ui = self.active_histogram_summary(&application_snapshot);
-        let project_actions_available = matches!(
-            application_snapshot.source(),
-            SourceVerificationSnapshot::Verified(_)
-        );
+        if let Some(command) =
+            self.initial_auto_dense_command(&application_snapshot, &active_layer_histogram_for_ui)
+        {
+            application_commands.push(command);
+        }
+        let project_actions_available = true;
         let project_is_bound = application_snapshot.is_bound();
         let project_store_status = self.project_store.as_ref().map(|service| service.status());
         let project_store_idle = project_store_status.as_ref().is_some_and(|status| {
@@ -418,7 +423,7 @@ impl eframe::App for MiranteWorkbenchApp {
                 },
                 left: ui_kit::LeftWorkbenchView {
                     application: &application_snapshot,
-                    source_verification_available,
+                    package_integrity_audit_available,
                     composite_fidelity: &viewer_ui_snapshot.composite_fidelity,
                     dataset_path: &viewer_ui_snapshot.dataset_path,
                 },
@@ -475,8 +480,6 @@ impl eframe::App for MiranteWorkbenchApp {
 
         self.drain_brick_results(ui.ctx());
         self.pump_viewer_pick(ui.ctx());
-        self.update_source_verification_interactive_busy();
-
         let snapshot = self.application.snapshot();
         let project_store_pending = self
             .project_store
@@ -535,12 +538,10 @@ impl eframe::App for MiranteWorkbenchApp {
             ui.ctx()
                 .request_repaint_after(FOREGROUND_VISIBLE_WORK_REPAINT_INTERVAL);
         } else if background_work_active
-            || workbench_playback_runtime::source_verification_polling_required(
-                self.pending_automatic_source_verification.is_some(),
-                self.source_verification_service
-                    .as_ref()
-                    .is_some_and(|service| service.active_token().is_some()),
-            )
+            || self
+                .package_integrity_audit_service
+                .as_ref()
+                .is_some_and(|service| service.active_token().is_some())
             || project_store_pending
         {
             request_background_work_repaint_after(ui.ctx());
@@ -561,10 +562,7 @@ impl eframe::App for MiranteWorkbenchApp {
         let final_snapshot = self.application.snapshot();
         let four_panel =
             application_view(&final_snapshot).layout() == CanonicalViewerLayout::FourPanel;
-        let source_verified = matches!(
-            final_snapshot.source(),
-            SourceVerificationSnapshot::Verified(_)
-        );
+        let source_admitted = true;
         let complete =
             self.render_coordination.frame_fidelity.completeness == FrameCompleteness::Complete;
         let current = self.render_coordination.frame_fidelity.display_freshness
@@ -581,13 +579,13 @@ impl eframe::App for MiranteWorkbenchApp {
             .displayed_scale_level;
         let selected_scale = self.render_coordination.frame_fidelity.target_scale_level;
         let ideal_scale = self.render_coordination.frame_fidelity.ideal_scale_level;
-        // Source verification and hidden refinement are deliberately not
+        // Optional package auditing and hidden refinement are deliberately not
         // readiness prerequisites. The owner-visible failure occurs while the
         // normal app is usable, and those background services must not turn
         // this finite interaction check into another idle launch protocol.
         let ready = four_panel && complete && current && displayed_scale == Some(3);
         let state_flags = u64::from(four_panel)
-            | (u64::from(source_verified) << 1)
+            | (u64::from(source_admitted) << 1)
             | (u64::from(complete) << 2)
             | (u64::from(current) << 3)
             | (u64::from(all_presentations) << 4)
@@ -806,10 +804,10 @@ impl eframe::App for MiranteWorkbenchApp {
         {
             tracing::warn!(%error, "dataset open service shutdown failed");
         }
-        if let Some(source_verification_service) = self.source_verification_service.take()
-            && let Err(error) = source_verification_service.shutdown()
+        if let Some(package_integrity_audit_service) = self.package_integrity_audit_service.take()
+            && let Err(error) = package_integrity_audit_service.shutdown()
         {
-            tracing::warn!(%error, "source-verification service shutdown failed");
+            tracing::warn!(%error, "package integrity audit service shutdown failed");
         }
         if let Err(error) = self.settings_connection.shutdown() {
             tracing::warn!(%error, "settings actor shutdown failed");

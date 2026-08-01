@@ -36,7 +36,7 @@ impl ResourceLease for HistogramTestLease {
 
 fn histogram_key(layer: u32, timepoint: u64, scale: u32, origin_x: u64, samples: u64) -> BrickKey {
     BrickKey::new(
-        DatasetResourceIdentity::Unverified(DatasetSourceId::new(77)),
+        DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(77)),
         LogicalLayerKey::new(layer),
         TimeIndex::new(timepoint),
         ScaleLevel::new(scale),
@@ -84,7 +84,7 @@ fn histogram_for_test(
         bridge,
         histogram::ActiveLayerHistogramInput {
             requirements: &requirements,
-            identity: DatasetResourceIdentity::Unverified(DatasetSourceId::new(77)),
+            identity: DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(77)),
             layer: LogicalLayerKey::new(layer),
             layer_name: "intensity",
             dtype: IntensityDType::Uint16,
@@ -295,6 +295,88 @@ fn auto_signal_window_ignores_dominant_low_background_bin() {
 }
 
 #[test]
+fn initial_auto_dense_uses_the_existing_histogram_algorithm_once() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(root).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let snapshot = app.application.snapshot();
+    let histogram = LayerHistogramSummary {
+        status: HistogramStatus::Exact,
+        bin_count: 4,
+        sample_count: 10,
+        min_value: 10.0,
+        max_value: 40.0,
+        bins: vec![1, 2, 3, 4],
+    };
+    let expected = auto_dense_window_from_histogram(&histogram).unwrap();
+
+    let command = app
+        .initial_auto_dense_command(&snapshot, &histogram)
+        .expect("the settled initial histogram queues one display-window command");
+    let ApplicationCommand::SetLayerView(layer) = command else {
+        panic!("initial Auto Dense must use the canonical layer-view command");
+    };
+    assert_eq!(layer.transfer().window(), expected);
+    assert_eq!(app.initial_auto_dense.applied_window(), Some(expected));
+    assert!(app.initial_auto_dense_command(&snapshot, &histogram).is_none());
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn deliberate_window_edit_cancels_pending_initial_auto_dense() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let root = write_target_fixture(tempdir.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(root).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let context = egui::Context::default();
+    let snapshot = app.application.snapshot();
+    let active = application_view(&snapshot)
+        .layer(application_view(&snapshot).active_layer())
+        .unwrap();
+    let window = mirante4d_domain::DisplayWindow::new(12.0, 34.0).unwrap();
+    let current = active.transfer();
+    let transfer = mirante4d_domain::LayerTransfer::new(
+        window,
+        current.color(),
+        current.opacity(),
+        current.curve(),
+        current.invert(),
+    );
+    app.apply_application_command(
+        ApplicationCommand::SetLayerView(LayerViewState::new(
+            active.layer_key(),
+            active.visible(),
+            transfer,
+            *active.render_state(),
+        )),
+        &context,
+    )
+    .unwrap();
+
+    assert_eq!(app.initial_auto_dense, InitialAutoDenseState::Cancelled);
+    let histogram = LayerHistogramSummary {
+        status: HistogramStatus::Exact,
+        bin_count: 2,
+        sample_count: 2,
+        min_value: 0.0,
+        max_value: 100.0,
+        bins: vec![1, 1],
+    };
+    let current = app.application.snapshot();
+    assert!(app.initial_auto_dense_command(&current, &histogram).is_none());
+    assert_eq!(
+        application_view(&current)
+            .layer(application_view(&current).active_layer())
+            .unwrap()
+            .transfer()
+            .window(),
+        window
+    );
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
 fn histogram_bins_label_is_plain_product_text_not_ascii_art() {
     let histogram = LayerHistogramSummary {
         status: HistogramStatus::Exact,
@@ -335,12 +417,14 @@ fn application_playback_commands_reconcile_transient_state_and_timepoint() {
     );
     assert_eq!(
         playback_status_label(
-            snapshot.transient().playback_active(),
+            snapshot.transient().playback_phase(),
             application_view(&snapshot).timepoint(),
             workbench_playback_runtime::catalog_timepoint_count(&snapshot),
         ),
-        "playback playing | t 1/3"
+        "playback warming | t 1/3"
     );
+    app.apply_application_command(ApplicationCommand::MarkPlaybackPrepared, &ctx)
+        .unwrap();
 
     app.apply_application_command(ApplicationCommand::AdvancePlaybackTick(10), &ctx)
         .unwrap();
@@ -378,7 +462,7 @@ fn application_playback_commands_reconcile_transient_state_and_timepoint() {
     );
     assert_eq!(
         playback_status_label(
-            snapshot.transient().playback_active(),
+            snapshot.transient().playback_phase(),
             application_view(&snapshot).timepoint(),
             workbench_playback_runtime::catalog_timepoint_count(&snapshot),
         ),
@@ -387,7 +471,7 @@ fn application_playback_commands_reconcile_transient_state_and_timepoint() {
 }
 
 #[test]
-fn timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
+fn timepoint_command_marks_new_demand_while_retaining_every_previous_presentation() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_target_fixture(tempdir.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(root).unwrap();
@@ -421,13 +505,36 @@ fn timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
             generation,
             CrossSectionPanelScheduleState::missing_viewport(generation),
         ));
+        assert!(app.render_coordination.record_presented_frame(
+            panel_id.presentation_slot(),
+            generation,
+            synthetic_presented_frame(panel_id.presentation_slot(), render),
+        ));
     }
+    let three_d_generation = app
+        .render_coordination
+        .surface(PanelId::ThreeD.presentation_slot())
+        .generation();
+    assert!(app.render_coordination.record_presented_frame(
+        mirante4d_application::PresentationSlot::ThreeD,
+        three_d_generation,
+        synthetic_presented_frame(
+            mirante4d_application::PresentationSlot::ThreeD,
+            app.render_coordination.render_viewport,
+        ),
+    ));
     let generations_before =
         [PanelId::Xy, PanelId::Xz, PanelId::ThreeD, PanelId::Yz].map(|panel_id| {
             app.render_coordination
                 .surface(panel_id.presentation_slot())
                 .generation()
         });
+    let retained_three_d = app
+        .render_coordination
+        .surface(PanelId::ThreeD.presentation_slot())
+        .presented_frame()
+        .cloned()
+        .expect("the fixture starts with one paintable 3D frame");
 
     app.apply_application_command(ApplicationCommand::SetTimepoint(TimeIndex::new(1)), &ctx)
         .unwrap();
@@ -452,6 +559,32 @@ fn timepoint_command_dirties_cross_section_panels_without_dirtying_3d_panel() {
     }
     let three_d = runtime.surface(PanelId::ThreeD.presentation_slot());
     assert_eq!(three_d.generation(), generations_before[2]);
+    assert_eq!(three_d.presented_frame(), Some(&retained_three_d));
+    let ui_snapshot = app.application_snapshot_for_ui();
+    let ui_three_d = ui_snapshot
+        .presentations()
+        .get(mirante4d_application::PresentationSlot::ThreeD)
+        .expect("the 3D slot remains projected");
+    assert!(!ui_three_d.frame_is_current());
+    assert!(
+        ui_three_d.paint_request().is_some(),
+        "a temporal seek must keep the previous complete volume paintable"
+    );
+    for slot in [
+        mirante4d_application::PresentationSlot::Xy,
+        mirante4d_application::PresentationSlot::Xz,
+        mirante4d_application::PresentationSlot::Yz,
+    ] {
+        let surface = ui_snapshot
+            .presentations()
+            .get(slot)
+            .expect("every four-panel slot remains projected");
+        assert!(!surface.frame_is_current());
+        assert!(
+            surface.paint_request().is_some(),
+            "a temporal seek must retain every linked-panel texture"
+        );
+    }
 }
 
 #[test]
@@ -472,5 +605,15 @@ fn workbench_shell_exposes_playback_controls_for_time_series() {
     harness.get_by_label("Play");
     harness.get_by_label("Next");
     harness.get_by_label("Last");
-    harness.get_by_label("playback stopped | t 1/3");
+    let playback_slider = harness.get_by_role_and_label(egui::accesskit::Role::SpinButton, "t");
+    let fps_slider = harness.get_by_role_and_label(egui::accesskit::Role::SpinButton, "FPS");
+    let playback_status = harness.get_by_label("playback stopped | t 1/3");
+    assert!(
+        playback_slider.rect().bottom() <= fps_slider.rect().top(),
+        "the FPS selector must remain directly below the timepoint slider"
+    );
+    assert!(
+        fps_slider.rect().bottom() <= playback_status.rect().top(),
+        "playback controls must remain above the variable-height status rows"
+    );
 }

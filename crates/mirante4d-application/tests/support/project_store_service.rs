@@ -1,8 +1,7 @@
 use std::{
     fs,
-    io::{self, Cursor, Read},
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -10,27 +9,21 @@ use std::{
 };
 
 use mirante4d_dataset::{
-    DatasetCatalog, DatasetLayer, DatasetSourceId, ResourceValidity, ScientificIdentityStatus,
+    ContentAddressStatus, DatasetCatalog, DatasetLayer, DatasetSourceId, ResourceValidity,
 };
 use mirante4d_domain::{
     CameraView, CrossSectionView, DisplayWindow, GridToWorld, IntensityDType, IsoLightState,
     LayerTransfer, LogicalLayerKey, Opacity, Projection, RenderState, RgbColor, SamplingPolicy,
     Shape4D, TimeIndex, TransferCurve, UnitQuaternion, ViewerLayout, WorldPoint3,
 };
-use mirante4d_identity::{
-    ArtifactContentId, ExactBytesHasher, MediaType, ObjectRole, RawObjectDescriptor,
-    ScientificContentId,
-};
-use mirante4d_project_model::{
-    ArtifactCompleteness, ArtifactHandleId, ArtifactRecoverability, ArtifactReference,
-    ArtifactSchema, DatasetReference, LayerViewState, ProjectId, ViewState,
-};
+use mirante4d_identity::ScientificContentId;
+use mirante4d_project_model::{DatasetReference, LayerViewState, ProjectId, ViewState};
 use mirante4d_settings::{GIB, ResourcePolicy};
 
 use super::*;
 use crate::{
-    ApplicationCommand, ApplicationEvent, ApplicationState, MAX_PENDING_EVENTS,
-    OperationCompletion, SourceSessionGeneration, UnboundWorkspace,
+    ApplicationCommand, ApplicationEvent, ApplicationState, ContentAddressOrigin,
+    MAX_PENDING_EVENTS, OperationCompletion, SourceSessionGeneration, UnboundWorkspace,
 };
 
 #[derive(Clone, Default)]
@@ -76,15 +69,14 @@ fn idle_and_maximum_deadlines_are_exact() {
 #[test]
 fn every_eligibility_fact_blocks_capture_without_consuming_the_deadline() {
     let project = ProjectId::from_bytes([2; 16]);
-    for blocked in 0..4 {
+    for blocked in 0..3 {
         let mut scheduler = AutosaveScheduler::default();
         scheduler.observe(seconds(0), eligible(project, 0)).unwrap();
         let mut observation = eligible(project, 0);
         match blocked {
-            0 => observation.verified = false,
-            1 => observation.writable = false,
-            2 => observation.commit_active = true,
-            3 => observation.writes_suspended = true,
+            0 => observation.writable = false,
+            1 => observation.commit_active = true,
+            2 => observation.writes_suspended = true,
             _ => unreachable!(),
         }
         assert_eq!(scheduler.observe(seconds(30), observation), Ok(None));
@@ -165,7 +157,7 @@ fn decreasing_tick_is_rejected_atomically() {
 
 #[test]
 fn pending_repaint_deadline_and_busy_status_are_exact_without_polling() {
-    let application = verified_bound_application();
+    let application = admitted_bound_application();
     let snapshot = application.snapshot();
     let directory = TestDirectory::new();
     let destination = ProjectStorePath::new(directory.path().join("recovery.m4dproj")).unwrap();
@@ -226,118 +218,8 @@ fn pending_repaint_deadline_and_busy_status_are_exact_without_polling() {
 }
 
 #[test]
-fn source_invalidation_cancels_an_active_autosave_and_suppresses_its_stale_result() {
-    let mut application = verified_bound_application();
-    application.drain_events(MAX_PENDING_EVENTS);
-    let (artifact, source, gate) = gated_artifact_source();
-    application
-        .dispatch(ApplicationCommand::UpsertArtifact(artifact))
-        .unwrap();
-    application.drain_events(MAX_PENDING_EVENTS);
-    let snapshot = application.snapshot();
-
-    let directory = TestDirectory::new();
-    let destination = ProjectStorePath::new(directory.path().join("recovery.m4dproj")).unwrap();
-    let clock = ManualClock::default();
-    let mut service = ProjectStoreApplicationService::start(
-        ProjectStoreConfig::default(),
-        clock.clone(),
-        Some(destination.clone()),
-    )
-    .unwrap();
-    assert!(
-        service
-            .drive(&snapshot, |_| panic!("autosave was not due"))
-            .unwrap()
-            .is_empty()
-    );
-    clock.set(seconds(30));
-    assert!(matches!(
-        service
-            .drive(&snapshot, move |_| Ok(vec![source]))
-            .unwrap()
-            .as_slice(),
-        [ProjectStoreServiceEvent::AutosaveSubmitted { .. }]
-    ));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !gate.started() {
-        let events = service
-            .drive(&snapshot, |_| {
-                panic!("active autosave recaptured its source")
-            })
-            .unwrap();
-        match events.as_slice() {
-            [
-                ProjectStoreServiceEvent::AutosaveFinished {
-                    result: Err(ProjectStoreFault::UnsupportedFilesystem),
-                    ..
-                },
-            ] => {
-                assert!(!gate.started());
-                assert!(!destination.as_path().exists());
-                assert_eq!(service.status().lifecycle(), ProjectStoreLifecycle::Unbound);
-                assert_eq!(service.status().current_autosave(), None);
-                service.join().unwrap();
-                return;
-            }
-            [] => {}
-            events => panic!("unexpected autosave event before the gated read: {events:?}"),
-        }
-        assert!(
-            Instant::now() < deadline,
-            "project-store actor did not begin the gated read"
-        );
-        thread::yield_now();
-    }
-
-    application
-        .dispatch(ApplicationCommand::InvalidateSourceVerification {
-            source_generation: SourceSessionGeneration::new(1),
-        })
-        .unwrap();
-    let invalidated = application.snapshot();
-    assert!(
-        service
-            .drive(&invalidated, |_| panic!("invalid source recaptured"))
-            .unwrap()
-            .is_empty()
-    );
-    let active = service.active_autosave.as_ref().unwrap();
-    assert!(active.stale_source_observed);
-    assert!(active.cancellation_request.is_some());
-
-    gate.release();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut acknowledged = false;
-    let mut cancelled = false;
-    while Instant::now() < deadline && !cancelled {
-        for event in service
-            .drive(&invalidated, |_| panic!("invalid source recaptured"))
-            .unwrap()
-        {
-            match event {
-                ProjectStoreServiceEvent::CancellationAcknowledged { .. } => acknowledged = true,
-                ProjectStoreServiceEvent::AutosaveFinished {
-                    result: Err(ProjectStoreFault::Cancelled),
-                    ..
-                } => cancelled = true,
-                _ => {}
-            }
-        }
-        thread::yield_now();
-    }
-    assert!(acknowledged);
-    assert!(cancelled);
-    assert_eq!(service.status().lifecycle(), ProjectStoreLifecycle::Unbound);
-    assert_eq!(service.status().current_autosave(), None);
-
-    close_service(&mut service, &invalidated);
-    service.join().unwrap();
-}
-
-#[test]
 fn missing_recovery_destination_disables_only_provisional_autosave() {
-    let application = verified_bound_application();
+    let application = admitted_bound_application();
     let snapshot = application.snapshot();
     let mut service = ProjectStoreApplicationService::start(
         ProjectStoreConfig::default(),
@@ -487,7 +369,7 @@ fn opening_a_provisional_store_is_dirty_until_recovery_is_selected() {
 
 #[test]
 fn save_as_rejects_a_projection_not_retained_by_its_exact_token() {
-    let mut application = verified_bound_application();
+    let mut application = admitted_bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     let requested_id = ProjectId::from_bytes([10; 16]);
     application
@@ -593,7 +475,7 @@ fn save_as_rejects_a_projection_not_retained_by_its_exact_token() {
 
 #[test]
 fn foreground_completion_at_autosave_deadline_does_not_capture_the_stale_snapshot() {
-    let mut application = verified_bound_application();
+    let mut application = admitted_bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     let snapshot = application.snapshot();
     let (token, projection) = project_save_request(&mut application);
@@ -693,7 +575,7 @@ fn real_open_recovery_inspection_failure_enters_recovery_only() {
         return;
     }
 
-    let mut opener = verified_unbound_application();
+    let mut opener = admitted_unbound_application();
     opener.drain_events(MAX_PENDING_EVENTS);
     let token = project_open_request(&mut opener);
     let opener_snapshot = opener.snapshot();
@@ -751,7 +633,7 @@ fn automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit() {
     let Some((newer_generation, _)) = create_established_recovery_store(&newer_path, false) else {
         return;
     };
-    let mut newer_opener = verified_unbound_application();
+    let mut newer_opener = admitted_unbound_application();
     newer_opener.drain_events(MAX_PENDING_EVENTS);
     let newer_token = project_open_request(&mut newer_opener);
     let newer_snapshot = newer_opener.snapshot();
@@ -797,7 +679,7 @@ fn automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit() {
         branch_path.as_path(),
         current_manual.expect("branch fixture advances the manual head"),
     );
-    let mut branch_opener = verified_unbound_application();
+    let mut branch_opener = admitted_unbound_application();
     branch_opener.drain_events(MAX_PENDING_EVENTS);
     let branch_token = project_open_request(&mut branch_opener);
     let branch_snapshot = branch_opener.snapshot();
@@ -841,7 +723,7 @@ fn real_recovery_selected_save_as_establishes_the_new_project() {
         return;
     };
 
-    let mut opener = verified_unbound_application();
+    let mut opener = admitted_unbound_application();
     opener.drain_events(MAX_PENDING_EVENTS);
     let open_token = project_open_request(&mut opener);
     let mut service = ProjectStoreApplicationService::start(
@@ -983,7 +865,7 @@ fn inactive_cancellation_uses_the_service_path() {
 
 #[test]
 fn pending_recovery_review_cancellation_is_terminal_and_closes_the_session() {
-    let mut application = verified_unbound_application();
+    let mut application = admitted_unbound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     application
         .dispatch(ApplicationCommand::RequestProjectOpen)
@@ -997,7 +879,7 @@ fn pending_recovery_review_cancellation_is_terminal_and_closes_the_session() {
         })
         .unwrap();
     let snapshot = application.snapshot();
-    let mut projection_application = verified_bound_application();
+    let mut projection_application = admitted_bound_application();
     projection_application.drain_events(MAX_PENDING_EVENTS);
     let (_, projection) = project_save_request(&mut projection_application);
     let directory = TestDirectory::new();
@@ -1052,11 +934,11 @@ fn pending_recovery_review_cancellation_is_terminal_and_closes_the_session() {
 
 #[test]
 fn initial_save_preserves_the_reducer_token_on_qualified_or_unsupported_filesystems() {
-    let mut application = verified_bound_application();
+    let mut application = admitted_bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     let (token, projection) = project_save_request(&mut application);
 
-    let mut wrong_application = verified_bound_application();
+    let mut wrong_application = admitted_bound_application();
     wrong_application
         .dispatch(ApplicationCommand::BeginOperation(OperationKind::Import))
         .unwrap();
@@ -1133,7 +1015,7 @@ fn initial_save_preserves_the_reducer_token_on_qualified_or_unsupported_filesyst
 
 #[test]
 fn real_actor_autosave_obeys_filesystem_policy_without_advancing_manual_saved_revision() {
-    let mut application = verified_bound_application();
+    let mut application = admitted_bound_application();
     let first_snapshot = application.snapshot();
     let first_revision = bound_revision(&first_snapshot);
     assert_eq!(bound_saved_revision(&first_snapshot), None);
@@ -1224,7 +1106,7 @@ fn real_actor_autosave_obeys_filesystem_policy_without_advancing_manual_saved_re
 
 #[test]
 fn failed_capture_is_not_retried_until_a_later_durable_edit() {
-    let mut application = verified_bound_application();
+    let mut application = admitted_bound_application();
     let first_snapshot = application.snapshot();
     let directory = TestDirectory::new();
     let destination = ProjectStorePath::new(directory.path().join("recovery.m4dproj")).unwrap();
@@ -1336,7 +1218,7 @@ fn cancelled_completion_does_not_rearm_the_captured_revision() {
 
 #[test]
 fn queued_analysis_target_before_cancel_ack_preserves_both_events() {
-    let mut application = verified_bound_application();
+    let mut application = admitted_bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     application
         .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
@@ -1407,7 +1289,7 @@ fn queued_analysis_target_before_cancel_ack_preserves_both_events() {
 
 #[test]
 fn commit_indeterminate_suspends_writes_until_service_reopen() {
-    let mut application = verified_bound_application();
+    let mut application = admitted_bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     let (token, projection) = project_save_request(&mut application);
     let snapshot = application.snapshot();
@@ -1480,7 +1362,6 @@ fn eligible(project_id: ProjectId, revision: u64) -> AutosaveObservation {
         revision: Some(ProjectRevisionId::new(project_id, revision)),
         bound: true,
         dirty: true,
-        verified: true,
         writable: true,
         commit_active: false,
         writes_suspended: false,
@@ -1500,7 +1381,6 @@ fn ineligible_unbound() -> AutosaveObservation {
         revision: None,
         bound: false,
         dirty: false,
-        verified: true,
         writable: true,
         commit_active: false,
         writes_suspended: false,
@@ -1538,119 +1418,6 @@ fn test_source_identity() -> ScientificContentId {
         "1".repeat(64)
     ))
     .unwrap()
-}
-
-#[derive(Default)]
-struct ReadGate {
-    state: Mutex<ReadGateState>,
-    wake: Condvar,
-}
-
-#[derive(Default)]
-struct ReadGateState {
-    started: bool,
-    released: bool,
-}
-
-impl ReadGate {
-    fn started(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .started
-    }
-
-    fn release(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        state.released = true;
-        self.wake.notify_all();
-    }
-}
-
-struct GatedObjectSource {
-    descriptor: RawObjectDescriptor,
-    bytes: Arc<[u8]>,
-    gate: Arc<ReadGate>,
-}
-
-impl ProjectObjectSource for GatedObjectSource {
-    fn descriptor(&self) -> &RawObjectDescriptor {
-        &self.descriptor
-    }
-
-    fn open(&self) -> io::Result<Box<dyn Read + Send>> {
-        Ok(Box::new(GatedReader {
-            bytes: Cursor::new(Arc::clone(&self.bytes)),
-            gate: Arc::clone(&self.gate),
-        }))
-    }
-}
-
-struct GatedReader {
-    bytes: Cursor<Arc<[u8]>>,
-    gate: Arc<ReadGate>,
-}
-
-impl Read for GatedReader {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let mut state = self
-            .gate
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        state.started = true;
-        self.gate.wake.notify_all();
-        while !state.released {
-            state = self
-                .gate
-                .wake
-                .wait(state)
-                .unwrap_or_else(|poison| poison.into_inner());
-        }
-        drop(state);
-        self.bytes.read(buffer)
-    }
-}
-
-fn gated_artifact_source() -> (
-    ArtifactReference,
-    Box<dyn ProjectObjectSource>,
-    Arc<ReadGate>,
-) {
-    let bytes = Arc::<[u8]>::from(b"bounded stale autosave source".as_slice());
-    let facts = ExactBytesHasher::hash(&bytes).unwrap();
-    let schema = ArtifactSchema::AnnotationV1;
-    let descriptor = RawObjectDescriptor::new(
-        facts.digest(),
-        facts.byte_length(),
-        MediaType::parse(schema.media_type()).unwrap(),
-        ObjectRole::parse(schema.object_role()).unwrap(),
-    );
-    let artifact = ArtifactReference::new(
-        ArtifactHandleId::from_bytes([0x41; 16]),
-        schema,
-        ArtifactContentId::parse(&format!("{}{}", ArtifactContentId::PREFIX, "41".repeat(32)))
-            .unwrap(),
-        descriptor.clone(),
-        None,
-        None,
-        vec![LogicalLayerKey::new(0)],
-        "stale autosave test",
-        true,
-        ArtifactCompleteness::Complete,
-        ArtifactRecoverability::NonRegenerable,
-    )
-    .unwrap();
-    let gate = Arc::new(ReadGate::default());
-    let source = Box::new(GatedObjectSource {
-        descriptor,
-        bytes,
-        gate: Arc::clone(&gate),
-    });
-    (artifact, source, gate)
 }
 
 fn bound_revision(snapshot: &ApplicationSnapshot) -> ProjectRevisionId {
@@ -1756,7 +1523,7 @@ fn close_service(
 }
 
 fn create_established_store(path: &ProjectStorePath) -> bool {
-    let mut application = verified_bound_application();
+    let mut application = admitted_bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     let (token, projection) = project_save_request(&mut application);
     let snapshot = application.snapshot();
@@ -1792,7 +1559,7 @@ fn create_established_recovery_store(
     path: &ProjectStorePath,
     advance_manual: bool,
 ) -> Option<(ProjectGenerationId, Option<ProjectGenerationId>)> {
-    let mut application = verified_bound_application();
+    let mut application = admitted_bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     let (create_token, create_projection) = project_save_request(&mut application);
     let create_snapshot = application.snapshot();
@@ -1954,15 +1721,15 @@ fn project_save_request(
         .expect("project save request")
 }
 
-fn verified_bound_application() -> ApplicationState {
-    let mut application = verified_unbound_application();
+fn admitted_bound_application() -> ApplicationState {
+    let mut application = admitted_unbound_application();
     application
-        .dispatch(ApplicationCommand::AttachVerifiedDataset)
+        .dispatch(ApplicationCommand::AttachDataset)
         .unwrap();
     application
 }
 
-fn verified_unbound_application() -> ApplicationState {
+fn admitted_unbound_application() -> ApplicationState {
     let project_id = ProjectId::from_bytes([7; 16]);
     let layer = LogicalLayerKey::new(0);
     let transfer = LayerTransfer::new(
@@ -1997,7 +1764,7 @@ fn verified_unbound_application() -> ApplicationState {
     .unwrap();
     let catalog = DatasetCatalog::new(
         "service-test",
-        ScientificIdentityStatus::Unverified(DatasetSourceId::new(1)),
+        ContentAddressStatus::SessionLocal(DatasetSourceId::new(1)),
         vec![
             DatasetLayer::new(
                 layer,
@@ -2011,24 +1778,6 @@ fn verified_unbound_application() -> ApplicationState {
         ],
     )
     .unwrap();
-    let mut application = ApplicationState::new_unbound(
-        SourceSessionGeneration::new(1),
-        catalog,
-        UnboundWorkspace::new(project_id, view, Vec::new()).unwrap(),
-        ResourcePolicy::new(4 * GIB, GIB).unwrap(),
-    )
-    .unwrap();
-    application
-        .dispatch(ApplicationCommand::RequestSourceVerification)
-        .unwrap();
-    let token = application
-        .drain_events(MAX_PENDING_EVENTS)
-        .into_iter()
-        .find_map(|event| match event {
-            ApplicationEvent::SourceVerificationRequested { token } => Some(token),
-            _ => None,
-        })
-        .unwrap();
     let identity = ScientificContentId::parse(&format!(
         "{}{}",
         ScientificContentId::PREFIX,
@@ -2036,25 +1785,15 @@ fn verified_unbound_application() -> ApplicationState {
     ))
     .unwrap();
     let dataset = DatasetReference::new(identity, None, None, None);
-    let verified_catalog = Arc::new(
-        DatasetCatalog::new(
-            application.snapshot().catalog().label(),
-            ScientificIdentityStatus::Verified(identity),
-            application.snapshot().catalog().layers().cloned().collect(),
-        )
-        .unwrap(),
-    );
-    application
-        .dispatch(ApplicationCommand::CompleteOperation {
-            token,
-            completion: OperationCompletion::SourceVerified {
-                source_generation: SourceSessionGeneration::new(1),
-                catalog: verified_catalog,
-                dataset,
-            },
-        })
-        .unwrap();
-    application
+    ApplicationState::new_unbound(
+        SourceSessionGeneration::new(1),
+        catalog,
+        dataset,
+        ContentAddressOrigin::DeclaredByPackage,
+        UnboundWorkspace::new(project_id, view, Vec::new()).unwrap(),
+        ResourcePolicy::new(4 * GIB, GIB).unwrap(),
+    )
+    .unwrap()
 }
 
 struct TestDirectory {

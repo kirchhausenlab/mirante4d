@@ -7,9 +7,9 @@ use std::{
 };
 
 use mirante4d_dataset::{
-    BrickKey, DatasetCatalog, DatasetLayer, DatasetResourceIdentity, DatasetScale, DatasetSource,
-    DatasetSourceFault, DatasetSourceId, ReservedDecodeSink, ResourceLease, ResourceRegion,
-    ResourceValidity, ScientificIdentityStatus,
+    BrickKey, ContentAddressStatus, DatasetCatalog, DatasetLayer, DatasetResourceIdentity,
+    DatasetScale, DatasetSource, DatasetSourceFault, DatasetSourceId, ReservedDecodeSink,
+    ResourceLease, ResourceRegion, ResourceValidity,
 };
 use mirante4d_dataset_runtime::{
     AccountedResourceLease, CancellationGeneration, DatasetRuntime, DatasetRuntimeConfig,
@@ -37,10 +37,11 @@ use mirante4d_render_reference::{
 };
 
 use super::{
-    CoordinatedTargetLayout, CoordinatedTargetRequest, CoordinatedValidationCaptureTicket,
-    GpuFrameTiming, GpuTimingTicket, PipelineCapability, PipelineReadiness,
-    RetainedFrameRenderPolicy, ValidationCapture, VolumeColorSchedule, WgpuRenderRuntime,
-    WgpuRenderRuntimeConfig, WgpuRenderRuntimeDiagnostics, WgpuRenderRuntimeError,
+    CoordinatedPublicationGroup, CoordinatedTargetLayout, CoordinatedTargetRequest,
+    CoordinatedValidationCaptureTicket, GpuFrameTiming, GpuTimingTicket, PipelineCapability,
+    PipelineReadiness, RetainedFrameRenderPolicy, ValidationCapture, VolumeColorSchedule,
+    WgpuRenderRuntime, WgpuRenderRuntimeConfig, WgpuRenderRuntimeDiagnostics,
+    WgpuRenderRuntimeError,
     global_residency::{compact_cell_keys, directory_hash},
     runtime::GLOBAL_DIRECTORY_SLOTS,
 };
@@ -263,7 +264,7 @@ fn resource_key_at_scale(
     shape: [u64; 3],
 ) -> BrickKey {
     BrickKey::new(
-        DatasetResourceIdentity::Unverified(SOURCE_ID),
+        DatasetResourceIdentity::SessionLocal(SOURCE_ID),
         LogicalLayerKey::new(layer),
         TimeIndex::new(0),
         scale,
@@ -366,7 +367,7 @@ fn build_fixtures() -> GpuFixtures {
     let catalog = Arc::new(
         DatasetCatalog::new(
             "renderer GPU fixtures",
-            ScientificIdentityStatus::Unverified(SOURCE_ID),
+            ContentAddressStatus::SessionLocal(SOURCE_ID),
             vec![
                 layer(
                     0,
@@ -855,7 +856,7 @@ fn intent_and_requirements(
     };
     let intent = RenderIntent::new(
         FrameIdentity::new(frame),
-        DatasetResourceIdentity::Unverified(SOURCE_ID),
+        DatasetResourceIdentity::SessionLocal(SOURCE_ID),
         TimeIndex::new(0),
         view,
         presentation,
@@ -901,7 +902,7 @@ fn multichannel_intent_and_requirements(
     .expect("fixture presentation is valid");
     let intent = RenderIntent::new(
         FrameIdentity::new(frame),
-        DatasetResourceIdentity::Unverified(SOURCE_ID),
+        DatasetResourceIdentity::SessionLocal(SOURCE_ID),
         TimeIndex::new(0),
         view,
         presentation,
@@ -3014,6 +3015,7 @@ fn coordinated_atomic_volume_strips_stay_hidden_and_match_the_direct_frame() {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assert_atomic_striped_capture_matches_direct(
     gpu: &mut WgpuRenderRuntime,
     catalog: &DatasetCatalog,
@@ -3339,29 +3341,39 @@ fn coordinated_four_target_resident_cutoff_has_real_pixels_one_submit_and_idle_z
             &three_d_requirements,
             200,
             RetainedFrameRenderPolicy::ExactFrameOnly,
-        ),
+        )
+        .with_atomic_publication_group(CoordinatedPublicationGroup::FULL_LAYOUT),
         CoordinatedTargetRequest::new(
             PresentationTarget::Xy,
             &xy_intent,
             &xy_requirements,
             200,
-            RetainedFrameRenderPolicy::EveryUsefulFrame,
-        ),
+            RetainedFrameRenderPolicy::ExactFrameOnly,
+        )
+        .with_atomic_publication_group(CoordinatedPublicationGroup::FULL_LAYOUT),
         CoordinatedTargetRequest::new(
             PresentationTarget::Xz,
             &xz_intent,
             &xz_requirements,
             200,
-            RetainedFrameRenderPolicy::EveryUsefulFrame,
-        ),
+            RetainedFrameRenderPolicy::ExactFrameOnly,
+        )
+        .with_atomic_publication_group(CoordinatedPublicationGroup::FULL_LAYOUT),
         CoordinatedTargetRequest::new(
             PresentationTarget::Yz,
             &yz_intent,
             &yz_requirements,
             200,
-            RetainedFrameRenderPolicy::EveryUsefulFrame,
-        ),
+            RetainedFrameRenderPolicy::ExactFrameOnly,
+        )
+        .with_atomic_publication_group(CoordinatedPublicationGroup::FULL_LAYOUT),
     ];
+
+    let withheld = gpu
+        .execute_coordinated_frame(&catalog, PresentationTarget::Xy, &requests[..3])
+        .expect("an incomplete atomic target group may prepare but not publish");
+    assert_eq!(withheld.color_queue_submissions(), 0);
+    assert!(withheld.targets().iter().all(|report| !report.presented()));
 
     let diagnostics_before = (
         gpu.diagnostics().queue_submissions(),

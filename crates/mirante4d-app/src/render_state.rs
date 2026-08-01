@@ -64,6 +64,7 @@ pub(crate) fn frame_failure_kind_for_renderer_error(
         | Error::StaleFrame { .. }
         | Error::RequirementSetChanged
         | Error::InvalidVolumeColorSchedule { .. }
+        | Error::InvalidCoordinatedPublicationGroup
         | Error::DuplicateCoordinatedTarget { .. }
         | Error::CoordinatedTargetNotConfigured { .. }
         | Error::CoordinatedTargetViewMismatch { .. }

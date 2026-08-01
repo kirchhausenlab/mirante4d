@@ -127,12 +127,6 @@ pub(crate) struct LocalObjectSnapshot {
     identity: FileIdentity,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LocalObjectGeneration {
-    bytes: u64,
-    identity: FileIdentity,
-}
-
 /// Opaque identity of the package-root directory that owns a validated local
 /// package capability.
 ///
@@ -181,13 +175,6 @@ impl LocalObjectSnapshot {
 
     pub(crate) const fn path(&self) -> &PackagePath {
         &self.path
-    }
-
-    pub(crate) const fn generation(&self) -> LocalObjectGeneration {
-        LocalObjectGeneration {
-            bytes: self.bytes,
-            identity: self.identity,
-        }
     }
 }
 
@@ -1326,10 +1313,6 @@ impl LocalPackageReader {
 
     pub(crate) fn root_path(&self) -> &Path {
         &self.root
-    }
-
-    pub(crate) const fn same_root_node(&self, other: &Self) -> bool {
-        self.root_identity.same_node(other.root_identity)
     }
 
     #[cfg(target_os = "linux")]

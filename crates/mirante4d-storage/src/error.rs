@@ -41,4 +41,6 @@ pub enum StorageProfileError {
     },
     #[error("a dataset geometry dimension or scale count is zero")]
     ZeroGeometry,
+    #[error("spatial pyramid did not progress from z/y/x shape {z}/{y}/{x}")]
+    PyramidDidNotProgress { z: u64, y: u64, x: u64 },
 }

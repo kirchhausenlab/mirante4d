@@ -527,7 +527,7 @@ fn project_store_b2_aggregate_evidence(hosted: Value) -> Value {
             "checkpoint": "B2",
             "public_ci_and_protected_main": "pending_external_acceptance",
             "store_product_reachability": "declared_off_product_and_enforced_by_the_separate_policy_gate",
-            "source_identity_verification": "not_applicable_until_b3",
+            "package_integrity_audit": "not_part_of_b2_project_store_qualification",
             "product_display_validation": "not_applicable_until_b4",
             "product_durability_claim": false
         }
@@ -2414,8 +2414,8 @@ mod tests {
         assert_eq!(aggregate["hostile_cases"].as_array().unwrap().len(), 5);
         assert_eq!(aggregate["runtime_gate_cases"].as_array().unwrap().len(), 6);
         assert_eq!(
-            aggregate["qualification_scope"]["source_identity_verification"],
-            "not_applicable_until_b3"
+            aggregate["qualification_scope"]["package_integrity_audit"],
+            "not_part_of_b2_project_store_qualification"
         );
         assert_eq!(
             aggregate["qualification_scope"]["product_display_validation"],

@@ -7,6 +7,12 @@ use crate::{
     dataset_requests::DatasetDemandState,
 };
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ViewRuntimeChange {
+    pub(crate) dataset_binding_changed: bool,
+    pub(crate) timepoint_changed: bool,
+}
+
 /// Reconciles payload-free presentation state after a canonical view change.
 /// Unified demand planning performs the actual scoped cancellation and lease
 /// requirement replacement immediately after this function returns.
@@ -16,15 +22,15 @@ pub(crate) fn reconcile_view_runtime(
     dataset: &mut DatasetDemandState,
     render: &mut RenderCoordinationState,
     analysis: &mut AnalysisProductRuntime,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<ViewRuntimeChange> {
     let view = application_view(snapshot);
     if previous_view == view {
-        return Ok(false);
+        return Ok(ViewRuntimeChange::default());
     }
 
-    let source_selection_changed = previous_view.active_layer() != view.active_layer()
-        || previous_view.timepoint() != view.timepoint();
-    if source_selection_changed {
+    let dataset_binding_changed = previous_view.active_layer() != view.active_layer();
+    let timepoint_changed = previous_view.timepoint() != view.timepoint();
+    if dataset_binding_changed || timepoint_changed {
         let layer = snapshot
             .catalog()
             .layer(view.active_layer())
@@ -37,19 +43,26 @@ pub(crate) fn reconcile_view_runtime(
                 layer.shape().t()
             );
         }
-        drop(dataset.take_retained_leases());
+        if dataset_binding_changed {
+            drop(dataset.take_retained_leases());
+        }
         if previous_view.layout() == ViewerLayout::FourPanel
             || view.layout() == ViewerLayout::FourPanel
         {
             render.invalidate_cross_sections();
         }
-        analysis.set_roi([0; 3], layer.shape().spatial().dimensions())?;
+        if dataset_binding_changed {
+            analysis.set_roi([0; 3], layer.shape().spatial().dimensions())?;
+        }
     }
 
     if volume_render_changed(previous_view, view) {
         render.mark_3d_display_stale();
     }
-    Ok(source_selection_changed)
+    Ok(ViewRuntimeChange {
+        dataset_binding_changed,
+        timepoint_changed,
+    })
 }
 
 /// Canonical fields consumed by the 3D render and demand pipeline.

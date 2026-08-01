@@ -1091,7 +1091,7 @@ mod tests {
         scale: u32,
     ) -> BrickKey {
         BrickKey::new(
-            DatasetResourceIdentity::Unverified(DatasetSourceId::new(7)),
+            DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(7)),
             LogicalLayerKey::new(layer),
             TimeIndex::new(timepoint),
             ScaleLevel::new(scale),

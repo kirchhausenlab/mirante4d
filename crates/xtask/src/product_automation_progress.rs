@@ -127,11 +127,18 @@ fn parse_command_plan(index: usize, value: &Value) -> anyhow::Result<CommandPlan
         .with_context(|| format!("automation command {index} has an unknown command kind"))?;
 
     let budget = match kind {
-        "wait_for_import_progress" | "wait_for_imported_open_ready" | "wait_for" => Some(
-            Duration::from_millis(required_u64(object, "timeout_ms", index)?),
-        ),
+        "wait_for_import_progress"
+        | "wait_for_imported_open_ready"
+        | "wait_for"
+        | "wait_for_presented_time_index"
+        | "wait_for_temporal_transitions" => Some(Duration::from_millis(required_u64(
+            object,
+            "timeout_ms",
+            index,
+        )?)),
         "switch_dataset" => Some(Duration::from_secs(120)),
-        "camera_orbit_sequence"
+        "observe_playback_cadence"
+        | "camera_orbit_sequence"
         | "camera_pan_sequence"
         | "camera_zoom_sequence"
         | "cross_section_rotate_sequence"
@@ -156,9 +163,11 @@ fn parse_command_plan(index: usize, value: &Value) -> anyhow::Result<CommandPlan
                     .saturating_add(Duration::from_millis(frames.saturating_mul(100))),
             )
         }
-        "capture_screenshot" | "assert" | "probe_hover" | "primary_click" => {
-            Some(Duration::from_secs(30))
-        }
+        "capture_screenshot"
+        | "capture_temporal_frame"
+        | "assert"
+        | "probe_hover"
+        | "primary_click" => Some(Duration::from_secs(30)),
         "hold_for_external_kill" => None,
         // Commands without a script-declared duration are still bounded. A
         // live heartbeat proves that the event loop is running; it does not
@@ -172,9 +181,13 @@ fn parse_command_plan(index: usize, value: &Value) -> anyhow::Result<CommandPlan
         let accepted = match reserved {
             "timeout_ms" => matches!(
                 kind,
-                "wait_for_import_progress" | "wait_for_imported_open_ready" | "wait_for"
+                "wait_for_import_progress"
+                    | "wait_for_imported_open_ready"
+                    | "wait_for"
+                    | "wait_for_presented_time_index"
+                    | "wait_for_temporal_transitions"
             ),
-            "duration_ms" => kind.ends_with("_sequence"),
+            "duration_ms" => kind.ends_with("_sequence") || kind == "observe_playback_cadence",
             "frames" => kind == "sleep_frames",
             _ => false,
         };
@@ -206,9 +219,9 @@ fn known_command_kind(kind: &str) -> Option<&'static str> {
         "close_project_store" => "close_project_store",
         "write_external_kill_checkpoint" => "write_external_kill_checkpoint",
         "hold_for_external_kill" => "hold_for_external_kill",
-        "cancel_source_verification" => "cancel_source_verification",
-        "cancel_active_source_verification" => "cancel_active_source_verification",
-        "request_source_verification" => "request_source_verification",
+        "cancel_package_integrity_audit" => "cancel_package_integrity_audit",
+        "cancel_active_package_integrity_audit" => "cancel_active_package_integrity_audit",
+        "request_package_integrity_audit" => "request_package_integrity_audit",
         "begin_tiff_import_setup" => "begin_tiff_import_setup",
         "start_reviewed_import" => "start_reviewed_import",
         "wait_for_import_progress" => "wait_for_import_progress",
@@ -220,6 +233,11 @@ fn known_command_kind(kind: &str) -> Option<&'static str> {
         "set_render_target_size" => "set_render_target_size",
         "set_viewer_layout" => "set_viewer_layout",
         "set_time_index" => "set_time_index",
+        "set_playback_fps" => "set_playback_fps",
+        "set_playback_active" => "set_playback_active",
+        "wait_for_presented_time_index" => "wait_for_presented_time_index",
+        "wait_for_temporal_transitions" => "wait_for_temporal_transitions",
+        "observe_playback_cadence" => "observe_playback_cadence",
         "set_layer_visibility" => "set_layer_visibility",
         "set_layer_order" => "set_layer_order",
         "set_render_mode" => "set_render_mode",
@@ -250,6 +268,7 @@ fn known_command_kind(kind: &str) -> Option<&'static str> {
         "primary_click" => "primary_click",
         "copy_diagnostics" => "copy_diagnostics",
         "capture_screenshot" => "capture_screenshot",
+        "capture_temporal_frame" => "capture_temporal_frame",
         "assert" => "assert",
         "sleep_frames" => "sleep_frames",
         "quit" => "quit",

@@ -9,11 +9,12 @@ use std::{
 use eframe::egui;
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, ApplicationSnapshot, CommandEffect, CrossSectionPanelId,
-    OperationToken, PresentationSlot, ProjectStoreApplicationService, ProjectStoreLifecycle,
-    RenderGestureKind, RenderIntentBase, RenderIntentSample, RenderIntentTarget,
-    SourceVerificationSnapshot, WorkspaceSnapshot,
+    OperationToken, PackageIntegrityAuditSnapshot, PresentationSlot,
+    ProjectStoreApplicationService, ProjectStoreLifecycle, RenderGestureKind, RenderIntentBase,
+    RenderIntentSample, RenderIntentTarget, WorkspaceSnapshot,
     import_workflow::{
-        ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportWorkflowSnapshot,
+        ImportChannelSourceKind, ImportCommand, ImportProgressSnapshot, ImportReviewDraft,
+        ImportWorkflowSnapshot,
     },
     viewer_tools::{
         PickCompleteness, PickHit, PickHitKind, PickPolicy, PickValue, ScreenPosition,
@@ -29,7 +30,7 @@ use mirante4d_domain::{
     LayerTransfer, Opacity, Projection, RenderMode, RenderState, SamplingPolicy, TimeIndex,
     UnitQuaternion, ViewerLayout, WorldPoint3,
 };
-use mirante4d_import_pipeline::{ImportReceipt, ImportStatistics, TiffSource};
+use mirante4d_import_pipeline::{ImportReceipt, ImportStatistics, TiffChannelSource, TiffSource};
 use mirante4d_project_model::{LayerViewState, ProjectRevisionId};
 use mirante4d_render_api::{RenderExtent, VolumePickQuery};
 use mirante4d_storage::ScientificPublicationTransferEvidence;
@@ -56,7 +57,7 @@ use capture::{
 };
 use diagnostics::{
     dataset_runtime_diagnostics_json, gpu_adapter_diagnostics_json,
-    local_dataset_source_diagnostics_json, local_package_read_diagnostics_json,
+    local_dataset_source_diagnostics_json,
 };
 use model::*;
 use progress::ProductAutomationProgressPublisher;
@@ -67,6 +68,7 @@ const AUTOMATION_REPORT_ENV: &str = "MIRANTE4D_AUTOMATION_REPORT";
 const AUTOMATION_PICK_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTOMATION_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTOMATION_DATASET_SWITCH_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_TEMPORAL_OBSERVATIONS: usize = 4_096;
 
 fn sequence_sample_target_ns(sample: u32, samples: u32, duration_ms: u64) -> u64 {
     if samples == 0 {
@@ -76,37 +78,6 @@ fn sequence_sample_target_ns(sample: u32, samples: u32, duration_ms: u64) -> u64
         .saturating_mul(1_000_000)
         .saturating_mul(u128::from(sample.saturating_add(1)));
     u64::try_from(numerator / u128::from(samples)).unwrap_or(u64::MAX)
-}
-
-fn input_sequence_latest_pixels_are_current(
-    app: &MiranteWorkbenchApp,
-    required_group: CoordinatedPresentationGroup,
-    three_d_revision: mirante4d_render_api::FrameIdentity,
-    linked_2d_revision: mirante4d_render_api::FrameIdentity,
-) -> bool {
-    let target_is_current =
-        |slot: PresentationSlot, revision: mirante4d_render_api::FrameIdentity| {
-            let surface = app.render_coordination.surface(slot);
-            surface.display_current()
-                && surface
-                    .presented_frame()
-                    .is_some_and(|frame| frame.frame() == revision)
-        };
-    let three_d = || target_is_current(PresentationSlot::ThreeD, three_d_revision);
-    let linked = || {
-        [
-            PresentationSlot::Xy,
-            PresentationSlot::Xz,
-            PresentationSlot::Yz,
-        ]
-        .into_iter()
-        .all(|slot| target_is_current(slot, linked_2d_revision))
-    };
-    match required_group {
-        CoordinatedPresentationGroup::ThreeD => three_d(),
-        CoordinatedPresentationGroup::Linked2d => linked(),
-        CoordinatedPresentationGroup::FullLayout => three_d() && linked(),
-    }
 }
 
 fn egui_deadline_repaint_delay(ctx: &egui::Context, remaining: Duration) -> Duration {
@@ -210,8 +181,8 @@ fn assertion_capture_panels(condition: &ProductAutomationAssertCondition) -> Vec
 }
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-const AUTOMATION_SCHEMA_VERSION: u32 = 8;
-const AUTOMATION_REPORT_SCHEMA_VERSION: u32 = 8;
+const AUTOMATION_SCHEMA_VERSION: u32 = 10;
+const AUTOMATION_REPORT_SCHEMA_VERSION: u32 = 9;
 
 fn dispatch_application_command(
     app: &mut MiranteWorkbenchApp,
@@ -528,6 +499,15 @@ fn coordinated_visible_layout_current_complete_with_snapshot(
     }
 }
 
+fn visible_product_panels(snapshot: &ApplicationSnapshot) -> Vec<PanelId> {
+    match application_view(snapshot).layout() {
+        ViewerLayout::Single3d => vec![PanelId::ThreeD],
+        ViewerLayout::FourPanel => {
+            vec![PanelId::ThreeD, PanelId::Xy, PanelId::Xz, PanelId::Yz]
+        }
+    }
+}
+
 const fn automation_runtime_is_idle(
     background_work_active: bool,
     camera_demand_planning_active: bool,
@@ -536,51 +516,42 @@ const fn automation_runtime_is_idle(
     !background_work_active && !camera_demand_planning_active && !prepared_demand_install_pending
 }
 
-pub(super) fn cancel_active_source_verification(
+pub(super) fn cancel_active_package_integrity_audit(
     app: &mut MiranteWorkbenchApp,
 ) -> Result<Value, String> {
-    let automatic_request_pending = app.pending_automatic_source_verification.is_some();
-    // Observe a verifier that reached its commit point before attempting
-    // cancellation; committed promotion must win over cancellation.
     app.pump_application_services();
-    if app.pending_automatic_source_verification.is_some() {
-        app.try_start_pending_automatic_source_verification();
-        if app.pending_automatic_source_verification.is_some() {
-            return Err(
-                "automatic source verification could not enter a cancellable state".to_owned(),
-            );
-        }
-    }
     let snapshot = app.application.snapshot();
-    let operation_id = match snapshot.source() {
-        SourceVerificationSnapshot::Verifying { operation_id, .. } => Some(*operation_id),
-        SourceVerificationSnapshot::Required | SourceVerificationSnapshot::Verified(_) => None,
+    let operation_id = match snapshot.source().integrity_audit() {
+        PackageIntegrityAuditSnapshot::Running { operation_id, .. } => Some(*operation_id),
+        PackageIntegrityAuditSnapshot::NotRun
+        | PackageIntegrityAuditSnapshot::SelfConsistent(_)
+        | PackageIntegrityAuditSnapshot::Failed(_)
+        | PackageIntegrityAuditSnapshot::Cancelled => None,
     };
     if let Some(operation_id) = operation_id {
         app.application
             .dispatch(ApplicationCommand::CancelOperation(operation_id))
             .map_err(|fault| {
-                format!("active source-verification cancellation was rejected: {fault:?}")
+                format!("active package-integrity-audit cancellation was rejected: {fault:?}")
             })?;
         app.pump_application_services();
     }
     Ok(json!({
         "active_operation_observed": operation_id.is_some(),
         "cancellation_requested": operation_id.is_some(),
-        "automatic_request_dispatched": automatic_request_pending,
+        "automatic_request_dispatched": false,
     }))
 }
 
-pub(super) fn source_verification_inactive(app: &MiranteWorkbenchApp) -> bool {
+pub(super) fn package_integrity_audit_inactive(app: &MiranteWorkbenchApp) -> bool {
     let snapshot = app.application.snapshot();
-    matches!(
-        snapshot.source(),
-        SourceVerificationSnapshot::Required | SourceVerificationSnapshot::Verified(_)
+    !matches!(
+        snapshot.source().integrity_audit(),
+        PackageIntegrityAuditSnapshot::Running { .. }
     ) && app
-        .source_verification_service
+        .package_integrity_audit_service
         .as_ref()
         .is_some_and(|service| service.active_token().is_none())
-        && app.pending_automatic_source_verification.is_none()
         && !app.dataset.source_quarantined()
 }
 
@@ -699,6 +670,7 @@ pub(crate) struct ProductAutomationController {
     active_wait_started: Option<Instant>,
     sleep_frames_remaining: Option<u32>,
     active_input_sequence: Option<ActiveInputSequence>,
+    active_playback_cadence: Option<ActivePlaybackCadenceObservation>,
     automation_frame_nr: u64,
     started_at_epoch_ms: u128,
     started_at: Instant,
@@ -706,6 +678,20 @@ pub(crate) struct ProductAutomationController {
     events: Vec<ProductAutomationEvent>,
     diagnostics: Vec<Value>,
     artifacts: Vec<ProductAutomationArtifact>,
+    temporal_observations: Vec<Value>,
+    temporal_transition_count: u64,
+    temporal_contract_transition_count: u64,
+    last_coherent_temporal_timepoint: Option<TimeIndex>,
+    active_temporal_contract: Option<(u64, Vec<(u32, u32)>)>,
+    temporal_violation: Option<String>,
+    active_temporal_wait: Option<(usize, u64)>,
+    last_input_sequence_temporal_transitions: Option<u64>,
+    last_input_sequence_cancelled_gestures: Option<u64>,
+    last_input_sequence_temporal_distribution: Option<CompletedInputTemporalDistribution>,
+    last_stationary_playback_cadence: Option<CompletedInputTemporalDistribution>,
+    last_input_sequence_cadence_comparison: Option<PlaybackCadenceComparison>,
+    active_playback_stop_trace: Option<ActivePlaybackStopTrace>,
+    temporal_capture_baselines: Vec<TemporalCaptureBaseline>,
     limit_observations: ProductAutomationLimitObservations,
     render_target_override: Option<RenderExtent>,
     requested_mapped_client_pixels: Option<(u32, u32)>,
@@ -714,8 +700,8 @@ pub(crate) struct ProductAutomationController {
     active_import_pre_start_origin: Option<ImportPreStartOrigin>,
     completed_import_pre_start_measurement: Option<ImportPreStartMeasurement>,
     active_import_timing_origin: Option<ImportWorkerTimingOrigin>,
-    active_import_verification_diagnostics_origin:
-        Option<crate::current_source_verification_service::CurrentSourceVerificationDiagnostics>,
+    active_import_integrity_audit_diagnostics_origin:
+        Option<crate::package_integrity_audit_service::PackageIntegrityAuditDiagnostics>,
     completed_import_primary_measurement: Option<ImportPrimaryMeasurement>,
     imported_open_ready_outcome: Option<ImportedOpenReadyOutcome>,
     report_written: bool,
@@ -850,7 +836,7 @@ fn cancel_exact_dataset_switch(app: &mut MiranteWorkbenchApp, token: &OperationT
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct ActiveInputSequence {
     command_index: usize,
     started_at: Instant,
@@ -864,6 +850,10 @@ struct ActiveInputSequence {
     origin_render_intent_samples: u64,
     origin_render_intent_coalesced_samples: u64,
     origin_render_intent_finished_gestures: u64,
+    origin_render_intent_cancelled_gestures: u64,
+    origin_temporal_transitions: u64,
+    temporal_transitions_at_last_dispatch: Option<u64>,
+    temporal_transition_elapsed_ns: Vec<u64>,
     dispatched_samples: u32,
     distinct_dispatch_updates: u32,
     first_dispatch_elapsed_ns: Option<u64>,
@@ -874,6 +864,312 @@ struct ActiveInputSequence {
     maximum_dispatch_lateness_ns: u64,
     nonmonotonic_dispatches: u32,
     same_update_dispatches: u32,
+    stationary_baseline: Option<CompletedInputTemporalDistribution>,
+    requested_frame_period_ns: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CompletedInputTemporalDistribution {
+    transition_elapsed_ns: Vec<u64>,
+    first_half_transitions: u64,
+    second_half_transitions: u64,
+    maximum_gap_ns: u64,
+    observation_window_ns: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ActivePlaybackCadenceObservation {
+    command_index: usize,
+    started_at: Instant,
+    duration_ms: u64,
+    origin_temporal_transitions: u64,
+    transition_elapsed_ns: Vec<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct PlaybackCadenceComparison {
+    baseline_transitions: u64,
+    input_transitions: u64,
+    minimum_input_transitions: u64,
+    baseline_maximum_gap_ns: u64,
+    input_maximum_gap_ns: u64,
+    maximum_allowed_input_gap_ns: u64,
+    requested_frame_period_ns: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlaybackStopLayerState {
+    layer_ordinal: u32,
+    displayed_scale_level: Option<u32>,
+    mixed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlaybackStopPanelState {
+    panel: &'static str,
+    timepoint: Option<TimeIndex>,
+    frame_identity: Option<u64>,
+    frame_completeness: Option<String>,
+    available_requirements: Option<u64>,
+    total_requirements: Option<u64>,
+    cross_section_schedule: Option<String>,
+    texture_binding: Option<(u64, u64)>,
+    layers: Vec<PlaybackStopLayerState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlaybackStopVisibleState {
+    panels: Vec<PlaybackStopPanelState>,
+}
+
+#[derive(Clone, Debug)]
+struct ActivePlaybackStopTrace {
+    started_at: Instant,
+    expected_timepoint: TimeIndex,
+    playback_layer_scales: Vec<(u32, u32)>,
+    states: Vec<(u64, PlaybackStopVisibleState)>,
+    violation: Option<String>,
+}
+
+impl PlaybackCadenceComparison {
+    const fn passes(&self) -> bool {
+        self.input_transitions >= self.minimum_input_transitions
+            && self.input_maximum_gap_ns <= self.maximum_allowed_input_gap_ns
+    }
+}
+
+/// Same-duration interaction cadence floor for the mapped product oracle.
+///
+/// Count alone is deliberately not the pause detector: the oracle also
+/// requires transitions in both halves of the gesture and rejects a maximum
+/// gap beyond its frame-period/stationary-baseline bound. An 80% count floor
+/// keeps the comparison sensitive to material throughput loss without making
+/// a one-person product gate fail on the observed 20-versus-24/25 scheduling
+/// variance that remained visually continuous on the designated workstation.
+const fn minimum_interaction_cadence(baseline_transitions: u64) -> u64 {
+    baseline_transitions.saturating_mul(4).saturating_add(4) / 5
+}
+
+fn completed_temporal_distribution(
+    transition_elapsed_ns: &[u64],
+    observation_window_ns: u64,
+) -> CompletedInputTemporalDistribution {
+    let transition_elapsed_ns = transition_elapsed_ns
+        .iter()
+        .copied()
+        .filter(|elapsed_ns| *elapsed_ns <= observation_window_ns)
+        .collect::<Vec<_>>();
+    let half = observation_window_ns / 2;
+    let first_half_transitions = u64::try_from(
+        transition_elapsed_ns
+            .iter()
+            .filter(|elapsed_ns| **elapsed_ns <= half)
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+    let second_half_transitions = u64::try_from(
+        transition_elapsed_ns
+            .iter()
+            .filter(|elapsed_ns| **elapsed_ns > half)
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+    let maximum_gap_ns = std::iter::once(0)
+        .chain(transition_elapsed_ns.iter().copied())
+        .chain(std::iter::once(observation_window_ns))
+        .collect::<Vec<_>>()
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]))
+        .max()
+        .unwrap_or(observation_window_ns);
+    CompletedInputTemporalDistribution {
+        transition_elapsed_ns,
+        first_half_transitions,
+        second_half_transitions,
+        maximum_gap_ns,
+        observation_window_ns,
+    }
+}
+
+fn playback_stop_visible_state(
+    app: &MiranteWorkbenchApp,
+    playback_layer_scales: &[(u32, u32)],
+) -> PlaybackStopVisibleState {
+    let snapshot = app.application.snapshot();
+    let panels = visible_product_panels(&snapshot)
+        .into_iter()
+        .map(|panel| {
+            let slot = panel.presentation_slot();
+            let surface = app.render_coordination.surface(slot);
+            let presented = surface.presented_frame();
+            PlaybackStopPanelState {
+                panel: panel.label(),
+                timepoint: presented.map(|frame| frame.timepoint()),
+                frame_identity: presented.map(|frame| frame.frame().get()),
+                frame_completeness: presented
+                    .map(|frame| format!("{:?}", frame.progress().completeness())),
+                available_requirements: presented
+                    .map(|frame| frame.progress().coverage().available_requirements()),
+                total_requirements: presented
+                    .map(|frame| frame.progress().coverage().total_requirements()),
+                cross_section_schedule: surface
+                    .cross_section_schedule()
+                    .map(|schedule| format!("{:?}/{:?}", schedule.status, schedule.reason)),
+                texture_binding: app.native_presentation.texture_binding_identity(slot),
+                layers: playback_layer_scales
+                    .iter()
+                    .map(|(layer_ordinal, _)| {
+                        // Quality belongs to the immutable visible frame, not
+                        // to the mutable demand/schedule diagnostics carried
+                        // beside it. During a retained-front handoff those
+                        // diagnostics may already describe the hidden
+                        // successor while the predecessor texture is still
+                        // authoritative.
+                        let observed = presented.and_then(|frame| {
+                            frame
+                                .progress()
+                                .coverage()
+                                .layer_coverages()
+                                .find(|coverage| coverage.layer().ordinal() == *layer_ordinal)
+                        });
+                        PlaybackStopLayerState {
+                            layer_ordinal: *layer_ordinal,
+                            displayed_scale_level: observed
+                                .and_then(|coverage| coverage.scale())
+                                .map(|scale| scale.get()),
+                            mixed: observed.is_some_and(|coverage| coverage.is_mixed()),
+                        }
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    PlaybackStopVisibleState { panels }
+}
+
+impl ActivePlaybackStopTrace {
+    fn observe(&mut self, app: &MiranteWorkbenchApp) {
+        let state = playback_stop_visible_state(app, &self.playback_layer_scales);
+        if self.violation.is_none() {
+            self.violation = self.validate_state(&state);
+        }
+        if self
+            .states
+            .last()
+            .is_none_or(|(_, previous)| previous != &state)
+        {
+            self.states.push((
+                u64::try_from(self.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                state,
+            ));
+        }
+    }
+
+    fn validate_state(&self, state: &PlaybackStopVisibleState) -> Option<String> {
+        if state.panels.is_empty() {
+            return Some("playback Stop exposed no visible target front".to_owned());
+        }
+        let previous = self.states.last().map(|(_, state)| state);
+        for panel in &state.panels {
+            if panel.timepoint != Some(self.expected_timepoint) {
+                return Some(format!(
+                    "playback Stop exposed {} at timepoint {:?}, expected t{}",
+                    panel.panel,
+                    panel.timepoint.map(TimeIndex::get),
+                    self.expected_timepoint.get()
+                ));
+            }
+            for layer in &panel.layers {
+                let expected = self
+                    .playback_layer_scales
+                    .iter()
+                    .find_map(|(ordinal, scale)| {
+                        (*ordinal == layer.layer_ordinal).then_some(*scale)
+                    })
+                    .expect("stop trace layers come from the fixed playback scale map");
+                let Some(displayed) = layer.displayed_scale_level else {
+                    return Some(format!(
+                        "playback Stop exposed {} layer {} without a displayed scale",
+                        panel.panel, layer.layer_ordinal
+                    ));
+                };
+                if layer.mixed {
+                    return Some(format!(
+                        "playback Stop exposed a mixed-scale {} layer {}",
+                        panel.panel, layer.layer_ordinal
+                    ));
+                }
+                if displayed > expected {
+                    return Some(format!(
+                        "playback Stop downgraded {} layer {} from s{} to s{}",
+                        panel.panel, layer.layer_ordinal, expected, displayed
+                    ));
+                }
+                if let Some(previous_displayed) = previous
+                    .and_then(|previous| {
+                        previous
+                            .panels
+                            .iter()
+                            .find(|candidate| candidate.panel == panel.panel)
+                    })
+                    .and_then(|previous| {
+                        previous
+                            .layers
+                            .iter()
+                            .find(|candidate| candidate.layer_ordinal == layer.layer_ordinal)
+                    })
+                    .and_then(|previous| previous.displayed_scale_level)
+                    && displayed > previous_displayed
+                {
+                    return Some(format!(
+                        "playback Stop regressed {} layer {} from s{} back to s{}",
+                        panel.panel, layer.layer_ordinal, previous_displayed, displayed
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "clock": "std_instant_monotonic",
+            "expected_time_index": self.expected_timepoint.get(),
+            "playback_layer_scales": self.playback_layer_scales.iter().map(|(layer_ordinal, scale_level)| json!({
+                "layer_ordinal": layer_ordinal,
+                "scale_level": scale_level,
+            })).collect::<Vec<_>>(),
+            "violation": self.violation,
+            "states": self.states.iter().map(|(elapsed_ns, state)| json!({
+                "elapsed_ns": elapsed_ns,
+                "panels": state.panels.iter().map(|panel| json!({
+                    "panel": panel.panel,
+                    "time_index": panel.timepoint.map(TimeIndex::get),
+                    "frame_identity": panel.frame_identity,
+                    "frame_completeness": panel.frame_completeness.as_deref(),
+                    "available_requirements": panel.available_requirements,
+                    "total_requirements": panel.total_requirements,
+                    "cross_section_schedule": panel.cross_section_schedule.as_deref(),
+                    "texture_binding": panel.texture_binding.map(|(device_generation, texture_revision)| json!({
+                        "device_generation": device_generation,
+                        "texture_revision": texture_revision,
+                    })),
+                    "layers": panel.layers.iter().map(|layer| json!({
+                        "layer_ordinal": layer.layer_ordinal,
+                        "displayed_scale_level": layer.displayed_scale_level,
+                        "mixed": layer.mixed,
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TemporalCaptureBaseline {
+    target: ProductAutomationPresentationTarget,
+    timepoint: TimeIndex,
+    rgba8: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -927,20 +1223,20 @@ impl From<ScientificPublicationTransferEvidence> for ImportPublicationCurrentnes
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ImportPublicationEvidenceSnapshot {
     publication_currentness: ImportPublicationCurrentnessExecution,
-    source_verification_started_runs: u64,
-    source_verification_progress_updates: u64,
-    source_verification_cancelled_runs: u64,
-    source_verification_failed_runs: u64,
-    source_verification_successes: u64,
+    package_integrity_audit_started_runs: u64,
+    package_integrity_audit_progress_updates: u64,
+    package_integrity_audit_cancelled_runs: u64,
+    package_integrity_audit_failed_runs: u64,
+    package_integrity_audit_completed_runs: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ImportVerificationEvidenceSnapshot {
-    source_verification_started_runs: u64,
-    source_verification_progress_updates: u64,
-    source_verification_cancelled_runs: u64,
-    source_verification_failed_runs: u64,
-    source_verification_successes: u64,
+struct ImportIntegrityAuditEvidenceSnapshot {
+    package_integrity_audit_started_runs: u64,
+    package_integrity_audit_progress_updates: u64,
+    package_integrity_audit_cancelled_runs: u64,
+    package_integrity_audit_failed_runs: u64,
+    package_integrity_audit_completed_runs: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -952,14 +1248,17 @@ struct ImportedOpenReadyOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ImportedOpenReadyReadiness {
     selected_matches: bool,
-    verified: bool,
+    content_id_computed_during_import: bool,
     import_idle: bool,
     problem_absent: bool,
 }
 
 impl ImportedOpenReadyReadiness {
     const fn condition_met(self) -> bool {
-        self.selected_matches && self.verified && self.import_idle && self.problem_absent
+        self.selected_matches
+            && self.content_id_computed_during_import
+            && self.import_idle
+            && self.problem_absent
     }
 }
 
@@ -970,30 +1269,25 @@ fn imported_open_ready_readiness(
 ) -> ImportedOpenReadyReadiness {
     ImportedOpenReadyReadiness {
         selected_matches: normalize_path(app.dataset.selected_path()) == normalize_path(path),
-        verified: matches!(snapshot.source(), SourceVerificationSnapshot::Verified(_))
-            && app
-                .source_verification_service
-                .as_ref()
-                .is_some_and(|service| service.active_token().is_none()),
+        content_id_computed_during_import: snapshot.source().content_address_origin()
+            == mirante4d_application::ContentAddressOrigin::ComputedDuringImport,
         import_idle: !app.import.workers.status().is_active(),
         problem_absent: app.import.problem.is_none(),
     }
 }
 
-struct ImportedOpenReadyCommitState<'a, Origin, VerificationOrigin, Outcome> {
+struct ImportedOpenReadyCommitState<'a, Origin, AuditOrigin, Outcome> {
     active_origin: &'a mut Option<Origin>,
-    active_verification_origin: &'a mut Option<VerificationOrigin>,
+    active_audit_origin: &'a mut Option<AuditOrigin>,
     completed_primary: &'a mut Option<ImportPrimaryMeasurement>,
     open_ready_outcome: &'a mut Option<Outcome>,
 }
 
-impl<Origin, VerificationOrigin, Outcome>
-    ImportedOpenReadyCommitState<'_, Origin, VerificationOrigin, Outcome>
-{
+impl<Origin, AuditOrigin, Outcome> ImportedOpenReadyCommitState<'_, Origin, AuditOrigin, Outcome> {
     fn commit(self, primary: ImportPrimaryMeasurement, outcome: Outcome) {
         *self.open_ready_outcome = Some(outcome);
         *self.completed_primary = Some(primary);
-        *self.active_verification_origin = None;
+        *self.active_audit_origin = None;
         *self.active_origin = None;
     }
 }
@@ -1102,6 +1396,7 @@ impl ProductAutomationController {
             active_wait_started: None,
             sleep_frames_remaining: None,
             active_input_sequence: None,
+            active_playback_cadence: None,
             automation_frame_nr: 0,
             started_at_epoch_ms: epoch_ms(),
             started_at: Instant::now(),
@@ -1109,6 +1404,20 @@ impl ProductAutomationController {
             events: Vec::new(),
             diagnostics: Vec::new(),
             artifacts: Vec::new(),
+            temporal_observations: Vec::new(),
+            temporal_transition_count: 0,
+            temporal_contract_transition_count: 0,
+            last_coherent_temporal_timepoint: None,
+            active_temporal_contract: None,
+            temporal_violation: None,
+            active_temporal_wait: None,
+            last_input_sequence_temporal_transitions: None,
+            last_input_sequence_cancelled_gestures: None,
+            last_input_sequence_temporal_distribution: None,
+            last_stationary_playback_cadence: None,
+            last_input_sequence_cadence_comparison: None,
+            active_playback_stop_trace: None,
+            temporal_capture_baselines: Vec::new(),
             limit_observations: ProductAutomationLimitObservations::default(),
             render_target_override: None,
             requested_mapped_client_pixels: None,
@@ -1117,7 +1426,7 @@ impl ProductAutomationController {
             active_import_pre_start_origin: None,
             completed_import_pre_start_measurement: None,
             active_import_timing_origin: None,
-            active_import_verification_diagnostics_origin: None,
+            active_import_integrity_audit_diagnostics_origin: None,
             completed_import_primary_measurement: None,
             imported_open_ready_outcome: None,
             report_written: false,
@@ -1172,6 +1481,36 @@ impl ProductAutomationController {
         self.script.requires_gpu_timing()
     }
 
+    fn begin_playback_stop_trace(&mut self, app: &MiranteWorkbenchApp) -> Result<(), String> {
+        let contract = app.playback_session.contract().ok_or_else(|| {
+            "playback Stop evidence requires an admitted session contract".to_owned()
+        })?;
+        let expected_timepoint = app.playback_session.presented_timepoint().ok_or_else(|| {
+            "playback Stop evidence requires one coherently presented session cursor".to_owned()
+        })?;
+        let playback_layer_scales = contract
+            .layer_scales()
+            .iter()
+            .map(|(layer, scale)| (layer.ordinal(), scale.get()))
+            .collect::<Vec<_>>();
+        let mut trace = ActivePlaybackStopTrace {
+            started_at: Instant::now(),
+            expected_timepoint,
+            playback_layer_scales,
+            states: Vec::new(),
+            violation: None,
+        };
+        trace.observe(app);
+        self.active_playback_stop_trace = Some(trace);
+        Ok(())
+    }
+
+    fn observe_playback_stop_trace(&mut self, app: &MiranteWorkbenchApp) {
+        if let Some(trace) = self.active_playback_stop_trace.as_mut() {
+            trace.observe(app);
+        }
+    }
+
     fn close_active_input_sequence_window(&mut self, app: &mut MiranteWorkbenchApp) {
         if self.active_input_sequence.take().is_none() {
             return;
@@ -1189,8 +1528,15 @@ impl ProductAutomationController {
         required_group: CoordinatedPresentationGroup,
     ) -> InputSequenceStep {
         if self.active_input_sequence.is_none() {
+            self.last_input_sequence_temporal_transitions = None;
+            self.last_input_sequence_cancelled_gestures = None;
+            self.last_input_sequence_temporal_distribution = None;
+            self.last_input_sequence_cadence_comparison = None;
             let generation = app.render_coordination.display_generation();
             let mailbox = app.render_intent_mailbox.snapshot();
+            let requested_fps = app.application.snapshot().transient().playback_fps().get();
+            let requested_frame_period_ns = 1_000_000_000_u64 / u64::from(requested_fps.max(1));
+            let stationary_baseline = self.last_stationary_playback_cadence.take();
             let now_ns = app.display_instrumentation_now_ns();
             app.render_coordination
                 .begin_active_publication_window(now_ns, required_group);
@@ -1207,6 +1553,10 @@ impl ProductAutomationController {
                 origin_render_intent_samples: mailbox.raw_samples,
                 origin_render_intent_coalesced_samples: mailbox.coalesced_samples,
                 origin_render_intent_finished_gestures: mailbox.finished_gestures,
+                origin_render_intent_cancelled_gestures: mailbox.cancelled_gestures,
+                origin_temporal_transitions: self.temporal_transition_count,
+                temporal_transitions_at_last_dispatch: None,
+                temporal_transition_elapsed_ns: Vec::new(),
                 dispatched_samples: 0,
                 distinct_dispatch_updates: 0,
                 first_dispatch_elapsed_ns: None,
@@ -1217,6 +1567,8 @@ impl ProductAutomationController {
                 maximum_dispatch_lateness_ns: 0,
                 nonmonotonic_dispatches: 0,
                 same_update_dispatches: 0,
+                stationary_baseline,
+                requested_frame_period_ns,
             });
         }
         let frame_nr = self.automation_frame_nr;
@@ -1236,23 +1588,12 @@ impl ProductAutomationController {
             if sequence.last_dispatch_frame_nr == Some(frame_nr) {
                 return InputSequenceStep::Wait(Duration::ZERO);
             }
-            let generation = app.render_coordination.display_generation();
-            let mailbox = app.render_intent_mailbox.snapshot();
-            let last_sample_is_current = input_sequence_latest_pixels_are_current(
-                app,
-                required_group,
-                mailbox.three_d_revision,
-                mailbox.linked_2d_revision,
-            ) || app
-                .render_coordination
-                .coordinated_publication_diagnostics()
-                .current_presentation_generation()
-                == Some(generation.input_generation);
-            return if last_sample_is_current {
-                InputSequenceStep::Finish
-            } else {
-                InputSequenceStep::Wait(Duration::from_millis(1))
-            };
+            // A real pointer release is delivered independently of renderer
+            // settlement. Holding the synthetic gesture open until its final
+            // pixels became current made playback advancement and input
+            // completion circular, and did not model product input. Scripts
+            // that need settled pixels own an explicit subsequent wait.
+            return InputSequenceStep::Finish;
         }
         let target_ns =
             sequence_sample_target_ns(sequence.next_sample, sequence.samples, sequence.duration_ms);
@@ -1289,6 +1630,7 @@ impl ProductAutomationController {
     }
 
     fn complete_input_sequence_sample(&mut self) -> CommandProgress {
+        let temporal_transition_count = self.temporal_transition_count;
         let sequence = self
             .active_input_sequence
             .as_mut()
@@ -1306,6 +1648,8 @@ impl ProductAutomationController {
                 target_ns.saturating_sub(elapsed_ns),
             )));
         }
+        sequence.temporal_transitions_at_last_dispatch =
+            Some(temporal_transition_count.saturating_sub(sequence.origin_temporal_transitions));
         CommandProgress::PassiveWaiting(Some(Duration::ZERO))
     }
 
@@ -1334,6 +1678,46 @@ impl ProductAutomationController {
             .last_dispatch_elapsed_ns
             .zip(sequence.first_dispatch_elapsed_ns)
             .map(|(last, first)| last.saturating_sub(first));
+        let temporal_transitions = sequence
+            .temporal_transitions_at_last_dispatch
+            .expect("a completed sequence recorded its transition count at the last input sample");
+        let observation_window_ns = sequence
+            .last_dispatch_elapsed_ns
+            .unwrap_or(actual_duration_ns);
+        let temporal_distribution = completed_temporal_distribution(
+            &sequence.temporal_transition_elapsed_ns,
+            observation_window_ns,
+        );
+        let cadence_comparison = sequence.stationary_baseline.as_ref().map(|baseline| {
+            let baseline_transitions =
+                u64::try_from(baseline.transition_elapsed_ns.len()).unwrap_or(u64::MAX);
+            let input_transitions =
+                u64::try_from(temporal_distribution.transition_elapsed_ns.len())
+                    .unwrap_or(u64::MAX);
+            PlaybackCadenceComparison {
+                baseline_transitions,
+                input_transitions,
+                minimum_input_transitions: minimum_interaction_cadence(baseline_transitions),
+                baseline_maximum_gap_ns: baseline.maximum_gap_ns,
+                input_maximum_gap_ns: temporal_distribution.maximum_gap_ns,
+                maximum_allowed_input_gap_ns: sequence
+                    .requested_frame_period_ns
+                    .saturating_mul(3)
+                    .max(
+                        baseline
+                            .maximum_gap_ns
+                            .saturating_add(sequence.requested_frame_period_ns),
+                    ),
+                requested_frame_period_ns: sequence.requested_frame_period_ns,
+            }
+        });
+        let cancelled_gestures = mailbox
+            .cancelled_gestures
+            .saturating_sub(sequence.origin_render_intent_cancelled_gestures);
+        self.last_input_sequence_temporal_transitions = Some(temporal_transitions);
+        self.last_input_sequence_cancelled_gestures = Some(cancelled_gestures);
+        self.last_input_sequence_temporal_distribution = Some(temporal_distribution.clone());
+        self.last_input_sequence_cadence_comparison = cadence_comparison.clone();
         CommandProgress::Done(json!({
             "workload": workload,
             "samples": sequence.samples,
@@ -1364,7 +1748,27 @@ impl ProductAutomationController {
                 "render_intent_samples": mailbox.raw_samples.saturating_sub(sequence.origin_render_intent_samples),
                 "render_intent_coalesced_samples": mailbox.coalesced_samples.saturating_sub(sequence.origin_render_intent_coalesced_samples),
                 "render_intent_finished_gestures": mailbox.finished_gestures.saturating_sub(sequence.origin_render_intent_finished_gestures),
+                "render_intent_cancelled_gestures": cancelled_gestures,
+                "presented_temporal_transitions": temporal_transitions,
             },
+            "temporal_presentation_timing": {
+                "clock": "std_instant_monotonic",
+                "observation_window_ns": temporal_distribution.observation_window_ns,
+                "transition_elapsed_ns": temporal_distribution.transition_elapsed_ns,
+                "first_half_transitions": temporal_distribution.first_half_transitions,
+                "second_half_transitions": temporal_distribution.second_half_transitions,
+                "maximum_gap_ns": temporal_distribution.maximum_gap_ns,
+            },
+            "stationary_cadence_comparison": cadence_comparison.as_ref().map(|comparison| json!({
+                "baseline_transitions": comparison.baseline_transitions,
+                "input_transitions": comparison.input_transitions,
+                "minimum_input_transitions": comparison.minimum_input_transitions,
+                "baseline_maximum_gap_ns": comparison.baseline_maximum_gap_ns,
+                "input_maximum_gap_ns": comparison.input_maximum_gap_ns,
+                "maximum_allowed_input_gap_ns": comparison.maximum_allowed_input_gap_ns,
+                "requested_frame_period_ns": comparison.requested_frame_period_ns,
+                "passed": comparison.passes(),
+            })),
         }))
     }
 
@@ -1389,6 +1793,198 @@ impl ProductAutomationController {
         controller
     }
 
+    fn observe_temporal_presentation(&mut self, app: &MiranteWorkbenchApp) {
+        let snapshot = app.application.snapshot();
+        let panels = visible_product_panels(&snapshot);
+        let panel_timepoints = panels
+            .iter()
+            .map(|panel| {
+                let frame = product_presentation(app, *panel);
+                (
+                    panel.label(),
+                    frame.map(|frame| frame.timepoint()),
+                    frame.map(|frame| frame.progress().completeness()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let all_present = panel_timepoints
+            .iter()
+            .all(|(_, timepoint, _)| timepoint.is_some());
+        let coherent = panel_timepoints
+            .first()
+            .and_then(|(_, timepoint, _)| *timepoint)
+            .filter(|timepoint| {
+                panel_timepoints
+                    .iter()
+                    .all(|(_, candidate, _)| *candidate == Some(*timepoint))
+            });
+        let playback_active = snapshot.transient().playback_active();
+        let spatial_interaction_active = app
+            .render_intent_mailbox
+            .active_target(RenderIntentBase::from_snapshot(&snapshot))
+            .is_some();
+        let temporal_contract = app.playback_session.contract();
+        let temporal_contract_identity = temporal_contract.map(|contract| {
+            (
+                contract.generation(),
+                contract
+                    .layer_scales()
+                    .iter()
+                    .map(|(layer, scale)| (layer.ordinal(), scale.get()))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        if !playback_active {
+            self.active_temporal_contract = None;
+        } else if let Some(identity) = temporal_contract_identity.as_ref() {
+            match self.active_temporal_contract.as_ref() {
+                None => self.active_temporal_contract = Some(identity.clone()),
+                Some(active) if active != identity && self.temporal_violation.is_none() => {
+                    self.temporal_violation = Some(format!(
+                        "playback replaced immutable session contract {:?} with {:?} while active",
+                        active, identity
+                    ));
+                }
+                Some(_) => {}
+            }
+        } else if self.active_temporal_contract.is_some() && self.temporal_violation.is_none() {
+            self.temporal_violation =
+                Some("playback lost its immutable session contract while active".to_owned());
+        }
+        if playback_active && self.temporal_violation.is_none() {
+            if !all_present {
+                self.temporal_violation = Some(format!(
+                    "playback exposed a missing visible presentation: {}",
+                    panel_timepoints
+                        .iter()
+                        .map(|(panel, timepoint, _)| format!(
+                            "{panel}={}",
+                            timepoint
+                                .map_or_else(|| "none".to_owned(), |value| value.get().to_string())
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            } else if coherent.is_none() {
+                self.temporal_violation = Some(format!(
+                    "playback exposed incoherent visible timepoints: {}",
+                    panel_timepoints
+                        .iter()
+                        .map(|(panel, timepoint, _)| format!(
+                            "{panel}={}",
+                            timepoint
+                                .map_or_else(|| "none".to_owned(), |value| value.get().to_string())
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            } else if !spatial_interaction_active
+                && panel_timepoints.iter().any(|(_, _, completeness)| {
+                    *completeness == Some(mirante4d_render_api::FrameCompleteness::Progressive)
+                })
+            {
+                self.temporal_violation =
+                    Some("playback exposed a partially complete temporal presentation".to_owned());
+            }
+        }
+
+        let Some(timepoint) = coherent else {
+            return;
+        };
+        let changed = self.last_coherent_temporal_timepoint != Some(timepoint);
+        if changed {
+            let previous = self.last_coherent_temporal_timepoint;
+            if playback_active && let Some(previous) = previous {
+                let count = snapshot.timepoint_count();
+                let expected = TimeIndex::new((previous.get() + 1) % count);
+                if timepoint != expected && self.temporal_violation.is_none() {
+                    self.temporal_violation = Some(format!(
+                        "playback presented timepoint {} after {}, expected {}",
+                        timepoint.get(),
+                        previous.get(),
+                        expected.get()
+                    ));
+                }
+                let Some(contract) = temporal_contract else {
+                    if self.temporal_violation.is_none() {
+                        self.temporal_violation = Some(format!(
+                            "playback presented timepoint {} without an admitted session contract",
+                            timepoint.get()
+                        ));
+                    }
+                    return;
+                };
+                if contract.target_set()
+                    != crate::playback_session::PlaybackTargetSet::from(
+                        application_view(&snapshot).layout(),
+                    )
+                    && self.temporal_violation.is_none()
+                {
+                    self.temporal_violation = Some(format!(
+                        "playback session target set {:?} disagrees with visible layout {:?}",
+                        contract.target_set(),
+                        application_view(&snapshot).layout()
+                    ));
+                }
+                for panel in &panels {
+                    let surface = app.render_coordination.surface(panel.presentation_slot());
+                    for (layer, selected_scale) in contract.layer_scales().iter() {
+                        let observed = surface
+                            .layer_presentations()
+                            .iter()
+                            .find(|status| status.layer_ordinal == layer.ordinal());
+                        let stable = observed.is_some_and(|status| {
+                            !status.mixed
+                                && status.displayed_scale_level == Some(selected_scale.get())
+                        });
+                        if !stable && self.temporal_violation.is_none() {
+                            self.temporal_violation = Some(format!(
+                                "playback presented {} layer {} outside fixed session scale s{}: {:?}",
+                                panel.label(),
+                                layer.ordinal(),
+                                selected_scale.get(),
+                                observed
+                            ));
+                        }
+                    }
+                }
+                if let Some(sequence) = self.active_input_sequence.as_mut() {
+                    sequence.temporal_transition_elapsed_ns.push(
+                        u64::try_from(sequence.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    );
+                }
+                if let Some(observation) = self.active_playback_cadence.as_mut() {
+                    observation.transition_elapsed_ns.push(
+                        u64::try_from(observation.started_at.elapsed().as_nanos())
+                            .unwrap_or(u64::MAX),
+                    );
+                }
+                self.temporal_transition_count = self.temporal_transition_count.saturating_add(1);
+                self.temporal_contract_transition_count =
+                    self.temporal_contract_transition_count.saturating_add(1);
+            }
+            self.last_coherent_temporal_timepoint = Some(timepoint);
+            if self.temporal_observations.len() < MAX_TEMPORAL_OBSERVATIONS {
+                self.temporal_observations.push(json!({
+                    "elapsed_ns": u64::try_from(self.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    "time_index": timepoint.get(),
+                    "playback_active": playback_active,
+                    "playback_phase": format!("{:?}", snapshot.transient().playback_phase()),
+                    "session_generation": temporal_contract.map(|contract| contract.generation()),
+                    "fixed_layer_scales": temporal_contract.map(|contract| contract.layer_scales().iter().map(|(layer, scale)| json!({
+                        "layer_ordinal": layer.ordinal(),
+                        "scale_level": scale.get(),
+                    })).collect::<Vec<_>>()),
+                    "panels": panel_timepoints.iter().map(|(panel, candidate, completeness)| json!({
+                        "panel": panel,
+                        "time_index": candidate.map(TimeIndex::get),
+                        "completeness": completeness.map(|value| format!("{value:?}")),
+                    })).collect::<Vec<_>>(),
+                }));
+            }
+        }
+    }
+
     fn step(&mut self, app: &mut MiranteWorkbenchApp, ctx: &egui::Context) -> AutomationStatus {
         if self.report_written {
             return AutomationStatus::Waiting {
@@ -1406,6 +2002,7 @@ impl ProductAutomationController {
         let command_index = self.command_index;
         if self
             .active_input_sequence
+            .as_ref()
             .is_some_and(|sequence| sequence.command_index != command_index)
         {
             self.close_active_input_sequence_window(app);
@@ -1438,6 +2035,8 @@ impl ProductAutomationController {
                 reason,
             );
         }
+        self.observe_temporal_presentation(app);
+        self.observe_playback_stop_trace(app);
         self.observe_import_projection(app);
         let result = self.execute_command(app, ctx, &command);
         if let Err(reason) = self.observe_and_enforce_hard_safety_limits(app) {
@@ -1516,6 +2115,7 @@ impl ProductAutomationController {
             details,
         ));
         self.active_wait_started = None;
+        self.active_temporal_wait = None;
         self.sleep_frames_remaining = None;
         if self.command_index == command_index {
             self.command_index += 1;
@@ -1649,48 +2249,50 @@ impl ProductAutomationController {
         }
     }
 
-    fn capture_import_verification_evidence(
+    fn capture_import_integrity_audit_evidence(
         &self,
         app: &MiranteWorkbenchApp,
-    ) -> Result<ImportVerificationEvidenceSnapshot, String> {
-        let verification_origin = self
-            .active_import_verification_diagnostics_origin
+    ) -> Result<ImportIntegrityAuditEvidenceSnapshot, String> {
+        let audit_origin = self
+            .active_import_integrity_audit_diagnostics_origin
             .as_ref()
             .ok_or_else(|| {
-                "import publication has no source-verification diagnostics origin".to_owned()
+                "import publication has no package-integrity-audit diagnostics origin".to_owned()
             })?;
-        let verification_current = app
-            .source_verification_service
+        let audit_current = app
+            .package_integrity_audit_service
             .as_ref()
-            .ok_or_else(|| "import publication has no source-verification diagnostics".to_owned())?
+            .ok_or_else(|| {
+                "import publication has no package-integrity-audit diagnostics".to_owned()
+            })?
             .diagnostics();
-        let source_verification_started_runs = verification_current
+        let package_integrity_audit_started_runs = audit_current
             .started_runs
-            .checked_sub(verification_origin.started_runs)
-            .ok_or_else(|| "source-verification started-run counter regressed".to_owned())?;
-        let source_verification_progress_updates = verification_current
-            .accepted_progress_updates
-            .checked_sub(verification_origin.accepted_progress_updates)
-            .ok_or_else(|| "source-verification progress counter regressed".to_owned())?;
-        let source_verification_cancelled_runs = verification_current
+            .checked_sub(audit_origin.started_runs)
+            .ok_or_else(|| "package-integrity-audit started-run counter regressed".to_owned())?;
+        let package_integrity_audit_progress_updates = audit_current
+            .progress_updates
+            .checked_sub(audit_origin.progress_updates)
+            .ok_or_else(|| "package-integrity-audit progress counter regressed".to_owned())?;
+        let package_integrity_audit_cancelled_runs = audit_current
             .cancelled_runs
-            .checked_sub(verification_origin.cancelled_runs)
-            .ok_or_else(|| "source-verification cancellation counter regressed".to_owned())?;
-        let source_verification_failed_runs = verification_current
+            .checked_sub(audit_origin.cancelled_runs)
+            .ok_or_else(|| "package-integrity-audit cancellation counter regressed".to_owned())?;
+        let package_integrity_audit_failed_runs = audit_current
             .failed_runs
-            .checked_sub(verification_origin.failed_runs)
-            .ok_or_else(|| "source-verification failed-run counter regressed".to_owned())?;
-        let source_verification_successes = verification_current
-            .accepted_successes
-            .checked_sub(verification_origin.accepted_successes)
-            .ok_or_else(|| "source-verification success counter regressed".to_owned())?;
+            .checked_sub(audit_origin.failed_runs)
+            .ok_or_else(|| "package-integrity-audit failed-run counter regressed".to_owned())?;
+        let package_integrity_audit_completed_runs = audit_current
+            .completed_runs
+            .checked_sub(audit_origin.completed_runs)
+            .ok_or_else(|| "package-integrity-audit success counter regressed".to_owned())?;
 
-        Ok(ImportVerificationEvidenceSnapshot {
-            source_verification_started_runs,
-            source_verification_progress_updates,
-            source_verification_cancelled_runs,
-            source_verification_failed_runs,
-            source_verification_successes,
+        Ok(ImportIntegrityAuditEvidenceSnapshot {
+            package_integrity_audit_started_runs,
+            package_integrity_audit_progress_updates,
+            package_integrity_audit_cancelled_runs,
+            package_integrity_audit_failed_runs,
+            package_integrity_audit_completed_runs,
         })
     }
 
@@ -1730,15 +2332,16 @@ impl ProductAutomationController {
                 "storage publication-transfer evidence is bound to another destination".to_owned(),
             );
         }
-        let verification = self.capture_import_verification_evidence(app)?;
+        let audit = self.capture_import_integrity_audit_evidence(app)?;
 
         Ok(ImportPublicationEvidenceSnapshot {
             publication_currentness: publication_transfer.execution().into(),
-            source_verification_started_runs: verification.source_verification_started_runs,
-            source_verification_progress_updates: verification.source_verification_progress_updates,
-            source_verification_cancelled_runs: verification.source_verification_cancelled_runs,
-            source_verification_failed_runs: verification.source_verification_failed_runs,
-            source_verification_successes: verification.source_verification_successes,
+            package_integrity_audit_started_runs: audit.package_integrity_audit_started_runs,
+            package_integrity_audit_progress_updates: audit
+                .package_integrity_audit_progress_updates,
+            package_integrity_audit_cancelled_runs: audit.package_integrity_audit_cancelled_runs,
+            package_integrity_audit_failed_runs: audit.package_integrity_audit_failed_runs,
+            package_integrity_audit_completed_runs: audit.package_integrity_audit_completed_runs,
         })
     }
 
@@ -1814,7 +2417,7 @@ impl ProductAutomationController {
         };
         ImportedOpenReadyCommitState {
             active_origin: &mut self.active_import_timing_origin,
-            active_verification_origin: &mut self.active_import_verification_diagnostics_origin,
+            active_audit_origin: &mut self.active_import_integrity_audit_diagnostics_origin,
             completed_primary: &mut self.completed_import_primary_measurement,
             open_ready_outcome: &mut self.imported_open_ready_outcome,
         }
@@ -1854,7 +2457,7 @@ impl ProductAutomationController {
                 self.execute_dataset_switch(app, ctx, path)
             }
             ProductAutomationCommand::NewProject => {
-                dispatch_application_command(app, ctx, ApplicationCommand::AttachVerifiedDataset)?;
+                dispatch_application_command(app, ctx, ApplicationCommand::AttachDataset)?;
                 if !app.application.snapshot().is_bound() {
                     return Err("new_project did not establish a bound workspace".to_owned());
                 }
@@ -1905,15 +2508,6 @@ impl ProductAutomationController {
                 })))
             }
             ProductAutomationCommand::RecoverExposedUnsavedAutosave => {
-                if !matches!(
-                    app.application.snapshot().source(),
-                    SourceVerificationSnapshot::Verified(_)
-                ) {
-                    return Err(
-                        "exposed unsaved-autosave recovery requires a verified current dataset"
-                            .to_owned(),
-                    );
-                }
                 if !app.project_recovery_panel_open {
                     return Err(
                         "unsaved-autosave recovery was not exposed in the startup recovery panel"
@@ -2016,50 +2610,46 @@ impl ProductAutomationController {
             ProductAutomationCommand::HoldForExternalKill => {
                 Ok(CommandProgress::PassiveWaiting(None))
             }
-            ProductAutomationCommand::CancelSourceVerification => {
+            ProductAutomationCommand::CancelPackageIntegrityAudit => {
                 let service = app
-                    .source_verification_service
+                    .package_integrity_audit_service
                     .as_mut()
-                    .ok_or_else(|| "source-verification service is unavailable".to_owned())?;
+                    .ok_or_else(|| "package-integrity-audit service is unavailable".to_owned())?;
                 service
                     .reset_diagnostics()
                     .map_err(|error| error.to_string())?;
 
                 let snapshot = app.application.snapshot();
-                match snapshot.source() {
-                    SourceVerificationSnapshot::Verified(_) => {
-                        app.application
-                            .dispatch(ApplicationCommand::InvalidateSourceVerification {
-                                source_generation: snapshot.source_generation(),
-                            })
-                            .map_err(|fault| {
-                                format!("source-verification invalidation was rejected: {fault:?}")
-                            })?;
-                    }
-                    SourceVerificationSnapshot::Required => {}
-                    SourceVerificationSnapshot::Verifying { .. } => {
+                match snapshot.source().integrity_audit() {
+                    PackageIntegrityAuditSnapshot::Running { .. } => {
                         return Err(
-                            "cancel_source_verification requires an idle source state".to_owned()
+                            "cancel_package_integrity_audit requires an idle source state"
+                                .to_owned(),
                         );
                     }
+                    PackageIntegrityAuditSnapshot::NotRun
+                    | PackageIntegrityAuditSnapshot::SelfConsistent(_)
+                    | PackageIntegrityAuditSnapshot::Failed(_)
+                    | PackageIntegrityAuditSnapshot::Cancelled => {}
                 }
                 app.application
-                    .dispatch(ApplicationCommand::RequestSourceVerification)
+                    .dispatch(ApplicationCommand::RequestPackageIntegrityAudit)
                     .map_err(|fault| {
-                        format!("source-verification request was rejected: {fault:?}")
+                        format!("package-integrity-audit request was rejected: {fault:?}")
                     })?;
-                let operation_id = match app.application.snapshot().source() {
-                    SourceVerificationSnapshot::Verifying { operation_id, .. } => *operation_id,
+                let operation_id = match app.application.snapshot().source().integrity_audit() {
+                    PackageIntegrityAuditSnapshot::Running { operation_id, .. } => *operation_id,
                     _ => {
                         return Err(
-                            "source-verification request did not create an operation".to_owned()
+                            "package-integrity-audit request did not create an operation"
+                                .to_owned(),
                         );
                     }
                 };
                 app.application
                     .dispatch(ApplicationCommand::CancelOperation(operation_id))
                     .map_err(|fault| {
-                        format!("source-verification cancellation was rejected: {fault:?}")
+                        format!("package-integrity-audit cancellation was rejected: {fault:?}")
                     })?;
                 app.pump_application_services();
                 Ok(CommandProgress::Done(json!({
@@ -2067,14 +2657,14 @@ impl ProductAutomationController {
                     "cancellation_requested_before_worker_poll": true,
                 })))
             }
-            ProductAutomationCommand::CancelActiveSourceVerification => {
-                cancel_active_source_verification(app).map(CommandProgress::Done)
+            ProductAutomationCommand::CancelActivePackageIntegrityAudit => {
+                cancel_active_package_integrity_audit(app).map(CommandProgress::Done)
             }
-            ProductAutomationCommand::RequestSourceVerification => {
+            ProductAutomationCommand::RequestPackageIntegrityAudit => {
                 dispatch_application_command(
                     app,
                     ctx,
-                    ApplicationCommand::RequestSourceVerification,
+                    ApplicationCommand::RequestPackageIntegrityAudit,
                 )?;
                 Ok(CommandProgress::Done(json!({
                     "requested": true,
@@ -2083,6 +2673,7 @@ impl ProductAutomationController {
             ProductAutomationCommand::BeginTiffImportSetup {
                 source,
                 output_parent,
+                source_kind,
             } => {
                 if app.import.workers.status().is_active() {
                     return Err("an import or TIFF inspection is already active".to_owned());
@@ -2099,7 +2690,23 @@ impl ProductAutomationController {
                         output_parent.display()
                     ));
                 }
-                let tiff_source = TiffSource::auto(source);
+                let (setup_kind, channel_source) = match source_kind {
+                    ProductAutomationTiffSourceKind::Single3dTiff => (
+                        ImportChannelSourceKind::Single3dTiff,
+                        TiffChannelSource::single_3d("channel 1", source).map_err(str::to_owned)?,
+                    ),
+                    ProductAutomationTiffSourceKind::FolderOf3dTiffs => (
+                        ImportChannelSourceKind::FolderOf3dTiffs,
+                        TiffChannelSource::folder_of_3d("channel 1", source)
+                            .map_err(str::to_owned)?,
+                    ),
+                    ProductAutomationTiffSourceKind::FolderOf2dTiffs => (
+                        ImportChannelSourceKind::FolderOf2dTiffs,
+                        TiffChannelSource::folder_of_2d("channel 1", source)
+                            .map_err(str::to_owned)?,
+                    ),
+                };
+                let tiff_source = TiffSource::new(vec![channel_source]).map_err(str::to_owned)?;
                 let destination =
                     crate::import_workflow::tiff_destination(&tiff_source, output_parent);
                 self.active_import_pre_start_origin = Some(ImportPreStartOrigin {
@@ -2109,7 +2716,15 @@ impl ProductAutomationController {
                     destination: destination.clone(),
                 });
                 self.completed_import_pre_start_measurement = None;
-                app.start_tiff_import_setup_task(tiff_source, output_parent.clone(), ctx);
+                app.import.begin_setup();
+                app.import.set_channel_kind(0, setup_kind);
+                app.import.install_channel_selection(0, source.clone());
+                app.bind_import_worker_completion_repaint(ctx);
+                app.import
+                    .workers
+                    .start_inspection(tiff_source, PathBuf::new())
+                    .map_err(|error| error.to_string())?;
+                app.import.mark_channel_inspection_active(0);
                 if let Some(problem) = app.import.problem.as_ref() {
                     return Err(format!("TIFF inspection could not start: {problem}"));
                 }
@@ -2122,8 +2737,8 @@ impl ProductAutomationController {
             ProductAutomationCommand::StartReviewedImport {
                 spacing_zyx_um,
                 time_step_seconds,
-                no_data_sentinel,
-                working_memory_bytes,
+                no_data_value_rule,
+                hide_constant_z_planes,
             } => {
                 let ImportWorkflowSnapshot::Review(review) = app.import.snapshot() else {
                     return Err("no completed TIFF review is ready to start".to_owned());
@@ -2132,8 +2747,15 @@ impl ProductAutomationController {
                     spacing_zyx_um: *spacing_zyx_um,
                     calibration_confirmed: true,
                     time_step_seconds: *time_step_seconds,
-                    no_data_sentinel: *no_data_sentinel,
-                    working_memory_bytes: *working_memory_bytes,
+                    no_data_value_rule: no_data_value_rule.map(|rule| match rule {
+                        ProductAutomationNoDataValueRule::Automatic => {
+                            mirante4d_application::import_workflow::ImportNoDataValueRule::Automatic
+                        }
+                        ProductAutomationNoDataValueRule::ManualUint8 {
+                            value,
+                        } => mirante4d_application::import_workflow::ImportNoDataValueRule::ManualUint8(value),
+                    }),
+                    hide_constant_z_planes: *hide_constant_z_planes,
                 };
                 let pre_start_origin =
                     self.active_import_pre_start_origin
@@ -2163,11 +2785,11 @@ impl ProductAutomationController {
                     wall_time_ns: pre_start_wall_time_ns,
                     process_cpu_time_ns: pre_start_process_cpu_time_ns,
                 };
-                let verification_diagnostics_origin = app
-                    .source_verification_service
+                let integrity_audit_diagnostics_origin = app
+                    .package_integrity_audit_service
                     .as_ref()
                     .ok_or_else(|| {
-                        "reviewed TIFF import has no source-verification service".to_owned()
+                        "reviewed TIFF import has no package-integrity-audit service".to_owned()
                     })?
                     .diagnostics();
                 app.apply_import_command(
@@ -2191,8 +2813,8 @@ impl ProductAutomationController {
                         "reviewed TIFF import has no exact worker timing origin".to_owned()
                     })?;
                 self.active_import_timing_origin = Some(timing_origin.clone());
-                self.active_import_verification_diagnostics_origin =
-                    Some(verification_diagnostics_origin);
+                self.active_import_integrity_audit_diagnostics_origin =
+                    Some(integrity_audit_diagnostics_origin);
                 self.completed_import_primary_measurement = None;
                 self.imported_open_ready_outcome = None;
                 self.completed_import_pre_start_measurement = Some(pre_start_measurement);
@@ -2200,10 +2822,9 @@ impl ProductAutomationController {
                 Ok(CommandProgress::Done(json!({
                     "review_id": review.review_id.get(),
                     "destination": review.destination,
-                    "operation_token": operation_token_json(&timing_origin.token),
+                    "operation_token": timing_origin.token.as_ref().map(operation_token_json),
                     "reviewed_source_fingerprint_sha256": timing_origin.source_fingerprint.to_string(),
                     "reviewed_source_bytes": timing_origin.reviewed_source_bytes,
-                    "working_memory_bytes": working_memory_bytes,
                     "primary_clock_started_at_epoch_ms": timing_origin.started_at_epoch_ms,
                     "primary_clock_start_boundary": "accepted_start_import_command_immediately_before_worker_spawn",
                     "normal_review_command_path": true,
@@ -2254,7 +2875,7 @@ impl ProductAutomationController {
                     let measurement = self.complete_imported_open_ready_measurement(app, path)?;
                     Ok(CommandProgress::Done(json!({
                         "path": path.display().to_string(),
-                        "verified": true,
+                        "content_id_computed_during_import": true,
                         "import_idle": true,
                         "normal_product_open_path": true,
                         "primary_clock": import_primary_measurement_json(Some(measurement)),
@@ -2262,10 +2883,10 @@ impl ProductAutomationController {
                     })))
                 } else if started.elapsed() >= Duration::from_millis(*timeout_ms) {
                     Err(format!(
-                        "timed out after {timeout_ms} ms waiting for imported package {} to become verified and open-ready (selected_matches={}, verified={}, import_idle={}, problem={:?})",
+                        "timed out after {timeout_ms} ms waiting for imported package {} to become admitted and open-ready (selected_matches={}, content_id_computed_during_import={}, import_idle={}, problem={:?})",
                         path.display(),
                         readiness.selected_matches,
-                        readiness.verified,
+                        readiness.content_id_computed_during_import,
                         readiness.import_idle,
                         app.import.problem,
                     ))
@@ -2277,6 +2898,34 @@ impl ProductAutomationController {
                 condition,
                 timeout_ms,
             } => {
+                if matches!(condition, ProductAutomationWaitCondition::ImportReviewReady)
+                    && matches!(app.import.snapshot(), ImportWorkflowSnapshot::Configure(_))
+                    && !app.import.workers.status().is_active()
+                    && app.import.setup.as_ref().is_some_and(|setup| {
+                        setup
+                            .channels
+                            .iter()
+                            .all(|channel| channel.inspection.is_some())
+                    })
+                {
+                    let inspection = app
+                        .import
+                        .validated_setup_inspection()
+                        .map_err(|error| error.to_string())?;
+                    let source = inspection.source().clone();
+                    let destination = self
+                        .active_import_pre_start_origin
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "inspected TIFF setup has no automation destination".to_owned()
+                        })?
+                        .destination
+                        .clone();
+                    app.import.setup = None;
+                    app.import
+                        .install_review(source, inspection, destination)
+                        .map_err(|error| error.to_string())?;
+                }
                 let started = *self.active_wait_started.get_or_insert_with(Instant::now);
                 if self.wait_condition_met(app, *condition) {
                     Ok(CommandProgress::Done(json!({
@@ -2416,6 +3065,195 @@ impl ProductAutomationController {
                     "time_index": time_index,
                     "timepoint_count": timepoint_count,
                     "semantic_application_command": true,
+                })))
+            }
+            ProductAutomationCommand::SetPlaybackFps { fps } => {
+                let playback_fps = mirante4d_application::PlaybackFps::new(*fps)
+                    .ok_or_else(|| format!("invalid playback FPS {fps}"))?;
+                dispatch_application_command(
+                    app,
+                    ctx,
+                    ApplicationCommand::SetPlaybackFps(playback_fps),
+                )?;
+                Ok(CommandProgress::Done(json!({
+                    "fps": fps,
+                    "semantic_application_command": true,
+                })))
+            }
+            ProductAutomationCommand::SetPlaybackActive { active } => {
+                if *active {
+                    self.active_playback_stop_trace = None;
+                } else {
+                    self.begin_playback_stop_trace(app)?;
+                }
+                dispatch_application_command(
+                    app,
+                    ctx,
+                    ApplicationCommand::SetPlaybackActive(*active),
+                )?;
+                let snapshot = app.application.snapshot();
+                if snapshot.transient().playback_active() != *active {
+                    return Err(format!(
+                        "playback active state remained {} after requesting {active}",
+                        snapshot.transient().playback_active()
+                    ));
+                }
+                Ok(CommandProgress::Done(json!({
+                    "active": active,
+                    "phase": format!("{:?}", snapshot.transient().playback_phase()),
+                    "effective_time_index": snapshot.view().timepoint().get(),
+                    "semantic_application_command": true,
+                })))
+            }
+            ProductAutomationCommand::WaitForPresentedTimeIndex {
+                time_index,
+                timeout_ms,
+            } => {
+                let snapshot = app.application.snapshot();
+                if *time_index >= snapshot.timepoint_count() {
+                    return Err(format!(
+                        "presented time index {time_index} is out of bounds for {} timepoints",
+                        snapshot.timepoint_count()
+                    ));
+                }
+                let expected = TimeIndex::new(*time_index);
+                let panels = visible_product_panels(&snapshot);
+                let ready = snapshot.view().timepoint() == expected
+                    && coordinated_visible_layout_current_complete_with_snapshot(app, &snapshot)
+                    && panels.iter().all(|panel| {
+                        let surface = app.render_coordination.surface(panel.presentation_slot());
+                        surface.display_current()
+                            && surface.presented_frame().is_some_and(|frame| {
+                                frame.timepoint() == expected
+                                    && frame.progress().completeness()
+                                        != mirante4d_render_api::FrameCompleteness::Progressive
+                            })
+                    });
+                if ready {
+                    return Ok(CommandProgress::Done(json!({
+                        "time_index": time_index,
+                        "visible_panels": panels.iter().map(|panel| panel.label()).collect::<Vec<_>>(),
+                        "actual_presented_timepoint_observed": true,
+                        "coordinated_current_complete": true,
+                    })));
+                }
+                let started = *self.active_wait_started.get_or_insert_with(Instant::now);
+                if started.elapsed() >= Duration::from_millis(*timeout_ms) {
+                    return Err(format!(
+                        "timed out waiting for complete current presentation of timepoint {time_index}; actual={}",
+                        panels
+                            .iter()
+                            .map(|panel| format!(
+                                "{}={}",
+                                panel.label(),
+                                product_presentation(app, *panel).map_or_else(
+                                    || "none".to_owned(),
+                                    |frame| frame.timepoint().get().to_string(),
+                                )
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                Ok(CommandProgress::Waiting)
+            }
+            ProductAutomationCommand::WaitForTemporalTransitions {
+                minimum_transitions,
+                timeout_ms,
+            } => {
+                if let Some(violation) = self.temporal_violation.as_ref() {
+                    return Err(format!("temporal continuity violation: {violation}"));
+                }
+                let origin = match self.active_temporal_wait {
+                    Some((command_index, origin)) if command_index == self.command_index => origin,
+                    _ => {
+                        let origin = self.temporal_transition_count;
+                        self.active_temporal_wait = Some((self.command_index, origin));
+                        origin
+                    }
+                };
+                let observed = self.temporal_transition_count.saturating_sub(origin);
+                if observed >= u64::from(*minimum_transitions) {
+                    return Ok(CommandProgress::Done(json!({
+                        "minimum_transitions": minimum_transitions,
+                        "observed_transitions": observed,
+                        "ordered_coherent_presentations": true,
+                    })));
+                }
+                let started = *self.active_wait_started.get_or_insert_with(Instant::now);
+                if started.elapsed() >= Duration::from_millis(*timeout_ms) {
+                    return Err(format!(
+                        "timed out after {timeout_ms} ms waiting for {minimum_transitions} presented temporal transitions; observed {observed}"
+                    ));
+                }
+                Ok(CommandProgress::Waiting)
+            }
+            ProductAutomationCommand::ObservePlaybackCadence { duration_ms } => {
+                if !app.application.snapshot().transient().playback_active() {
+                    return Err(
+                        "playback cadence observation requires an active prepared playback session"
+                            .to_owned(),
+                    );
+                }
+                if self.active_playback_cadence.is_none() {
+                    self.last_stationary_playback_cadence = None;
+                    self.active_playback_cadence = Some(ActivePlaybackCadenceObservation {
+                        command_index: self.command_index,
+                        started_at: Instant::now(),
+                        duration_ms: *duration_ms,
+                        origin_temporal_transitions: self.temporal_transition_count,
+                        transition_elapsed_ns: Vec::new(),
+                    });
+                }
+                let active = self
+                    .active_playback_cadence
+                    .as_ref()
+                    .expect("an initialized cadence observation retains active state");
+                if active.command_index != self.command_index || active.duration_ms != *duration_ms
+                {
+                    return Err(
+                        "playback cadence observation state belongs to a different command"
+                            .to_owned(),
+                    );
+                }
+                let elapsed_ns =
+                    u64::try_from(active.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let requested_ns = duration_ms.saturating_mul(1_000_000);
+                if elapsed_ns < requested_ns {
+                    return Ok(CommandProgress::PassiveWaiting(Some(Duration::from_nanos(
+                        requested_ns.saturating_sub(elapsed_ns),
+                    ))));
+                }
+                let active = self
+                    .active_playback_cadence
+                    .take()
+                    .expect("the completed cadence observation retains active state");
+                let observed = self
+                    .temporal_transition_count
+                    .saturating_sub(active.origin_temporal_transitions);
+                let distribution =
+                    completed_temporal_distribution(&active.transition_elapsed_ns, elapsed_ns);
+                if u64::try_from(distribution.transition_elapsed_ns.len()).unwrap_or(u64::MAX)
+                    != observed
+                {
+                    return Err(format!(
+                        "stationary cadence transition counter ({observed}) disagrees with its monotonic timestamps ({})",
+                        distribution.transition_elapsed_ns.len()
+                    ));
+                }
+                self.last_stationary_playback_cadence = Some(distribution.clone());
+                Ok(CommandProgress::Done(json!({
+                    "requested_duration_ms": duration_ms,
+                    "actual_duration_ns": elapsed_ns,
+                    "presented_temporal_transitions": observed,
+                    "temporal_presentation_timing": {
+                        "clock": "std_instant_monotonic",
+                        "observation_window_ns": distribution.observation_window_ns,
+                        "transition_elapsed_ns": distribution.transition_elapsed_ns,
+                        "first_half_transitions": distribution.first_half_transitions,
+                        "second_half_transitions": distribution.second_half_transitions,
+                        "maximum_gap_ns": distribution.maximum_gap_ns,
+                    },
                 })))
             }
             ProductAutomationCommand::SetLayerVisibility {
@@ -3213,6 +4051,109 @@ impl ProductAutomationController {
                 self.artifacts.push(artifact.clone());
                 Ok(CommandProgress::Done(artifact.json()))
             }
+            ProductAutomationCommand::CaptureTemporalFrame {
+                target,
+                name,
+                min_different_pixels_from_previous,
+            } => {
+                let panel = PanelId::from(*target);
+                if !product_presentations_ready(app, &[panel])? {
+                    let started = *self.active_wait_started.get_or_insert_with(Instant::now);
+                    if started.elapsed() >= AUTOMATION_CAPTURE_TIMEOUT {
+                        return Err(format!(
+                            "timed out waiting for temporal GPU validation capture: {}",
+                            product_capture_state(app, &[panel])
+                        ));
+                    }
+                    return Ok(CommandProgress::Waiting);
+                }
+                let surface = app.render_coordination.surface(panel.presentation_slot());
+                let frame = surface
+                    .presented_frame()
+                    .ok_or_else(|| format!("{} has no presented temporal frame", panel.label()))?;
+                if !surface.display_current()
+                    || frame.progress().completeness()
+                        == mirante4d_render_api::FrameCompleteness::Progressive
+                {
+                    return Err(format!(
+                        "{} temporal capture is not a complete current presentation",
+                        panel.label()
+                    ));
+                }
+                let timepoint = frame.timepoint();
+                let rgba8 = product_target_capture(app, panel)
+                    .expect("capture readiness was established above")
+                    .rgba8()
+                    .to_vec();
+                let intermediate_rgb_pixels = rgba8
+                    .chunks_exact(4)
+                    .filter(|pixel| pixel[..3].iter().any(|value| (1..=254).contains(value)))
+                    .count();
+                if intermediate_rgb_pixels == 0 {
+                    return Err(format!(
+                        "{} temporal capture at timepoint {} is clipped or blank; no intermediate RGB pixels were observed",
+                        panel.label(),
+                        timepoint.get()
+                    ));
+                }
+                let previous = self
+                    .temporal_capture_baselines
+                    .iter()
+                    .find(|baseline| baseline.target == *target);
+                let different_pixels = previous.map(|baseline| {
+                    baseline
+                        .rgba8
+                        .chunks_exact(4)
+                        .zip(rgba8.chunks_exact(4))
+                        .filter(|(before, after)| before[..3] != after[..3])
+                        .count()
+                        .saturating_add(baseline.rgba8.len().abs_diff(rgba8.len()).div_ceil(4))
+                });
+                if let Some(minimum) = min_different_pixels_from_previous {
+                    let observed = different_pixels.ok_or_else(|| {
+                        format!(
+                            "{} temporal capture requested a pixel-difference threshold without a prior baseline",
+                            panel.label()
+                        )
+                    })?;
+                    if observed < *minimum {
+                        return Err(format!(
+                            "{} temporal capture changed {observed} pixels, fewer than required {minimum}",
+                            panel.label()
+                        ));
+                    }
+                    if previous.is_some_and(|baseline| baseline.timepoint == timepoint) {
+                        return Err(format!(
+                            "{} temporal capture pixels changed without advancing from timepoint {}",
+                            panel.label(),
+                            timepoint.get()
+                        ));
+                    }
+                }
+                let artifact = self.capture_viewport_artifact(app, *target, name.as_deref())?;
+                if artifact.pixel_stats.is_blank() {
+                    return Err(format!(
+                        "temporal viewport capture {} is blank",
+                        artifact.path.display()
+                    ));
+                }
+                self.temporal_capture_baselines
+                    .retain(|baseline| baseline.target != *target);
+                self.temporal_capture_baselines
+                    .push(TemporalCaptureBaseline {
+                        target: *target,
+                        timepoint,
+                        rgba8,
+                    });
+                self.artifacts.push(artifact.clone());
+                Ok(CommandProgress::Done(json!({
+                    "artifact": artifact.json(),
+                    "presented_time_index": timepoint.get(),
+                    "different_pixels_from_previous": different_pixels,
+                    "intermediate_rgb_pixels": intermediate_rgb_pixels,
+                    "semantic_and_visual_evidence": true,
+                })))
+            }
             ProductAutomationCommand::Assert { condition } => {
                 let capture_panels = assertion_capture_panels(condition);
                 if !capture_panels.is_empty() && !product_presentations_ready(app, &capture_panels)?
@@ -3227,11 +4168,22 @@ impl ProductAutomationController {
                     return Ok(CommandProgress::Waiting);
                 }
                 self.assert_condition(app, condition)?;
+                let playback_stop_handoff_trace = matches!(
+                    condition,
+                    ProductAutomationAssertCondition::PlaybackStoppedAndReleased
+                )
+                .then(|| {
+                    self.active_playback_stop_trace
+                        .as_ref()
+                        .map(ActivePlaybackStopTrace::json)
+                })
+                .flatten();
                 Ok(CommandProgress::Done(json!({
                     "condition": condition.name(),
                     "cross_section_snapshot": condition
                         .is_cross_section_condition()
                         .then(|| cross_section_diagnostics_json(app)),
+                    "playback_stop_handoff_trace": playback_stop_handoff_trace,
                 })))
             }
             ProductAutomationCommand::SleepFrames { frames } => {
@@ -3408,22 +4360,26 @@ impl ProductAutomationController {
             ProductAutomationWaitCondition::CoordinatedPresentationSettled => {
                 coordinated_visible_layout_current_complete_with_snapshot(app, snapshot)
             }
-            ProductAutomationWaitCondition::SourceVerificationInactive => {
-                source_verification_inactive(app)
+            ProductAutomationWaitCondition::PackageIntegrityAuditInactive => {
+                package_integrity_audit_inactive(app)
             }
-            ProductAutomationWaitCondition::SourceVerificationRequired => {
-                matches!(snapshot.source(), SourceVerificationSnapshot::Required)
-                    && app
-                        .source_verification_service
-                        .as_ref()
-                        .is_some_and(|service| service.active_token().is_none())
+            ProductAutomationWaitCondition::PackageIntegrityAuditNotRun => {
+                matches!(
+                    snapshot.source().integrity_audit(),
+                    PackageIntegrityAuditSnapshot::NotRun
+                ) && app
+                    .package_integrity_audit_service
+                    .as_ref()
+                    .is_some_and(|service| service.active_token().is_none())
             }
-            ProductAutomationWaitCondition::SourceVerificationVerified => {
-                matches!(snapshot.source(), SourceVerificationSnapshot::Verified(_))
-                    && app
-                        .source_verification_service
-                        .as_ref()
-                        .is_some_and(|service| service.active_token().is_none())
+            ProductAutomationWaitCondition::PackageIntegrityAuditSelfConsistent => {
+                matches!(
+                    snapshot.source().integrity_audit(),
+                    PackageIntegrityAuditSnapshot::SelfConsistent(_)
+                ) && app
+                    .package_integrity_audit_service
+                    .as_ref()
+                    .is_some_and(|service| service.active_token().is_none())
             }
             ProductAutomationWaitCondition::ImportReviewReady => {
                 matches!(app.import.snapshot(), ImportWorkflowSnapshot::Review(_))
@@ -3451,8 +4407,7 @@ impl ProductAutomationController {
                 app.project_recovery_review.is_some()
             }
             ProductAutomationWaitCondition::UnsavedAutosaveRecoveryExposed => {
-                matches!(snapshot.source(), SourceVerificationSnapshot::Verified(_))
-                    && app.project_recovery_panel_open
+                app.project_recovery_panel_open
                     && app.project_store.as_ref().is_some_and(|service| {
                         service.can_open() && service.recovery_store_project_ids().len() == 1
                     })
@@ -3467,6 +4422,27 @@ impl ProductAutomationController {
                         app.project_store_product_evidence.actor_join,
                         Some(crate::ProjectStoreRecordedResult::Succeeded)
                     )
+            }
+            ProductAutomationWaitCondition::InitialAutoDenseApplied => {
+                app.initial_auto_dense_is_applied(snapshot)
+            }
+            ProductAutomationWaitCondition::PlaybackResidencyReleased => {
+                let current = snapshot.view().timepoint();
+                !snapshot.transient().playback_active()
+                    && app
+                        .dataset
+                        .scope_requirements(crate::dataset_requests::SCOPE_PLAYBACK)
+                        .is_empty()
+                    && app
+                        .dataset
+                        .renderer_requirement_handle()
+                        .requirements
+                        .iter()
+                        .all(|key| key.timepoint() == current)
+                    && visible_product_panels(snapshot).iter().all(|panel| {
+                        product_presentation(app, *panel)
+                            .is_some_and(|frame| frame.timepoint() == current)
+                    })
             }
         }
     }
@@ -3789,25 +4765,25 @@ impl ProductAutomationController {
             ProductAutomationAssertCondition::CrossSectionRetired => {
                 assert_cross_section_retired(app)
             }
-            ProductAutomationAssertCondition::SourceVerificationEvidence {
-                min_accepted_progress_updates,
+            ProductAutomationAssertCondition::PackageIntegrityAuditEvidence {
+                min_progress_updates,
                 min_cancelled_runs,
-                min_accepted_successes,
+                min_completed_runs,
             } => {
                 let diagnostics = app
-                    .source_verification_service
+                    .package_integrity_audit_service
                     .as_ref()
-                    .ok_or_else(|| "source-verification service is unavailable".to_owned())?
+                    .ok_or_else(|| "package-integrity-audit service is unavailable".to_owned())?
                     .diagnostics();
-                if diagnostics.accepted_progress_updates < *min_accepted_progress_updates
+                if diagnostics.progress_updates < *min_progress_updates
                     || diagnostics.cancelled_runs < *min_cancelled_runs
-                    || diagnostics.accepted_successes < *min_accepted_successes
+                    || diagnostics.completed_runs < *min_completed_runs
                 {
                     Err(format!(
-                        "source-verification evidence is incomplete: progress={}, cancelled={}, successes={}",
-                        diagnostics.accepted_progress_updates,
+                        "package-integrity-audit evidence is incomplete: progress={}, cancelled={}, successes={}",
+                        diagnostics.progress_updates,
                         diagnostics.cancelled_runs,
-                        diagnostics.accepted_successes,
+                        diagnostics.completed_runs,
                     ))
                 } else {
                     Ok(())
@@ -3905,6 +4881,174 @@ impl ProductAutomationController {
                         app.project_status_message,
                     ))
                 }
+            }
+            ProductAutomationAssertCondition::TemporalContinuity => {
+                if let Some(violation) = self.temporal_violation.as_ref() {
+                    Err(format!("temporal continuity violation: {violation}"))
+                } else if self.temporal_transition_count == 0 {
+                    Err("temporal continuity has no observed presented transition".to_owned())
+                } else if self.temporal_contract_transition_count != self.temporal_transition_count
+                {
+                    Err(format!(
+                        "only {} of {} temporal transitions carried an immutable playback contract",
+                        self.temporal_contract_transition_count, self.temporal_transition_count
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            ProductAutomationAssertCondition::PlaybackAdvancedDuringPreviousInput {
+                minimum_transitions,
+            } => {
+                let observed = self
+                    .last_input_sequence_temporal_transitions
+                    .ok_or_else(|| {
+                        "playback/input assertion has no completed preceding input sequence"
+                            .to_owned()
+                    })?;
+                let cancelled = self.last_input_sequence_cancelled_gestures.ok_or_else(|| {
+                    "playback/input assertion has no gesture-lifecycle evidence".to_owned()
+                })?;
+                let distribution = self
+                    .last_input_sequence_temporal_distribution
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "playback/input assertion has no temporal distribution evidence".to_owned()
+                    })?;
+                let cadence = self
+                    .last_input_sequence_cadence_comparison
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "playback/input assertion has no same-duration stationary cadence baseline"
+                            .to_owned()
+                    })?;
+                if cancelled != 0 {
+                    Err(format!(
+                        "playback cancelled the preceding input gesture {cancelled} times"
+                    ))
+                } else if u64::try_from(distribution.transition_elapsed_ns.len())
+                    .unwrap_or(u64::MAX)
+                    != observed
+                {
+                    Err(format!(
+                        "playback transition counter ({observed}) disagrees with its monotonic presentation timestamps ({})",
+                        distribution.transition_elapsed_ns.len()
+                    ))
+                } else if *minimum_transitions >= 2
+                    && (distribution.first_half_transitions == 0
+                        || distribution.second_half_transitions == 0)
+                {
+                    Err(format!(
+                        "playback transitions were not distributed through the held input: first_half={}, second_half={}, maximum_gap_ns={}, window_ns={}",
+                        distribution.first_half_transitions,
+                        distribution.second_half_transitions,
+                        distribution.maximum_gap_ns,
+                        distribution.observation_window_ns,
+                    ))
+                } else if cadence.baseline_transitions < 3 {
+                    Err(format!(
+                        "stationary cadence baseline contained only {} temporal transitions",
+                        cadence.baseline_transitions
+                    ))
+                } else if cadence.input_transitions != observed {
+                    Err(format!(
+                        "cadence comparison counted {} input transitions but the presentation oracle counted {observed}",
+                        cadence.input_transitions
+                    ))
+                } else if !cadence.passes() {
+                    Err(format!(
+                        "input cadence regressed against the same-duration stationary baseline: input={}/{}, required>={}, input_max_gap_ns={}, allowed_max_gap_ns={}, baseline_max_gap_ns={}, frame_period_ns={}",
+                        cadence.input_transitions,
+                        cadence.baseline_transitions,
+                        cadence.minimum_input_transitions,
+                        cadence.input_maximum_gap_ns,
+                        cadence.maximum_allowed_input_gap_ns,
+                        cadence.baseline_maximum_gap_ns,
+                        cadence.requested_frame_period_ns,
+                    ))
+                } else if observed >= u64::from(*minimum_transitions) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "playback presented {observed} transitions during the preceding input sequence, fewer than required {minimum_transitions}"
+                    ))
+                }
+            }
+            ProductAutomationAssertCondition::PlaybackStoppedAndReleased => {
+                let current = snapshot.view().timepoint();
+                let visible_panels = visible_product_panels(&snapshot);
+                let trace = self.active_playback_stop_trace.as_ref().ok_or_else(|| {
+                    "playback stop assertion has no retained-front handoff trace".to_owned()
+                })?;
+                if let Some(violation) = trace.violation.as_ref() {
+                    return Err(format!(
+                        "playback stop handoff violation: {violation}; bounded_trace={}",
+                        trace.json()
+                    ));
+                }
+                let first = trace
+                    .states
+                    .first()
+                    .map(|(_, state)| state)
+                    .ok_or_else(|| {
+                        "playback stop handoff trace contains no visible state".to_owned()
+                    })?;
+                for panel in &first.panels {
+                    for layer in &panel.layers {
+                        let expected = trace
+                            .playback_layer_scales
+                            .iter()
+                            .find_map(|(ordinal, scale)| {
+                                (*ordinal == layer.layer_ordinal).then_some(*scale)
+                            })
+                            .expect("stop trace layers come from the fixed playback scale map");
+                        if layer.displayed_scale_level != Some(expected) || layer.mixed {
+                            return Err(format!(
+                                "playback stop trace did not begin at the fixed session scale for {} layer {}: expected s{}, observed {:?}",
+                                panel.panel,
+                                layer.layer_ordinal,
+                                expected,
+                                layer.displayed_scale_level
+                            ));
+                        }
+                    }
+                }
+                if snapshot.transient().playback_active() {
+                    return Err("playback remains active after stop".to_owned());
+                }
+                if !app
+                    .dataset
+                    .scope_requirements(crate::dataset_requests::SCOPE_PLAYBACK)
+                    .is_empty()
+                {
+                    return Err("playback scope still owns resources after stop".to_owned());
+                }
+                if app
+                    .dataset
+                    .renderer_requirement_handle()
+                    .requirements
+                    .iter()
+                    .any(|key| key.timepoint() != current)
+                {
+                    return Err(
+                        "renderer authority retains a non-current timepoint after stop".to_owned(),
+                    );
+                }
+                if visible_panels.iter().any(|panel| {
+                    product_presentation(app, *panel)
+                        .is_none_or(|frame| frame.timepoint() != current)
+                }) {
+                    return Err(format!(
+                        "stopped playback did not retain a coherent current presentation at timepoint {}",
+                        current.get()
+                    ));
+                }
+                if !coordinated_visible_layout_current_complete_with_snapshot(app, &snapshot) {
+                    return Err(
+                        "playback Stop did not reach the direct stationary replacement".to_owned(),
+                    );
+                }
+                Ok(())
             }
         }
     }
@@ -4124,7 +5268,7 @@ impl ProductAutomationController {
                 .dataset
                 .local_source_diagnostics()
                 .map(local_dataset_source_diagnostics_json),
-            "source_verification": source_verification_diagnostics_json(app),
+            "package_integrity_audit": package_integrity_audit_diagnostics_json(app),
             "retained_leases": retained_leases_diagnostics_json(app),
             "cross_section": cross_section_diagnostics_json(app),
             "gpu_adapter": app
@@ -4264,6 +5408,13 @@ impl ProductAutomationController {
                 .iter()
                 .map(ProductAutomationArtifact::json)
                 .collect::<Vec<_>>(),
+            "temporal_evidence": {
+                "presented_transition_count": self.temporal_transition_count,
+                "fixed_contract_transition_count": self.temporal_contract_transition_count,
+                "last_coherent_time_index": self.last_coherent_temporal_timepoint.map(TimeIndex::get),
+                "continuity_violation": &self.temporal_violation,
+                "observations": &self.temporal_observations,
+            },
             "final_diagnostics": self.diagnostics_json(app),
             "logs": {
                 "app_log": app.startup_diagnostics.logs_path.as_ref().map(|path| path.display().to_string()),
@@ -4325,7 +5476,7 @@ fn import_primary_measurement_json(measurement: Option<ImportPrimaryMeasurement>
     measurement.map_or(Value::Null, |measurement| {
         json!({
             "start_boundary": "accepted_start_import_command_immediately_before_worker_spawn",
-            "end_boundary": "published_destination_verified_and_open_ready_for_normal_product_use",
+            "end_boundary": "published_destination_admitted_and_open_ready_for_normal_product_use",
             "clock": "std_instant_monotonic",
             "started_at_epoch_ms": measurement.started_at_epoch_ms,
             "open_ready_at_epoch_ms": measurement.open_ready_at_epoch_ms,
@@ -4389,13 +5540,13 @@ fn import_publication_to_open_ready_measurement_json(
             "observed_total_object_reads": currentness.observed_total_object_reads,
             "observed_codec_decode_calls": currentness.observed_codec_decode_calls,
         },
-        "source_verification_started_runs": evidence.source_verification_started_runs,
-        "source_verification_progress_updates": evidence.source_verification_progress_updates,
-        "source_verification_cancelled_runs": evidence.source_verification_cancelled_runs,
-        "source_verification_failed_runs": evidence.source_verification_failed_runs,
-        "source_verification_successes": evidence.source_verification_successes,
+        "package_integrity_audit_started_runs": evidence.package_integrity_audit_started_runs,
+        "package_integrity_audit_progress_updates": evidence.package_integrity_audit_progress_updates,
+        "package_integrity_audit_cancelled_runs": evidence.package_integrity_audit_cancelled_runs,
+        "package_integrity_audit_failed_runs": evidence.package_integrity_audit_failed_runs,
+        "package_integrity_audit_completed_runs": evidence.package_integrity_audit_completed_runs,
         "start_boundary": "import_worker_published_event",
-        "end_boundary": "published_destination_verified_and_open_ready_for_normal_product_use",
+        "end_boundary": "published_destination_admitted_and_open_ready_for_normal_product_use",
         "wall_clock": "std_instant_monotonic",
         "cpu_clock": "process_cpu_time",
         "published_at_epoch_ms": measurement.published_at_epoch_ms,
@@ -4403,7 +5554,7 @@ fn import_publication_to_open_ready_measurement_json(
         "wall_time_ns": measurement.wall_time_ns,
         "process_cpu_time_ns": measurement.process_cpu_time_ns,
         "included_in_primary_clock": true,
-        "transfer_mode": "staged_verified_capability",
+        "transfer_mode": "staged_self_consistent_capability",
     })
 }
 
@@ -4430,7 +5581,7 @@ fn successful_import_evidence_json(
         });
     json!({
         "review_id": evidence.review_id.get(),
-        "operation_token": operation_token_json(&evidence.token),
+        "operation_token": evidence.token.as_ref().map(operation_token_json),
         "destination": evidence.destination,
         "reviewed_source_fingerprint_sha256": evidence.source_fingerprint.to_string(),
         "reviewed_source_bytes": evidence.reviewed_source_bytes,
@@ -4463,6 +5614,7 @@ fn import_statistics_json(statistics: &ImportStatistics) -> Value {
         "source_revalidation_bytes_read" => statistics.source_revalidation_bytes_read,
         "native_decoded_bytes" => statistics.native_decoded_bytes,
         "base_native_decoded_bytes" => statistics.base_native_decoded_bytes,
+        "no_data_detection_native_decoded_bytes" => statistics.no_data_detection_native_decoded_bytes,
         "scientific_identity_native_decoded_bytes" => statistics.scientific_identity_native_decoded_bytes,
         "tiff_open_count" => statistics.tiff_open_count,
         "native_chunk_decode_count" => statistics.native_chunk_decode_count,
@@ -4491,13 +5643,24 @@ fn import_statistics_json(statistics: &ImportStatistics) -> Value {
         "sampled_peak_open_file_descriptors" => statistics.sampled_peak_open_file_descriptors,
         "open_file_descriptor_structural_bound" => statistics.open_file_descriptor_structural_bound,
         "peak_open_file_descriptors" => statistics.peak_open_file_descriptors,
-        "preflight_temporary_bytes_bound" => statistics.preflight_temporary_bytes_bound,
+        "preflight_required_headroom_bytes" => statistics.preflight_required_headroom_bytes,
         "peak_temporary_bytes" => statistics.peak_temporary_bytes,
         "peak_checkpoint_regular_files" => statistics.peak_checkpoint_regular_files,
         "peak_working_bytes" => statistics.peak_working_bytes,
         "peak_process_rss_bytes" => statistics.peak_process_rss_bytes,
         "resumed_work_units" => statistics.resumed_work_units,
         "produced_work_units" => statistics.produced_work_units,
+        "maximum_temporal_pipeline_width" => statistics.maximum_temporal_pipeline_width,
+        "prefetch_units_admitted" => statistics.prefetch_units_admitted,
+        "prefetch_units_consumed" => statistics.prefetch_units_consumed,
+        "prefetch_cache_hits" => statistics.prefetch_cache_hits,
+        "temporal_ingest_busy_time_ns" => statistics.temporal_ingest_busy_time_ns,
+        "temporal_canonical_processing_time_ns" => statistics.temporal_canonical_processing_time_ns,
+        "prefetch_ingest_busy_time_ns" => statistics.prefetch_ingest_busy_time_ns,
+        "prefetch_overlap_time_ns" => statistics.prefetch_overlap_time_ns,
+        "prefetch_cpu_capacity_deferrals" => statistics.prefetch_cpu_capacity_deferrals,
+        "prefetch_disk_headroom_deferrals" => statistics.prefetch_disk_headroom_deferrals,
+        "prefetch_queue_capacity_deferrals" => statistics.prefetch_queue_capacity_deferrals,
         "primary_wall_time_ns" => statistics.primary_wall_time_ns,
         "primary_cpu_time_ns" => statistics.primary_cpu_time_ns,
     }
@@ -4986,14 +6149,16 @@ fn refinement_handoff_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     })
 }
 
-fn source_verification_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
+fn package_integrity_audit_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     let snapshot = app.application.snapshot();
-    let state = match snapshot.source() {
-        SourceVerificationSnapshot::Required => "Required",
-        SourceVerificationSnapshot::Verifying { .. } => "Verifying",
-        SourceVerificationSnapshot::Verified(_) => "Verified",
+    let state = match snapshot.source().integrity_audit() {
+        PackageIntegrityAuditSnapshot::NotRun => "NotRun",
+        PackageIntegrityAuditSnapshot::Running { .. } => "Running",
+        PackageIntegrityAuditSnapshot::SelfConsistent(_) => "SelfConsistent",
+        PackageIntegrityAuditSnapshot::Failed(_) => "Failed",
+        PackageIntegrityAuditSnapshot::Cancelled => "Cancelled",
     };
-    let Some(service) = app.source_verification_service.as_ref() else {
+    let Some(service) = app.package_integrity_audit_service.as_ref() else {
         return json!({
             "state": state,
             "active_operation": false,
@@ -5006,17 +6171,10 @@ fn source_verification_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
         "active_operation": service.active_token().is_some(),
         "service": {
             "started_runs": diagnostics.started_runs,
-            "accepted_progress_updates": diagnostics.accepted_progress_updates,
+            "progress_updates": diagnostics.progress_updates,
             "cancelled_runs": diagnostics.cancelled_runs,
             "failed_runs": diagnostics.failed_runs,
-            "accepted_successes": diagnostics.accepted_successes,
-            "completed_reader_runs": diagnostics.completed_reader_runs,
-            "completed_reader_scope": "completed_separate_strict_verification_readers",
-            "completed_reader_counters_include_only_completed_runs": true,
-            "completed_reader_operations": diagnostics.reader.physical_range_read_operations,
-            "completed_reader_bytes": diagnostics.reader.physical_encoded_bytes_read,
-            "completed_codec_decodes": diagnostics.reader.codec_decode_operations,
-            "completed_reader": local_package_read_diagnostics_json(diagnostics.reader),
+            "completed_runs": diagnostics.completed_runs,
         },
     })
 }

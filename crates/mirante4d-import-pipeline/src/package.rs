@@ -12,24 +12,26 @@ use mirante4d_storage::{
     AsciiToken, CanonicalMapEntry, CanonicalValue, DerivationBinding, DerivationBody,
     DerivationExactness, DerivationImplementation, DerivationOutcome, DerivationPayload,
     DerivationScope, DerivationSpaceBox, DerivationTimeRange, DisplayDefaults,
-    DisplayLayerDefaults, F32Bits, F64Bits, OmeImageGroupMetadata, OmeInteroperabilityBase,
-    OmeLevelTransform, PackageArrayInput, PortableRecord, PortableRecordPayload, ProfileHeader,
-    ProfileImage, ProfileKind, ProfileLevel, ProfileLogicalLayer, ProfileValidityMode, RecipeBody,
-    RecipeDeterminism, RecipeNumericPolicy, RecipeOperation, RecipePayload, Rgb24, ScaleCountRule,
-    ScienceDescriptor, ScienceLayer, ScienceTemporalCalibration, ShardProfileKind,
-    SourceIdentifier, SourceIdentifierScheme, SourcePayload, TypedId, U64Decimal,
-    ZarrArrayMetadata, profile_limits,
+    DisplayLayerDefaults, F32Bits, F64Bits, NfcText, OmeImageGroupMetadata,
+    OmeInteroperabilityBase, OmeLevelTransform, PackageArrayInput, PortableRecord,
+    PortableRecordPayload, ProfileHeader, ProfileImage, ProfileKind, ProfileLevel,
+    ProfileLogicalLayer, ProfileValidityMode, RecipeBody, RecipeDeterminism, RecipeNumericPolicy,
+    RecipeOperation, RecipePayload, Rgb24, ScaleCountRule, ScienceDescriptor, ScienceLayer,
+    ScienceTemporalCalibration, ShardProfileKind, SourceIdentifier, SourceIdentifierScheme,
+    SourcePayload, TypedId, U64Decimal, ZarrArrayMetadata, profile_limits,
 };
 
-use crate::ImportError;
+use crate::{
+    ImportError, NoDataValueRule,
+    model::{ResolvedNoDataPolicy, ResolvedNoDataValue},
+};
 
 const IMAGE_ORDINAL: u32 = 0;
 const PACKED_INDEX_RECORD_BYTES: u64 = 64;
-const MAX_SOURCE_FILES: usize = 4_096;
 const EXECUTABLE_HASH_BUFFER_BYTES: usize = 64 * 1024;
 const BASE_OPERATION_REGISTRY_V1: &[u8] = b"mirante4d-import-pipeline-base-operation-registry-v1";
-const U8_SENTINEL_OPERATION_REGISTRY_V2: &[u8] =
-    b"mirante4d-import-pipeline-u8-sentinel-guarded-pyramid-operation-registry-v2";
+const NO_DATA_OPERATION_REGISTRY_V2: &[u8] =
+    b"mirante4d-import-pipeline-typed-first-volume-no-data-operation-registry-v2";
 
 /// The scientific and storage facts needed to construct package metadata.
 #[derive(Clone, Debug, PartialEq)]
@@ -38,14 +40,15 @@ pub(crate) struct PackageMetadataInput {
     pub scientific_content_id: ScientificContentId,
     pub base_shape: Shape4D,
     pub channel_count: u32,
+    pub channel_labels: Vec<String>,
     pub dtype: IntensityDType,
     pub pyramid_shapes: Vec<Shape4D>,
     pub spacing_zyx_um: [f64; 3],
     pub regular_time_step_seconds: Option<f64>,
     pub explicit_validity: bool,
-    /// Raw TIFF file digests in deterministic logical source order.
-    pub source_file_sha256: Vec<Sha256Digest>,
-    pub u8_sentinel: Option<u8>,
+    /// Path-free digest of the canonical values decoded from the source.
+    pub decoded_source_sha256: Sha256Digest,
+    pub no_data: ResolvedNoDataPolicy,
 }
 
 /// Complete non-shard input fields for `PackageWriteInput`.
@@ -116,7 +119,7 @@ pub(crate) fn build_package_metadata(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let science = ScienceDescriptor::new(input.scientific_content_id, science_layers)?;
-    let display_defaults = display_defaults(input.channel_count, input.dtype)?;
+    let display_defaults = display_defaults(&input.channel_labels, input.dtype)?;
     let ome_images = vec![ome_metadata(&image, &temporal, input)?];
     let arrays = package_arrays(&image, input)?;
 
@@ -135,6 +138,13 @@ fn validate_input(input: &PackageMetadataInput) -> Result<(), ImportError> {
     if input.channel_count == 0 {
         return Err(ImportError::InvalidRequest(
             "package metadata requires at least one channel",
+        ));
+    }
+    if input.channel_labels.len()
+        != usize::try_from(input.channel_count).map_err(|_| ImportError::Overflow)?
+    {
+        return Err(ImportError::InvalidRequest(
+            "package metadata requires exactly one label per channel",
         ));
     }
     if input.pyramid_shapes.is_empty() || input.pyramid_shapes[0] != input.base_shape {
@@ -188,19 +198,30 @@ fn validate_input(input: &PackageMetadataInput) -> Result<(), ImportError> {
             "regular time spacing must be finite and positive",
         ));
     }
-    if input.explicit_validity != input.u8_sentinel.is_some() {
+    if input.explicit_validity != input.no_data.explicit_validity() {
         return Err(ImportError::InvalidRequest(
-            "WP-11 explicit validity requires exactly one u8 sentinel policy",
+            "explicit validity differs from the resolved no-data policy",
         ));
     }
-    if input.u8_sentinel.is_some() && input.dtype != IntensityDType::Uint8 {
+    if input
+        .no_data
+        .value()
+        .is_some_and(|value| value.dtype() != input.dtype)
+    {
         return Err(ImportError::InvalidRequest(
-            "the u8 sentinel policy is valid only for uint8 source pixels",
+            "the resolved no-data value has the wrong source dtype",
         ));
     }
-    if input.source_file_sha256.is_empty() || input.source_file_sha256.len() > MAX_SOURCE_FILES {
+    if input.no_data.automatic_mask().is_some_and(|mask| {
+        mask.shape_zyx()
+            != [
+                input.base_shape.z(),
+                input.base_shape.y(),
+                input.base_shape.x(),
+            ]
+    }) {
         return Err(ImportError::InvalidRequest(
-            "package provenance requires one through 4096 source TIFF file digests",
+            "the automatic no-data mask shape differs from the package base shape",
         ));
     }
     Ok(())
@@ -220,7 +241,7 @@ fn ome_metadata(
     temporal: &ScienceTemporalCalibration,
     input: &PackageMetadataInput,
 ) -> Result<OmeImageGroupMetadata, ImportError> {
-    let centered_mean_pyramid = input.u8_sentinel.is_some();
+    let centered_mean_pyramid = input.explicit_validity;
     let mut factors_zyx = [1_u64; 3];
     let mut transforms = Vec::with_capacity(input.pyramid_shapes.len());
     for (ordinal, shape) in input.pyramid_shapes.iter().enumerate() {
@@ -345,7 +366,7 @@ const fn pixel_kind(dtype: IntensityDType, two_dimensional: bool) -> ShardProfil
 }
 
 fn display_defaults(
-    channel_count: u32,
+    channel_labels: &[String],
     dtype: IntensityDType,
 ) -> Result<DisplayDefaults, ImportError> {
     const COLORS: [&str; 7] = [
@@ -356,12 +377,16 @@ fn display_defaults(
         IntensityDType::Uint16 => 65_535.0,
         IntensityDType::Float32 => 1.0,
     };
-    let layers = (0..channel_count)
-        .map(|channel| {
+    let layers = channel_labels
+        .iter()
+        .enumerate()
+        .map(|(channel, label)| {
+            let channel = u32::try_from(channel).map_err(|_| ImportError::Overflow)?;
             let color_index =
                 usize::try_from(channel).map_err(|_| ImportError::Overflow)? % COLORS.len();
-            DisplayLayerDefaults::new(
+            DisplayLayerDefaults::new_with_label(
                 LogicalLayerKey::new(channel),
+                Some(NfcText::parse(label)?),
                 channel == 0,
                 Rgb24::parse(COLORS[color_index])?,
                 f32_bits(0.0)?,
@@ -375,37 +400,20 @@ fn display_defaults(
 
 fn portable_records(input: &PackageMetadataInput) -> Result<Vec<PortableRecord>, ImportError> {
     let subject = vec![TypedId::Scientific(input.scientific_content_id)];
-    let mut unique_source_digests = input.source_file_sha256.clone();
-    unique_source_digests.sort_unstable();
-    unique_source_digests.dedup();
     let source = SourcePayload::new(
-        unique_source_digests
-            .into_iter()
-            .map(|digest| {
-                SourceIdentifier::new(
-                    SourceIdentifierScheme::Sha256,
-                    mirante4d_storage::NfcText::parse(&digest.to_string())?,
-                )
-                .map_err(ImportError::from)
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+        vec![SourceIdentifier::new(
+            SourceIdentifierScheme::Sha256,
+            mirante4d_storage::NfcText::parse(&input.decoded_source_sha256.to_string())?,
+        )?],
         None,
     )?;
 
     let recipe = recipe(input)?;
     let recipe_id = recipe.recipe_id();
-    let derivation_inputs = input
-        .source_file_sha256
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(ordinal, digest)| {
-            Ok(DerivationBinding::new(
-                token(&format!("source-{ordinal:04}"))?,
-                TypedId::ExactBytes(ExactBytesDigest::from_digest(digest)),
-            ))
-        })
-        .collect::<Result<Vec<_>, ImportError>>()?;
+    let derivation_inputs = vec![DerivationBinding::new(
+        token("decoded-source")?,
+        TypedId::ExactBytes(ExactBytesDigest::from_digest(input.decoded_source_sha256)),
+    )];
     let zero = number(0)?;
     let scope = DerivationScope::new(
         (0..input.channel_count)
@@ -471,8 +479,8 @@ fn recipe(input: &PackageMetadataInput) -> Result<RecipePayload, ImportError> {
             CanonicalValue::from_f64(f64_bits(input.spacing_zyx_um[0])?),
         ),
     ];
-    let (operation, registry_preimage) = match input.u8_sentinel {
-        Some(sentinel) => sentinel_recipe_operation(input, base_parameters, sentinel)?,
+    let (operation, registry_preimage) = match input.no_data.request() {
+        Some(_) => no_data_recipe_operation(input, base_parameters)?,
         None => base_recipe_operation(input, base_parameters)?,
     };
     let registry = ExactBytesDigest::from_digest(Sha256Hasher::digest(registry_preimage));
@@ -518,18 +526,64 @@ fn base_recipe_operation(
     Ok((operation, BASE_OPERATION_REGISTRY_V1))
 }
 
-fn sentinel_recipe_operation(
+fn no_data_recipe_operation(
     input: &PackageMetadataInput,
     base_parameters: Vec<CanonicalMapEntry>,
-    sentinel: u8,
 ) -> Result<(RecipeOperation, &'static [u8]), ImportError> {
-    // Canonical maps require strict lexical key order. These fields make the
-    // complete restored policy identity-bearing instead of relying on an
-    // ambiguous sentinel-to-invalid label.
+    let request = input
+        .no_data
+        .request()
+        .ok_or(ImportError::InvalidRequest("no-data recipe has no request"))?;
+    let automatic_mask = input.no_data.automatic_mask();
     let mut parameters = vec![
         CanonicalMapEntry::new(
-            token("canonical_invalid_u8")?,
-            CanonicalValue::from_u64(number(0)?),
+            token("automatic_block_edge")?,
+            CanonicalValue::from_u64(number(5)?),
+        ),
+        CanonicalMapEntry::new(
+            token("automatic_connectivity")?,
+            CanonicalValue::from_ascii(token("face-6")?),
+        ),
+        CanonicalMapEntry::new(
+            token("automatic_mask_encoding")?,
+            CanonicalValue::from_ascii(token("row-packed-lsb0-zyx")?),
+        ),
+        CanonicalMapEntry::new(
+            token("automatic_mask_present")?,
+            CanonicalValue::from_bool(automatic_mask.is_some()),
+        ),
+        CanonicalMapEntry::new(
+            token("automatic_mask_voxels")?,
+            CanonicalValue::from_u64(number(
+                automatic_mask.map_or(0, |mask| mask.masked_voxels()),
+            )?),
+        ),
+        CanonicalMapEntry::new(
+            token("automatic_reconstruction")?,
+            CanonicalValue::from_ascii(token("exact-value-components-containing-5-cube")?),
+        ),
+        CanonicalMapEntry::new(
+            token("automatic_scope")?,
+            CanonicalValue::from_ascii(token("first-volume-fixed-spatial-mask")?),
+        ),
+        CanonicalMapEntry::new(
+            token("canonical_invalid")?,
+            CanonicalValue::from_ascii(token("typed-zero")?),
+        ),
+        CanonicalMapEntry::new(
+            token("constant_z_planes")?,
+            CanonicalValue::list(
+                input
+                    .no_data
+                    .constant_z_planes()
+                    .iter()
+                    .map(|z| Ok(CanonicalValue::from_u64(number(*z)?)))
+                    .collect::<Result<Vec<_>, ImportError>>()?,
+            )?,
+        ),
+        CanonicalMapEntry::new(
+            token("constant_z_rule")?,
+            CanonicalValue::from_ascii(token("exact-whole-plane-equality")?),
         ),
         CanonicalMapEntry::new(
             token("dilation_application")?,
@@ -552,6 +606,10 @@ fn sentinel_recipe_operation(
             CanonicalValue::from_u64(number(1)?),
         ),
         CanonicalMapEntry::new(
+            token("hide_constant_z_planes")?,
+            CanonicalValue::from_bool(request.hides_constant_z_planes()),
+        ),
+        CanonicalMapEntry::new(
             token("mean_block")?,
             CanonicalValue::from_ascii(token("aligned-factor-two-reduced-axes")?),
         ),
@@ -560,44 +618,113 @@ fn sentinel_recipe_operation(
             CanonicalValue::from_ascii(token("invalid")?),
         ),
         CanonicalMapEntry::new(
-            token("sentinel_classification")?,
-            CanonicalValue::from_ascii(token("exact-source-byte-equality")?),
+            token("plane_morphology")?,
+            CanonicalValue::from_ascii(token("strict-no-dilation")?),
+        ),
+        CanonicalMapEntry::new(
+            token("resolved_value_present")?,
+            CanonicalValue::from_bool(input.no_data.value().is_some()),
+        ),
+        CanonicalMapEntry::new(
+            token("value_classification")?,
+            CanonicalValue::from_ascii(token(match request.value_rule() {
+                Some(NoDataValueRule::Automatic) => "first-volume-fixed-spatial-mask",
+                Some(NoDataValueRule::ManualUint8(_)) => "exact-typed-equality",
+                None => "disabled",
+            })?),
+        ),
+        CanonicalMapEntry::new(
+            token("value_rule")?,
+            CanonicalValue::from_ascii(token(match request.value_rule() {
+                None => "disabled",
+                Some(NoDataValueRule::Automatic) => "automatic-first-volume",
+                Some(NoDataValueRule::ManualUint8(_)) => "manual-uint8",
+            })?),
         ),
     ];
     parameters.extend(base_parameters);
+    if let Some(mask) = automatic_mask {
+        parameters.push(CanonicalMapEntry::new(
+            token("automatic_mask_sha256")?,
+            CanonicalValue::from_ascii(token(&mask.digest().to_string())?),
+        ));
+    }
+    if let Some(value) = input.no_data.value() {
+        parameters.push(CanonicalMapEntry::new(
+            token("resolved_value")?,
+            match value {
+                ResolvedNoDataValue::Uint8(value) => {
+                    CanonicalValue::from_u64(number(u64::from(value))?)
+                }
+                ResolvedNoDataValue::Uint16(value) => {
+                    CanonicalValue::from_u64(number(u64::from(value))?)
+                }
+                ResolvedNoDataValue::Float32Bits(bits) => {
+                    CanonicalValue::from_f32(F32Bits::parse(&format!("{bits:08x}"))?)
+                }
+            },
+        ));
+    }
     if let Some(seconds) = input.regular_time_step_seconds {
         parameters.push(CanonicalMapEntry::new(
             token("time_step_seconds")?,
             CanonicalValue::from_f64(f64_bits(seconds)?),
         ));
     }
-    parameters.push(CanonicalMapEntry::new(
-        token("u8_sentinel")?,
-        CanonicalValue::from_u64(number(u64::from(sentinel))?),
-    ));
+    parameters.sort_by(|left, right| left.key().as_str().cmp(right.key().as_str()));
 
     let operation = RecipeOperation::new(
         number(0)?,
-        token("tiff-import-u8-sentinel-guarded-pyramid")?,
+        token("tiff-import-typed-first-volume-no-data")?,
         token("2.0.0")?,
-        token("m4d.import.u8-sentinel-guarded-pyramid.v2")?,
+        token("m4d.import.typed-first-volume-no-data.v2")?,
         CanonicalValue::map(parameters)?,
         Vec::new(),
-        RecipeNumericPolicy::new(
-            token("uint8")?,
-            token("half-up")?,
-            token("valid-only-mean")?,
-            token("aligned-factor-two-mean")?,
-            token("ignore-out-of-bounds")?,
-            token("none")?,
-            token("u8-sentinel-chebyshev-radius-one-every-level")?,
-            token("tczyx")?,
-            token("exact-integer")?,
-            None,
-        ),
+        if input.explicit_validity {
+            RecipeNumericPolicy::new(
+                token(dtype_name(input.dtype))?,
+                token(if input.dtype == IntensityDType::Float32 {
+                    "finite-f32"
+                } else {
+                    "half-up"
+                })?,
+                token("valid-only-mean")?,
+                token("aligned-factor-two-mean")?,
+                token("ignore-out-of-bounds")?,
+                token("none")?,
+                token(match request.value_rule() {
+                    Some(NoDataValueRule::Automatic) if automatic_mask.is_some() => {
+                        "first-volume-spatial-mask-dilated-plane-strict"
+                    }
+                    Some(NoDataValueRule::Automatic) => "constant-plane-strict",
+                    Some(NoDataValueRule::ManualUint8(_)) => "typed-value-dilated-plane-strict",
+                    None => "constant-plane-strict",
+                })?,
+                token("tczyx")?,
+                token(if input.dtype == IntensityDType::Float32 {
+                    "finite-f32"
+                } else {
+                    "exact-integer"
+                })?,
+                None,
+            )
+        } else {
+            RecipeNumericPolicy::new(
+                token(dtype_name(input.dtype))?,
+                token("identity")?,
+                token("none")?,
+                token("aligned-factor-two-point")?,
+                token("ignore-out-of-bounds")?,
+                token("none")?,
+                token("all-valid-after-no-match")?,
+                token("tczyx")?,
+                token("identity")?,
+                None,
+            )
+        },
         vec![token("multiscale-image")?],
     )?;
-    Ok((operation, U8_SENTINEL_OPERATION_REGISTRY_V2))
+    Ok((operation, NO_DATA_OPERATION_REGISTRY_V2))
 }
 
 fn running_executable_digest() -> Result<ExactBytesDigest, ImportError> {
@@ -689,18 +816,30 @@ mod tests {
 
     fn input(base_shape: Shape4D, pyramid_shapes: Vec<Shape4D>) -> PackageMetadataInput {
         PackageMetadataInput {
-            profile_kind: ProfileKind::Ds0,
+            profile_kind: ProfileKind::Current,
             scientific_content_id: scientific_id(),
             base_shape,
             channel_count: 1,
+            channel_labels: vec!["channel 1".to_owned()],
             dtype: IntensityDType::Uint16,
             pyramid_shapes,
             spacing_zyx_um: [0.5, 0.3, 0.2],
             regular_time_step_seconds: Some(2.0),
             explicit_validity: false,
-            source_file_sha256: vec![Sha256Digest::from_bytes([9; 32])],
-            u8_sentinel: None,
+            decoded_source_sha256: Sha256Digest::from_bytes([9; 32]),
+            no_data: ResolvedNoDataPolicy::all_valid(base_shape.z()),
         }
+    }
+
+    fn manual_u8_policy(value: u8, depth: u64) -> ResolvedNoDataPolicy {
+        ResolvedNoDataPolicy::new(
+            Some(crate::NoDataPolicy::manual_uint8(value)),
+            Some(ResolvedNoDataValue::Uint8(value)),
+            None,
+            Vec::new(),
+            depth,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -777,9 +916,10 @@ mod tests {
         let coarse = Shape4D::new(1, 1, 256, 256).unwrap();
         let mut input = input(base, vec![base, coarse]);
         input.channel_count = 2;
+        input.channel_labels = vec!["channel 1".to_owned(), "channel 2".to_owned()];
         input.dtype = IntensityDType::Uint8;
         input.explicit_validity = true;
-        input.u8_sentinel = Some(255);
+        input.no_data = manual_u8_policy(255, base.z());
         let metadata = build_package_metadata(&input).unwrap();
 
         assert_eq!(metadata.science.layers().len(), 2);
@@ -822,10 +962,10 @@ mod tests {
         let s2 = Shape4D::new(1, 1, 2, 3).unwrap();
         let s3 = Shape4D::new(1, 1, 1, 2).unwrap();
         let mut input = input(s0, vec![s0, s1, s2, s3]);
-        input.profile_kind = ProfileKind::Ds4;
+        input.profile_kind = ProfileKind::Current;
         input.dtype = IntensityDType::Uint8;
         input.explicit_validity = true;
-        input.u8_sentinel = Some(255);
+        input.no_data = manual_u8_policy(255, s0.z());
 
         let metadata = build_package_metadata(&input).unwrap();
         assert_eq!(
@@ -860,29 +1000,14 @@ mod tests {
         let mut mismatch = input(base, vec![base]);
         mismatch.explicit_validity = true;
         assert!(build_package_metadata(&mismatch).is_err());
-
-        let mut too_many_sources = input(base, vec![base]);
-        too_many_sources.source_file_sha256 =
-            vec![Sha256Digest::from_bytes([1; 32]); MAX_SOURCE_FILES + 1];
-        assert!(matches!(
-            build_package_metadata(&too_many_sources),
-            Err(ImportError::InvalidRequest(
-                "package provenance requires one through 4096 source TIFF file digests"
-            ))
-        ));
     }
 
     #[test]
-    fn records_raw_source_files_executable_build_and_base_only_recipe() {
+    fn records_decoded_source_identity_executable_build_and_base_only_recipe() {
         let base = Shape4D::new(1, 3, 8, 8).unwrap();
         let mut input = input(base, vec![base]);
-        let logical_source_digests = vec![
-            Sha256Digest::from_bytes([3; 32]),
-            Sha256Digest::from_bytes([1; 32]),
-            Sha256Digest::from_bytes([3; 32]),
-            Sha256Digest::from_bytes([2; 32]),
-        ];
-        input.source_file_sha256 = logical_source_digests.clone();
+        let decoded_source_digest = Sha256Digest::from_bytes([3; 32]);
+        input.decoded_source_sha256 = decoded_source_digest;
         let metadata = build_package_metadata(&input).unwrap();
 
         let PortableRecordPayload::Source(source) = metadata.portable_records[0].payload() else {
@@ -897,11 +1022,7 @@ mod tests {
                     identifier.value().as_str().to_owned()
                 })
                 .collect::<Vec<_>>(),
-            vec![
-                Sha256Digest::from_bytes([1; 32]).to_string(),
-                Sha256Digest::from_bytes([2; 32]).to_string(),
-                Sha256Digest::from_bytes([3; 32]).to_string(),
-            ]
+            vec![decoded_source_digest.to_string()]
         );
 
         let PortableRecordPayload::Derivation(derivation) = metadata.portable_records[2].payload()
@@ -915,7 +1036,7 @@ mod tests {
                 .iter()
                 .map(|binding| binding.role().as_str())
                 .collect::<Vec<_>>(),
-            vec!["source-0000", "source-0001", "source-0002", "source-0003"]
+            vec!["decoded-source"]
         );
         assert_eq!(
             derivation
@@ -924,10 +1045,9 @@ mod tests {
                 .iter()
                 .map(DerivationBinding::id)
                 .collect::<Vec<_>>(),
-            logical_source_digests
-                .into_iter()
-                .map(|digest| TypedId::ExactBytes(ExactBytesDigest::from_digest(digest)))
-                .collect::<Vec<_>>()
+            vec![TypedId::ExactBytes(ExactBytesDigest::from_digest(
+                decoded_source_digest,
+            ))]
         );
         let build = derivation.body().implementation().build();
         assert_eq!(build, independently_hash_running_executable());
@@ -967,30 +1087,30 @@ mod tests {
     }
 
     #[test]
-    fn sentinel_recipe_records_the_complete_restored_policy() {
+    fn typed_no_data_recipe_records_the_complete_resolved_policy() {
         let base = Shape4D::new(1, 1, 9, 11).unwrap();
         let coarse = Shape4D::new(1, 1, 5, 6).unwrap();
         let mut input = input(base, vec![base, coarse]);
         input.dtype = IntensityDType::Uint8;
         input.explicit_validity = true;
-        input.u8_sentinel = Some(253);
+        input.no_data = manual_u8_policy(253, base.z());
 
         let recipe = recipe(&input).unwrap();
         let operation = &recipe.body().operations()[0];
         assert_eq!(
             operation.name().as_str(),
-            "tiff-import-u8-sentinel-guarded-pyramid"
+            "tiff-import-typed-first-volume-no-data"
         );
         assert_eq!(operation.semantic_version().as_str(), "2.0.0");
         assert_eq!(
             operation.parameter_schema().as_str(),
-            "m4d.import.u8-sentinel-guarded-pyramid.v2"
+            "m4d.import.typed-first-volume-no-data.v2"
         );
         assert_eq!(operation.output_roles()[0].as_str(), "multiscale-image");
         assert_eq!(
             recipe.body().operation_registry_digest(),
             ExactBytesDigest::from_digest(Sha256Hasher::digest(
-                b"mirante4d-import-pipeline-u8-sentinel-guarded-pyramid-operation-registry-v2"
+                b"mirante4d-import-pipeline-typed-first-volume-no-data-operation-registry-v2"
             ))
         );
 
@@ -1004,23 +1124,61 @@ mod tests {
         assert_eq!(
             parameter_names,
             [
-                "canonical_invalid_u8",
+                "automatic_block_edge",
+                "automatic_connectivity",
+                "automatic_mask_encoding",
+                "automatic_mask_present",
+                "automatic_mask_voxels",
+                "automatic_reconstruction",
+                "automatic_scope",
+                "canonical_invalid",
+                "constant_z_planes",
+                "constant_z_rule",
                 "dilation_application",
                 "dilation_metric",
                 "dilation_radius_xy",
                 "dilation_radius_z_2d",
                 "dilation_radius_z_3d",
+                "hide_constant_z_planes",
                 "mean_block",
                 "no_support",
-                "sentinel_classification",
+                "plane_morphology",
+                "resolved_value",
+                "resolved_value_present",
                 "spacing_x_um",
                 "spacing_y_um",
                 "spacing_z_um",
                 "time_step_seconds",
-                "u8_sentinel",
+                "value_classification",
+                "value_rule",
             ]
         );
-        assert_eq!(parameter_u64(operation, "canonical_invalid_u8"), 0);
+        assert_eq!(parameter_u64(operation, "automatic_block_edge"), 5);
+        assert_eq!(
+            parameter_ascii(operation, "automatic_connectivity"),
+            "face-6"
+        );
+        assert_eq!(
+            parameter_ascii(operation, "automatic_mask_encoding"),
+            "row-packed-lsb0-zyx"
+        );
+        assert_eq!(
+            parameter(operation, "automatic_mask_present").as_bool(),
+            Some(false)
+        );
+        assert_eq!(parameter_u64(operation, "automatic_mask_voxels"), 0);
+        assert_eq!(
+            parameter_ascii(operation, "automatic_reconstruction"),
+            "exact-value-components-containing-5-cube"
+        );
+        assert_eq!(
+            parameter_ascii(operation, "automatic_scope"),
+            "first-volume-fixed-spatial-mask"
+        );
+        assert_eq!(
+            parameter_ascii(operation, "canonical_invalid"),
+            "typed-zero"
+        );
         assert_eq!(
             parameter_ascii(operation, "dilation_application"),
             "base-and-every-lod"
@@ -1035,10 +1193,15 @@ mod tests {
         );
         assert_eq!(parameter_ascii(operation, "no_support"), "invalid");
         assert_eq!(
-            parameter_ascii(operation, "sentinel_classification"),
-            "exact-source-byte-equality"
+            parameter_ascii(operation, "value_classification"),
+            "exact-typed-equality"
         );
-        assert_eq!(parameter_u64(operation, "u8_sentinel"), 253);
+        assert_eq!(parameter_u64(operation, "resolved_value"), 253);
+        assert_eq!(parameter_ascii(operation, "value_rule"), "manual-uint8");
+        assert_eq!(
+            parameter_ascii(operation, "plane_morphology"),
+            "strict-no-dilation"
+        );
 
         let policy = operation.numeric_policy();
         assert_eq!(policy.dtype().as_str(), "uint8");
@@ -1049,10 +1212,88 @@ mod tests {
         assert_eq!(policy.interpolation().as_str(), "none");
         assert_eq!(
             policy.no_data().as_str(),
-            "u8-sentinel-chebyshev-radius-one-every-level"
+            "typed-value-dilated-plane-strict"
         );
         assert_eq!(policy.ordering().as_str(), "tczyx");
         assert_eq!(policy.precision().as_str(), "exact-integer");
+    }
+
+    #[test]
+    fn automatic_no_match_recipe_records_resolution_and_all_valid_point_sampling() {
+        let base = Shape4D::new(1, 3, 9, 11).unwrap();
+        let coarse = Shape4D::new(1, 2, 5, 6).unwrap();
+        let mut input = input(base, vec![base, coarse]);
+        input.no_data = ResolvedNoDataPolicy::new(
+            Some(crate::NoDataPolicy::automatic()),
+            None,
+            None,
+            Vec::new(),
+            base.z(),
+        )
+        .unwrap();
+
+        let recipe = recipe(&input).unwrap();
+        let operation = &recipe.body().operations()[0];
+        assert_eq!(
+            parameter_ascii(operation, "value_rule"),
+            "automatic-first-volume"
+        );
+        assert_eq!(
+            parameter(operation, "resolved_value_present").as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parameter(operation, "automatic_mask_present").as_bool(),
+            Some(false)
+        );
+        assert_eq!(operation.numeric_policy().reduction().as_str(), "none");
+        assert_eq!(
+            operation.numeric_policy().kernel().as_str(),
+            "aligned-factor-two-point"
+        );
+        assert_eq!(
+            operation.numeric_policy().no_data().as_str(),
+            "all-valid-after-no-match"
+        );
+    }
+
+    #[test]
+    fn automatic_recipe_binds_the_reconstructed_spatial_mask() {
+        let base = Shape4D::new(1, 5, 5, 5).unwrap();
+        let coarse = Shape4D::new(1, 3, 3, 3).unwrap();
+        let mut input = input(base, vec![base, coarse]);
+        let bits = vec![0x1f; 25];
+        let mask = crate::model::ResolvedAutomaticNoDataMask::new([5, 5, 5], bits).unwrap();
+        let expected_digest = mask.digest().to_string();
+        input.explicit_validity = true;
+        input.no_data = ResolvedNoDataPolicy::new(
+            Some(crate::NoDataPolicy::automatic()),
+            Some(ResolvedNoDataValue::Uint16(42)),
+            Some(mask),
+            Vec::new(),
+            base.z(),
+        )
+        .unwrap();
+
+        let recipe = recipe(&input).unwrap();
+        let operation = &recipe.body().operations()[0];
+        assert_eq!(
+            parameter_ascii(operation, "value_classification"),
+            "first-volume-fixed-spatial-mask"
+        );
+        assert_eq!(
+            parameter(operation, "automatic_mask_present").as_bool(),
+            Some(true)
+        );
+        assert_eq!(parameter_u64(operation, "automatic_mask_voxels"), 125);
+        assert_eq!(
+            parameter_ascii(operation, "automatic_mask_sha256"),
+            expected_digest
+        );
+        assert_eq!(
+            operation.numeric_policy().no_data().as_str(),
+            "first-volume-spatial-mask-dilated-plane-strict"
+        );
     }
 
     fn diagonal_transform(scale: [f64; 3], translation: [f64; 3]) -> OmeLevelTransform {

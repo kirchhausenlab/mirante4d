@@ -2,9 +2,8 @@ use std::{sync::Arc, thread, time::Duration};
 
 use mirante4d_analysis_core::{AnalysisDefinition, AnalysisOperation};
 use mirante4d_dataset::{
-    CpuLedgerCategory, DatasetCatalog, DatasetLayer, DatasetSource, DatasetSourceFault,
-    DecodeSinkError, ReservedDecodeSink, ResourceRegion, ResourceValidity,
-    ScientificIdentityStatus,
+    ContentAddressStatus, CpuLedgerCategory, DatasetCatalog, DatasetLayer, DatasetSource,
+    DatasetSourceFault, DecodeSinkError, ReservedDecodeSink, ResourceRegion, ResourceValidity,
 };
 use mirante4d_dataset_runtime::{
     CancellationGeneration, DatasetRuntime, DatasetRuntimeConfig, RequestPriority, RequestTicket,
@@ -86,7 +85,9 @@ fn fixture() -> (
     let catalog = Arc::new(
         DatasetCatalog::new(
             "analysis-runtime-test",
-            ScientificIdentityStatus::Verified(ScientificContentId::parse(SCIENTIFIC_ID).unwrap()),
+            ContentAddressStatus::ContentAddress(
+                ScientificContentId::parse(SCIENTIFIC_ID).unwrap(),
+            ),
             vec![layer],
         )
         .unwrap(),

@@ -156,19 +156,20 @@ fn ui_snapshot_projects_visible_surfaces_without_native_handles() {
 }
 
 #[test]
-fn tiff_import_setup_state_is_visible_immediately_after_output_selection() {
+fn explicit_channel_inspection_state_is_visible_immediately() {
     let tempdir = tempfile::tempdir().unwrap();
     let root = write_target_fixture(tempdir.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(root).unwrap();
     let source = tempdir.path().join("raw.tif");
-    let output_parent = tempdir.path().join("output");
-    fs::create_dir(&output_parent).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
-    let tiff_source = TiffSource::auto(source.clone());
-    let destination = deterministic_tiff_destination(&tiff_source, &output_parent);
-
-    app.enter_tiff_import_setup_waiting_state(tiff_source, destination.clone())
+    let tiff_source = TiffSource::single_3d(source.clone());
+    app.import.begin_setup();
+    app.import.install_channel_selection(0, source.clone());
+    app.import
+        .workers
+        .start_inspection(tiff_source, PathBuf::new())
         .unwrap();
+    app.import.mark_channel_inspection_active(0);
 
     assert!(matches!(
         app.import.workers.status(),
@@ -176,7 +177,7 @@ fn tiff_import_setup_state_is_visible_immediately_after_output_selection() {
             source: active_source,
             destination: active_destination,
             ..
-        } if active_source.path == source && active_destination == destination
+        } if active_source.primary_path() == source && active_destination.as_os_str().is_empty()
     ));
     assert!(app.import.pending_review.is_none());
     assert!(app.import.problem.is_none());

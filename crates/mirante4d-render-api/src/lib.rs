@@ -1754,6 +1754,13 @@ impl FrameCoverage {
         })
     }
 
+    /// Recorded dataset timepoint carried by the exact immutable requirement
+    /// body that produced this coverage. This is presentation evidence, not a
+    /// projection of the application's currently selected timepoint.
+    pub fn timepoint(&self) -> TimeIndex {
+        self.requirements.timepoint
+    }
+
     /// Applies a bounded list of residency additions/removals to a retained
     /// bitmap. The bitmap clone is N/64 words and each changed key is an O(1)
     /// lookup, so a complete progressive stream is O(N) rather than O(N²).
@@ -2101,6 +2108,13 @@ impl PresentedFrame {
 
     pub const fn progress(&self) -> &FrameProgress {
         &self.progress
+    }
+
+    /// Recorded dataset timepoint whose requirement body produced the visible
+    /// frame. Keeping this derivation on the retained requirement body makes
+    /// stale-frame retention observable without inventing a second identity.
+    pub fn timepoint(&self) -> TimeIndex {
+        self.progress.coverage().timepoint()
     }
 }
 
@@ -2954,7 +2968,7 @@ mod tests {
     }
 
     fn resource_identity() -> DatasetResourceIdentity {
-        DatasetResourceIdentity::Verified(
+        DatasetResourceIdentity::ContentAddress(
             "m4d-sc-v1-sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 .parse()
                 .unwrap(),
@@ -3193,7 +3207,7 @@ mod tests {
                 &intent,
                 vec![RenderRequirement::new(
                     BrickKey::new(
-                        DatasetResourceIdentity::Unverified(DatasetSourceId::new(99)),
+                        DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(99)),
                         LogicalLayerKey::new(3),
                         TimeIndex::new(5),
                         ScaleLevel::new(1),

@@ -6,7 +6,7 @@ use std::{
 };
 
 use mirante4d_app::{
-    AppSmokeOptions, MiranteWorkbenchApp, ProcessTerminationLatch, collect_startup_diagnostics,
+    AppSmokeOptions, MiranteApplicationShell, ProcessTerminationLatch, collect_startup_diagnostics,
     default_log_path, run_headless_smoke,
 };
 use mirante4d_domain::RenderMode;
@@ -115,16 +115,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let Some(dataset) = std::env::var_os("MIRANTE4D_DEV_DATASET")
-        .map(PathBuf::from)
-        .or_else(|| {
-            rfd::FileDialog::new()
-                .set_title("Open Mirante4D dataset package")
-                .pick_folder()
-        })
-    else {
-        return Ok(());
-    };
+    let initial_dataset = std::env::var_os("MIRANTE4D_DEV_DATASET").map(PathBuf::from);
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Mirante4D")
@@ -142,13 +133,11 @@ fn main() -> anyhow::Result<()> {
         "Mirante4D",
         native_options,
         Box::new(move |cc| {
-            Ok(Box::new(
-                MiranteWorkbenchApp::open_dataset_with_process_termination(
-                    cc,
-                    &dataset,
-                    process_termination,
-                )?,
-            ))
+            Ok(Box::new(MiranteApplicationShell::new(
+                cc,
+                initial_dataset,
+                process_termination,
+            )?))
         }),
     )
     .map_err(|err| anyhow::anyhow!("failed to launch native window: {err}"))

@@ -301,8 +301,9 @@ pub fn decode_inner_payload(
 
 /// Decodes one validated inner frame directly into the caller-owned reserved
 /// sink in bounded spans. `observe` sees each span after decode and before its
-/// explicit commit; verified delivery uses a no-op observer while provisional
-/// delivery derives facts from the bytes in their final allocation. No
+/// explicit commit; published self-consistent delivery uses a no-op observer
+/// while admitted delivery derives facts from the bytes in its final
+/// allocation. No
 /// decoded payload-sized staging allocation or post-decode copy is involved.
 pub(crate) fn decode_inner_payload_direct<E>(
     kind: ShardProfileKind,

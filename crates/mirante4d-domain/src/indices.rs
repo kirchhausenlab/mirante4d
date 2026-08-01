@@ -16,7 +16,7 @@ impl IntensityDType {
     }
 }
 
-/// Zero-based logical layer ordinal used by the scientific identity contract.
+/// Zero-based logical layer ordinal used by the scientific-content-address contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LogicalLayerKey(u32);
 

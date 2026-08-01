@@ -40,6 +40,7 @@ winit.workspace = true
 egui_kittest = { workspace = true, features = ["eframe", "snapshot", "wgpu"] }
 insta.workspace = true
 pollster.workspace = true
+mirante4d-identity.workspace = true
 mirante4d-render-reference.workspace = true
 tempfile.workspace = true
 tiff.workspace = true

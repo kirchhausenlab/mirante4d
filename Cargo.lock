@@ -2103,6 +2103,7 @@ dependencies = [
  "mirante4d-dataset",
  "mirante4d-dataset-runtime",
  "mirante4d-domain",
+ "mirante4d-identity",
  "mirante4d-import-pipeline",
  "mirante4d-project-model",
  "mirante4d-project-store",

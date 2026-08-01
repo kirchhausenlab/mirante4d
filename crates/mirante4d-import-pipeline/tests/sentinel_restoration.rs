@@ -8,11 +8,11 @@ use mirante4d_identity::{
 };
 use mirante4d_import_pipeline::{
     ImportCancellation, ImportEvent, ImportOptions, ImportStage, NoDataPolicy, SpatialCalibration,
-    TiffSource, import_tiff, inspect_tiff,
+    TiffChannelSource, TiffSource, import_tiff, inspect_tiff,
 };
 use mirante4d_storage::{
-    OmeLevelTransform, PackagePath, PackedIndexCoordinates, ProfileKind, ShardProfileKind,
-    VerifiedScientificPackageCapability,
+    OmeLevelTransform, PackagePath, PackedIndexCoordinates, ProfileKind,
+    SelfConsistentPackageCapability, ShardProfileKind,
 };
 use tiff::encoder::{TiffEncoder, colortype};
 
@@ -325,8 +325,8 @@ fn restored_corner_packages_match_the_independent_2d_and_3d_facts() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join(format!("{name}.tif"));
         write_multipage_u8(&source, shape, &raw);
-        let verified = import_sentinel(&source, root.path(), name, SENTINEL);
-        assert_package_matches_oracle(&verified, &expected, [2.0, 4.0, 6.0]);
+        let self_consistent = import_sentinel(&source, root.path(), name, SENTINEL);
+        assert_package_matches_oracle(&self_consistent, &expected, [2.0, 4.0, 6.0]);
     }
 }
 
@@ -357,8 +357,8 @@ fn production_packages_support_zero_and_non_255_sentinels_without_reclassifying_
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join(format!("{name}.tif"));
         write_multipage_u8(&source, shape, &raw);
-        let verified = import_sentinel(&source, root.path(), name, sentinel);
-        assert_package_matches_oracle(&verified, &expected, [2.0, 4.0, 6.0]);
+        let self_consistent = import_sentinel(&source, root.path(), name, sentinel);
+        assert_package_matches_oracle(&self_consistent, &expected, [2.0, 4.0, 6.0]);
     }
 }
 
@@ -369,23 +369,31 @@ fn sentinel_neighborhoods_do_not_cross_timepoints_or_logical_layers() {
     fs::create_dir(&source).unwrap();
     let shape = [3, 3, 3];
     for channel in 0..2 {
+        let channel_root = source.join(format!("channel{channel}"));
+        fs::create_dir_all(&channel_root).unwrap();
         for timepoint in 0..2 {
             let mut raw = vec![9; 27];
             if channel == 0 && timepoint == 0 {
                 raw[13] = SENTINEL;
             }
             write_multipage_u8(
-                &source.join(format!("sample_ch{channel}_time{timepoint}.tif")),
+                &channel_root.join(format!("time{timepoint}.tif")),
                 shape,
                 &raw,
             );
         }
     }
 
-    let verified = import_sentinel(&source, root.path(), "sentinel-tc-grid", SENTINEL);
+    let source_manifest = TiffSource::new(vec![
+        TiffChannelSource::folder_of_3d("channel 1", source.join("channel0")).unwrap(),
+        TiffChannelSource::folder_of_3d("channel 2", source.join("channel1")).unwrap(),
+    ])
+    .unwrap();
+    let self_consistent =
+        import_sentinel_manifest(source_manifest, root.path(), "sentinel-tc-grid", SENTINEL);
     for channel in 0..2 {
         for timepoint in 0..2 {
-            let brick = verified
+            let brick = self_consistent
                 .read_brick(
                     PackedIndexCoordinates::new(0, 0, timepoint, channel, 0, 0, 0),
                     || false,
@@ -420,18 +428,17 @@ fn guarded_sentinel_resume_matches_a_fresh_import() {
         })
         .collect::<Vec<_>>();
     write_multipage_u8(&source, shape, &raw);
-    let inspection = inspect_tiff(TiffSource::auto(&source)).unwrap();
+    let inspection = inspect_tiff(TiffSource::single_3d(&source)).unwrap();
     let destination = root.path().join("sentinel-resumed.m4d");
     let checkpoint = root.path().join("sentinel-resumed.checkpoint");
     let options = ImportOptions {
         inspection: inspection.clone(),
         destination: destination.clone(),
         checkpoint_directory: checkpoint.clone(),
-        profile: ProfileKind::Ds0,
+        profile: ProfileKind::Current,
         calibration: SpatialCalibration::new([2.0, 4.0, 6.0]),
         time_step_seconds: None,
-        no_data: Some(NoDataPolicy::U8Sentinel(SENTINEL)),
-        working_memory_bytes: WORKING_MEMORY_BYTES,
+        no_data: Some(NoDataPolicy::manual_uint8(SENTINEL)),
     };
     let cancellation = ImportCancellation::new();
     let from_progress = cancellation.clone();
@@ -453,7 +460,13 @@ fn guarded_sentinel_resume_matches_a_fresh_import() {
         mirante4d_import_pipeline::ImportError::Cancelled
     ));
     assert!(!destination.exists());
-    assert_eq!(fs::read_dir(&checkpoint).unwrap().count(), 6);
+    assert!(
+        checkpoint
+            .join(".mirante4d-import-control")
+            .join("stage-header")
+            .is_file()
+    );
+    assert!(!checkpoint.join("payload").exists());
 
     let resumed = import_tiff(options, &TestLedger, &ImportCancellation::new(), |_| {}).unwrap();
     let fresh = import_tiff(
@@ -461,11 +474,10 @@ fn guarded_sentinel_resume_matches_a_fresh_import() {
             inspection,
             destination: root.path().join("sentinel-fresh.m4d"),
             checkpoint_directory: root.path().join("sentinel-fresh.checkpoint"),
-            profile: ProfileKind::Ds0,
+            profile: ProfileKind::Current,
             calibration: SpatialCalibration::new([2.0, 4.0, 6.0]),
             time_step_seconds: None,
-            no_data: Some(NoDataPolicy::U8Sentinel(SENTINEL)),
-            working_memory_bytes: WORKING_MEMORY_BYTES,
+            no_data: Some(NoDataPolicy::manual_uint8(SENTINEL)),
         },
         &TestLedger,
         &ImportCancellation::new(),
@@ -507,8 +519,8 @@ fn restored_2d_package_matches_oracle_at_every_lod_and_chunk_seam() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("sentinel-boundary-2d.tif");
     write_multipage_u8(&source, SHAPE, &raw);
-    let verified = import_sentinel(&source, root.path(), "sentinel-boundary-2d", SENTINEL);
-    assert_package_matches_oracle(&verified, &expected, [2.0, 4.0, 6.0]);
+    let self_consistent = import_sentinel(&source, root.path(), "sentinel-boundary-2d", SENTINEL);
+    assert_package_matches_oracle(&self_consistent, &expected, [2.0, 4.0, 6.0]);
 }
 
 #[test]
@@ -537,8 +549,8 @@ fn restored_3d_package_matches_oracle_across_z_and_x_chunk_faces() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("sentinel-boundary-3d.tif");
     write_multipage_u8(&source, SHAPE, &raw);
-    let verified = import_sentinel(&source, root.path(), "sentinel-boundary-3d", SENTINEL);
-    assert_package_matches_oracle(&verified, &expected, [2.0, 4.0, 6.0]);
+    let self_consistent = import_sentinel(&source, root.path(), "sentinel-boundary-3d", SENTINEL);
+    assert_package_matches_oracle(&self_consistent, &expected, [2.0, 4.0, 6.0]);
 }
 
 fn boundary_fixture_2d(shape_zyx: [usize; 3]) -> Vec<u8> {
@@ -649,18 +661,26 @@ fn import_sentinel(
     root: &Path,
     name: &str,
     sentinel: u8,
-) -> VerifiedScientificPackageCapability {
-    let inspection = inspect_tiff(TiffSource::auto(source)).unwrap();
+) -> SelfConsistentPackageCapability {
+    import_sentinel_manifest(TiffSource::single_3d(source), root, name, sentinel)
+}
+
+fn import_sentinel_manifest(
+    source: TiffSource,
+    root: &Path,
+    name: &str,
+    sentinel: u8,
+) -> SelfConsistentPackageCapability {
+    let inspection = inspect_tiff(source).unwrap();
     let published = import_tiff(
         ImportOptions {
             inspection,
             destination: root.join(format!("{name}.m4d")),
             checkpoint_directory: root.join(format!("{name}.checkpoint")),
-            profile: ProfileKind::Ds0,
+            profile: ProfileKind::Current,
             calibration: SpatialCalibration::new([2.0, 4.0, 6.0]),
             time_step_seconds: None,
-            no_data: Some(NoDataPolicy::U8Sentinel(sentinel)),
-            working_memory_bytes: WORKING_MEMORY_BYTES,
+            no_data: Some(NoDataPolicy::manual_uint8(sentinel)),
         },
         &TestLedger,
         &ImportCancellation::new(),
@@ -672,18 +692,18 @@ fn import_sentinel(
 }
 
 fn assert_package_matches_oracle(
-    verified: &VerifiedScientificPackageCapability,
+    self_consistent: &SelfConsistentPackageCapability,
     expected: &[DenseLevel],
     spacing_zyx: [f64; 3],
 ) {
     assert_eq!(
-        verified.scientific_content_id().to_string(),
+        self_consistent.scientific_content_id().to_string(),
         oracle_scientific_content_id(&expected[0], spacing_zyx),
-        "scientific identity must cover the oracle's dilated base values and validity"
+        "the scientific content address must cover the oracle's dilated base values and validity"
     );
-    let image = &verified.catalog().profile().images()[0];
+    let image = &self_consistent.catalog().profile().images()[0];
     assert_eq!(image.levels().len(), expected.len());
-    let transforms = verified
+    let transforms = self_consistent
         .catalog()
         .ome_image(&PackagePath::parse("images/i00000000/zarr.json").unwrap())
         .unwrap()
@@ -716,7 +736,7 @@ fn assert_package_matches_oracle(
                 spacing_zyx[axis] * (factors[axis] - 1) as f64 / 2.0
             );
         }
-        let actual = read_dense_level(verified, u32::try_from(scale).unwrap());
+        let actual = read_dense_level(self_consistent, u32::try_from(scale).unwrap());
         assert_eq!(&actual, level, "sentinel output differs at LOD {scale}");
         assert!(
             actual
@@ -729,12 +749,15 @@ fn assert_package_matches_oracle(
     }
 }
 
-fn read_dense_level(verified: &VerifiedScientificPackageCapability, scale: u32) -> DenseLevel {
-    let image = &verified.catalog().profile().images()[0];
+fn read_dense_level(self_consistent: &SelfConsistentPackageCapability, scale: u32) -> DenseLevel {
+    let image = &self_consistent.catalog().profile().images()[0];
     let profile_level = &image.levels()[usize::try_from(scale).unwrap()];
     let pixel_metadata_path =
         PackagePath::parse(&format!("{}/zarr.json", profile_level.pixel_path())).unwrap();
-    let array = verified.catalog().zarr_array(&pixel_metadata_path).unwrap();
+    let array = self_consistent
+        .catalog()
+        .zarr_array(&pixel_metadata_path)
+        .unwrap();
     assert_eq!(array.shape()[0..2], [1, 1]);
     let shape_zyx = [
         usize::try_from(array.shape()[2]).unwrap(),
@@ -754,7 +777,7 @@ fn read_dense_level(verified: &VerifiedScientificPackageCapability, scale: u32) 
     for brick_z in 0..grid[0] {
         for brick_y in 0..grid[1] {
             for brick_x in 0..grid[2] {
-                let brick = verified
+                let brick = self_consistent
                     .read_brick(
                         PackedIndexCoordinates::new(
                             0,

@@ -242,7 +242,7 @@ mod tests {
             FrameFidelityStatus::new_with_presentation(extent, presentation),
         );
         assert!(coordination.record_viewports(PresentationSlot::Xy, presentation, extent,));
-        let identity = DatasetResourceIdentity::Unverified(DatasetSourceId::new(91));
+        let identity = DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(91));
         let requirements = (0..LARGE_BODY_LEN)
             .map(|index| {
                 BrickKey::new(

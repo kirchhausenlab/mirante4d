@@ -122,6 +122,30 @@ fn source_architecture_violations(path: &Path, source: &str) -> Vec<String> {
     violations.extend(axis_aligned_2d_chunk_dependency_violations(path, source));
     let ui_layer = normalized.starts_with("crates/mirante4d-app/")
         || normalized.starts_with("crates/mirante4d-ui-egui/");
+    if normalized.starts_with("crates/mirante4d-app/src/") {
+        violations.extend(source_pattern_violations(
+            path,
+            source,
+            &[
+                "current_layout_ready",
+                "temporal_predecessor_renderer_union_required",
+                "a four-panel temporal frame is incomplete or escaped its fixed scale map",
+            ],
+            "the composed presentation cutover forbids predecessor temporal inference and whole-layout clock gates",
+        ));
+    }
+    if normalized == "crates/mirante4d-app/src/workbench_playback_runtime.rs" {
+        violations.extend(source_pattern_violations(
+            path,
+            source,
+            &[
+                ".display_generation()",
+                ".active_target(",
+                "visible_demand_plan_currentness",
+            ],
+            "the playback clock may depend on temporal presentation and successor readiness, not spatial settlement",
+        ));
+    }
     if !ui_layer {
         violations.extend(source_pattern_violations(
             path,
@@ -610,14 +634,14 @@ fn check_current_state_ownership(
     )?;
     check_dataset_ownership(repo_root, &app_root, &app_fields)?;
     check_target_dataset_source(repo_root, &app_root)?;
-    check_imported_verified_open_authority(repo_root, &app_root)?;
+    check_dataset_open_adapter_authority(repo_root, &app_root)?;
     check_render_ownership(repo_root, metadata)?;
     check_analysis_ownership(repo_root)?;
     check_project_store_ownership(repo_root, metadata, &app_fields)?;
     check_application_route(&app_source)
 }
 
-fn check_imported_verified_open_authority(repo_root: &Path, app_root: &Path) -> anyhow::Result<()> {
+fn check_dataset_open_adapter_authority(repo_root: &Path, app_root: &Path) -> anyhow::Result<()> {
     let mut routes = Vec::new();
     let mut constructors = 0_usize;
     for source_path in collect_rust_source_files(app_root)? {
@@ -627,18 +651,14 @@ fn check_imported_verified_open_authority(repo_root: &Path, app_root: &Path) -> 
             continue;
         }
         let source = fs::read_to_string(&source_path)?;
-        let count = source
-            .matches("OperationCompletion::VerifiedDatasetOpened")
-            .count();
+        let count = source.matches("OperationCompletion::DatasetOpened").count();
         if count != 0 {
             routes.push(normalized);
             constructors += count;
         }
     }
     if constructors != 1 || routes != ["crates/mirante4d-app/src/current_source_open_service.rs"] {
-        bail!(
-            "imported verified-dataset completion must have one trusted app adapter constructor: {routes:?}"
-        );
+        bail!("dataset-open completion must have one application adapter constructor: {routes:?}");
     }
     Ok(())
 }
@@ -1552,9 +1572,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn imported_verified_dataset_completion_has_one_trusted_adapter_constructor() {
+    fn dataset_open_completion_has_one_application_adapter_constructor() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        check_imported_verified_open_authority(
+        check_dataset_open_adapter_authority(
             &repo_root,
             &repo_root.join("crates/mirante4d-app/src"),
         )
@@ -1589,6 +1609,18 @@ mod tests {
                 .iter()
                 .all(|violation| violation.contains("must not perform direct filesystem I/O"))
         );
+    }
+
+    #[test]
+    fn source_policy_rejects_spatial_settlement_as_playback_clock_authority() {
+        let violations = source_architecture_violations(
+            Path::new("crates/mirante4d-app/src/workbench_playback_runtime.rs"),
+            "let ready = render.display_generation();\nlet target = mailbox.active_target(base);\n",
+        );
+        assert_eq!(violations.len(), 2);
+        assert!(violations.iter().all(|violation| violation.contains(
+            "playback clock may depend on temporal presentation and successor readiness"
+        )));
     }
 
     #[test]

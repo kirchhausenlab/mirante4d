@@ -162,6 +162,9 @@ pub(crate) struct DatasetDemandState {
     layer_scales_by_scope: BTreeMap<u64, BTreeMap<mirante4d_domain::LogicalLayerKey, ScaleLevel>>,
     admission_cursor_by_scope: BTreeMap<u64, usize>,
     readiness_by_scope: BTreeMap<u64, ScopeReadiness>,
+    /// Ranked prefix length of one complete future playback timepoint. This is
+    /// distinct from the longer startup-runway prefix retained by the scope.
+    playback_resources_per_timepoint: usize,
     retained_requirements_dirty: bool,
     linked_cpu_authoritative_keys: HashSet<BrickKey>,
     linked_cpu_authoritative_keys_dirty: bool,
@@ -505,6 +508,7 @@ impl DatasetDemandState {
             layer_scales_by_scope: BTreeMap::new(),
             admission_cursor_by_scope: BTreeMap::new(),
             readiness_by_scope: BTreeMap::new(),
+            playback_resources_per_timepoint: 0,
             retained_requirements_dirty: true,
             linked_cpu_authoritative_keys: HashSet::new(),
             linked_cpu_authoritative_keys_dirty: true,
@@ -698,10 +702,6 @@ impl DatasetDemandState {
         self.cpu_ledger.capacity_epoch()
     }
 
-    pub(crate) fn local_source(&self) -> Option<&Arc<LocalDatasetSource>> {
-        self.local_source.as_ref()
-    }
-
     pub(crate) fn local_source_diagnostics(&self) -> Option<LocalDatasetSourceDiagnostics> {
         self.local_source
             .as_ref()
@@ -714,13 +714,6 @@ impl DatasetDemandState {
 
     pub(crate) const fn source_quarantined(&self) -> bool {
         self.source_quarantined
-    }
-
-    /// Re-enables demand after a fresh exact/scientific proof refreshed the
-    /// same local source authority. Returns whether a quarantined source was
-    /// actually restored.
-    pub(crate) fn restore_verified_source(&mut self) -> bool {
-        std::mem::replace(&mut self.source_quarantined, false)
     }
 
     pub(crate) fn dispatcher_mut(&mut self) -> &mut DatasetRequestDispatcher {
@@ -1002,6 +995,7 @@ impl DatasetDemandState {
             coarse,
             navigation_candidates: _,
             reuse_envelope: _,
+            playback_timepoint_count: _,
         } = plan;
         self.current_ideal_scale = ideal_scale;
         self.current_capacity_constrained = target.layer_scales != ideal_layer_scales;
@@ -1401,6 +1395,26 @@ impl DatasetDemandState {
         true
     }
 
+    pub(crate) fn commit_preflighted_playback_scope_replacement(
+        &mut self,
+        requirements: PreparedDemandRequirements,
+        layer_scales: BTreeMap<mirante4d_domain::LogicalLayerKey, ScaleLevel>,
+        resources_per_timepoint: usize,
+    ) -> bool {
+        debug_assert!(
+            resources_per_timepoint == 0
+                || (requirements.required_prefix_len() >= resources_per_timepoint
+                    && requirements
+                        .ranked()
+                        .len()
+                        .is_multiple_of(resources_per_timepoint)),
+            "a playback frame body must partition the ranked temporal window"
+        );
+        self.playback_resources_per_timepoint =
+            resources_per_timepoint.min(requirements.ranked().len());
+        self.commit_preflighted_scope_replacement(SCOPE_PLAYBACK, requirements, layer_scales)
+    }
+
     /// Removes one preflighted scope without allocating an empty replacement
     /// body. All scope getters already define absence as the canonical empty
     /// state.
@@ -1415,6 +1429,9 @@ impl DatasetDemandState {
         self.layer_scales_by_scope.remove(&scope);
         self.admission_cursor_by_scope.remove(&scope);
         self.readiness_by_scope.remove(&scope);
+        if scope == SCOPE_PLAYBACK {
+            self.playback_resources_per_timepoint = 0;
+        }
         self.retained_requirements_dirty |= removed;
         if matches!(scope, SCOPE_CURRENT_3D | SCOPE_CURRENT_3D_REFINEMENT) {
             self.histogram_cpu_authoritative_keys_dirty |= removed;
@@ -1995,52 +2012,6 @@ impl DatasetDemandState {
         self.dispatcher.begin_submission_pass();
     }
 
-    /// Quarantines every interactive demand owned by this source without
-    /// shutting down the runtime. The CPU ledger must remain usable because
-    /// current-source reverification scans against that same bounded ledger.
-    pub(crate) fn cancel_and_clear_interactive_demand(&mut self) -> Result<(), RuntimeFault> {
-        self.source_quarantined = true;
-        self.requirements_by_scope.clear();
-        self.gpu_priority_order_by_scope.clear();
-        self.required_prefix_len_by_scope.clear();
-        self.prepared_body_by_scope.clear();
-        self.layer_scales_by_scope.clear();
-        self.admission_cursor_by_scope.clear();
-        self.readiness_by_scope.clear();
-        self.retained_requirements_dirty = true;
-        self.linked_cpu_authoritative_keys.clear();
-        self.linked_cpu_authoritative_keys_dirty = true;
-        self.histogram_cpu_authoritative_keys.clear();
-        self.histogram_cpu_authoritative_keys_dirty = true;
-        self.histogram_requirements_by_layer.clear();
-        self.histogram_generation_by_layer.clear();
-        self.released_cpu_authority_candidates.clear();
-        self.staged_current_plan = None;
-        self.holding_previous_presentation = false;
-        self.current_playback_downshifted = false;
-        self.current_ideal_scale = ScaleLevel::BASE;
-        self.current_ideal_layer_scales.clear();
-        self.current_capacity_constrained = false;
-        self.current_covers_full_volume = false;
-        self.dispatcher.begin_submission_pass();
-        self.last_plan_error = None;
-
-        let mut first_fault = None;
-        for scope in DATASET_DEMAND_SCOPES {
-            if let Err(fault) = self.dispatcher.advance_scope(scope)
-                && first_fault.is_none()
-            {
-                first_fault = Some(fault);
-            }
-        }
-        let _ = self.dispatcher.take_last_fault();
-
-        match first_fault {
-            Some(fault) => Err(fault),
-            None => Ok(()),
-        }
-    }
-
     pub(crate) fn scope_complete(&self, scope: u64) -> bool {
         self.scope_complete_with_gpu_residency(scope, |_| false)
     }
@@ -2081,6 +2052,28 @@ impl DatasetDemandState {
         self.advance_scope_readiness_cursor(
             resources,
             required_prefix_len,
+            &readiness.required_cursor,
+            gpu_resident,
+        )
+    }
+
+    pub(crate) fn playback_successor_complete_with_gpu_residency(
+        &self,
+        gpu_resident: impl FnMut(BrickKey) -> bool,
+    ) -> bool {
+        if self.playback_resources_per_timepoint == 0 {
+            return false;
+        }
+        let Some(resources) = self.gpu_priority_order_by_scope.get(&SCOPE_PLAYBACK) else {
+            return false;
+        };
+        let Some(readiness) = self.readiness_by_scope.get(&SCOPE_PLAYBACK) else {
+            debug_assert!(false, "every installed playback scope has readiness state");
+            return false;
+        };
+        self.advance_scope_readiness_cursor(
+            resources,
+            self.playback_resources_per_timepoint,
             &readiness.required_cursor,
             gpu_resident,
         )
@@ -2366,6 +2359,53 @@ fn install_prepared_scope_test_fixture_with_required_prefix(
 }
 
 #[cfg(test)]
+fn install_prepared_playback_scope_test_fixture(
+    state: &mut DatasetDemandState,
+    resources: Vec<BrickKey>,
+    required_prefix_len: usize,
+    resources_per_timepoint: usize,
+) -> anyhow::Result<bool> {
+    let layer_scales = requirement_layer_scales(&resources)?;
+    let mut scope_reservations = PreparedAllocationReservations::new(state.cpu_ledger.as_ref());
+    let requirements = PreparedDemandRequirements::from_ranked_accounted(
+        resources,
+        required_prefix_len,
+        &mut scope_reservations,
+    )?;
+    requirements
+        .body()
+        .attach_charge(scope_reservations.finish())?;
+    let mut targets = ScopeReconciliationTargets::default();
+    targets.replace(SCOPE_PLAYBACK, &requirements);
+    let update =
+        prepare_test_renderer_requirement_update(state, &final_test_union_bodies(state, &targets))?;
+    state.preflight_prepared_renderer_requirement_update(
+        &update.previous.requirements,
+        &update.next.requirements,
+    )?;
+    let reconciliation = state.prepare_scope_reconciliation(targets)?;
+    state.commit_prepared_scope_reconciliation(reconciliation)?;
+    let changed = state.commit_preflighted_playback_scope_replacement(
+        requirements,
+        layer_scales,
+        resources_per_timepoint,
+    );
+    let crate::camera_demand_cache::PreparedRendererRequirementUpdate {
+        previous,
+        next,
+        removals,
+        removal_charge: _removal_charge,
+    } = update;
+    state.commit_preflighted_renderer_requirement_update(
+        previous.requirements,
+        next.requirements,
+        &removals,
+        next.charge,
+    );
+    Ok(changed)
+}
+
+#[cfg(test)]
 fn install_prepared_progressive_test_fixture(
     state: &mut DatasetDemandState,
     plan: PreparedProgressiveDatasetDemandPlan,
@@ -2415,9 +2455,9 @@ mod tests {
     };
 
     use mirante4d_dataset::{
-        CpuByteLease, CpuLedgerCategory, CpuLedgerError, DatasetCatalog, DatasetLayer,
-        DatasetSource, DatasetSourceFault, DatasetSourceId, ReservedDecodeSink,
-        ResourcePayloadFacts, ResourceRegion, ResourceValidity, ScientificIdentityStatus,
+        ContentAddressStatus, CpuByteLease, CpuLedgerCategory, CpuLedgerError, DatasetCatalog,
+        DatasetLayer, DatasetSource, DatasetSourceFault, DatasetSourceId, ReservedDecodeSink,
+        ResourcePayloadFacts, ResourceRegion, ResourceValidity,
     };
     use mirante4d_dataset_runtime::DatasetRuntimeConfig;
     use mirante4d_domain::{GridToWorld, IntensityDType, Shape3D, Shape4D, TimeIndex};
@@ -2567,6 +2607,77 @@ mod tests {
     }
 
     #[test]
+    fn playing_can_consume_one_complete_successor_while_the_startup_runway_refills() {
+        let source_id = DatasetSourceId::new(111);
+        let layer_key = mirante4d_domain::LogicalLayerKey::new(0);
+        let layer = DatasetLayer::new(
+            layer_key,
+            "playback-successor-readiness",
+            Shape4D::new(4, 1, 1, 2).unwrap(),
+            IntensityDType::Uint8,
+            GridToWorld::identity(),
+            ResourceValidity::AllValid,
+        )
+        .unwrap();
+        let catalog = Arc::new(
+            DatasetCatalog::new(
+                "playback-successor-readiness",
+                ContentAddressStatus::SessionLocal(source_id),
+                vec![layer],
+            )
+            .unwrap(),
+        );
+        let source: Arc<dyn DatasetSource> = Arc::new(ZeroSource {
+            catalog: Arc::clone(&catalog),
+        });
+        let config = DatasetRuntimeConfig::new(1 << 20, 1, 8, 8).unwrap();
+        let (runtime, _) = <dyn DatasetRuntime>::start(config, move |_| Ok(source)).unwrap();
+        let identity = DatasetResourceIdentity::SessionLocal(source_id);
+        let resources = (1..=3)
+            .flat_map(|timepoint| {
+                (0..2).map(move |x| {
+                    BrickKey::new(
+                        identity,
+                        layer_key,
+                        TimeIndex::new(timepoint),
+                        ScaleLevel::BASE,
+                        ResourceRegion::new([0, 0, x], Shape3D::new(1, 1, 1).unwrap()).unwrap(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut state = DatasetDemandState::new_with_local_source(
+            runtime,
+            Arc::new(NoopLedger),
+            identity,
+            PathBuf::from("playback-successor-readiness"),
+            None,
+        )
+        .unwrap();
+        install_prepared_playback_scope_test_fixture(
+            &mut state,
+            resources.clone(),
+            resources.len(),
+            2,
+        )
+        .unwrap();
+
+        assert!(
+            !state.scope_resources_complete_with_gpu_residency(SCOPE_PLAYBACK, |key| {
+                key.timepoint() == TimeIndex::new(1)
+            }),
+            "warmup must still wait for the complete multi-frame startup runway"
+        );
+        assert!(
+            state.playback_successor_complete_with_gpu_residency(|key| {
+                key.timepoint() == TimeIndex::new(1)
+            }),
+            "steady-state playback may consume its complete immediate successor"
+        );
+        state.request_shutdown().unwrap();
+    }
+
+    #[test]
     fn transient_capacity_failure_does_not_poison_an_unchanged_scope() {
         let capacity = RuntimeFaultCode::CapacityExceeded {
             category: mirante4d_dataset::CpuLedgerCategory::DecodedResidency,
@@ -2597,7 +2708,7 @@ mod tests {
         let catalog = Arc::new(
             DatasetCatalog::new(
                 "renderer-eviction-resolution",
-                ScientificIdentityStatus::Unverified(source_id),
+                ContentAddressStatus::SessionLocal(source_id),
                 vec![layer],
             )
             .unwrap(),
@@ -2607,7 +2718,7 @@ mod tests {
         });
         let config = DatasetRuntimeConfig::new(1 << 20, 2, 16, 16).unwrap();
         let (runtime, _) = <dyn DatasetRuntime>::start(config, move |_| Ok(source)).unwrap();
-        let identity = DatasetResourceIdentity::Unverified(source_id);
+        let identity = DatasetResourceIdentity::SessionLocal(source_id);
         let resources = (0..9)
             .map(|x| {
                 BrickKey::new(
@@ -2822,7 +2933,7 @@ mod tests {
         let catalog = Arc::new(
             DatasetCatalog::new(
                 "guard-priority",
-                ScientificIdentityStatus::Unverified(source_id),
+                ContentAddressStatus::SessionLocal(source_id),
                 vec![layer],
             )
             .unwrap(),
@@ -2834,7 +2945,7 @@ mod tests {
         });
         let config = DatasetRuntimeConfig::new(1 << 20, 1, 8, 8).unwrap();
         let (runtime, _) = <dyn DatasetRuntime>::start(config, move |_| Ok(source)).unwrap();
-        let identity = DatasetResourceIdentity::Unverified(source_id);
+        let identity = DatasetResourceIdentity::SessionLocal(source_id);
         let resource = |x| {
             BrickKey::new(
                 identity,
@@ -2994,7 +3105,7 @@ mod tests {
         let catalog = Arc::new(
             DatasetCatalog::new(
                 "replacement-plane-priority",
-                ScientificIdentityStatus::Unverified(source_id),
+                ContentAddressStatus::SessionLocal(source_id),
                 vec![layer],
             )
             .unwrap(),
@@ -3006,7 +3117,7 @@ mod tests {
         });
         let config = DatasetRuntimeConfig::new(1 << 20, 1, 1, 1).unwrap();
         let (runtime, _) = <dyn DatasetRuntime>::start(config, move |_| Ok(source)).unwrap();
-        let identity = DatasetResourceIdentity::Unverified(source_id);
+        let identity = DatasetResourceIdentity::SessionLocal(source_id);
         let predecessor = |x| {
             BrickKey::new(
                 identity,
@@ -3099,7 +3210,7 @@ mod tests {
         let catalog = Arc::new(
             DatasetCatalog::new(
                 "linear-admission",
-                ScientificIdentityStatus::Unverified(source_id),
+                ContentAddressStatus::SessionLocal(source_id),
                 vec![layer],
             )
             .unwrap(),
@@ -3111,7 +3222,7 @@ mod tests {
         let (runtime, opened_catalog) = <dyn DatasetRuntime>::start(config, move |_| Ok(source))
             .expect("the bounded production runtime starts");
         assert!(Arc::ptr_eq(&opened_catalog, &catalog));
-        let identity = DatasetResourceIdentity::Unverified(source_id);
+        let identity = DatasetResourceIdentity::SessionLocal(source_id);
         let resources = (0..100)
             .map(|x| {
                 BrickKey::new(
@@ -3262,6 +3373,7 @@ mod tests {
                         coarse: None,
                         navigation_candidates: Vec::new(),
                     },
+                    playback_timepoint_count: 0,
                     candidates_visited: 99,
                     reuse_envelope: None,
                     scratch_charges: Vec::new(),
@@ -3400,6 +3512,7 @@ mod tests {
                         coarse: None,
                         navigation_candidates: Vec::new(),
                     },
+                    playback_timepoint_count: 0,
                     candidates_visited: 98,
                     reuse_envelope: None,
                     scratch_charges: Vec::new(),
@@ -3464,7 +3577,7 @@ mod tests {
         let catalog = Arc::new(
             DatasetCatalog::new(
                 "atomic-reconciliation",
-                ScientificIdentityStatus::Unverified(source_id),
+                ContentAddressStatus::SessionLocal(source_id),
                 vec![layer],
             )
             .unwrap(),
@@ -3474,7 +3587,7 @@ mod tests {
         });
         let config = DatasetRuntimeConfig::new(1 << 20, 2, 8, 8).unwrap();
         let (runtime, _) = <dyn DatasetRuntime>::start(config, move |_| Ok(source)).unwrap();
-        let identity = DatasetResourceIdentity::Unverified(source_id);
+        let identity = DatasetResourceIdentity::SessionLocal(source_id);
         let resource = |x| {
             BrickKey::new(
                 identity,

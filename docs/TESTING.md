@@ -1,6 +1,6 @@
 # Testing And Validation
 
-Last updated: 2026-07-31
+Last updated: 2026-08-01
 
 Testing exists to expose meaningful failures quickly. It is not a measure of
 project seriousness, and a large passing suite is not a substitute for using
@@ -144,6 +144,57 @@ cargo run --release -p xtask -- import-performance-t2 --help
 cargo run --release -p xtask -- import-performance-t5 --help
 ```
 
+The bounded temporal-pipeline release comparison is a developer-local,
+generated-data benchmark rather than a PR test:
+
+```bash
+cargo test --release -p mirante4d-import-pipeline \
+  temporal_decode_ahead_release_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+It runs three forced-serial and three shipped one-ahead imports of the same
+twenty-timepoint multipage-TIFF source, requires identical package and
+scientific identities, checks that source ingest and canonical production are
+both material baseline phases, enforces the 15-percent median throughput gate,
+and then runs the three-pair single-unit regression control. Its ignored case
+is assigned to the developer-local verification lane; ordinary PR runs never
+execute it.
+
+The current large-dataset cutover clears the predecessor private T5
+configuration pin because that configuration names the removed aggregate
+profile/checkpoint contract. `import-performance-t5` therefore remains a
+diagnostic/configuration tool until the owner reviews and pins a new
+current-format configuration; it cannot publish a current qualification claim
+while the pin is absent.
+
+The explicit-manifest/application-shell cutover has a display-free focused
+set suitable for iteration:
+
+```bash
+cargo test -p mirante4d-import-pipeline --lib --test import_pipeline \
+  --test sentinel_restoration
+cargo test -p mirante4d-dataset-runtime --lib
+cargo test -p mirante4d-application
+cargo test -p mirante4d-ui-egui
+cargo test -p mirante4d-app --lib
+cargo test -p mirante4d-storage
+cargo test -p xtask
+```
+
+These checks cover explicit source ordering, metadata inspection, stale
+completion suppression, decode-once counters, no-data reconstruction and run
+spill, compositional storage boundaries, bounded temporal-unit scratch,
+occupied-slot edge-object accounting, `T/C`-independent hard headroom,
+final-layout journal recovery/corruption rejection, exact durable-range byte
+accounting, capacity-pause versus invalid-checkpoint recovery UI,
+progress-lane accounting/backpressure, labels through reopen, package
+lifecycle, and automation schema shape. Import statistics intentionally report
+`preflight_required_headroom_bytes`; `peak_temporary_bytes` is observed stage
+growth and is not compared with that one-unit headroom as though it were a
+whole-package reservation. These checks do not prove that the
+welcome screen, file choosers, wizard, or a long local import behave correctly
+on the owner's workstation.
+
 Private datasets and configuration stay outside the repository. Source
 nonmutation, bounded work, cancellation, and atomic create-only publication
 remain mandatory. Full private qualification is run only when the affected
@@ -158,7 +209,7 @@ relevant workload and hardware, unless the user explicitly waives that check.
 Useful bounded scenarios include:
 
 ```bash
-cargo xtask product-validate target_source_verification
+cargo xtask product-validate target_package_integrity_audit
 cargo xtask product-validate target_fixture_render_modes
 cargo xtask product-validate pre_alpha_reliability
 cargo xtask product-validate \
@@ -169,6 +220,13 @@ cargo xtask product-validate \
 the native-navigation cut in the normal release application across four-panel
 and standalone 3D, linked-only input during 3D refinement, both sampling
 modes, MIP, DVR, ISO, nonblank GPU captures, and exact/current settlement.
+
+`target_package_integrity_audit` uses the promoted bounded target fixture. It
+first proves that ordinary open and idle leave the audit in `not run`, then
+starts and cancels one explicit scan, starts a second scan to
+`self-consistent`, and requires real progress plus cancellation/completion
+counters. The scan is read-only and cannot be used as an ordinary-open,
+project, analysis, or rendering prerequisite.
 
 `pre_alpha_reliability` is the bounded package/reliability closeout. Against
 one release executable it performs exactly three launches with zero automatic
@@ -424,6 +482,62 @@ selected S4, rejected resident S3/S2 as unsafe, completed all 60 commands, and
 reported zero renderer validation errors. This is evidence for the selected
 workstation and scenario, not a universal frame-rate guarantee.
 
+## Composed Temporal Presentation Gate
+
+The playback scenario accepts an explicit representative multi-timepoint
+package and runs the normal release application:
+
+```bash
+MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
+  cargo xtask product-validate \
+  /absolute/path/to/time-series.m4d representative_temporal_playback
+```
+
+The current script has 70 commands and uses the same playback clock,
+readiness, mailbox, demand, renderer-completion, and presentation boundaries as
+the viewer. It independently checks distinct timepoint-bound GPU captures,
+fixed session scales, ordered successors, and coherent active-layout target
+groups. Seven paired phases compare a same-duration stationary baseline with
+two seconds of held mapped input: standalone 3D orbit and zoom, four-panel 3D
+orbit, linked pan/zoom/oblique rotation, and lower-FPS four-panel zoom.
+
+Every held-input phase must receive its generated input, materially change the
+requested geometry, preserve the gesture through the interval, and present
+temporal successors in both halves. Its transition count must reach 80% of the
+immediately preceding stationary baseline, rounded up. Its maximum temporal
+gap must not exceed the greater of three requested frame periods or the
+baseline maximum plus one requested period. This is a calibrated pause and
+starvation check for the designated scenario, not a universal frame-rate
+promise.
+
+The scenario also records Stop handoff states from the actual presented
+timepoint, target group, frame identity, texture binding, completeness, and
+displayed scale. Only the playback scale followed directly by the stationary
+scale is accepted; blank, partial, stale, mixed, or intermediate coarse output
+fails. The launcher isolates the runtime log and rejects requirement-set
+changes, missing prepared plans, contract loss, capacity regressions, scale
+escape, timepoint skips, incoherent panel publication, and renderer errors.
+
+The 2026-08-01 mapped run used a 960x640 native client viewport on the NVIDIA
+GeForce RTX 3070 Ti Laptop GPU/Vulkan adapter. All seven cadence comparisons
+passed; input transition counts ranged from 21 to 36 and all exceeded their
+paired 80% floors, while the worst input maximum gap was 119.342 ms. All three
+Stop traces had no violation and contained only exact S1 plus exact S0 where a
+finer stationary replacement was available. Focused app, xtask, and renderer
+suites passed 305, 169, and 71 tests respectively; expected ignored hardware
+tests remained ignored in those ordinary package runs. The owner then
+exercised the normal app and accepted its visible behavior. Internal
+presentation records and GPU readbacks remain supporting evidence; owner
+observation on the mapped display supplies product validation.
+
+The final public PR gate passed every policy phase, zero-warning workspace
+Clippy, exact lane discovery, and all 1,316 applicable unit, contract, and UI
+tests with retries disabled.
+
+The
+[composed presentation scheduler cutover](plans/active/VIEWER_COMPOSED_PRESENTATION_SCHEDULER_CUTOVER.md)
+owns the architecture, threshold rationale, and completion boundary.
+
 The mapped four-panel linked diagnostic is currently quarantined after its
 first S0 attempt froze the desktop. Do not use it as an unattended check. A
 later owner-approved controlled invocation must acknowledge that host risk
@@ -528,16 +642,18 @@ boundaries:
 
 - scientific values, validity, axes, calibration, and independent numerical
   expectations;
-- source nonmutation and identity where a source is imported or verified;
+- source nonmutation and content addressing where a source is imported;
 - bounded memory, descriptors, queues, and cancellation;
 - atomic create-only publication and project/package durability;
 - per-object integrity at storage and transport boundaries; and
 - real viewer behavior on relevant data and hardware.
 
-Exact hashing is appropriate for durable object identity, source identity,
-scientific identity, publication integrity, and external downloads. Rehashing
-the same immutable inputs at every internal step, hash-chaining development
-checkpoints, or signing ordinary test output is not a default requirement.
+Exact hashing is appropriate for durable object identity, import-source
+currentness, scientific content addressing, publication self-consistency, and
+external downloads. A digest authenticates nothing without an independent
+expected value or trust source. Rehashing the same immutable inputs at every
+internal step, hash-chaining development checkpoints, or signing ordinary test
+output is not a default requirement.
 
 ## Retired Viewer Qualification Protocols
 

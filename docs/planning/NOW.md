@@ -1,10 +1,123 @@
 # Current Work
 
-Last updated: 2026-07-31
+Last updated: 2026-08-01
 
 ## Current Status
 
-No implementation package is currently active. The
+The
+[large-dataset preprocessing and storage cutover](../plans/active/LARGE_DATASET_PREPROCESSING_AND_STORAGE_CUTOVER.md)
+is implemented and automated-verified in the current working tree, including
+its corrective storage-admission amendment. The
+owner authorized full implementation on 2026-08-01. One compositional storage
+contract now replaces aggregate reference-dataset classes; its format,
+per-object, aggregate-addressability, and explicit 64 MiB manifest working-set
+limits are independently derived. Import executes one `(timepoint, channel)`
+volume at a time through bounded cache/spool scratch and writes committed outer
+shards directly into the destination-bound final-layout stage. A chained unit
+journal, sparse decoded-digest store, and resumable scientific-hash frontier
+retain only compact control history. The corrected placement plan sums actual
+occupied inner slots for each edge object and keeps the whole-package ceiling
+as non-reserved guidance. Hard admission is only one unfinished unit, one
+compact increment, and finalization; exact durable input-range bytes are
+deducted on resume, and later timepoints never enter the current `statvfs`
+comparison. Capacity pauses preserve the checkpoint and expose Resume, while
+invalid checkpoints retain the confirmed reset route. Setup and running UI
+projections expose those distinctions. The focused suites and bounded native
+cancel/resume/publish/open scenario pass. On 2026-08-01 the owner reported
+that the completed normal preprocessing workflows all worked correctly and
+accepted the result as product-validated. Private dataset facts remain outside
+repository evidence, and that acceptance is not a universal performance or
+maximum-dataset claim.
+
+The
+[preprocessing application and importer cutover](../plans/active/PREPROCESSING_APPLICATION_AND_IMPORTER_CUTOVER.md)
+is implemented and automated-verified in the current working tree. The native
+window starts without a dataset and offers opening or preprocessing; inferred
+TIFF hierarchy parsing has been replaced by an explicit named per-channel
+manifest; setup inspection is metadata-only and generation checked; imported
+labels persist through package reopen; and no import-local working-memory
+selector or hard category percentage remains. One process CPU broker protects
+the interactive reserve and a non-stealable import progress lane while
+ordered workers borrow, drain, and retry around it. Native TIFF chunks decode
+once into the active temporal unit's bounded canonical cache and the
+decoded-source digest is fused into that pass. Automatic-mask reconstruction
+is bit-packed with bounded run spill and scratch preflight. The predecessor
+whole-dataset cache/spool checkpoint has now been superseded by the
+large-dataset cutover above. The owner's 2026-08-01 acceptance also closes the
+welcome and wizard workflow on the normal product. No broader release-
+performance claim follows. Float16, mixed-dtype channel publication, and
+filename-order presentation remain explicitly deferred.
+
+The
+[generalized no-data import plan](../plans/active/GENERALIZED_NO_DATA_IMPORT.md)
+is complete and automated-verified. It replaces the uint8-only manual
+sentinel request with one typed first-volume resolver for uint8, uint16, and
+finite float32; adds optional exact constant-Z-plane exclusion without
+dilation; reconstructs automatic invalidity as six-connected exact-value
+components containing a `5 x 5 x 5` seed; and keeps later timepoints outside
+detection. Equal-valued disconnected data remains valid, while the fixed
+first-volume mask is reused for every channel/timepoint. An automatic no-match
+continues as an ordinary all-valid import. Source safety, bounded work,
+valid-only pyramid reduction, checkpoint binding, and atomic publication remain
+mandatory.
+
+Focused pipeline, application, egui, app, and tooling suites pass. The bounded
+normal-app import scenario also passed cancel/resume, atomic publication,
+direct open, exact source-byte preservation, and the real no-data detection
+stage on its public generated TIFF fixture. This is automated product evidence,
+not an owner visual-validation claim for the new controls.
+
+The
+[viewer composed-presentation scheduler cutover](../plans/active/VIEWER_COMPOSED_PRESENTATION_SCHEDULER_CUTOVER.md)
+is complete. One application-side coordinator now owns independent temporal,
+3D-spatial, linked-spatial, and retained-quality transactions. Complete typed
+logical target sets are assembled from prepared/reused members before their
+physical delta is derived, and playback Stop retains the visible playback
+front until a complete stationary replacement is renderable. The renderer's
+existing frame coordinator remains the sole GPU target, submission, and swap
+authority; the predecessor joint readiness gate, inferred temporal path,
+delta-as-frame validation, and quality-only coarse-preview handoff are absent.
+
+Focused application, scheduler, renderer, and tooling checks pass. The normal
+mapped 70-command representative time-series run passed all seven substantial
+stationary/held-input comparisons, coherent fixed-scale four-panel
+publication, and three direct retained-front Stop traces on the designated RTX
+workstation. The owner then exercised the normal application and reported that
+it behaves correctly. The correction is therefore implemented, automated-
+verified, and owner product-validated for that named workflow; it makes no
+universal frame-rate claim.
+
+The
+[viewer playback-session and source-integrity cutover](../plans/active/VIEWER_PLAYBACK_SESSION_AND_SOURCE_INTEGRITY_CUTOVER.md)
+remains implemented only for its retained boundaries: one immutable fixed-LOD
+session contract, bounded temporal slot residency, geometry-independent
+timepoint bodies, fast structural source admission, lazy per-consumed-object
+integrity, and an explicit user-requested package self-consistency audit. Its
+withdrawn presentation-independence and atomic-assembly claims are superseded
+by the completed composed-presentation correction above.
+
+The same cut removed the automatic whole-package source scan, background
+promotion, destructive `SourceChanged` invalidation, and project/analysis
+gates. Ordinary packages receive bounded structural admission and lazy
+per-consumed-object integrity. Externally supplied packed facts cannot suppress
+their first required payload check. A separate user-requested, cancellable
+package-integrity audit reports encoded-object, S0 content-address, and packed-
+fact self-consistency with exact stages and real progress; it neither
+authenticates the dataset nor changes source/presentation authority.
+
+The
+[time-series import profile correction plan](../plans/active/TIME_SERIES_IMPORT_PROFILE_CORRECTION.md)
+is complete. Terminal pyramid geometry has one storage-owned authority used by
+profile accounting and import production; representative DS envelopes follow
+that authority, concrete capacity failures retain their diagnostics, and
+source/UI guidance no longer mislabels those failures as TIFF-selection
+problems. The owner completed normal preprocessing and opened the resulting
+package in the application. Private source, calibration, filesystem paths,
+and package identities remain outside repository evidence. The new
+large-dataset cutover retains the shared geometry and diagnostics but
+supersedes representative aggregate envelopes as long-term admission policy.
+
+The previously completed
 [pre-alpha reliability and packaging plan](../plans/active/PRE_ALPHA_RELIABILITY_AND_PACKAGING.md)
 is complete: the rendering checkpoint is preserved on its publication
 branch, native clean shutdown has one exit-time owner, unsaved provisional
@@ -14,15 +127,16 @@ package checks. The unpacked packaged executable also passed the mapped
 render-mode matrix and the exact three-launch crash/recovery/native-close
 scenario with zero retries, panic-free stderr, and byte-identical source
 data. This remains a local pre-alpha handoff, not a supported public release.
-The next implementation package requires a new owner decision.
 
-The viewer performance refactor is closed as of 2026-07-31. The owner
+The spatial viewer performance refactor is closed as of 2026-07-31. The owner
 exercised the normal application after the final resident-navigation-ladder
 cut and reported that four-panel and 3D behavior works as expected. No
-rendering implementation, performance-repair, or validation package remains
-active. Smooth-linear sampling stays functionally supported but has a known
-fine-scale refinement cost relative to voxel-exact; any optimization or
-removal is a separate future product decision.
+spatial rendering-performance repair remains active. The completed composed-
+presentation correction concerns concurrency, target assembly, and quality
+handoff across playback and interaction; it does not reopen the accepted
+spatial renderer or LOD policy. Smooth-linear sampling stays functionally
+supported but has a known fine-scale refinement cost relative to voxel-exact;
+any optimization or removal is a separate future product decision.
 
 The
 [resident 3D navigation ladder plan](../plans/active/VIEWER_RESIDENT_3D_NAVIGATION_LADDER.md)
@@ -98,8 +212,9 @@ representative Cell navigation scenario with nine nonblank GPU captures,
 exact/current native settlement, independent target revisions, and no
 validation, capacity, demand, or renderer fault.
 
-The foundation refactor through WP-15, import/preprocessing cutover, and
-corrective `uint8` sentinel restoration remain implemented. Their scientific,
+The foundation refactor through WP-15 and the import/preprocessing cutover
+remain implemented. The former corrective `uint8` sentinel route is superseded
+by the completed generalized no-data import above. Its scientific,
 source-safety, persistence, bounded-resource, and product-boundary guarantees
 remain in force.
 
@@ -315,10 +430,11 @@ deferred and separate.
 
 ## Verification Boundary
 
-Focused formatting, `xtask`, UI, application, selector, residency, capacity,
-currentness, and stale-result checks pass. The final broad PR gate also passed
-every policy phase, zero-warning workspace Clippy, exact lane discovery, and
-all 1,298 current unit, contract, and UI tests. Those checks do not establish
+Focused formatting, storage, import, `xtask`, UI, application, selector,
+residency, capacity, currentness, and stale-result checks pass. The latest
+broad PR gate also passed every policy phase, zero-warning workspace Clippy,
+exact lane discovery, and all 1,336 applicable unit, contract, and UI tests
+with retries disabled. Those checks do not establish
 linked-2D monitor continuity or transition performance: the mapped zoom
 workflow targeted 3D, generic capture implicitly targeted 3D, and internal
 publication cannot validate visible output. A passing suite cannot outvote
@@ -329,8 +445,32 @@ capture boundary exists.
 
 ## Next Package
 
-There is no active viewer-performance package. The quarantined host-stress
-diagnostic is retained only for an explicitly approved future investigation,
-not as routine validation. Smooth-linear optimization or removal, public
-benchmarks, 4K support, other platforms, storage-format experiments, and
-release claims each require their own separately scoped decision.
+No implementation package is currently selected. The
+[large-dataset preprocessing and storage cutover](../plans/active/LARGE_DATASET_PREPROCESSING_AND_STORAGE_CUTOVER.md),
+[preprocessing application and importer cutover](../plans/active/PREPROCESSING_APPLICATION_AND_IMPORTER_CUTOVER.md),
+and
+[bounded temporal pipeline](../plans/active/PREPROCESSING_BOUNDED_TEMPORAL_PIPELINE.md)
+are complete, automated-verified, and owner product-validated. Together they
+replace aggregate fixture admission, the whole-dataset checkpoint,
+whole-package hard reservation, inferred source layouts, the import-local
+working-memory control, and fully serial temporal orchestration.
+
+The shipped temporal pipeline has one canonical production/spool/commit
+owner now overlaps at most one resource-admitted future decode cache. Forced
+serial and shipped schedules produce identical packages and scientific IDs;
+the generated twenty-timepoint release qualification improved median primary
+wall time by 20.39 percent, and the single-unit control improved by 5.26
+percent. That result exceeded the evidence threshold, so no second lane was
+implemented. Optional overlap is not a Start requirement and cannot borrow
+the current unit's progress bytes or weaken scientific, resume, capacity, and
+publication contracts. The owner's 2026-08-01 acceptance closes the normal
+product handoff without disclosing private dataset facts.
+
+The generalized no-data and completed time-series geometry correction remain
+scientific and geometry constraints of that work, not alternate import paths.
+The quarantined linked-S0 host-stress diagnostic is unrelated and remains
+closed.
+
+Smooth-linear optimization or removal, public benchmarks, 4K support, other
+platforms, compression/storage-format experiments, external identity trust,
+and release claims each require their own separately scoped decision.

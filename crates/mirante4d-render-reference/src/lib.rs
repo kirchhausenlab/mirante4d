@@ -1302,7 +1302,7 @@ mod tests {
 
     fn key(shape: Shape3D) -> BrickKey {
         BrickKey::new(
-            DatasetResourceIdentity::Unverified(DatasetSourceId::new(7)),
+            DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(7)),
             LogicalLayerKey::new(0),
             mirante4d_domain::TimeIndex::new(0),
             ScaleLevel::BASE,

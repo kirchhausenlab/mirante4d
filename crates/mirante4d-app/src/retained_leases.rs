@@ -19,7 +19,6 @@ pub(crate) const MAX_RETAINED_LEASE_REQUIREMENTS: usize = PRODUCT_RENDER_RESOURC
 pub(crate) enum RetainedLeaseError {
     TooManyRequirements { actual: usize, maximum: usize },
     ResourceNotRequired { key: BrickKey },
-    ConflictingLeaseAllocation { key: BrickKey },
     PreparedRequirementsChanged,
 }
 
@@ -32,9 +31,6 @@ impl fmt::Display for RetainedLeaseError {
             ),
             Self::ResourceNotRequired { .. } => formatter.write_str(
                 "a runtime lease was delivered for a resource that is not currently required",
-            ),
-            Self::ConflictingLeaseAllocation { .. } => formatter.write_str(
-                "one semantic resource was delivered by two different lease allocations",
             ),
             Self::PreparedRequirementsChanged => formatter.write_str(
                 "the retained requirement union changed after its worker delta was prepared",
@@ -329,8 +325,8 @@ impl RetainedLeases {
 
     /// Retains a runtime lease without copying its payload.
     ///
-    /// Returns `true` for a new handle and `false` when the same underlying
-    /// allocation was already retained.
+    /// Returns `true` for a new handle and `false` when this immutable
+    /// semantic resource already has a retained allocation.
     pub(crate) fn install(
         &mut self,
         lease: Arc<dyn ResourceLease>,
@@ -339,12 +335,14 @@ impl RetainedLeases {
         if self.requirements.binary_search(&key).is_err() {
             return Err(RetainedLeaseError::ResourceNotRequired { key });
         }
-        if let Some(current) = self.leases.get(&key) {
-            return if same_payload_allocation(current.as_ref(), lease.as_ref()) {
-                Ok(false)
-            } else {
-                Err(RetainedLeaseError::ConflictingLeaseAllocation { key })
-            };
+        if self.leases.contains_key(&key) {
+            // BrickKey is the immutable scientific-content identity. The
+            // runtime cache may evict its own handle while this owner still
+            // retains one, then validly decode the same key into a different
+            // physical allocation for a raced waiter. Keep the first retained
+            // lease and release the redundant delivery without changing
+            // readiness, generation, or renderer authority.
+            return Ok(false);
         }
         self.leases.insert(key, lease);
         let spatial = RetainedSpatialKey::for_resource(key);
@@ -652,24 +650,6 @@ impl<'a> RetainedLeaseCohort<'a> {
     }
 }
 
-fn same_payload_allocation(left: &dyn ResourceLease, right: &dyn ResourceLease) -> bool {
-    if left.key() != right.key() {
-        return false;
-    }
-    let left = left.payload();
-    let right = right.payload();
-    left.descriptor() == right.descriptor()
-        && left.value_bytes().len() == right.value_bytes().len()
-        && std::ptr::eq(left.value_bytes().as_ptr(), right.value_bytes().as_ptr())
-        && match (left.validity_bits(), right.validity_bits()) {
-            (None, None) => true,
-            (Some(left), Some(right)) => {
-                left.len() == right.len() && std::ptr::eq(left.as_ptr(), right.as_ptr())
-            }
-            (None, Some(_)) | (Some(_), None) => false,
-        }
-}
-
 fn region_contains(region: mirante4d_dataset::ResourceRegion, index: [u64; 3]) -> bool {
     region
         .origin()
@@ -745,9 +725,6 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct OuterLease(Arc<FixtureLease>);
-
-    #[derive(Debug)]
     struct FixtureCpuCharge(u64);
 
     impl CpuByteLease for FixtureCpuCharge {
@@ -760,23 +737,9 @@ mod tests {
         }
     }
 
-    impl ResourceLease for OuterLease {
-        fn key(&self) -> BrickKey {
-            self.0.key()
-        }
-
-        fn payload(&self) -> ResourcePayloadView<'_> {
-            self.0.payload()
-        }
-
-        fn payload_facts(&self) -> mirante4d_dataset::ResourcePayloadFacts {
-            self.0.payload_facts()
-        }
-    }
-
     fn key(x: u64) -> BrickKey {
         BrickKey::new(
-            DatasetResourceIdentity::Unverified(DatasetSourceId::new(7)),
+            DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(7)),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -790,7 +753,7 @@ mod tests {
 
     fn semantic_key(layer: u32, tile_x: u64) -> BrickKey {
         BrickKey::new(
-            DatasetResourceIdentity::Unverified(DatasetSourceId::new(17)),
+            DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(17)),
             LogicalLayerKey::new(layer),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -933,24 +896,23 @@ mod tests {
     }
 
     #[test]
-    fn install_rejects_unrequired_and_conflicting_allocations() {
+    fn install_rejects_unrequired_and_coalesces_redecoded_allocations() {
         let required = key(0);
         let unrequired = key(2);
-        let inner = Arc::new(FixtureLease::u16(required, &[7, 9], None).unwrap());
-        let first: Arc<dyn ResourceLease> = Arc::new(OuterLease(Arc::clone(&inner)));
-        let same_payload: Arc<dyn ResourceLease> = Arc::new(OuterLease(inner));
+        let first = lease(required, &[7, 9], None);
 
         let mut retained = RetainedLeases::new();
         retained.replace_requirements([required]).unwrap();
         assert_eq!(retained.install(Arc::clone(&first)), Ok(true));
-        assert_eq!(retained.install(same_payload), Ok(false));
+        assert_eq!(retained.install(Arc::clone(&first)), Ok(false));
         assert_eq!(
             retained.install(lease(unrequired, &[3, 4], None)),
             Err(RetainedLeaseError::ResourceNotRequired { key: unrequired })
         );
         assert_eq!(
             retained.install(lease(required, &[7, 9], None)),
-            Err(RetainedLeaseError::ConflictingLeaseAllocation { key: required })
+            Ok(false),
+            "an immutable semantic duplicate may use another physical allocation"
         );
         assert!(Arc::ptr_eq(
             retained.retained_lease(required).unwrap(),

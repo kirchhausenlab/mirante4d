@@ -8,7 +8,7 @@ use super::{
     ControlError, IMAGE_COUNT_MAX, LEVEL_COUNT_MAX, MAX_PORTABLE_CONTROL_OBJECT_BYTES,
     PORTABLE_RECORD_COUNT_MAX, U64Decimal, jcs,
 };
-use crate::{PackagePath, ProfileKind, profile_limits};
+use crate::{MANIFEST_DESCRIPTORS_MAX, MANIFEST_PAGE_REFERENCES_MAX, PackagePath};
 
 const DESCRIPTOR_OBJECT: &str = "manifest descriptor";
 const PAGE_OBJECT: &str = "manifest page";
@@ -16,9 +16,8 @@ const ROOT_OBJECT: &str = "manifest root";
 const PAGE_SCHEMA: &str = "m4d-manifest-page";
 const ROOT_SCHEMA: &str = "m4d-manifest-root";
 const MAX_DESCRIPTOR_BYTES: usize = 512;
-const MAX_MANIFEST_DESCRIPTORS: usize =
-    profile_limits(ProfileKind::Ds4).total_physical_objects as usize;
-const MAX_MANIFEST_PAGES: usize = profile_limits(ProfileKind::Ds4).manifest_pages as usize;
+const MAX_MANIFEST_DESCRIPTORS: usize = MANIFEST_DESCRIPTORS_MAX as usize;
+const MAX_MANIFEST_PAGES: usize = MANIFEST_PAGE_REFERENCES_MAX as usize;
 
 /// The closed object kinds admitted by the experimental package manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -384,7 +383,10 @@ impl ManifestRoot {
 /// Returns the sole canonical path for one zero-based manifest page ordinal.
 pub fn manifest_page_path(ordinal: u32) -> Result<PackagePath, ControlError> {
     if usize::try_from(ordinal).map_or(true, |ordinal| ordinal >= MAX_MANIFEST_PAGES) {
-        return invalid(ROOT_OBJECT, "manifest page ordinal exceeds five");
+        return invalid(
+            ROOT_OBJECT,
+            "manifest page ordinal exceeds the compositional root-reference capacity",
+        );
     }
     package_path(
         &format!("m4d/manifest/pages/p{ordinal:08}.json"),
@@ -448,7 +450,10 @@ pub fn pack_manifest_pages(
         pages.push(ManifestPage::new(current)?);
     }
     if pages.len() > MAX_MANIFEST_PAGES {
-        return invalid(PAGE_OBJECT, "manifest requires more than six pages");
+        return invalid(
+            PAGE_OBJECT,
+            "manifest exceeds the compositional root-reference capacity",
+        );
     }
     Ok(pages)
 }
@@ -457,7 +462,7 @@ fn validate_greedy_pages(pages: &[ManifestPage]) -> Result<(), ControlError> {
     if pages.is_empty() || pages.len() > MAX_MANIFEST_PAGES {
         return invalid(
             ROOT_OBJECT,
-            "manifest root must reference one through six pages",
+            "manifest root page count is outside the compositional reference capacity",
         );
     }
     let mut descriptor_count = 0_usize;
@@ -524,7 +529,7 @@ fn validate_page_references(pages: &[ManifestPageReference]) -> Result<(), Contr
     if pages.is_empty() || pages.len() > MAX_MANIFEST_PAGES {
         return invalid(
             ROOT_OBJECT,
-            "manifest root must reference one through six pages",
+            "manifest root page count is outside the compositional reference capacity",
         );
     }
     let mut descriptor_count = 0_u64;
