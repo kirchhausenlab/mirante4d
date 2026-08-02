@@ -1,7 +1,9 @@
 use mirante4d_domain::LogicalLayerKey;
 use serde::{Deserialize, Serialize};
 
-use super::{ControlError, F32Bits, MAX_PORTABLE_CONTROL_OBJECT_BYTES, Rgb24, U64Decimal, jcs};
+use super::{
+    ControlError, F32Bits, MAX_PORTABLE_CONTROL_OBJECT_BYTES, NfcText, Rgb24, U64Decimal, jcs,
+};
 
 const OBJECT: &str = "display defaults";
 const SCHEMA: &str = "m4d-display-defaults";
@@ -10,6 +12,7 @@ const SCHEMA: &str = "m4d-display-defaults";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DisplayLayerDefaults {
     logical_layer: LogicalLayerKey,
+    label: Option<NfcText>,
     visible: bool,
     color: Rgb24,
     window_min: F32Bits,
@@ -24,6 +27,17 @@ impl DisplayLayerDefaults {
         window_min: F32Bits,
         window_max: F32Bits,
     ) -> Result<Self, ControlError> {
+        Self::new_with_label(logical_layer, None, visible, color, window_min, window_max)
+    }
+
+    pub fn new_with_label(
+        logical_layer: LogicalLayerKey,
+        label: Option<NfcText>,
+        visible: bool,
+        color: Rgb24,
+        window_min: F32Bits,
+        window_max: F32Bits,
+    ) -> Result<Self, ControlError> {
         if window_min.value() >= window_max.value() {
             return Err(ControlError::InvalidControlObject {
                 object: OBJECT,
@@ -32,6 +46,7 @@ impl DisplayLayerDefaults {
         }
         Ok(Self {
             logical_layer,
+            label,
             visible,
             color,
             window_min,
@@ -41,6 +56,10 @@ impl DisplayLayerDefaults {
 
     pub const fn logical_layer(&self) -> LogicalLayerKey {
         self.logical_layer
+    }
+
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_ref().map(NfcText::as_str)
     }
 
     pub const fn visible(&self) -> bool {
@@ -137,6 +156,8 @@ struct WireDisplayDefaults {
 #[serde(deny_unknown_fields)]
 struct WireDisplayLayerDefaults {
     logical_layer_ordinal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
     visible: bool,
     color_rgb: String,
     window_min_f32_bits: String,
@@ -170,8 +191,9 @@ impl TryFrom<WireDisplayLayerDefaults> for DisplayLayerDefaults {
             object: OBJECT,
             reason: "logical layer ordinal exceeds u32",
         })?;
-        Self::new(
+        Self::new_with_label(
             LogicalLayerKey::new(ordinal),
+            wire.label.as_deref().map(NfcText::parse).transpose()?,
             wire.visible,
             Rgb24::parse(&wire.color_rgb)?,
             F32Bits::parse(&wire.window_min_f32_bits)?,
@@ -198,6 +220,7 @@ impl From<&DisplayLayerDefaults> for WireDisplayLayerDefaults {
     fn from(value: &DisplayLayerDefaults) -> Self {
         Self {
             logical_layer_ordinal: value.logical_layer.ordinal().to_string(),
+            label: value.label.as_ref().map(|label| label.as_str().to_owned()),
             visible: value.visible,
             color_rgb: value.color.to_string(),
             window_min_f32_bits: value.window_min.to_string(),

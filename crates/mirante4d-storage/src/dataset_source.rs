@@ -6,19 +6,18 @@
 )]
 
 use std::{
-    fmt,
     sync::{
-        Arc, Condvar, Mutex, MutexGuard, RwLock,
+        Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use mirante4d_dataset::{
-    BrickKey, CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError, DatasetCatalog,
-    DatasetCatalogError, DatasetLayer, DatasetScale, DatasetSource, DatasetSourceFault,
-    DatasetSourceId, DecodeSinkError, ReservedDecodeSink, ResourceContractError,
-    ResourcePayloadDescriptor, ResourcePayloadFacts, ResourceValidity, ScientificIdentityStatus,
+    BrickKey, ContentAddressStatus, CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError,
+    DatasetCatalog, DatasetCatalogError, DatasetLayer, DatasetResourceIdentity, DatasetScale,
+    DatasetSource, DatasetSourceFault, DatasetSourceId, DecodeSinkError, ReservedDecodeSink,
+    ResourceContractError, ResourcePayloadDescriptor, ResourcePayloadFacts, ResourceValidity,
 };
 use mirante4d_domain::{GridToWorld, IntensityDType, ScaleLevel, Shape3D};
 use mirante4d_identity::PackageId;
@@ -29,13 +28,13 @@ use crate::package_read::{
     read_local_brick_reusing_in_transaction, read_local_brick_reusing_into_sink_in_transaction,
 };
 use crate::range_io::{
-    LOCAL_OBJECT_CACHE_ACCOUNTED_BYTES_MAX, LocalCurrentnessBatch, LocalObjectGeneration,
-    LocalPackageReadDiagnostics, LocalPackageReader,
+    LOCAL_OBJECT_CACHE_ACCOUNTED_BYTES_MAX, LocalCurrentnessBatch, LocalPackageReadDiagnostics,
+    LocalPackageReader,
 };
 use crate::{
     INNER_CODEC_WORKING_BYTES_MAX, LocalBrickRead, LocalPackageCatalog, OmeLevelTransform,
     PackageAdmissionError, PackagePath, PackageReadError, PackedIndexCoordinates,
-    ProfileValidityMode, RangeReadError, ShardProfileKind, VerifiedScientificPackageCapability,
+    ProfileValidityMode, RangeReadError, SelfConsistentPackageCapability, ShardProfileKind,
 };
 
 const METADATA_MIN_BYTES: u64 = 64 * 1024;
@@ -49,8 +48,9 @@ const PHYSICAL_BRICK_OBJECT_SNAPSHOTS_MAX: usize = 3;
 ///
 /// The accepted validators retain bounded metadata, one 64 KiB hash buffer,
 /// four fixed scientific tiles, one physical brick, the shared native codec
-/// workspace, and a bounded tile-digest slab. Product verification acquires
-/// this from `InFlightDecode` before invoking them.
+/// workspace, and a bounded tile-digest slab. Explicit integrity audit and
+/// import publication acquire this from `InFlightDecode` before invoking the
+/// validators.
 pub const PACKAGE_VALIDATION_WORKING_BYTES: u64 = 64 * 1024 * 1024;
 
 const _: () = assert!(PACKAGE_VALIDATION_WORKING_BYTES >= crate::INNER_CODEC_WORKING_BYTES_MAX);
@@ -72,81 +72,30 @@ pub enum LocalDatasetSourceOpenError {
     MetadataInvariant { reason: &'static str },
 }
 
-#[derive(Debug, Error)]
-pub enum LocalDatasetSourcePromotionError {
-    #[error(
-        "the verified capability belongs to a different root, storage contract, or scientific identity"
-    )]
-    StorageContractMismatch,
-    #[error("provisional delivery observed more than one object generation")]
-    ProvisionalGenerationDrift,
-    #[error("the dataset source authority epoch overflowed")]
-    AuthorityEpochOverflow,
-    #[error("promotion overlap metadata admission failed: {0}")]
-    MetadataAdmission(#[source] CpuLedgerError),
-    #[error("the CPU byte ledger returned an invalid promotion-overlap metadata lease")]
-    InvalidMetadataLease,
-    #[error("the verified capability does not prove the provisional read generation: {0}")]
-    Currentness(#[source] PackageReadError),
-}
-
-#[derive(Debug)]
-pub struct LocalDatasetSourcePromotionFailure {
-    capability: VerifiedScientificPackageCapability,
-    error: LocalDatasetSourcePromotionError,
-}
-
-impl LocalDatasetSourcePromotionFailure {
-    pub fn into_parts(
-        self,
-    ) -> (
-        VerifiedScientificPackageCapability,
-        LocalDatasetSourcePromotionError,
-    ) {
-        (self.capability, self.error)
-    }
-
-    pub const fn error(&self) -> &LocalDatasetSourcePromotionError {
-        &self.error
-    }
-}
-
-impl fmt::Display for LocalDatasetSourcePromotionFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.error.fmt(formatter)
-    }
-}
-
-impl std::error::Error for LocalDatasetSourcePromotionFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
-    }
-}
-
 enum LocalPackageAccess {
-    Provisional(Box<LocalPackageCatalog>),
-    Verified(Box<VerifiedScientificPackageCapability>),
+    Admitted(Box<LocalPackageCatalog>),
+    Published(Box<SelfConsistentPackageCapability>),
 }
 
 impl LocalPackageAccess {
     const fn storage_catalog(&self) -> &LocalPackageCatalog {
         match self {
-            Self::Provisional(catalog) => catalog,
-            Self::Verified(capability) => capability.catalog(),
+            Self::Admitted(catalog) => catalog,
+            Self::Published(capability) => capability.catalog(),
         }
     }
 
     const fn package_id(&self) -> Option<PackageId> {
         match self {
-            Self::Provisional(_) => None,
-            Self::Verified(capability) => Some(capability.package_id()),
+            Self::Admitted(_) => None,
+            Self::Published(capability) => Some(capability.package_id()),
         }
     }
 
     fn runtime_read_object_capacity(&self) -> usize {
         match self {
-            Self::Provisional(catalog) => catalog.runtime_read_object_capacity(),
-            Self::Verified(capability) => capability.runtime_read_object_capacity(),
+            Self::Admitted(catalog) => catalog.runtime_read_object_capacity(),
+            Self::Published(capability) => capability.runtime_read_object_capacity(),
         }
     }
 
@@ -159,8 +108,8 @@ impl LocalPackageAccess {
             return Err(PackageReadError::Cancelled);
         }
         let read = match self {
-            Self::Provisional(catalog) => catalog.read_brick_unverified(coordinates),
-            Self::Verified(capability) => capability.read_brick(coordinates, &mut is_cancelled),
+            Self::Admitted(catalog) => catalog.read_brick_admitted(coordinates),
+            Self::Published(capability) => capability.read_brick(coordinates, &mut is_cancelled),
         }?;
         if is_cancelled() {
             Err(PackageReadError::Cancelled)
@@ -177,11 +126,11 @@ impl LocalPackageAccess {
             return Err(PackageReadError::Cancelled);
         }
         match self {
-            Self::Provisional(catalog) => catalog
+            Self::Admitted(catalog) => catalog
                 .reader()
                 .begin_cached_read_transaction_with_capacity(self.runtime_read_object_capacity())
                 .map_err(PackageReadError::from),
-            Self::Verified(capability) => capability.begin_runtime_read_cohort(is_cancelled),
+            Self::Published(capability) => capability.begin_runtime_read_cohort(is_cancelled),
         }
     }
 
@@ -197,7 +146,7 @@ impl LocalPackageAccess {
             ));
         }
         let read = match self {
-            Self::Provisional(catalog) => {
+            Self::Admitted(catalog) => {
                 let plan = catalog.plan_brick_storage(coordinates)?;
                 read_local_brick_reusing_into_sink_in_transaction(
                     catalog.reader(),
@@ -208,7 +157,7 @@ impl LocalPackageAccess {
                     DirectPayloadFactsAuthority::ScanDecoded,
                 )
             }
-            Self::Verified(capability) => {
+            Self::Published(capability) => {
                 capability.read_brick_into_sink_in_cohort(coordinates, sink, transaction)
             }
         }?;
@@ -231,7 +180,7 @@ impl LocalPackageAccess {
             return Err(PackageReadError::Cancelled);
         }
         match self {
-            Self::Provisional(catalog) => {
+            Self::Admitted(catalog) => {
                 let plan = catalog.plan_brick_storage(coordinates)?;
                 read_local_brick_reusing_in_transaction(
                     catalog.reader(),
@@ -241,7 +190,7 @@ impl LocalPackageAccess {
                     DirectPayloadFactsAuthority::ScanDecoded,
                 )
             }
-            Self::Verified(capability) => {
+            Self::Published(capability) => {
                 capability.read_brick_in_cohort(coordinates, transaction, is_cancelled)
             }
         }
@@ -257,7 +206,7 @@ impl LocalPackageAccess {
             return Err(PackageReadError::Cancelled);
         }
         match self {
-            Self::Provisional(_) => {
+            Self::Admitted(_) => {
                 for snapshot in brick.object_snapshots() {
                     if is_cancelled() {
                         return Err(PackageReadError::Cancelled);
@@ -266,7 +215,7 @@ impl LocalPackageAccess {
                 }
                 Ok(())
             }
-            Self::Verified(capability) => {
+            Self::Published(capability) => {
                 capability.validate_cached_brick_in_cohort(brick, transaction, is_cancelled)
             }
         }
@@ -285,100 +234,20 @@ impl LocalPackageAccess {
             return Err(PackageReadError::Cancelled);
         }
         match self {
-            Self::Provisional(catalog) => catalog
+            Self::Admitted(catalog) => catalog
                 .reader()
                 .revalidate_cached_snapshots(brick.object_snapshots())
                 .map_err(PackageReadError::from),
-            Self::Verified(capability) => {
+            Self::Published(capability) => {
                 capability.revalidate_cached_brick(brick, &mut is_cancelled)
             }
         }
     }
-
-    fn revalidate_cached_snapshots(
-        &self,
-        snapshots: &[crate::range_io::LocalObjectSnapshot],
-        mut is_cancelled: impl FnMut() -> bool,
-    ) -> Result<(), PackageReadError> {
-        if is_cancelled() {
-            return Err(PackageReadError::Cancelled);
-        }
-        match self {
-            Self::Provisional(catalog) => catalog
-                .reader()
-                .revalidate_cached_snapshots(snapshots)
-                .map_err(PackageReadError::from),
-            Self::Verified(capability) => {
-                capability.revalidate_cached_snapshots(snapshots, &mut is_cancelled)
-            }
-        }
-    }
-}
-
-struct LocalPackageAccessSnapshot {
-    epoch: u64,
-    access: Arc<LocalPackageAccess>,
-    // Fields are dropped in declaration order. The access Arc therefore
-    // retires before this guard checks whether diagnostics owns the final old
-    // authority reference and releases its overlap metadata lease.
-    retirement: ReaderDiagnosticsRetirement,
-}
-
-impl Clone for LocalPackageAccessSnapshot {
-    fn clone(&self) -> Self {
-        Self {
-            epoch: self.epoch,
-            access: Arc::clone(&self.access),
-            retirement: self.retirement.clone(),
-        }
-    }
-}
-
-struct LocalPackageAuthority {
-    epoch: u64,
-    access: Arc<LocalPackageAccess>,
-}
-
-struct ReaderDiagnosticsSource {
-    access: Arc<LocalPackageAccess>,
-    baseline: LocalPackageReadDiagnostics,
-    _overlap_metadata_lease: Option<Box<dyn CpuByteLease>>,
-}
-
-struct ReaderDiagnosticsState {
-    prior: LocalPackageReadDiagnostics,
-    sources: Vec<ReaderDiagnosticsSource>,
 }
 
 #[derive(Clone)]
-struct ReaderDiagnosticsRetirement {
-    access_identity: usize,
-    diagnostics: Arc<Mutex<ReaderDiagnosticsState>>,
-}
-
-impl Drop for ReaderDiagnosticsRetirement {
-    fn drop(&mut self) {
-        let mut diagnostics = lock_unpoisoned(&self.diagnostics);
-        let Some(index) = diagnostics.sources.iter().position(|source| {
-            Arc::as_ptr(&source.access) as usize == self.access_identity
-                && source._overlap_metadata_lease.is_some()
-                && Arc::strong_count(&source.access) == 1
-        }) else {
-            return;
-        };
-        let retired = diagnostics.sources.remove(index);
-        diagnostics.prior = add_reader_diagnostics(
-            diagnostics.prior,
-            subtract_reader_diagnostics(
-                retired.access.reader().read_diagnostics(),
-                retired.baseline,
-            ),
-        );
-        drop(retired);
-        if diagnostics.sources.len() == 1 {
-            diagnostics.sources[0]._overlap_metadata_lease = None;
-        }
-    }
+struct LocalPackageAccessSnapshot {
+    access: Arc<LocalPackageAccess>,
 }
 
 #[derive(Clone, Copy)]
@@ -486,7 +355,7 @@ pub struct LocalDatasetSourceDiagnostics {
     /// spans with no decoded payload-sized copy.
     pub aligned_direct_sink_span_bytes: u64,
     /// Already-decoded aligned bytes copied into a sink after decode. The
-    /// common verified all-valid 3D path is expected to remain zero.
+    /// common fact-checked all-valid 3D path is expected to remain zero.
     pub aligned_direct_post_decode_copy_bytes: u64,
     pub physical_brick_cache_entries: u64,
     pub physical_brick_cache_bytes: u64,
@@ -528,12 +397,6 @@ struct PhysicalBrickCacheState {
     next_generation: u64,
     retained_bytes: u64,
     peak_retained_bytes: u64,
-}
-
-struct ProvisionalReadObservations {
-    generations: Vec<Option<LocalObjectGeneration>>,
-    drifted: bool,
-    version: u64,
 }
 
 struct PhysicalBrickCacheEntry {
@@ -626,52 +489,49 @@ impl Default for PhysicalBrickCache {
 
 /// One target-package source for the shared dataset scheduler.
 ///
-/// Provisional construction uses a caller-assigned opaque source ID and never
-/// exposes the manifest's declared package identity. Verified construction
-/// accepts only the capability issued after exact and scientific validation.
-/// The caller supplies the human display label; it is UI metadata, not a
-/// persisted or scientific identity.
+/// Ordinary admitted construction uses a caller-assigned opaque resource ID
+/// while exposing the content address declared by the manifest. Published
+/// construction accepts only the self-consistency capability handed across
+/// the import publication boundary. The caller supplies the human display
+/// label; it is UI metadata, not a persisted identity or content address.
 pub struct LocalDatasetSource {
-    authority: RwLock<LocalPackageAuthority>,
+    access: Arc<LocalPackageAccess>,
     catalog: Arc<DatasetCatalog>,
     mappings: Vec<LayerStorageMapping>,
     ledger: Arc<dyn CpuByteLedger>,
     physical_cache: PhysicalBrickCache,
-    provisional_observations: Mutex<ProvisionalReadObservations>,
-    reader_diagnostics: Arc<Mutex<ReaderDiagnosticsState>>,
+    reader_diagnostics_baseline: LocalPackageReadDiagnostics,
     counters: LocalDatasetSourceCounters,
-    #[cfg(test)]
-    promotion_validation_attempts: AtomicU64,
-    #[cfg(test)]
-    delivery_epoch_revalidations: AtomicU64,
-    metadata_bytes: u64,
     _metadata_lease: Box<dyn CpuByteLease>,
 }
 
 impl LocalDatasetSource {
-    pub fn from_provisional(
+    pub fn from_admitted(
         storage: LocalPackageCatalog,
         source_id: DatasetSourceId,
         display_label: impl AsRef<str>,
         ledger: Arc<dyn CpuByteLedger>,
     ) -> Result<Arc<Self>, LocalDatasetSourceOpenError> {
+        let content_id = storage.science().scientific_content_id();
         Self::new(
-            LocalPackageAccess::Provisional(Box::new(storage)),
-            ScientificIdentityStatus::Unverified(source_id),
+            LocalPackageAccess::Admitted(Box::new(storage)),
+            ContentAddressStatus::ContentAddress(content_id),
+            DatasetResourceIdentity::SessionLocal(source_id),
             display_label.as_ref(),
             ledger,
         )
     }
 
-    pub fn from_verified(
-        capability: VerifiedScientificPackageCapability,
+    pub fn from_published(
+        capability: SelfConsistentPackageCapability,
         display_label: impl AsRef<str>,
         ledger: Arc<dyn CpuByteLedger>,
     ) -> Result<Arc<Self>, LocalDatasetSourceOpenError> {
         let scientific_content_id = capability.scientific_content_id();
         Self::new(
-            LocalPackageAccess::Verified(Box::new(capability)),
-            ScientificIdentityStatus::Verified(scientific_content_id),
+            LocalPackageAccess::Published(Box::new(capability)),
+            ContentAddressStatus::ContentAddress(scientific_content_id),
+            DatasetResourceIdentity::ContentAddress(scientific_content_id),
             display_label.as_ref(),
             ledger,
         )
@@ -679,7 +539,8 @@ impl LocalDatasetSource {
 
     fn new(
         access: LocalPackageAccess,
-        identity: ScientificIdentityStatus,
+        content_address_status: ContentAddressStatus,
+        resource_identity: DatasetResourceIdentity,
         display_label: &str,
         ledger: Arc<dyn CpuByteLedger>,
     ) -> Result<Arc<Self>, LocalDatasetSourceOpenError> {
@@ -690,14 +551,6 @@ impl LocalDatasetSource {
             .ok_or(LocalDatasetSourceOpenError::MetadataAccountingOverflow)?
             .max(METADATA_MIN_BYTES)
             .checked_add(LOCAL_OBJECT_CACHE_ACCOUNTED_BYTES_MAX)
-            .and_then(|bytes| {
-                let observations = access
-                    .storage_catalog()
-                    .descriptors()
-                    .len()
-                    .checked_mul(std::mem::size_of::<Option<LocalObjectGeneration>>())?;
-                bytes.checked_add(u64::try_from(observations).ok()?)
-            })
             .ok_or(LocalDatasetSourceOpenError::MetadataAccountingOverflow)?;
         let metadata_lease = ledger
             .try_acquire(CpuLedgerCategory::MetadataAndIndexes, metadata_bytes)
@@ -707,63 +560,46 @@ impl LocalDatasetSource {
         {
             return Err(LocalDatasetSourceOpenError::InvalidMetadataLease);
         }
-        if matches!(&access, LocalPackageAccess::Provisional(_)) {
+        if matches!(&access, LocalPackageAccess::Admitted(_)) {
             access
                 .storage_catalog()
                 .admit_supported_dataset_profile(|| false)
                 .map_err(LocalDatasetSourceOpenError::Admission)?;
         }
 
-        let observation_count = access.storage_catalog().descriptors().len();
-        let (catalog, mappings) =
-            build_dataset_catalog(access.storage_catalog(), identity, display_label)?;
+        let (catalog, mappings) = build_dataset_catalog(
+            access.storage_catalog(),
+            content_address_status,
+            resource_identity,
+            display_label,
+        )?;
         let access = Arc::new(access);
         let reader_diagnostics_baseline = access.reader().read_diagnostics();
         Ok(Arc::new(Self {
-            authority: RwLock::new(LocalPackageAuthority {
-                epoch: 0,
-                access: Arc::clone(&access),
-            }),
+            access,
             catalog: Arc::new(catalog),
             mappings,
             ledger,
             physical_cache: PhysicalBrickCache::default(),
-            provisional_observations: Mutex::new(ProvisionalReadObservations {
-                generations: vec![None; observation_count],
-                drifted: false,
-                version: 0,
-            }),
-            reader_diagnostics: Arc::new(Mutex::new(ReaderDiagnosticsState {
-                prior: LocalPackageReadDiagnostics::default(),
-                sources: vec![ReaderDiagnosticsSource {
-                    access,
-                    baseline: reader_diagnostics_baseline,
-                    _overlap_metadata_lease: None,
-                }],
-            })),
+            reader_diagnostics_baseline,
             counters: LocalDatasetSourceCounters::default(),
-            #[cfg(test)]
-            promotion_validation_attempts: AtomicU64::new(0),
-            #[cfg(test)]
-            delivery_epoch_revalidations: AtomicU64::new(0),
-            metadata_bytes,
             _metadata_lease: metadata_lease,
         }))
     }
 
-    /// Returns the exact package identity only after full verification.
+    /// Returns the exact package identity only for an importer-published
+    /// source whose publication capability already owns that address.
     pub fn package_id(&self) -> Option<PackageId> {
-        self.access_snapshot().access.package_id()
+        self.access.package_id()
     }
 
     pub fn diagnostics(&self) -> LocalDatasetSourceDiagnostics {
         let cache = lock_unpoisoned(&self.physical_cache.state);
-        let current = self.access_snapshot();
-        let mut reader = self.collect_reader_diagnostics(&current.access);
-        let current_reader = current.access.reader().read_diagnostics();
-        // Cumulative counters span proof-backed authority promotion. Gauges
-        // instead describe the exact currently active reader authority and
-        // must never be baseline-subtracted as though they were events.
+        let current_reader = self.access.reader().read_diagnostics();
+        let mut reader =
+            subtract_reader_diagnostics(current_reader, self.reader_diagnostics_baseline);
+        // Gauges describe the live reader and must never be
+        // baseline-subtracted as though they were event counters.
         reader.open_object_handles_current = current_reader.open_object_handles_current;
         reader.open_object_handles_peak = current_reader.open_object_handles_peak;
         reader.object_handle_cache_entries = current_reader.object_handle_cache_entries;
@@ -831,181 +667,9 @@ impl LocalDatasetSource {
         }
     }
 
-    /// Promotes only the source's read authority while retaining its opaque
-    /// provisional resource identity and every already-issued runtime key.
-    ///
-    /// All physical object generations previously used by this source must be
-    /// a subset of the new exact capability's current proof. If the source is
-    /// already verified, package and scientific identities must also match.
-    /// Candidate validation is optimistic and performs no filesystem work
-    /// while holding the authority lock. A versioned commit retries whenever
-    /// a provisional observation arrived after the candidate snapshot.
-    pub fn promote_verified(
-        &self,
-        capability: VerifiedScientificPackageCapability,
-        mut is_cancelled: impl FnMut() -> bool,
-    ) -> Result<LocalPackageReadDiagnostics, LocalDatasetSourcePromotionFailure> {
-        loop {
-            let current = self.access_snapshot();
-            if !current
-                .access
-                .storage_catalog()
-                .same_runtime_storage_contract(capability.catalog())
-            {
-                return Err(LocalDatasetSourcePromotionFailure {
-                    capability,
-                    error: LocalDatasetSourcePromotionError::StorageContractMismatch,
-                });
-            }
-            if let LocalPackageAccess::Verified(existing) = &*current.access
-                && (existing.package_id() != capability.package_id()
-                    || existing.scientific_content_id() != capability.scientific_content_id()
-                    || existing.layer_roots() != capability.layer_roots())
-            {
-                return Err(LocalDatasetSourcePromotionFailure {
-                    capability,
-                    error: LocalDatasetSourcePromotionError::StorageContractMismatch,
-                });
-            }
-
-            let (observation_version, observed_generations) = {
-                let observations = lock_unpoisoned(&self.provisional_observations);
-                if observations.drifted {
-                    return Err(LocalDatasetSourcePromotionFailure {
-                        capability,
-                        error: LocalDatasetSourcePromotionError::ProvisionalGenerationDrift,
-                    });
-                }
-                (observations.version, observations.generations.clone())
-            };
-
-            #[cfg(test)]
-            self.promotion_validation_attempts
-                .fetch_add(1, Ordering::Relaxed);
-            if let Err(error) =
-                capability.validate_promotion_observations(&observed_generations, &mut is_cancelled)
-            {
-                return Err(LocalDatasetSourcePromotionFailure {
-                    capability,
-                    error: LocalDatasetSourcePromotionError::Currentness(error),
-                });
-            }
-            let candidate_reader_baseline = capability.catalog().reader().read_diagnostics();
-            // Retired authority generations must release their overlap lease
-            // before admitting another one. Otherwise an already-dead A
-            // generation can spuriously prevent a valid B-to-C refresh.
-            {
-                let mut reader_diagnostics = lock_unpoisoned(&self.reader_diagnostics);
-                Self::reap_reader_diagnostics(&mut reader_diagnostics, &current.access);
-            }
-            let overlap_metadata_lease = match self
-                .ledger
-                .try_acquire(CpuLedgerCategory::MetadataAndIndexes, self.metadata_bytes)
-            {
-                Ok(lease)
-                    if lease.category() == CpuLedgerCategory::MetadataAndIndexes
-                        && lease.reserved_bytes() == self.metadata_bytes =>
-                {
-                    lease
-                }
-                Ok(_) => {
-                    return Err(LocalDatasetSourcePromotionFailure {
-                        capability,
-                        error: LocalDatasetSourcePromotionError::InvalidMetadataLease,
-                    });
-                }
-                Err(error) => {
-                    return Err(LocalDatasetSourcePromotionFailure {
-                        capability,
-                        error: LocalDatasetSourcePromotionError::MetadataAdmission(error),
-                    });
-                }
-            };
-
-            // Acquire diagnostics bookkeeping before the authority write lock:
-            // waiting for diagnostics aggregation must never stall snapshots.
-            let mut reader_diagnostics = lock_unpoisoned(&self.reader_diagnostics);
-            let mut authority = self
-                .authority
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if authority.epoch != current.epoch || !Arc::ptr_eq(&authority.access, &current.access)
-            {
-                drop(authority);
-                drop(reader_diagnostics);
-                continue;
-            }
-            let observations = lock_unpoisoned(&self.provisional_observations);
-            if observations.version != observation_version {
-                drop(observations);
-                drop(authority);
-                drop(reader_diagnostics);
-                continue;
-            }
-            if observations.drifted {
-                return Err(LocalDatasetSourcePromotionFailure {
-                    capability,
-                    error: LocalDatasetSourcePromotionError::ProvisionalGenerationDrift,
-                });
-            }
-            let Some(next_epoch) = authority.epoch.checked_add(1) else {
-                return Err(LocalDatasetSourcePromotionFailure {
-                    capability,
-                    error: LocalDatasetSourcePromotionError::AuthorityEpochOverflow,
-                });
-            };
-            let next_access = Arc::new(LocalPackageAccess::Verified(Box::new(capability)));
-            let Some(previous_diagnostics) = reader_diagnostics
-                .sources
-                .iter_mut()
-                .find(|source| Arc::ptr_eq(&source.access, &current.access))
-            else {
-                return Err(LocalDatasetSourcePromotionFailure {
-                    capability: match Arc::try_unwrap(next_access) {
-                        Ok(LocalPackageAccess::Verified(capability)) => *capability,
-                        Ok(LocalPackageAccess::Provisional(_)) | Err(_) => {
-                            unreachable!("the uncommitted candidate has one verified owner")
-                        }
-                    },
-                    error: LocalDatasetSourcePromotionError::InvalidMetadataLease,
-                });
-            };
-            previous_diagnostics._overlap_metadata_lease = Some(overlap_metadata_lease);
-            reader_diagnostics.sources.push(ReaderDiagnosticsSource {
-                access: Arc::clone(&next_access),
-                baseline: candidate_reader_baseline,
-                _overlap_metadata_lease: None,
-            });
-            authority.epoch = next_epoch;
-            authority.access = Arc::clone(&next_access);
-            drop(reader_diagnostics);
-            drop(observations);
-            drop(authority);
-            drop(current);
-            let mut reader_diagnostics = lock_unpoisoned(&self.reader_diagnostics);
-            Self::reap_reader_diagnostics(&mut reader_diagnostics, &next_access);
-            // This exact snapshot includes the separate verification reader's
-            // metadata, exact-package, scientific, and promotion-currentness
-            // work. The source installs it as the new authority baseline, so
-            // returning the same value lets callers attribute verification
-            // contention without mixing it into normal runtime-reader deltas.
-            return Ok(candidate_reader_baseline);
-        }
-    }
-
     fn access_snapshot(&self) -> LocalPackageAccessSnapshot {
-        let authority = self
-            .authority
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let access = Arc::clone(&authority.access);
         LocalPackageAccessSnapshot {
-            epoch: authority.epoch,
-            retirement: ReaderDiagnosticsRetirement {
-                access_identity: Arc::as_ptr(&access) as usize,
-                diagnostics: Arc::clone(&self.reader_diagnostics),
-            },
-            access,
+            access: Arc::clone(&self.access),
         }
     }
 
@@ -1020,39 +684,14 @@ impl LocalDatasetSource {
 
     fn finish_snapshot_delivery(
         &self,
-        mut accepted: LocalPackageAccessSnapshot,
-        snapshots: &[crate::range_io::LocalObjectSnapshot],
+        _accepted: LocalPackageAccessSnapshot,
+        _snapshots: &[crate::range_io::LocalObjectSnapshot],
         mut is_cancelled: impl FnMut() -> bool,
     ) -> Result<(), PackageReadError> {
-        loop {
-            let next = {
-                let authority = self
-                    .authority
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if authority.epoch == accepted.epoch
-                    && Arc::ptr_eq(&authority.access, &accepted.access)
-                {
-                    // This brief read-side critical section is the delivery
-                    // linearization point. It performs no filesystem work.
-                    return Ok(());
-                }
-                let access = Arc::clone(&authority.access);
-                LocalPackageAccessSnapshot {
-                    epoch: authority.epoch,
-                    retirement: ReaderDiagnosticsRetirement {
-                        access_identity: Arc::as_ptr(&access) as usize,
-                        diagnostics: Arc::clone(&self.reader_diagnostics),
-                    },
-                    access,
-                }
-            };
-            #[cfg(test)]
-            self.delivery_epoch_revalidations
-                .fetch_add(1, Ordering::Relaxed);
-            next.access
-                .revalidate_cached_snapshots(snapshots, &mut is_cancelled)?;
-            accepted = next;
+        if is_cancelled() {
+            Err(PackageReadError::Cancelled)
+        } else {
+            Ok(())
         }
     }
 
@@ -1066,99 +705,6 @@ impl LocalDatasetSource {
             .access
             .revalidate_cached_brick(brick, &mut is_cancelled)?;
         self.finish_physical_delivery(access, brick, is_cancelled)
-    }
-
-    fn collect_reader_diagnostics(
-        &self,
-        current_access: &Arc<LocalPackageAccess>,
-    ) -> LocalPackageReadDiagnostics {
-        let mut diagnostics = lock_unpoisoned(&self.reader_diagnostics);
-        Self::reap_reader_diagnostics(&mut diagnostics, current_access);
-        diagnostics
-            .sources
-            .iter()
-            .fold(diagnostics.prior, |total, source| {
-                add_reader_diagnostics(
-                    total,
-                    subtract_reader_diagnostics(
-                        source.access.reader().read_diagnostics(),
-                        source.baseline,
-                    ),
-                )
-            })
-    }
-
-    fn reap_reader_diagnostics(
-        diagnostics: &mut ReaderDiagnosticsState,
-        current_access: &Arc<LocalPackageAccess>,
-    ) {
-        let mut index = 0;
-        while index < diagnostics.sources.len() {
-            let source = &diagnostics.sources[index];
-            if !Arc::ptr_eq(&source.access, current_access)
-                && Arc::strong_count(&source.access) == 1
-            {
-                diagnostics.prior = add_reader_diagnostics(
-                    diagnostics.prior,
-                    subtract_reader_diagnostics(
-                        source.access.reader().read_diagnostics(),
-                        source.baseline,
-                    ),
-                );
-                diagnostics.sources.remove(index);
-            } else {
-                index += 1;
-            }
-        }
-        if diagnostics.sources.len() == 1
-            && Arc::ptr_eq(&diagnostics.sources[0].access, current_access)
-        {
-            // The source-wide base lease accounts the sole current catalog
-            // and reader cache. An overlap lease is needed only while a prior
-            // authority remains live in diagnostics or an in-flight read.
-            diagnostics.sources[0]._overlap_metadata_lease = None;
-        }
-    }
-
-    fn record_delivery_observations(
-        &self,
-        access: &LocalPackageAccess,
-        snapshots: &[crate::range_io::LocalObjectSnapshot],
-    ) -> Result<(), PackageReadError> {
-        let descriptors = access.storage_catalog().descriptors();
-        let mut observations = lock_unpoisoned(&self.provisional_observations);
-        observations.version =
-            observations
-                .version
-                .checked_add(1)
-                .ok_or(PackageReadError::AccountingOverflow {
-                    metric: "provisional observation version",
-                })?;
-        for snapshot in snapshots {
-            let Some(index) = descriptors
-                .binary_search_by(|descriptor| descriptor.path().cmp(snapshot.path()))
-                .ok()
-            else {
-                observations.drifted = true;
-                return Err(RangeReadError::ObjectChanged {
-                    path: snapshot.path().to_string(),
-                }
-                .into());
-            };
-            let generation = snapshot.generation();
-            match observations.generations[index] {
-                Some(previous) if previous != generation => {
-                    observations.drifted = true;
-                    return Err(RangeReadError::ObjectChanged {
-                        path: snapshot.path().to_string(),
-                    }
-                    .into());
-                }
-                Some(_) => {}
-                None => observations.generations[index] = Some(generation),
-            }
-        }
-        Ok(())
     }
 
     fn mapping(&self, key: BrickKey) -> Result<LayerStorageMapping, DatasetSourceFault> {
@@ -1508,9 +1054,9 @@ impl LocalDatasetSource {
                 .fetch_add(1, Ordering::Relaxed);
             drop(cache);
 
-            // Snapshot authority before any potentially blocking allocation or
-            // filesystem work. Crossing a later promotion is reconciled below
-            // before this physical result may be published or returned.
+            // Snapshot the immutable package access before any potentially
+            // blocking allocation or filesystem work. The Arc owns the one
+            // source identity through the complete delivery.
             let read_access = cohort
                 .as_deref()
                 .map_or_else(|| self.access_snapshot(), |cohort| cohort.accepted.clone());
@@ -1522,34 +1068,24 @@ impl LocalDatasetSource {
                         return Err(error);
                     }
                 };
-            let loaded = {
-                let loaded = if let Some(cohort) = cohort.as_deref_mut() {
-                    read_access
-                        .access
-                        .read_brick_in_cohort(coordinates, cohort.transaction, || {
-                            if joined_loading.is_some() && sink.is_cancelled() {
-                                self.leave_physical_interest(coordinates, &loading_ticket);
-                                joined_loading = None;
-                            }
-                            shared_cancellation.load(Ordering::Acquire)
-                        })
-                } else {
-                    read_access.access.read_brick(coordinates, || {
+            let loaded = if let Some(cohort) = cohort.as_deref_mut() {
+                read_access
+                    .access
+                    .read_brick_in_cohort(coordinates, cohort.transaction, || {
                         if joined_loading.is_some() && sink.is_cancelled() {
                             self.leave_physical_interest(coordinates, &loading_ticket);
                             joined_loading = None;
                         }
                         shared_cancellation.load(Ordering::Acquire)
                     })
-                };
-                if let Ok(brick) = &loaded
-                    && let Err(error) = self
-                        .record_delivery_observations(&read_access.access, brick.object_snapshots())
-                {
-                    self.remove_physical_loading(coordinates, &loading_ticket);
-                    return Err(map_read_error(key, error));
-                }
-                loaded
+            } else {
+                read_access.access.read_brick(coordinates, || {
+                    if joined_loading.is_some() && sink.is_cancelled() {
+                        self.leave_physical_interest(coordinates, &loading_ticket);
+                        joined_loading = None;
+                    }
+                    shared_cancellation.load(Ordering::Acquire)
+                })
             };
             let brick = match loaded {
                 Ok(brick) if brick.payload_facts().is_some() => Arc::new(brick),
@@ -2294,15 +1830,11 @@ impl LocalDatasetSource {
                 }
             }
         }
-        let shared_delivery = self
-            .record_delivery_observations(&read_access.access, &snapshots)
-            .and_then(|()| {
-                self.finish_snapshot_delivery(read_access, &snapshots, || {
-                    pending
-                        .iter()
-                        .all(|(member, _)| sinks[member.sink_index].is_cancelled())
-                })
-            });
+        let shared_delivery = self.finish_snapshot_delivery(read_access, &snapshots, || {
+            pending
+                .iter()
+                .all(|(member, _)| sinks[member.sink_index].is_cancelled())
+        });
         if let Err(error) = shared_delivery {
             let kind = SharedSourceFault::from_read_error(&error);
             for (member, _) in pending {
@@ -2371,8 +1903,8 @@ impl DatasetSource for LocalDatasetSource {
         let access = self.access_snapshot();
         let descriptor_count = access.access.storage_catalog().descriptors().len();
         // The catalog already contains the immutable root/page closure used by
-        // verified currentness checks. This bound is therefore identical
-        // before and after provisional-to-verified promotion.
+        // per-read currentness checks. This bound is identical for ordinary
+        // admitted and importer-published sources.
         let transaction_object_capacity = access.access.runtime_read_object_capacity();
         let snapshots = work
             .saturating_mul(PHYSICAL_BRICK_OBJECT_SNAPSHOTS_MAX)
@@ -2453,7 +1985,8 @@ impl DatasetSource for LocalDatasetSource {
 
 fn build_dataset_catalog(
     storage: &LocalPackageCatalog,
-    identity: ScientificIdentityStatus,
+    content_address_status: ContentAddressStatus,
+    resource_identity: DatasetResourceIdentity,
     display_label: &str,
 ) -> Result<(DatasetCatalog, Vec<LayerStorageMapping>), LocalDatasetSourceOpenError> {
     let mut layers = Vec::with_capacity(storage.science().layers().len());
@@ -2534,7 +2067,14 @@ fn build_dataset_catalog(
                 },
             ));
         }
-        let layer_label = format!("Layer {}", logical_layer.ordinal() + 1);
+        let layer_label = storage
+            .display_defaults()
+            .layers()
+            .iter()
+            .find(|display| display.logical_layer() == logical_layer)
+            .and_then(crate::DisplayLayerDefaults::label)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("Layer {}", logical_layer.ordinal() + 1));
         layers.push(DatasetLayer::new_multiscale(
             logical_layer,
             layer_label,
@@ -2551,7 +2091,12 @@ fn build_dataset_catalog(
         });
     }
     Ok((
-        DatasetCatalog::new(display_label, identity, layers)?,
+        DatasetCatalog::new_with_resource_identity(
+            display_label,
+            content_address_status,
+            resource_identity,
+            layers,
+        )?,
         mappings,
     ))
 }
@@ -3177,104 +2722,6 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn add_reader_diagnostics(
-    left: LocalPackageReadDiagnostics,
-    right: LocalPackageReadDiagnostics,
-) -> LocalPackageReadDiagnostics {
-    LocalPackageReadDiagnostics {
-        object_open_operations: left
-            .object_open_operations
-            .saturating_add(right.object_open_operations),
-        object_open_time_ns: left
-            .object_open_time_ns
-            .saturating_add(right.object_open_time_ns),
-        open_object_handles_current: left
-            .open_object_handles_current
-            .saturating_add(right.open_object_handles_current),
-        open_object_handles_peak: left
-            .open_object_handles_peak
-            .max(right.open_object_handles_peak),
-        object_handle_cache_entries: left
-            .object_handle_cache_entries
-            .saturating_add(right.object_handle_cache_entries),
-        object_handle_cache_peak_entries: left
-            .object_handle_cache_peak_entries
-            .saturating_add(right.object_handle_cache_peak_entries),
-        object_handle_cache_hits: left
-            .object_handle_cache_hits
-            .saturating_add(right.object_handle_cache_hits),
-        object_handle_cache_misses: left
-            .object_handle_cache_misses
-            .saturating_add(right.object_handle_cache_misses),
-        object_handle_cache_evictions: left
-            .object_handle_cache_evictions
-            .saturating_add(right.object_handle_cache_evictions),
-        object_handle_cache_lock_acquisitions: left
-            .object_handle_cache_lock_acquisitions
-            .saturating_add(right.object_handle_cache_lock_acquisitions),
-        object_handle_cache_lock_contentions: left
-            .object_handle_cache_lock_contentions
-            .saturating_add(right.object_handle_cache_lock_contentions),
-        object_handle_cache_lock_wait_time_ns: left
-            .object_handle_cache_lock_wait_time_ns
-            .saturating_add(right.object_handle_cache_lock_wait_time_ns),
-        shard_index_cache_hits: left
-            .shard_index_cache_hits
-            .saturating_add(right.shard_index_cache_hits),
-        shard_index_cache_misses: left
-            .shard_index_cache_misses
-            .saturating_add(right.shard_index_cache_misses),
-        shard_index_decode_operations: left
-            .shard_index_decode_operations
-            .saturating_add(right.shard_index_decode_operations),
-        packed_inner_cache_hits: left
-            .packed_inner_cache_hits
-            .saturating_add(right.packed_inner_cache_hits),
-        packed_inner_cache_misses: left
-            .packed_inner_cache_misses
-            .saturating_add(right.packed_inner_cache_misses),
-        currentness_pre_use_batches: left
-            .currentness_pre_use_batches
-            .saturating_add(right.currentness_pre_use_batches),
-        currentness_post_use_batches: left
-            .currentness_post_use_batches
-            .saturating_add(right.currentness_post_use_batches),
-        currentness_snapshot_batches: left
-            .currentness_snapshot_batches
-            .saturating_add(right.currentness_snapshot_batches),
-        currentness_root_metadata_checks: left
-            .currentness_root_metadata_checks
-            .saturating_add(right.currentness_root_metadata_checks),
-        currentness_named_object_resolutions: left
-            .currentness_named_object_resolutions
-            .saturating_add(right.currentness_named_object_resolutions),
-        currentness_object_fd_metadata_checks: left
-            .currentness_object_fd_metadata_checks
-            .saturating_add(right.currentness_object_fd_metadata_checks),
-        currentness_time_ns: left
-            .currentness_time_ns
-            .saturating_add(right.currentness_time_ns),
-        physical_range_read_operations: left
-            .physical_range_read_operations
-            .saturating_add(right.physical_range_read_operations),
-        physical_encoded_bytes_read: left
-            .physical_encoded_bytes_read
-            .saturating_add(right.physical_encoded_bytes_read),
-        physical_range_read_time_ns: left
-            .physical_range_read_time_ns
-            .saturating_add(right.physical_range_read_time_ns),
-        codec_decode_operations: left
-            .codec_decode_operations
-            .saturating_add(right.codec_decode_operations),
-        codec_decoded_bytes: left
-            .codec_decoded_bytes
-            .saturating_add(right.codec_decoded_bytes),
-        codec_decode_time_ns: left
-            .codec_decode_time_ns
-            .saturating_add(right.codec_decode_time_ns),
-    }
 }
 
 fn subtract_reader_diagnostics(
@@ -4184,7 +3631,7 @@ mod tests {
         crate::LocalPackageWriter::write_new(
             fixture.path(),
             crate::PackageWriteInput::new(
-                crate::ProfileKind::Ds0,
+                crate::ProfileKind::Current,
                 profile,
                 science,
                 display,
@@ -4371,7 +3818,7 @@ mod tests {
         crate::LocalPackageWriter::write_new(
             fixture.path(),
             crate::PackageWriteInput::new(
-                crate::ProfileKind::Ds0,
+                crate::ProfileKind::Current,
                 profile,
                 science,
                 display,
@@ -4536,7 +3983,7 @@ mod tests {
         crate::LocalPackageWriter::write_new(
             fixture.path(),
             crate::PackageWriteInput::new(
-                crate::ProfileKind::Ds0,
+                crate::ProfileKind::Current,
                 profile,
                 science,
                 display,
@@ -4856,7 +4303,7 @@ mod tests {
     #[test]
     fn contiguous_validity_ranges_match_scalar_bit_setting() {
         let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(DatasetSourceId::new(1)),
+            DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(1)),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -4881,24 +4328,22 @@ mod tests {
         let ledger = Arc::new(TestLedger::default());
         let injected: Arc<dyn CpuByteLedger> = ledger.clone();
         let source_id = DatasetSourceId::new(41);
-        let source = LocalDatasetSource::from_provisional(
-            LocalPackageCatalog::open(fixture.path()).unwrap(),
-            source_id,
-            "Sparse target",
-            injected,
-        )
-        .unwrap();
+        let storage = LocalPackageCatalog::open(fixture.path()).unwrap();
+        let declared_content_id = storage.science().scientific_content_id();
+        let source =
+            LocalDatasetSource::from_admitted(storage, source_id, "Sparse target", injected)
+                .unwrap();
 
         assert_eq!(source.package_id(), None);
         let catalog = source.catalog().unwrap();
         assert_eq!(catalog.label(), "Sparse target");
         assert_eq!(
-            catalog.scientific_identity(),
-            &ScientificIdentityStatus::Unverified(source_id)
+            catalog.content_address_status(),
+            &ContentAddressStatus::ContentAddress(declared_content_id)
         );
         let region = ResourceRegion::new([0, 256, 255], Shape3D::new(1, 1, 770).unwrap()).unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(source_id),
+            DatasetResourceIdentity::SessionLocal(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -4937,7 +4382,7 @@ mod tests {
             let ledger = Arc::new(TestLedger::default());
             let injected: Arc<dyn CpuByteLedger> = ledger.clone();
             let source_id = DatasetSourceId::new(77);
-            let source = LocalDatasetSource::from_provisional(
+            let source = LocalDatasetSource::from_admitted(
                 LocalPackageCatalog::open(fixture.path()).unwrap(),
                 source_id,
                 "Coalesced target",
@@ -4949,7 +4394,7 @@ mod tests {
 
         fn quadrant_key(source_id: DatasetSourceId, y: u64, x: u64) -> BrickKey {
             BrickKey::new(
-                DatasetResourceIdentity::Unverified(source_id),
+                DatasetResourceIdentity::SessionLocal(source_id),
                 LogicalLayerKey::new(0),
                 TimeIndex::new(0),
                 ScaleLevel::BASE,
@@ -5011,7 +4456,7 @@ mod tests {
 
         let fixture = wide_2d_overlap_target();
         let source_id = DatasetSourceId::new(177);
-        let source = LocalDatasetSource::from_provisional(
+        let source = LocalDatasetSource::from_admitted(
             LocalPackageCatalog::open(fixture.path()).unwrap(),
             source_id,
             "Physical-order cohort target",
@@ -5022,7 +4467,7 @@ mod tests {
         let mut owned = (0..MEMBERS)
             .map(|x| {
                 let key = BrickKey::new(
-                    DatasetResourceIdentity::Unverified(source_id),
+                    DatasetResourceIdentity::SessionLocal(source_id),
                     LogicalLayerKey::new(0),
                     TimeIndex::new(0),
                     ScaleLevel::BASE,
@@ -5071,7 +4516,7 @@ mod tests {
         let (runtime, catalog) = <dyn DatasetRuntime>::start(config, move |ledger| {
             let package = LocalPackageCatalog::open(&source_path)
                 .map_err(|_| RuntimeFault::new(RuntimeFaultCode::InvariantViolation))?;
-            let inner = LocalDatasetSource::from_provisional(
+            let inner = LocalDatasetSource::from_admitted(
                 package,
                 source_id,
                 "Runtime physical-order cohort target",
@@ -5091,7 +4536,7 @@ mod tests {
         let mut blocker_tickets = Vec::with_capacity(WORKERS);
         for index in 0..WORKERS {
             let key = BrickKey::new(
-                DatasetResourceIdentity::Unverified(source_id),
+                DatasetResourceIdentity::SessionLocal(source_id),
                 LogicalLayerKey::new(0),
                 TimeIndex::new(0),
                 ScaleLevel::BASE,
@@ -5215,7 +4660,7 @@ mod tests {
     fn unaligned_cohort_postvalidation_rejects_mutation_before_any_sink_publication() {
         let fixture = TargetFixture::extract("m4d-t1-u8-2d-sparse");
         let source_id = DatasetSourceId::new(178);
-        let source = LocalDatasetSource::from_provisional(
+        let source = LocalDatasetSource::from_admitted(
             LocalPackageCatalog::open(fixture.path()).unwrap(),
             source_id,
             "Late mutation target",
@@ -5223,7 +4668,7 @@ mod tests {
         )
         .unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(source_id),
+            DatasetResourceIdentity::SessionLocal(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -5259,7 +4704,7 @@ mod tests {
     fn physical_loading_cancellation_is_interest_and_generation_scoped() {
         let fixture = TargetFixture::extract("m4d-t1-u8-2d-sparse");
         let ledger: Arc<dyn CpuByteLedger> = Arc::new(TestLedger::default());
-        let source = LocalDatasetSource::from_provisional(
+        let source = LocalDatasetSource::from_admitted(
             LocalPackageCatalog::open(fixture.path()).unwrap(),
             DatasetSourceId::new(79),
             "Generation target",
@@ -5347,7 +4792,7 @@ mod tests {
         let ledger = Arc::new(TestLedger::default());
         let injected: Arc<dyn CpuByteLedger> = ledger.clone();
         let source_id = DatasetSourceId::new(81);
-        let source = LocalDatasetSource::from_provisional(
+        let source = LocalDatasetSource::from_admitted(
             LocalPackageCatalog::open(fixture.path()).unwrap(),
             source_id,
             "Cancellation target",
@@ -5355,7 +4800,7 @@ mod tests {
         )
         .unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(source_id),
+            DatasetResourceIdentity::SessionLocal(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -5415,7 +4860,7 @@ mod tests {
         let ledger = Arc::new(GatedBypassLedger::default());
         let injected: Arc<dyn CpuByteLedger> = ledger.clone();
         let source_id = DatasetSourceId::new(80);
-        let source = LocalDatasetSource::from_provisional(
+        let source = LocalDatasetSource::from_admitted(
             LocalPackageCatalog::open(fixture.path()).unwrap(),
             source_id,
             "Bypass target",
@@ -5423,7 +4868,7 @@ mod tests {
         )
         .unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(source_id),
+            DatasetResourceIdentity::SessionLocal(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -5548,7 +4993,7 @@ mod tests {
         let ledger = Arc::new(TestLedger::default());
         let injected: Arc<dyn CpuByteLedger> = ledger.clone();
         let source_id = DatasetSourceId::new(78);
-        let source = LocalDatasetSource::from_provisional(
+        let source = LocalDatasetSource::from_admitted(
             LocalPackageCatalog::open(fixture.path()).unwrap(),
             source_id,
             "Direct target",
@@ -5556,7 +5001,7 @@ mod tests {
         )
         .unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(source_id),
+            DatasetResourceIdentity::SessionLocal(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -5611,24 +5056,29 @@ mod tests {
     }
 
     #[test]
-    fn aligned_direct_delivery_preserves_verified_authority_batches() {
+    fn aligned_direct_delivery_preserves_self_consistent_authority_batches() {
         let fixture = TargetFixture::extract("m4d-t1-u16-3d-multiscale");
-        let verified = LocalPackageCatalog::open(fixture.path())
+        let self_consistent = LocalPackageCatalog::open(fixture.path())
             .unwrap()
             .validate_exact_supported_package(|| false)
             .unwrap()
             .validate_scientific_content(|| false)
             .unwrap();
-        assert_eq!(verified.validation_report().pyramid_fact_brick_reads(), 6);
-        let scientific_id = verified.scientific_content_id();
-        let source = LocalDatasetSource::from_verified(
-            verified,
+        assert_eq!(
+            self_consistent
+                .validation_report()
+                .pyramid_fact_brick_reads(),
+            6
+        );
+        let scientific_id = self_consistent.scientific_content_id();
+        let source = LocalDatasetSource::from_published(
+            self_consistent,
             "Verified direct target",
             Arc::new(TestLedger::default()),
         )
         .unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Verified(scientific_id),
+            DatasetResourceIdentity::ContentAddress(scientific_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -5650,22 +5100,23 @@ mod tests {
     }
 
     #[test]
-    fn verified_aligned_cohort_has_constant_exact_currentness_and_one_scratch_lease() {
+    fn self_consistent_aligned_cohort_has_constant_exact_currentness_and_one_scratch_lease() {
         const MEMBERS: usize = 8;
         let fixture = TargetFixture::extract("m4d-t1-u16-3d-multiscale");
-        let verified = LocalPackageCatalog::open(fixture.path())
+        let self_consistent = LocalPackageCatalog::open(fixture.path())
             .unwrap()
             .validate_exact_supported_package(|| false)
             .unwrap()
             .validate_scientific_content(|| false)
             .unwrap();
-        let scientific_id = verified.scientific_content_id();
+        let scientific_id = self_consistent.scientific_content_id();
         let ledger = Arc::new(TestLedger::default());
         let injected: Arc<dyn CpuByteLedger> = ledger.clone();
         let source =
-            LocalDatasetSource::from_verified(verified, "Verified cohort", injected).unwrap();
+            LocalDatasetSource::from_published(self_consistent, "Self-consistent cohort", injected)
+                .unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Verified(scientific_id),
+            DatasetResourceIdentity::ContentAddress(scientific_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -5727,7 +5178,7 @@ mod tests {
     fn aligned_cohort_keeps_cancellation_and_sink_errors_member_local() {
         let fixture = TargetFixture::extract("m4d-t1-u16-3d-multiscale");
         let source_id = DatasetSourceId::new(181);
-        let source = LocalDatasetSource::from_provisional(
+        let source = LocalDatasetSource::from_admitted(
             LocalPackageCatalog::open(fixture.path()).unwrap(),
             source_id,
             "Independent cohort members",
@@ -5735,7 +5186,7 @@ mod tests {
         )
         .unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(source_id),
+            DatasetResourceIdentity::SessionLocal(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -5771,21 +5222,21 @@ mod tests {
     #[test]
     fn cohort_postvalidation_mutation_fails_every_unfinished_success() {
         let fixture = TargetFixture::extract("m4d-t1-u16-3d-multiscale");
-        let verified = LocalPackageCatalog::open(fixture.path())
+        let self_consistent = LocalPackageCatalog::open(fixture.path())
             .unwrap()
             .validate_exact_supported_package(|| false)
             .unwrap()
             .validate_scientific_content(|| false)
             .unwrap();
-        let scientific_id = verified.scientific_content_id();
-        let source = LocalDatasetSource::from_verified(
-            verified,
+        let scientific_id = self_consistent.scientific_content_id();
+        let source = LocalDatasetSource::from_published(
+            self_consistent,
             "Mutation cohort",
             Arc::new(TestLedger::default()),
         )
         .unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Verified(scientific_id),
+            DatasetResourceIdentity::ContentAddress(scientific_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -5818,7 +5269,7 @@ mod tests {
     }
 
     #[test]
-    fn scientific_capability_rejects_lied_s1_facts_before_verified_source_admission() {
+    fn scientific_capability_rejects_lied_s1_facts_before_published_source_admission() {
         let fixture = coarse_scale_lied_statistics_target();
         let exact = LocalPackageCatalog::open(fixture.path())
             .unwrap()
@@ -5839,25 +5290,25 @@ mod tests {
     /// brick without checking in a 512-MiB package.
     #[test]
     #[ignore = "release-only 1,024-brick storage-scale diagnostic"]
-    fn aligned_verified_1024_brick_storage_scale_diagnostic() {
+    fn aligned_self_consistent_1024_brick_storage_scale_diagnostic() {
         const BRICKS: u64 = 1_024;
 
         let fixture = TargetFixture::extract("m4d-t1-u16-3d-multiscale");
-        let verified = LocalPackageCatalog::open(fixture.path())
+        let self_consistent = LocalPackageCatalog::open(fixture.path())
             .unwrap()
             .validate_exact_supported_package(|| false)
             .unwrap()
             .validate_scientific_content(|| false)
             .unwrap();
-        let scientific_id = verified.scientific_content_id();
-        let source = LocalDatasetSource::from_verified(
-            verified,
+        let scientific_id = self_consistent.scientific_content_id();
+        let source = LocalDatasetSource::from_published(
+            self_consistent,
             "Verified 1,024-brick diagnostic",
             Arc::new(TestLedger::default()),
         )
         .unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Verified(scientific_id),
+            DatasetResourceIdentity::ContentAddress(scientific_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -5939,26 +5390,29 @@ mod tests {
     /// benchmark-only cache, batching path, or scheduler.
     #[test]
     #[ignore = "release-only 8-consumer storage-scale diagnostic"]
-    fn aligned_verified_1024_brick_eight_consumer_storage_scale_diagnostic() {
+    fn aligned_self_consistent_1024_brick_eight_consumer_storage_scale_diagnostic() {
         const CONSUMERS: u64 = 8;
         const BRICKS_PER_CONSUMER: u64 = 128;
         const BRICKS: u64 = CONSUMERS * BRICKS_PER_CONSUMER;
 
         let fixture = TargetFixture::extract("m4d-t1-u16-3d-multiscale");
-        let verified = LocalPackageCatalog::open(fixture.path())
+        let self_consistent = LocalPackageCatalog::open(fixture.path())
             .unwrap()
             .validate_exact_supported_package(|| false)
             .unwrap()
             .validate_scientific_content(|| false)
             .unwrap();
-        let scientific_id = verified.scientific_content_id();
+        let scientific_id = self_consistent.scientific_content_id();
         let ledger = Arc::new(TestLedger::with_capacity(128 * 1024 * 1024));
         let injected: Arc<dyn CpuByteLedger> = ledger.clone();
-        let source =
-            LocalDatasetSource::from_verified(verified, "Verified 8-consumer diagnostic", injected)
-                .unwrap();
+        let source = LocalDatasetSource::from_published(
+            self_consistent,
+            "Verified 8-consumer diagnostic",
+            injected,
+        )
+        .unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Verified(scientific_id),
+            DatasetResourceIdentity::ContentAddress(scientific_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -6071,7 +5525,7 @@ mod tests {
         let fixture = TargetFixture::extract("m4d-t1-u16-3d-multiscale");
         let source_id = DatasetSourceId::new(181);
         let ledger = Arc::new(TestLedger::default());
-        let source = LocalDatasetSource::from_provisional(
+        let source = LocalDatasetSource::from_admitted(
             LocalPackageCatalog::open(fixture.path()).unwrap(),
             source_id,
             "Cancelled direct target",
@@ -6079,7 +5533,7 @@ mod tests {
         )
         .unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(source_id),
+            DatasetResourceIdentity::SessionLocal(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -6108,7 +5562,7 @@ mod tests {
     fn assert_aligned_nan_source_rejected(valid_nan: bool) {
         let fixture = aligned_nan_target(valid_nan);
         let source_id = DatasetSourceId::new(if valid_nan { 179 } else { 180 });
-        let source = LocalDatasetSource::from_provisional(
+        let source = LocalDatasetSource::from_admitted(
             LocalPackageCatalog::open(fixture.path()).unwrap(),
             source_id,
             "Non-finite aligned target",
@@ -6116,7 +5570,7 @@ mod tests {
         )
         .unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(source_id),
+            DatasetResourceIdentity::SessionLocal(source_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -6149,20 +5603,21 @@ mod tests {
     }
 
     #[test]
-    fn verified_f32_source_uses_proved_identity_and_compact_validity() {
+    fn self_consistent_f32_source_uses_proved_identity_and_compact_validity() {
         let fixture = TargetFixture::extract("m4d-t1-f32-3d-validity");
-        let verified = LocalPackageCatalog::open(fixture.path())
+        let self_consistent = LocalPackageCatalog::open(fixture.path())
             .unwrap()
             .validate_exact_supported_package(|| false)
             .unwrap()
             .validate_scientific_content(|| false)
             .unwrap();
-        let expected_package_id = verified.package_id();
-        let expected_scientific_id = verified.scientific_content_id();
+        let expected_package_id = self_consistent.package_id();
+        let expected_scientific_id = self_consistent.scientific_content_id();
         let ledger = Arc::new(TestLedger::default());
         let injected: Arc<dyn CpuByteLedger> = ledger.clone();
         let source =
-            LocalDatasetSource::from_verified(verified, "Finite f32 target", injected).unwrap();
+            LocalDatasetSource::from_published(self_consistent, "Finite f32 target", injected)
+                .unwrap();
 
         assert_eq!(source.package_id(), Some(expected_package_id));
         let mut reader_diagnostics = source.diagnostics().reader;
@@ -6184,12 +5639,12 @@ mod tests {
         assert_eq!(reader_diagnostics, LocalPackageReadDiagnostics::default());
         let catalog = source.catalog().unwrap();
         assert_eq!(
-            catalog.scientific_identity(),
-            &ScientificIdentityStatus::Verified(expected_scientific_id)
+            catalog.content_address_status(),
+            &ContentAddressStatus::ContentAddress(expected_scientific_id)
         );
         let region = ResourceRegion::new([0, 0, 0], Shape3D::new(1, 1, 16).unwrap()).unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Verified(expected_scientific_id),
+            DatasetResourceIdentity::ContentAddress(expected_scientific_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -6231,23 +5686,23 @@ mod tests {
     }
 
     #[test]
-    fn verified_explicit_validity_decodes_pixels_and_mask_into_final_spans() {
+    fn self_consistent_explicit_validity_decodes_pixels_and_mask_into_final_spans() {
         let fixture = aligned_finite_explicit_validity_target();
-        let verified = LocalPackageCatalog::open(fixture.path())
+        let self_consistent = LocalPackageCatalog::open(fixture.path())
             .unwrap()
             .validate_exact_supported_package(|| false)
             .unwrap()
             .validate_scientific_content(|| false)
             .unwrap();
-        let scientific_id = verified.scientific_content_id();
-        let source = LocalDatasetSource::from_verified(
-            verified,
+        let scientific_id = self_consistent.scientific_content_id();
+        let source = LocalDatasetSource::from_published(
+            self_consistent,
             "Direct validity target",
             Arc::new(TestLedger::default()),
         )
         .unwrap();
         let key = BrickKey::new(
-            DatasetResourceIdentity::Verified(scientific_id),
+            DatasetResourceIdentity::ContentAddress(scientific_id),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -6271,383 +5726,6 @@ mod tests {
             descriptor.byte_len()
         );
         assert_eq!(diagnostics.aligned_direct_post_decode_copy_bytes, 0);
-    }
-
-    #[test]
-    fn provisional_read_crossing_promotion_revalidates_the_committed_authority() {
-        let fixture = TargetFixture::extract("m4d-t1-u8-2d-sparse");
-        let ledger = Arc::new(GatedBypassLedger::default());
-        let injected: Arc<dyn CpuByteLedger> = ledger.clone();
-        let source_id = DatasetSourceId::new(94);
-        let source = LocalDatasetSource::from_provisional(
-            LocalPackageCatalog::open(fixture.path()).unwrap(),
-            source_id,
-            "Crossing target",
-            injected,
-        )
-        .unwrap();
-        let verified = LocalPackageCatalog::open(fixture.path())
-            .unwrap()
-            .validate_exact_supported_package(|| false)
-            .unwrap()
-            .validate_scientific_content(|| false)
-            .unwrap();
-        let expected_package_id = verified.package_id();
-        let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(source_id),
-            LogicalLayerKey::new(0),
-            TimeIndex::new(0),
-            ScaleLevel::BASE,
-            ResourceRegion::new([0, 0, 0], Shape3D::new(1, 64, 64).unwrap()).unwrap(),
-        );
-        let descriptor = source
-            .catalog()
-            .unwrap()
-            .resource_payload_descriptor(key)
-            .unwrap();
-        let mapping = source.mapping(key).unwrap();
-        let coordinates = PackedIndexCoordinates::new(
-            mapping.image,
-            key.scale().get(),
-            u32::try_from(key.timepoint().get()).unwrap(),
-            mapping.physical_channel,
-            0,
-            0,
-            0,
-        );
-        let (finished_tx, finished_rx) = mpsc::channel();
-        let read_source = Arc::clone(&source);
-        let read = thread::spawn(move || {
-            let sink = TestSink::new(key, descriptor);
-            let succeeded = read_source
-                .read_physical_brick(&sink, key, coordinates, descriptor, mapping)
-                .is_ok();
-            finished_tx.send(succeeded).unwrap();
-        });
-
-        // In-flight admission happens after the read captured provisional
-        // authority. Commit while it is blocked, then let that old snapshot
-        // complete and cross the new epoch.
-        ledger.physical_decode.wait_until_entered();
-        source.promote_verified(verified, || false).unwrap();
-        assert_eq!(source.package_id(), Some(expected_package_id));
-        ledger.physical_decode.release();
-        assert!(
-            finished_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("the crossing read should finish")
-        );
-        read.join().unwrap();
-        assert_eq!(
-            source.delivery_epoch_revalidations.load(Ordering::Relaxed),
-            1
-        );
-    }
-
-    #[test]
-    fn gated_promotion_allows_diagnostics_and_reads_then_retries_new_observations() {
-        let fixture = TargetFixture::extract("m4d-t1-u8-2d-sparse");
-        let ledger: Arc<dyn CpuByteLedger> = Arc::new(TestLedger::default());
-        let source_id = DatasetSourceId::new(95);
-        let source = LocalDatasetSource::from_provisional(
-            LocalPackageCatalog::open(fixture.path()).unwrap(),
-            source_id,
-            "Concurrent promotion target",
-            ledger,
-        )
-        .unwrap();
-        let verified = LocalPackageCatalog::open(fixture.path())
-            .unwrap()
-            .validate_exact_supported_package(|| false)
-            .unwrap()
-            .validate_scientific_content(|| false)
-            .unwrap();
-        let expected_package_id = verified.package_id();
-        let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(source_id),
-            LogicalLayerKey::new(0),
-            TimeIndex::new(0),
-            ScaleLevel::BASE,
-            ResourceRegion::new([0, 0, 0], Shape3D::new(1, 64, 64).unwrap()).unwrap(),
-        );
-        let descriptor = source
-            .catalog()
-            .unwrap()
-            .resource_payload_descriptor(key)
-            .unwrap();
-        let promotion_gate = Arc::new(PhysicalDecodeGate::default());
-        let (promotion_tx, promotion_rx) = mpsc::channel();
-        let promotion_source = Arc::clone(&source);
-        let gate = Arc::clone(&promotion_gate);
-        let promotion = thread::spawn(move || {
-            let succeeded = promotion_source
-                .promote_verified(verified, || {
-                    gate.enter_and_wait();
-                    false
-                })
-                .is_ok();
-            promotion_tx.send(succeeded).unwrap();
-        });
-        promotion_gate.wait_until_entered();
-        assert_eq!(source.package_id(), None);
-
-        let (diagnostics_tx, diagnostics_rx) = mpsc::channel();
-        let diagnostics_source = Arc::clone(&source);
-        let diagnostics = thread::spawn(move || {
-            diagnostics_tx
-                .send(diagnostics_source.diagnostics())
-                .unwrap();
-        });
-        let before_read = diagnostics_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("diagnostics must not wait for promotion filesystem work");
-        diagnostics.join().unwrap();
-        assert_eq!(before_read.physical_brick_unique_decodes, 0);
-
-        let (read_tx, read_rx) = mpsc::channel();
-        let read_source = Arc::clone(&source);
-        let read = thread::spawn(move || {
-            let succeeded =
-                decode_one(read_source.as_ref(), &mut TestSink::new(key, descriptor)).is_ok();
-            read_tx.send(succeeded).unwrap();
-        });
-        assert!(
-            read_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("a read must progress during promotion filesystem work")
-        );
-        read.join().unwrap();
-        assert_eq!(source.package_id(), None);
-
-        promotion_gate.release();
-        assert!(
-            promotion_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("promotion should finish after its gate opens")
-        );
-        promotion.join().unwrap();
-        assert_eq!(source.package_id(), Some(expected_package_id));
-        assert_eq!(
-            source.promotion_validation_attempts.load(Ordering::Relaxed),
-            2
-        );
-        assert_eq!(source.diagnostics().physical_brick_unique_decodes, 1);
-    }
-
-    #[test]
-    fn proof_backed_promotion_retains_opaque_keys_and_warm_physical_residency() {
-        let fixture = TargetFixture::extract("m4d-t1-u8-2d-sparse");
-        let ledger = Arc::new(TestLedger::default());
-        let injected: Arc<dyn CpuByteLedger> = ledger.clone();
-        let source_id = DatasetSourceId::new(91);
-        let source = LocalDatasetSource::from_provisional(
-            LocalPackageCatalog::open(fixture.path()).unwrap(),
-            source_id,
-            "Promoted target",
-            injected,
-        )
-        .unwrap();
-        let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(source_id),
-            LogicalLayerKey::new(0),
-            TimeIndex::new(0),
-            ScaleLevel::BASE,
-            ResourceRegion::new([0, 0, 0], Shape3D::new(1, 64, 64).unwrap()).unwrap(),
-        );
-        let catalog = source.catalog().unwrap();
-        let descriptor = catalog.resource_payload_descriptor(key).unwrap();
-        decode_one(source.as_ref(), &mut TestSink::new(key, descriptor)).unwrap();
-        let before = source.diagnostics();
-        assert_eq!(before.physical_brick_unique_decodes, 1);
-
-        let verified = LocalPackageCatalog::open(fixture.path())
-            .unwrap()
-            .validate_exact_supported_package(|| false)
-            .unwrap()
-            .validate_scientific_content(|| false)
-            .unwrap();
-        let package_id = verified.package_id();
-        source.promote_verified(verified, || false).unwrap();
-        assert_eq!(source.package_id(), Some(package_id));
-        assert_eq!(
-            source.catalog().unwrap().scientific_identity(),
-            &ScientificIdentityStatus::Unverified(source_id)
-        );
-
-        decode_one(source.as_ref(), &mut TestSink::new(key, descriptor)).unwrap();
-        let after = source.diagnostics();
-        assert_eq!(after.physical_brick_unique_decodes, 1);
-        assert_eq!(after.physical_brick_cache_hits, 1);
-        assert!(after.reader.object_open_operations >= before.reader.object_open_operations);
-        assert!(ledger.used(CpuLedgerCategory::DecodedResidency) > 0);
-    }
-
-    #[test]
-    fn promotion_exactly_accounts_old_and_new_metadata_until_old_reads_retire() {
-        let fixture = TargetFixture::extract("m4d-t1-u8-2d-sparse");
-        let ledger = Arc::new(TestLedger::default());
-        let source = LocalDatasetSource::from_provisional(
-            LocalPackageCatalog::open(fixture.path()).unwrap(),
-            DatasetSourceId::new(191),
-            "Promotion overlap accounting target",
-            ledger.clone(),
-        )
-        .unwrap();
-        let verified = LocalPackageCatalog::open(fixture.path())
-            .unwrap()
-            .validate_exact_supported_package(|| false)
-            .unwrap()
-            .validate_scientific_content(|| false)
-            .unwrap();
-        let base = ledger.used(CpuLedgerCategory::MetadataAndIndexes);
-        assert_eq!(base, source.metadata_bytes);
-
-        let old_read = source.access_snapshot();
-        source.promote_verified(verified, || false).unwrap();
-        assert_eq!(ledger.used(CpuLedgerCategory::MetadataAndIndexes), base * 2);
-
-        drop(old_read);
-        assert_eq!(ledger.used(CpuLedgerCategory::MetadataAndIndexes), base);
-
-        let refreshed = LocalPackageCatalog::open(fixture.path())
-            .unwrap()
-            .validate_exact_supported_package(|| false)
-            .unwrap()
-            .validate_scientific_content(|| false)
-            .unwrap();
-        source.promote_verified(refreshed, || false).unwrap();
-        assert_eq!(ledger.used(CpuLedgerCategory::MetadataAndIndexes), base);
-    }
-
-    #[test]
-    fn verified_source_refreshes_matching_proof_without_rekeying_or_cold_restart() {
-        let fixture = TargetFixture::extract("m4d-t1-u8-2d-sparse");
-        let ledger: Arc<dyn CpuByteLedger> = Arc::new(TestLedger::default());
-        let source_id = DatasetSourceId::new(93);
-        let source = LocalDatasetSource::from_provisional(
-            LocalPackageCatalog::open(fixture.path()).unwrap(),
-            source_id,
-            "Refresh target",
-            ledger,
-        )
-        .unwrap();
-        let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(source_id),
-            LogicalLayerKey::new(0),
-            TimeIndex::new(0),
-            ScaleLevel::BASE,
-            ResourceRegion::new([0, 0, 0], Shape3D::new(1, 64, 64).unwrap()).unwrap(),
-        );
-        let descriptor = source
-            .catalog()
-            .unwrap()
-            .resource_payload_descriptor(key)
-            .unwrap();
-        decode_one(source.as_ref(), &mut TestSink::new(key, descriptor)).unwrap();
-
-        let first = LocalPackageCatalog::open(fixture.path())
-            .unwrap()
-            .validate_exact_supported_package(|| false)
-            .unwrap()
-            .validate_scientific_content(|| false)
-            .unwrap();
-        let expected_package = first.package_id();
-        let expected_science = first.scientific_content_id();
-        source.promote_verified(first, || false).unwrap();
-        let before_refresh = source.diagnostics();
-
-        let refreshed = LocalPackageCatalog::open(fixture.path())
-            .unwrap()
-            .validate_exact_supported_package(|| false)
-            .unwrap()
-            .validate_scientific_content(|| false)
-            .unwrap();
-        assert_eq!(refreshed.package_id(), expected_package);
-        assert_eq!(refreshed.scientific_content_id(), expected_science);
-        source.promote_verified(refreshed, || false).unwrap();
-        assert_eq!(source.package_id(), Some(expected_package));
-        assert_eq!(
-            source.catalog().unwrap().scientific_identity(),
-            &ScientificIdentityStatus::Unverified(source_id)
-        );
-
-        decode_one(source.as_ref(), &mut TestSink::new(key, descriptor)).unwrap();
-        let after_refresh = source.diagnostics();
-        assert_eq!(after_refresh.physical_brick_unique_decodes, 1);
-        assert_eq!(after_refresh.physical_brick_cache_entries, 1);
-        assert_eq!(
-            after_refresh.physical_brick_cache_hits,
-            before_refresh.physical_brick_cache_hits + 1
-        );
-
-        let pixel = fixture.path().join("images/i00000000/s00/c/0/0/0/0/0");
-        let replacement = fixture.path().join("replacement-refresh-pixel");
-        fs::write(&replacement, fs::read(&pixel).unwrap()).unwrap();
-        fs::rename(replacement, pixel).unwrap();
-        let changed_generation = LocalPackageCatalog::open(fixture.path())
-            .unwrap()
-            .validate_exact_supported_package(|| false)
-            .unwrap()
-            .validate_scientific_content(|| false)
-            .unwrap();
-        assert_eq!(changed_generation.package_id(), expected_package);
-        assert_eq!(changed_generation.scientific_content_id(), expected_science);
-        let failure = source
-            .promote_verified(changed_generation, || false)
-            .unwrap_err();
-        assert!(matches!(
-            failure.error(),
-            LocalDatasetSourcePromotionError::Currentness(_)
-        ));
-        assert_eq!(source.package_id(), Some(expected_package));
-    }
-
-    #[test]
-    fn promotion_rejects_a_replaced_used_object_and_returns_the_capability() {
-        let fixture = TargetFixture::extract("m4d-t1-u8-2d-sparse");
-        let ledger = Arc::new(TestLedger::default());
-        let injected: Arc<dyn CpuByteLedger> = ledger;
-        let source_id = DatasetSourceId::new(92);
-        let source = LocalDatasetSource::from_provisional(
-            LocalPackageCatalog::open(fixture.path()).unwrap(),
-            source_id,
-            "Drift target",
-            injected,
-        )
-        .unwrap();
-        let key = BrickKey::new(
-            DatasetResourceIdentity::Unverified(source_id),
-            LogicalLayerKey::new(0),
-            TimeIndex::new(0),
-            ScaleLevel::BASE,
-            ResourceRegion::new([0, 0, 0], Shape3D::new(1, 64, 64).unwrap()).unwrap(),
-        );
-        let descriptor = source
-            .catalog()
-            .unwrap()
-            .resource_payload_descriptor(key)
-            .unwrap();
-        decode_one(source.as_ref(), &mut TestSink::new(key, descriptor)).unwrap();
-        let verified = LocalPackageCatalog::open(fixture.path())
-            .unwrap()
-            .validate_exact_supported_package(|| false)
-            .unwrap()
-            .validate_scientific_content(|| false)
-            .unwrap();
-        let expected_package_id = verified.package_id();
-        let pixel = fixture.path().join("images/i00000000/s00/c/0/0/0/0/0");
-        let replacement = fixture.path().join("replacement-promotion-pixel");
-        fs::write(&replacement, fs::read(&pixel).unwrap()).unwrap();
-        fs::rename(replacement, pixel).unwrap();
-
-        let failure = source.promote_verified(verified, || false).unwrap_err();
-        assert!(matches!(
-            failure.error(),
-            LocalDatasetSourcePromotionError::Currentness(_)
-        ));
-        let (capability, _) = failure.into_parts();
-        assert_eq!(capability.package_id(), expected_package_id);
-        assert_eq!(source.package_id(), None);
     }
 
     struct TargetFixture(PathBuf);

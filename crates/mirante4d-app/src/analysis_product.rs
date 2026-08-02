@@ -5,7 +5,7 @@ use mirante4d_analysis_core::AnalysisDefinition;
 use mirante4d_analysis_runtime::{AnalysisFailure, CompletionEvent, required_result_bytes};
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, OperationCompletion, OperationFailureCode, OperationKind,
-    OperationToken, ProjectStoreLifecycle, SourceVerificationSnapshot, WorkspaceSnapshot,
+    OperationToken, ProjectStoreLifecycle, WorkspaceSnapshot,
 };
 use mirante4d_dataset::ResourceRegion;
 use mirante4d_dataset_runtime::{RequestPriority, RuntimeFault, RuntimeFaultCode};
@@ -26,9 +26,6 @@ impl MiranteWorkbenchApp {
             return Some("An analysis is already running or being saved.".to_owned());
         }
         let snapshot = self.application.snapshot();
-        if !matches!(snapshot.source(), SourceVerificationSnapshot::Verified(_)) {
-            return Some("Verify the microscopy source before analyzing it.".to_owned());
-        }
         let WorkspaceSnapshot::Bound { project, dirty, .. } = snapshot.workspace() else {
             return Some("Save the project once before running analysis.".to_owned());
         };
@@ -41,7 +38,7 @@ impl MiranteWorkbenchApp {
         if self.dataset.source_quarantined()
             || self.dataset.resource_identity() != snapshot.catalog().resource_identity()
         {
-            return Some("The verified microscopy runtime is not ready yet.".to_owned());
+            return Some("The admitted microscopy runtime is not ready yet.".to_owned());
         }
         let Some(service) = self.project_store.as_ref() else {
             return Some("Project storage is unavailable.".to_owned());
@@ -353,11 +350,7 @@ impl MiranteWorkbenchApp {
                 let code = analysis_failure_code(&failure);
                 self.complete_background_operation(token, OperationCompletion::Failed(code));
                 self.project_status_message = Some(format!("Analysis failed: {failure}"));
-                if let AnalysisFailure::Dataset(fault) = &failure
-                    && crate::workbench_brick_runtime::runtime_fault_invalidates_verified_source(
-                        fault.code(),
-                    )
-                {
+                if let AnalysisFailure::Dataset(fault) = &failure {
                     self.record_dataset_fault(fault);
                 }
             }

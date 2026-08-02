@@ -561,7 +561,7 @@ mod tests {
     use super::*;
 
     fn identity() -> DatasetResourceIdentity {
-        DatasetResourceIdentity::Verified(
+        DatasetResourceIdentity::ContentAddress(
             "m4d-sc-v1-sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 .parse()
                 .unwrap(),

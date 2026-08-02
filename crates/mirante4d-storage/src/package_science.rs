@@ -11,7 +11,6 @@ use thiserror::Error;
 
 use crate::brick_address::{brick_grid, pixel_brick};
 use crate::package_read::{LocalDirectBrickRead, LocalDirectBrickReadError};
-use crate::range_io::{LocalObjectGeneration, LocalObjectSnapshot};
 use crate::range_io::{LocalPackageRootSeal, PublishedPackageRootBinding};
 use crate::{
     DatasetProfileAdmission, DirectoryInventoryError, ExactPackageCapability,
@@ -23,7 +22,7 @@ use crate::{
 
 const SCIENTIFIC_SCAN_FIXED_WORKING_BYTES: u64 = 256 * 1024;
 
-/// Closed storage execution contract used when a verified scientific package
+/// Closed storage execution contract used when a self-consistent package
 /// crosses the create-only publication boundary.
 ///
 /// The identifier is evidence, not caller input: it is issued only after the
@@ -102,6 +101,35 @@ pub struct ScientificValidationReport {
     peak_scan_working_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScientificValidationProgressStage {
+    CanonicalBaseContent,
+    PyramidAccelerationFacts,
+}
+
+/// Truthful cumulative decode work emitted only after a brick has been read,
+/// decoded, and incorporated into the current audit stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScientificValidationProgress {
+    stage: ScientificValidationProgressStage,
+    decoded_bricks: u64,
+    decoded_bytes: u64,
+}
+
+impl ScientificValidationProgress {
+    pub const fn stage(self) -> ScientificValidationProgressStage {
+        self.stage
+    }
+
+    pub const fn decoded_bricks(self) -> u64 {
+        self.decoded_bricks
+    }
+
+    pub const fn decoded_bytes(self) -> u64 {
+        self.decoded_bytes
+    }
+}
+
 impl ScientificValidationReport {
     pub const fn layer_count(self) -> u32 {
         self.layer_count
@@ -116,8 +144,8 @@ impl ScientificValidationReport {
     }
 
     /// Non-base bricks decoded solely to prove every packed-index fact used by
-    /// the scan-free verified runtime path. Base-brick facts are proved while
-    /// computing the scientific identity and remain included in `brick_reads`.
+    /// the published fast path. Base-brick facts are proved while computing
+    /// the canonical content address and remain included in `brick_reads`.
     pub const fn pyramid_fact_brick_reads(self) -> u64 {
         self.pyramid_fact_brick_reads
     }
@@ -182,21 +210,31 @@ impl ScientificValidationReport {
 /// A package whose exact byte closure and declared scientific content both
 /// passed their distinct validation contracts.
 #[derive(Debug)]
-pub struct VerifiedScientificPackageCapability {
+pub struct SelfConsistentPackageCapability {
     exact: ExactPackageCapability,
     scientific_content_id: ScientificContentId,
     layer_roots: Vec<ScientificLayerRoot>,
     report: ScientificValidationReport,
-    all_scale_packed_record_facts: VerifiedAllScalePackedRecordFactsCapability,
+    all_scale_packed_record_facts: CheckedAllScalePackedRecordFactsCapability,
 }
 
 /// Private proof marker issued only after the scientific pass has compared
 /// every packed statistic at every runtime-addressable scale with its decoded
 /// canonical samples.
 #[derive(Debug)]
-struct VerifiedAllScalePackedRecordFactsCapability;
+struct CheckedAllScalePackedRecordFactsCapability;
 
-impl VerifiedScientificPackageCapability {
+impl SelfConsistentPackageCapability {
+    /// Number of encoded package objects covered by the exact-byte audit.
+    pub const fn objects_hashed(&self) -> u64 {
+        self.exact.objects_hashed()
+    }
+
+    /// Number of encoded package bytes covered by the exact-byte audit.
+    pub const fn bytes_hashed(&self) -> u64 {
+        self.exact.bytes_hashed()
+    }
+
     pub const fn package_id(&self) -> PackageId {
         self.exact.package_id()
     }
@@ -213,7 +251,7 @@ impl VerifiedScientificPackageCapability {
         self.exact.catalog()
     }
 
-    /// Canonical local root currently owned by this verified capability.
+    /// Canonical local root currently owned by this self-consistent capability.
     ///
     /// A capability transferred through create-only publication is rebound to
     /// the published destination before it can be returned to a caller.
@@ -267,7 +305,7 @@ impl VerifiedScientificPackageCapability {
             coordinates,
             sink,
             transaction,
-            crate::package_read::DirectPayloadFactsAuthority::VerifiedPackedRecord,
+            crate::package_read::DirectPayloadFactsAuthority::PublishedPackedRecord,
         )
     }
 
@@ -298,24 +336,6 @@ impl VerifiedScientificPackageCapability {
         is_cancelled: impl FnMut() -> bool,
     ) -> Result<(), PackageReadError> {
         self.exact.revalidate_cached_brick(brick, is_cancelled)
-    }
-
-    pub(crate) fn revalidate_cached_snapshots(
-        &self,
-        snapshots: &[LocalObjectSnapshot],
-        is_cancelled: impl FnMut() -> bool,
-    ) -> Result<(), PackageReadError> {
-        self.exact
-            .revalidate_cached_snapshots(snapshots, is_cancelled)
-    }
-
-    pub(crate) fn validate_promotion_observations(
-        &self,
-        observations: &[Option<LocalObjectGeneration>],
-        is_cancelled: impl FnMut() -> bool,
-    ) -> Result<(), PackageReadError> {
-        self.exact
-            .validate_promotion_observations(observations, is_cancelled)
     }
 
     pub(crate) fn prepare_atomic_publication(
@@ -368,7 +388,7 @@ pub enum ScientificPublicationTransferError {
 /// Linear, crate-private handoff from staged scientific validation into atomic
 /// local publication.
 pub(crate) struct PreparedScientificPublication {
-    capability: VerifiedScientificPackageCapability,
+    capability: SelfConsistentPackageCapability,
     root_seal: LocalPackageRootSeal,
 }
 
@@ -392,7 +412,7 @@ impl PreparedScientificPublication {
     pub(crate) fn rebind_after_publication(
         mut self,
         binding: PublishedPackageRootBinding,
-    ) -> Result<VerifiedScientificPackageCapability, ScientificPublicationTransferError> {
+    ) -> Result<SelfConsistentPackageCapability, ScientificPublicationTransferError> {
         self.capability
             .exact
             .catalog_mut()
@@ -404,7 +424,7 @@ impl PreparedScientificPublication {
 }
 
 pub(crate) fn refresh_publication_currentness(
-    capability: &VerifiedScientificPackageCapability,
+    capability: &SelfConsistentPackageCapability,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<ScientificPublicationTransferEvidence, ScientificPublicationTransferError> {
     let reader = capability.exact.catalog().reader();
@@ -495,7 +515,7 @@ fn validate_publication_currentness_evidence(
 }
 
 fn inspect_publication_inventory(
-    capability: &VerifiedScientificPackageCapability,
+    capability: &SelfConsistentPackageCapability,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<(), ScientificPublicationTransferError> {
     capability
@@ -533,7 +553,7 @@ fn map_publication_root_binding_error(error: RangeReadError) -> ScientificPublic
     }
 }
 
-/// Typed failure before a verified-scientific-package capability can issue.
+/// Typed failure before a self-consistent package capability can issue.
 #[derive(Debug, Error)]
 pub enum ScientificPackageValidationError {
     #[error("scientific-content validation was cancelled")]
@@ -570,51 +590,75 @@ pub enum ScientificPackageValidationError {
 }
 
 impl ExactPackageCapability {
-    /// Consumes an exact-package capability and verifies the storage-independent
-    /// scientific identity from base-scale pixels and effective validity.
+    /// Consumes an exact-package capability and recomputes the storage-independent
+    /// content address from base-scale pixels and effective validity.
     ///
     /// The operation retains at most four fixed D-009 identity tiles, one
     /// decoded storage brick, and one profile-bounded slab of opaque tile
-    /// digests. It authenticates manifest authority around the whole scan,
-    /// checks every consumed shard against the exact-package proof, and
+    /// digests. It checks manifest currentness around the whole scan, checks
+    /// every consumed shard against the exact-package proof, and
     /// performs a final complete snapshot sweep before issuing the stronger
     /// capability.
     pub fn validate_scientific_content(
         self,
         mut is_cancelled: impl FnMut() -> bool,
-    ) -> Result<VerifiedScientificPackageCapability, ScientificPackageValidationError> {
+    ) -> Result<SelfConsistentPackageCapability, ScientificPackageValidationError> {
+        self.validate_scientific_content_with_progress(&mut is_cancelled, |_| {})
+    }
+
+    pub fn validate_scientific_content_with_progress(
+        self,
+        mut is_cancelled: impl FnMut() -> bool,
+        mut report_progress: impl FnMut(ScientificValidationProgress),
+    ) -> Result<SelfConsistentPackageCapability, ScientificPackageValidationError> {
         check_cancelled(&mut is_cancelled)?;
         self.begin_scientific_scan(&mut is_cancelled)
             .map_err(map_exact_error)?;
+        report_progress(ScientificValidationProgress {
+            stage: ScientificValidationProgressStage::CanonicalBaseContent,
+            decoded_bricks: 0,
+            decoded_bytes: 0,
+        });
         let (computed, layer_roots, mut report) =
-            compute_scientific_content(&self, &mut is_cancelled)?;
+            compute_scientific_content(&self, &mut is_cancelled, &mut report_progress)?;
         let declared = self.catalog().science().scientific_content_id();
         if computed != declared || self.catalog().profile().scientific_content_id() != declared {
             return Err(
                 ScientificPackageValidationError::ScientificContentMismatch { declared, computed },
             );
         }
-        validate_pyramid_packed_record_facts(&self, &mut report, &mut is_cancelled)?;
+        report_progress(ScientificValidationProgress {
+            stage: ScientificValidationProgressStage::PyramidAccelerationFacts,
+            decoded_bricks: report.brick_reads,
+            decoded_bytes: report.decoded_bytes,
+        });
+        validate_pyramid_packed_record_facts(
+            &self,
+            &mut report,
+            &mut is_cancelled,
+            &mut report_progress,
+        )?;
         self.finish_scientific_scan(&mut is_cancelled)
             .map_err(map_exact_error)?;
-        Ok(VerifiedScientificPackageCapability {
+        Ok(SelfConsistentPackageCapability {
             exact: self,
             scientific_content_id: computed,
             layer_roots,
             report,
-            all_scale_packed_record_facts: VerifiedAllScalePackedRecordFactsCapability,
+            all_scale_packed_record_facts: CheckedAllScalePackedRecordFactsCapability,
         })
     }
 }
 
 /// Proves the packed statistics for every non-base brick before the runtime
-/// can receive a verified capability. Base bricks were already decoded and
-/// checked by `compute_scientific_content`; this pass deliberately visits only
-/// the remaining levels so verification adds the pyramid volume once.
+/// can receive a self-consistent capability. Base bricks were already decoded
+/// and checked by `compute_scientific_content`; this pass deliberately visits
+/// only the remaining levels so the audit adds the pyramid volume once.
 fn validate_pyramid_packed_record_facts(
     exact: &ExactPackageCapability,
     report: &mut ScientificValidationReport,
     is_cancelled: &mut impl FnMut() -> bool,
+    report_progress: &mut impl FnMut(ScientificValidationProgress),
 ) -> Result<(), ScientificPackageValidationError> {
     for image in exact.catalog().profile().images() {
         for level in image.levels().iter().skip(1) {
@@ -664,7 +708,7 @@ fn validate_pyramid_packed_record_facts(
                                 if brick.payload_facts().is_none() {
                                     return Err(
                                         ScientificPackageValidationError::MetadataInvariant {
-                                            reason: "pyramid fact verification returned no facts",
+                                            reason: "pyramid fact validation returned no facts",
                                         },
                                     );
                                 }
@@ -679,6 +723,16 @@ fn validate_pyramid_packed_record_facts(
                                         },
                                     )?;
                                 record_pyramid_fact_read(&brick, object_reads, report)?;
+                                report_progress(ScientificValidationProgress {
+                                    stage:
+                                        ScientificValidationProgressStage::PyramidAccelerationFacts,
+                                    decoded_bricks: report
+                                        .brick_reads
+                                        .saturating_add(report.pyramid_fact_brick_reads),
+                                    decoded_bytes: report
+                                        .decoded_bytes
+                                        .saturating_add(report.pyramid_fact_decoded_bytes),
+                                });
                             }
                         }
                     }
@@ -692,6 +746,7 @@ fn validate_pyramid_packed_record_facts(
 fn compute_scientific_content(
     exact: &ExactPackageCapability,
     is_cancelled: &mut impl FnMut() -> bool,
+    report_progress: &mut impl FnMut(ScientificValidationProgress),
 ) -> Result<
     (
         ScientificContentId,
@@ -767,6 +822,7 @@ fn compute_scientific_content(
             &mut hasher,
             &mut report,
             is_cancelled,
+            report_progress,
         )?;
         let root = hasher
             .finalize()
@@ -815,6 +871,7 @@ fn push_layer_tiles(
     hasher: &mut ScientificLayerHasher,
     report: &mut ScientificValidationReport,
     is_cancelled: &mut impl FnMut() -> bool,
+    report_progress: &mut impl FnMut(ScientificValidationProgress),
 ) -> Result<(), ScientificPackageValidationError> {
     let tile_counts = [
         shape.t(),
@@ -935,6 +992,11 @@ fn push_layer_tiles(
                                     metric: "brick object-read counter delta",
                                 })?;
                             record_brick_read(&brick, object_reads, report)?;
+                            report_progress(ScientificValidationProgress {
+                                stage: ScientificValidationProgressStage::CanonicalBaseContent,
+                                decoded_bricks: report.brick_reads,
+                                decoded_bytes: report.decoded_bytes,
+                            });
                             for buffer in &mut buffers {
                                 let tile_start = buffer.spatial_origin();
                                 let tile_extent = buffer.spatial_extent();
@@ -1104,7 +1166,7 @@ fn record_brick_read(
 ) -> Result<(), ScientificPackageValidationError> {
     if brick.payload_facts().is_none() {
         return Err(ScientificPackageValidationError::MetadataInvariant {
-            reason: "base-brick fact verification returned no facts",
+            reason: "base-brick fact validation returned no facts",
         });
     }
     report.brick_reads = checked_add(report.brick_reads, 1, "brick read count")?;
@@ -1384,7 +1446,7 @@ fn map_read_error(error: PackageReadError) -> ScientificPackageValidationError {
             sample_index,
             sample_valid: true,
         } => {
-            // Scientific verification owns the canonical finite-float
+            // Canonical content validation owns the finite-float
             // contract. The packed-fact pass may detect the same non-finite
             // sample before the tile hasher, but it must preserve the
             // established scientific-readback rejection class.

@@ -1,14 +1,47 @@
 use crate::{ProfileKind, ScaleCountRule, StorageProfileError, profile_limits};
-use mirante4d_domain::IntensityDType;
+use mirante4d_domain::{IntensityDType, Shape4D};
 
 pub const PACKED_INDEX_RECORD_BYTES: u64 = 64;
 pub const PACKED_INDEX_RECORDS_PER_INNER_CHUNK: u64 = 256;
 pub const PACKED_INDEX_RECORDS_PER_OUTER_SHARD: u64 = 16_384;
 pub const MANIFEST_DESCRIPTORS_PER_PAGE_GUARANTEED: u64 = 2_000;
+/// Maximum references in the authenticated manifest root. The 1 MiB root
+/// authority leaves at least 4 KiB per reference, comfortably above the
+/// bounded path/digest wire representation.
+pub const MANIFEST_PAGE_REFERENCES_MAX: u64 = 256;
+/// Wire-level descriptor capacity follows from authenticated page capacity.
+pub const MANIFEST_FORMAT_DESCRIPTORS_MAX: u64 =
+    MANIFEST_DESCRIPTORS_PER_PAGE_GUARANTEED * MANIFEST_PAGE_REFERENCES_MAX;
+/// Admission also keeps descriptor recovery, duplicate-path validation, and
+/// manifest packing inside one explicit 64 MiB control working set. The
+/// 1 KiB charge covers the bounded 512-byte wire descriptor plus owned path,
+/// vector, tree-node, and allocator overhead in the current implementation.
+pub const MANIFEST_DESCRIPTOR_WORKING_SET_BYTES_MAX: u64 = 64 * 1024 * 1024;
+pub const MANIFEST_DESCRIPTOR_WORKING_BYTES: u64 = 1_024;
+pub const MANIFEST_DESCRIPTORS_MAX: u64 = {
+    let working = MANIFEST_DESCRIPTOR_WORKING_SET_BYTES_MAX / MANIFEST_DESCRIPTOR_WORKING_BYTES;
+    if MANIFEST_FORMAT_DESCRIPTORS_MAX < working {
+        MANIFEST_FORMAT_DESCRIPTORS_MAX
+    } else {
+        working
+    }
+};
+/// A 3D outer shard contains at most 64 logical inner chunks.
+pub const COMPOSITIONAL_LOGICAL_BRICKS_MAX: u64 = MANIFEST_DESCRIPTORS_MAX * 64;
+pub const COMPOSITIONAL_SHARDS_PER_COMPONENT_MAX: u64 = MANIFEST_DESCRIPTORS_MAX;
+pub const COMPOSITIONAL_ZARR_METADATA_OBJECTS_MAX: u64 = 4_096;
+pub const COMPOSITIONAL_PHYSICAL_OBJECTS_MAX: u64 =
+    MANIFEST_DESCRIPTORS_MAX + MANIFEST_PAGE_REFERENCES_MAX + FIXED_CONTROL_OBJECTS;
+pub const COMPOSITIONAL_DIRECTORIES_MAX: u64 =
+    COMPOSITIONAL_PHYSICAL_OBJECTS_MAX * crate::MAX_DIRECTORY_DEPTH as u64;
+pub const COMPOSITIONAL_DIRECTORY_FAN_OUT_MAX: u64 = MANIFEST_DESCRIPTORS_MAX;
 pub const PORTABLE_PROVENANCE_RECORDS_MAX: u64 = 14;
 pub const FIXED_CONTROL_OBJECTS: u64 = 4;
 pub const GLOBAL_UNCOMPRESSED_OUTER_SHARD_BYTES_MAX: u64 = 67_108_864;
 pub const GLOBAL_ENCODED_OUTER_SHARD_BYTES_MAX: u64 = 83_890_176;
+pub const PROFILE_PYRAMID_TERMINAL_MAX_DIMENSION: u64 = 64;
+pub const PROFILE_PYRAMID_TERMINAL_VOXELS_PER_TIMEPOINT: u64 = 262_144;
+pub const PROFILE_PYRAMID_SCALE_COUNT_MAX: u64 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OneBrickAmplification {
@@ -325,6 +358,87 @@ pub struct ScaleCounts {
     pub packed_index_shards: u64,
 }
 
+/// Returns the active profile's complete factor-two spatial pyramid.
+///
+/// Time is preserved. Spatial dimensions are ceil-divided by two until both
+/// terminal bounds are satisfied. The result always contains `base` as S0.
+/// This is the sole geometry authority shared by package production and
+/// storage-envelope calibration.
+pub fn profile_pyramid_shapes(base: Shape4D) -> Result<Vec<Shape4D>, StorageProfileError> {
+    let capacity = usize::try_from(PROFILE_PYRAMID_SCALE_COUNT_MAX).map_err(|_| {
+        StorageProfileError::ArithmeticOverflow {
+            metric: "profile pyramid scale capacity",
+        }
+    })?;
+    let mut shapes = Vec::with_capacity(capacity);
+    shapes.push(base);
+
+    while !profile_pyramid_shape_is_terminal(*shapes.last().expect("S0 was inserted")) {
+        let previous = *shapes.last().expect("S0 was inserted");
+        let next = Shape4D::new(
+            previous.t(),
+            previous.z().div_ceil(2),
+            previous.y().div_ceil(2),
+            previous.x().div_ceil(2),
+        )
+        .map_err(|_| StorageProfileError::ArithmeticOverflow {
+            metric: "profile pyramid shape",
+        })?;
+        if next == previous {
+            return Err(StorageProfileError::PyramidDidNotProgress {
+                z: previous.z(),
+                y: previous.y(),
+                x: previous.x(),
+            });
+        }
+        shapes.push(next);
+        let actual =
+            u64::try_from(shapes.len()).map_err(|_| StorageProfileError::ArithmeticOverflow {
+                metric: "profile pyramid scale count",
+            })?;
+        if actual > PROFILE_PYRAMID_SCALE_COUNT_MAX {
+            return Err(StorageProfileError::CeilingExceeded {
+                profile: "m4d-zarr3-local-1.0",
+                metric: "geometry-derived scales per image",
+                actual,
+                maximum: PROFILE_PYRAMID_SCALE_COUNT_MAX,
+            });
+        }
+    }
+    shapes.shrink_to_fit();
+    Ok(shapes)
+}
+
+pub fn profile_pyramid_shape_is_terminal(shape: Shape4D) -> bool {
+    let maximum_dimension = shape.z().max(shape.y()).max(shape.x());
+    maximum_dimension <= PROFILE_PYRAMID_TERMINAL_MAX_DIMENSION
+        && shape
+            .z()
+            .checked_mul(shape.y())
+            .and_then(|zy| zy.checked_mul(shape.x()))
+            .is_some_and(|voxels| voxels <= PROFILE_PYRAMID_TERMINAL_VOXELS_PER_TIMEPOINT)
+}
+
+/// Counts the active geometry-derived pyramid for a validated base shape.
+pub fn count_3d_profile_pyramid(
+    base: Shape4D,
+    channels: u64,
+) -> Result<ScaleCounts, StorageProfileError> {
+    let scales = u64::try_from(profile_pyramid_shapes(base)?.len()).map_err(|_| {
+        StorageProfileError::ArithmeticOverflow {
+            metric: "profile pyramid scale count",
+        }
+    })?;
+    count_3d_pyramid(DatasetGeometry {
+        t: base.t(),
+        c: channels,
+        z: base.z(),
+        y: base.y(),
+        x: base.x(),
+        scales,
+    })
+}
+
 /// Counts a factor-two ceil pyramid using the frozen 64-cubed bricks and
 /// 256-cubed outer shards. This is arithmetic only and never materializes keys.
 pub fn count_3d_pyramid(geometry: DatasetGeometry) -> Result<ScaleCounts, StorageProfileError> {
@@ -496,14 +610,35 @@ mod tests {
     #[test]
     fn accepted_boundary_counts_recompute_exactly() {
         let cases = [
-            (geometry(4, 1, 119, 383, 518, 4), (524, 40, 4)),
-            (geometry(1, 1, 600, 1_148, 998, 5), (3_314, 76, 5)),
-            (geometry(8, 4, 256, 256, 256, 1), (2_048, 32, 1)),
-            (geometry(1, 1, 2_563, 2_240, 4_183, 7), (109_196, 2_014, 12)),
-            (geometry(365, 1, 74, 608, 600, 4), (86_870, 5_475, 8)),
+            (Shape4D::new(4, 119, 383, 518).unwrap(), 1, 5, (528, 44, 5)),
+            (
+                Shape4D::new(1, 600, 1_148, 998).unwrap(),
+                1,
+                6,
+                (3_315, 77, 6),
+            ),
+            (
+                Shape4D::new(8, 256, 256, 256).unwrap(),
+                4,
+                3,
+                (2_336, 96, 3),
+            ),
+            (
+                Shape4D::new(1, 2_563, 2_240, 4_183).unwrap(),
+                1,
+                8,
+                (109_197, 2_015, 13),
+            ),
+            (
+                Shape4D::new(365, 74, 608, 600).unwrap(),
+                1,
+                5,
+                (87_235, 5_840, 9),
+            ),
         ];
-        for (input, expected) in cases {
-            let actual = count_3d_pyramid(input).unwrap();
+        for (base, channels, expected_scales, expected) in cases {
+            assert_eq!(profile_pyramid_shapes(base).unwrap().len(), expected_scales);
+            let actual = count_3d_profile_pyramid(base, channels).unwrap();
             assert_eq!(
                 (
                     actual.logical_bricks,
@@ -513,6 +648,69 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn compositional_limits_follow_manifest_and_shard_authorities() {
+        let limits = profile_limits(ProfileKind::Current);
+        assert_eq!(
+            MANIFEST_FORMAT_DESCRIPTORS_MAX,
+            MANIFEST_DESCRIPTORS_PER_PAGE_GUARANTEED * MANIFEST_PAGE_REFERENCES_MAX
+        );
+        assert_eq!(
+            MANIFEST_DESCRIPTORS_MAX,
+            MANIFEST_DESCRIPTOR_WORKING_SET_BYTES_MAX / MANIFEST_DESCRIPTOR_WORKING_BYTES
+        );
+        assert_eq!(limits.logical_bricks, MANIFEST_DESCRIPTORS_MAX * 64);
+        assert_eq!(limits.pixel_shards, MANIFEST_DESCRIPTORS_MAX);
+        assert_eq!(limits.validity_shards, MANIFEST_DESCRIPTORS_MAX);
+        assert_eq!(limits.packed_index_shards, MANIFEST_DESCRIPTORS_MAX);
+        assert_eq!(limits.manifest_pages, MANIFEST_PAGE_REFERENCES_MAX);
+        assert_eq!(
+            limits.total_physical_objects,
+            MANIFEST_DESCRIPTORS_MAX + MANIFEST_PAGE_REFERENCES_MAX + FIXED_CONTROL_OBJECTS
+        );
+        assert_eq!(limits.logical_s0_bytes_max, None);
+    }
+
+    #[test]
+    fn shared_pyramid_geometry_enforces_both_terminal_bounds() {
+        let tiny = Shape4D::new(3, 8, 31, 256).unwrap();
+        assert_eq!(
+            profile_pyramid_shapes(tiny).unwrap(),
+            vec![
+                tiny,
+                Shape4D::new(3, 4, 16, 128).unwrap(),
+                Shape4D::new(3, 2, 8, 64).unwrap(),
+            ]
+        );
+
+        let already_terminal = Shape4D::new(2, 64, 64, 64).unwrap();
+        assert_eq!(
+            profile_pyramid_shapes(already_terminal).unwrap(),
+            vec![already_terminal]
+        );
+
+        let long_thin = Shape4D::new(1, 1, 1, 1_000_000).unwrap();
+        let shapes = profile_pyramid_shapes(long_thin).unwrap();
+        assert!(profile_pyramid_shape_is_terminal(*shapes.last().unwrap()));
+        assert!(
+            !profile_pyramid_shape_is_terminal(shapes[shapes.len() - 2]),
+            "a small voxel count cannot terminate a pathologically long volume"
+        );
+    }
+
+    #[test]
+    fn every_representable_shape_reaches_the_terminal_contract_within_the_profile_bound() {
+        let base = Shape4D::new(1, 1, 1, u64::MAX).unwrap();
+        let shapes = profile_pyramid_shapes(base).unwrap();
+
+        assert_eq!(shapes.len(), 59);
+        assert_eq!(
+            shapes.last().unwrap().dimensions(),
+            [1, 1, 1, PROFILE_PYRAMID_TERMINAL_MAX_DIMENSION]
+        );
+        assert!(u64::try_from(shapes.len()).unwrap() <= PROFILE_PYRAMID_SCALE_COUNT_MAX);
     }
 
     #[test]
@@ -551,62 +749,48 @@ mod tests {
     }
 
     #[test]
-    fn every_profile_rejects_one_object_above_its_ceiling() {
-        for profile in [
-            ProfileKind::Ds0,
-            ProfileKind::Ds1,
-            ProfileKind::Ds2,
-            ProfileKind::Ds3,
-            ProfileKind::Ds4,
-        ] {
-            let limits = profile_limits(profile);
-            let mut counts = minimal_package_counts(profile);
-            counts.addressed_pixel_shards = limits.pixel_shards + 1;
-            counts.total_physical_objects = counts.recomputed_total_physical_objects().unwrap();
-            assert!(matches!(
-                counts.validate(profile),
-                Err(StorageProfileError::CeilingExceeded {
-                    metric: "addressed pixel shards",
-                    ..
-                })
-            ));
-        }
+    fn compositional_contract_rejects_one_object_above_its_ceiling() {
+        let profile = ProfileKind::Current;
+        let limits = profile_limits(profile);
+        let mut counts = minimal_package_counts(profile);
+        counts.addressed_pixel_shards = limits.pixel_shards + 1;
+        counts.total_physical_objects = counts.recomputed_total_physical_objects().unwrap();
+        assert!(matches!(
+            counts.validate(profile),
+            Err(StorageProfileError::CeilingExceeded {
+                metric: "addressed pixel shards",
+                ..
+            })
+        ));
     }
 
     #[test]
     fn package_counts_reject_inconsistent_totals_and_invalid_scale_contracts() {
-        for profile in [
-            ProfileKind::Ds0,
-            ProfileKind::Ds1,
-            ProfileKind::Ds2,
-            ProfileKind::Ds3,
-            ProfileKind::Ds4,
-        ] {
-            assert!(minimal_package_counts(profile).validate(profile).is_ok());
-        }
+        let profile = ProfileKind::Current;
+        assert!(minimal_package_counts(profile).validate(profile).is_ok());
 
-        let mut underreported = minimal_package_counts(ProfileKind::Ds1);
+        let mut underreported = minimal_package_counts(ProfileKind::Current);
         underreported.total_physical_objects -= 1;
         assert!(matches!(
-            underreported.validate(ProfileKind::Ds1),
+            underreported.validate(ProfileKind::Current),
             Err(StorageProfileError::InconsistentCount { .. })
         ));
 
-        let mut excessive_scale_count = minimal_package_counts(ProfileKind::Ds3);
+        let mut excessive_scale_count = minimal_package_counts(ProfileKind::Current);
         excessive_scale_count.maximum_scales_per_image =
-            profile_limits(ProfileKind::Ds3).scales.maximum() + 1;
+            profile_limits(ProfileKind::Current).scales.maximum() + 1;
         assert!(matches!(
-            excessive_scale_count.validate(ProfileKind::Ds3),
+            excessive_scale_count.validate(ProfileKind::Current),
             Err(StorageProfileError::CeilingExceeded {
                 metric: "scales per image",
                 ..
             })
         ));
 
-        let mut zero_scale = minimal_package_counts(ProfileKind::Ds0);
+        let mut zero_scale = minimal_package_counts(ProfileKind::Current);
         zero_scale.maximum_scales_per_image = 0;
         assert!(matches!(
-            zero_scale.validate(ProfileKind::Ds0),
+            zero_scale.validate(ProfileKind::Current),
             Err(StorageProfileError::ZeroCount {
                 metric: "maximum scales per image"
             })
@@ -614,15 +798,9 @@ mod tests {
     }
 
     #[test]
-    fn ds0_enforces_logical_s0_byte_ceiling() {
-        let mut counts = minimal_package_counts(ProfileKind::Ds0);
-        counts.logical_s0_bytes = 67_108_865;
-        assert!(matches!(
-            counts.validate(ProfileKind::Ds0),
-            Err(StorageProfileError::CeilingExceeded {
-                metric: "logical S0 bytes",
-                ..
-            })
-        ));
+    fn aggregate_s0_bytes_are_not_a_fixture_calibrated_admission_ceiling() {
+        let mut counts = minimal_package_counts(ProfileKind::Current);
+        counts.logical_s0_bytes = u64::MAX;
+        assert!(counts.validate(ProfileKind::Current).is_ok());
     }
 }

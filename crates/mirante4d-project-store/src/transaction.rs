@@ -4132,7 +4132,11 @@ mod tests {
         for (label, capture, opens) in [
             ("fork provenance", fork_capture, fork_opens),
             ("project identity", project_capture, project_opens),
-            ("scientific identity", scientific_capture, scientific_opens),
+            (
+                "scientific content address",
+                scientific_capture,
+                scientific_opens,
+            ),
         ] {
             assert!(
                 publish_provisional_autosave_generation(

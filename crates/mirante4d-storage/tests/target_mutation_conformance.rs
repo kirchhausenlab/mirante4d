@@ -194,7 +194,7 @@ fn assert_typed_rejection(root: &Path, recipe: &Value) {
             let catalog = LocalPackageCatalog::open(root)
                 .unwrap_or_else(|error| panic!("mutation {id} failed before closure: {error}"));
             let error = catalog
-                .validate_exact_package(ProfileKind::Ds0, || false)
+                .validate_exact_package(ProfileKind::Current, || false)
                 .unwrap_err_or_else(|| panic!("mutation {id} passed exact validation"));
             match id {
                 "missing-pixel-shard" => assert!(matches!(
@@ -234,7 +234,7 @@ fn assert_typed_rejection(root: &Path, recipe: &Value) {
             });
             if id == "inner-crc32c-failure" {
                 let capability = catalog
-                    .validate_exact_package(ProfileKind::Ds0, || false)
+                    .validate_exact_package(ProfileKind::Current, || false)
                     .expect("inner CRC mutation retains an exact package closure");
                 let error = capability
                     .read_brick(
@@ -248,7 +248,7 @@ fn assert_typed_rejection(root: &Path, recipe: &Value) {
                 ));
             } else {
                 let error = catalog
-                    .validate_exact_package(ProfileKind::Ds0, || false)
+                    .validate_exact_package(ProfileKind::Current, || false)
                     .unwrap_err_or_else(|| panic!("mutation {id} passed structure validation"));
                 match id {
                     "end-index-crc32c-failure" => assert!(matches!(
@@ -270,7 +270,7 @@ fn assert_typed_rejection(root: &Path, recipe: &Value) {
         "scientific-readback" => {
             let exact = LocalPackageCatalog::open(root)
                 .unwrap_or_else(|error| panic!("mutation {id} failed before readback: {error}"))
-                .validate_exact_package(ProfileKind::Ds0, || false)
+                .validate_exact_package(ProfileKind::Current, || false)
                 .unwrap_or_else(|error| panic!("mutation {id} failed exact validation: {error}"));
             let error = exact
                 .validate_scientific_content(|| false)

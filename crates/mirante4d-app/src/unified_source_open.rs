@@ -5,23 +5,26 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use mirante4d_application::{RenderCoordinationState, UnboundWorkspace};
+use mirante4d_application::{ContentAddressOrigin, RenderCoordinationState, UnboundWorkspace};
 use mirante4d_dataset::{
     CpuByteLedger, CpuLedgerCategory, DatasetCatalog, DatasetSource, DatasetSourceId,
 };
 use mirante4d_dataset_runtime::{
-    DatasetRuntime, DatasetRuntimeConfig, RuntimeFault, RuntimeFaultCode,
+    DatasetRuntime, DatasetRuntimeConfig, ProcessCpuBroker, RuntimeFault, RuntimeFaultCode,
 };
 use mirante4d_domain::{
     CrossSectionView, DisplayWindow, IntensityDType, IsoLightState, LayerTransfer, Opacity,
     RenderState, RgbColor, SamplingPolicy, TransferCurve, UnitQuaternion, ViewerLayout,
 };
-use mirante4d_project_model::{LayerViewState, ProjectId, ViewState};
+use mirante4d_project_model::{
+    DatasetLocatorHint, DatasetReference, LayerViewState, ProjectId, ViewState,
+};
 use mirante4d_settings::ResourcePolicy;
 use mirante4d_storage::{
-    LocalDatasetSource, LocalDatasetSourceOpenError, LocalPackageCatalog,
-    PACKAGE_VALIDATION_WORKING_BYTES, PackageOpenError, PackageValidationError,
-    ScientificPackageValidationError, VerifiedScientificPackageCapability,
+    ExactPackageValidationProgress, LocalDatasetSource, LocalDatasetSourceOpenError,
+    LocalPackageCatalog, PACKAGE_VALIDATION_WORKING_BYTES, PackageOpenError,
+    PackageValidationError, ScientificPackageValidationError, ScientificValidationProgress,
+    ScientificValidationProgressStage, SelfConsistentPackageCapability,
 };
 
 use crate::{
@@ -38,6 +41,13 @@ use crate::{
 const REQUEST_QUEUE_LIMIT: usize = 1_024;
 const COMPLETION_QUEUE_LIMIT: usize = 1_024;
 const MAX_DATASET_WORKERS: usize = 8;
+// One closed-profile interactive decode path: at most 1 MiB retained payload,
+// less than 3 MiB of component/range retention, the 8 MiB codec authority,
+// and less than 4 MiB of bounded control/staging state.
+const MAX_INTERACTIVE_DECODE_PATH_BYTES: u64 = 16 * 1024 * 1024;
+const RUNTIME_REQUEST_RECORD_BYTES: u64 = 512;
+const RUNTIME_CACHE_RECORD_BYTES: u64 = 192;
+const RUNTIME_SCOPE_RECORD_BYTES: u64 = 128;
 
 pub(crate) struct UnifiedOpenedSource {
     pub(crate) dataset: DatasetDemandState,
@@ -46,15 +56,18 @@ pub(crate) struct UnifiedOpenedSource {
     pub(crate) render_coordination: RenderCoordinationState,
     pub(crate) analysis_runtime: AnalysisProductRuntime,
     pub(crate) startup_diagnostics: StartupDiagnostics,
+    pub(crate) source_reference: DatasetReference,
+    pub(crate) content_address_origin: ContentAddressOrigin,
 }
 
-pub(crate) struct UnifiedVerifiedSource {
+pub(crate) struct UnifiedPublishedSource {
     pub(crate) dataset: DatasetDemandState,
     pub(crate) catalog: Arc<DatasetCatalog>,
+    pub(crate) source_reference: DatasetReference,
 }
 
 #[derive(Debug)]
-pub(crate) enum UnifiedVerifiedSourceOpenError {
+pub(crate) enum UnifiedPublishedSourceOpenError {
     RuntimeConfiguration(RuntimeFaultCode),
     Adapter(LocalDatasetSourceOpenError),
     Runtime(RuntimeFault),
@@ -64,20 +77,22 @@ pub(crate) enum UnifiedVerifiedSourceOpenError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TargetPackageVerificationStage {
-    MetadataOpened,
-    ExactPackageVerified,
-    ScientificContentVerified,
+pub(crate) enum TargetPackageAuditProgress {
+    Exact(ExactPackageValidationProgress),
+    Scientific(ScientificValidationProgress),
 }
 
 #[derive(Debug)]
-pub(crate) enum TargetPackageVerificationError {
+pub(crate) enum TargetPackageAuditError {
     Cancelled,
     Open(PackageOpenError),
     Reservation,
     InvalidReservation,
     Exact(PackageValidationError),
-    Scientific(ScientificPackageValidationError),
+    Scientific {
+        stage: ScientificValidationProgressStage,
+        source: ScientificPackageValidationError,
+    },
 }
 
 pub(crate) fn open(
@@ -85,9 +100,25 @@ pub(crate) fn open(
     resource_policy: ResourcePolicy,
     source_id: DatasetSourceId,
 ) -> anyhow::Result<UnifiedOpenedSource> {
+    let broker = ProcessCpuBroker::new(resource_policy.cpu_dataset_budget_bytes())
+        .map_err(|code| anyhow::anyhow!("process CPU broker configuration failed: {code}"))?;
+    open_with_broker(path, resource_policy, source_id, broker)
+}
+
+pub(crate) fn open_with_broker(
+    path: impl AsRef<Path>,
+    resource_policy: ResourcePolicy,
+    source_id: DatasetSourceId,
+    broker: ProcessCpuBroker,
+) -> anyhow::Result<UnifiedOpenedSource> {
     let selected_path = path.as_ref().to_path_buf();
     let config = runtime_config(resource_policy)
         .map_err(|code| anyhow::anyhow!("unified dataset runtime configuration failed: {code}"))?;
+    broker
+        .set_foreground_reserve(interactive_foreground_reserve(config)?)
+        .map_err(|error| {
+            anyhow::anyhow!("interactive CPU reserve could not be installed: {error}")
+        })?;
 
     let source_error = Arc::new(Mutex::new(None::<anyhow::Error>));
     let worker_error = Arc::clone(&source_error);
@@ -95,41 +126,56 @@ pub(crate) fn open(
     let worker_ledger = Arc::clone(&captured_ledger);
     let captured_source = Arc::new(Mutex::new(None));
     let worker_source = Arc::clone(&captured_source);
+    let captured_reference = Arc::new(Mutex::new(None));
+    let worker_reference = Arc::clone(&captured_reference);
     let source_path = selected_path.clone();
     let display_label = dataset_display_label(&selected_path);
-    let (runtime, catalog) = <dyn DatasetRuntime>::start(config, move |ledger| {
-        *worker_ledger
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&ledger));
-        let source = LocalPackageCatalog::open(&source_path)
-            .map_err(SourceConstructionError::Open)
-            .and_then(|catalog| {
-                LocalDatasetSource::from_provisional(catalog, source_id, &display_label, ledger)
-                    .map_err(SourceConstructionError::Adapter)
-            });
-        match source {
-            Ok(source) => {
-                *worker_source
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&source));
-                let source_contract: Arc<dyn DatasetSource> = source;
-                Ok(source_contract)
+    let (runtime, catalog) =
+        <dyn DatasetRuntime>::start_with_broker(config, broker, move |ledger| {
+            *worker_ledger
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&ledger));
+            let source = LocalPackageCatalog::open(&source_path)
+                .map_err(SourceConstructionError::Open)
+                .and_then(|catalog| {
+                    let locator_hint = source_path
+                        .to_str()
+                        .and_then(|path| DatasetLocatorHint::new(path).ok());
+                    *worker_reference
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) =
+                        Some(DatasetReference::new(
+                            catalog.science().scientific_content_id(),
+                            Some(catalog.declared_package_id()),
+                            None,
+                            locator_hint,
+                        ));
+                    LocalDatasetSource::from_admitted(catalog, source_id, &display_label, ledger)
+                        .map_err(SourceConstructionError::Adapter)
+                });
+            match source {
+                Ok(source) => {
+                    *worker_source
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&source));
+                    let source_contract: Arc<dyn DatasetSource> = source;
+                    Ok(source_contract)
+                }
+                Err(error) => {
+                    *worker_error
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) = Some(error.into());
+                    Err(RuntimeFault::new(RuntimeFaultCode::SourceRejected))
+                }
             }
-            Err(error) => {
-                *worker_error
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = Some(error.into());
-                Err(RuntimeFault::new(RuntimeFaultCode::SourceRejected))
-            }
-        }
-    })
-    .map_err(|runtime_error| {
-        source_error
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .take()
-            .unwrap_or_else(|| anyhow::Error::new(runtime_error))
-    })?;
+        })
+        .map_err(|runtime_error| {
+            source_error
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+                .unwrap_or_else(|| anyhow::Error::new(runtime_error))
+        })?;
     let cpu_ledger = captured_ledger
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -140,6 +186,11 @@ pub(crate) fn open(
         .unwrap_or_else(|poison| poison.into_inner())
         .take()
         .ok_or_else(|| anyhow::anyhow!("unified runtime did not retain its local source"))?;
+    let source_reference = captured_reference
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("unified runtime did not retain its source reference"))?;
 
     let workspace = workspace_from_catalog(catalog.as_ref())?;
     let (render_coordination, analysis_runtime) =
@@ -159,56 +210,83 @@ pub(crate) fn open(
         render_coordination,
         analysis_runtime,
         startup_diagnostics: collect_startup_diagnostics(),
+        source_reference,
+        content_address_origin: ContentAddressOrigin::DeclaredByPackage,
     })
 }
 
-pub(crate) fn verify_target_package(
+pub(crate) fn audit_target_package(
     path: impl AsRef<Path>,
     scan_ledger: Arc<dyn CpuByteLedger>,
     mut is_cancelled: impl FnMut() -> bool,
-    mut report_stage: impl FnMut(TargetPackageVerificationStage),
-) -> Result<VerifiedScientificPackageCapability, TargetPackageVerificationError> {
+    mut report_progress: impl FnMut(TargetPackageAuditProgress),
+) -> Result<SelfConsistentPackageCapability, TargetPackageAuditError> {
     if is_cancelled() {
-        return Err(TargetPackageVerificationError::Cancelled);
+        return Err(TargetPackageAuditError::Cancelled);
     }
     let validation_lease = scan_ledger
         .try_acquire(
             CpuLedgerCategory::InFlightDecode,
             PACKAGE_VALIDATION_WORKING_BYTES,
         )
-        .map_err(|_| TargetPackageVerificationError::Reservation)?;
+        .map_err(|_| TargetPackageAuditError::Reservation)?;
     if validation_lease.category() != CpuLedgerCategory::InFlightDecode
         || validation_lease.reserved_bytes() != PACKAGE_VALIDATION_WORKING_BYTES
     {
-        return Err(TargetPackageVerificationError::InvalidReservation);
+        return Err(TargetPackageAuditError::InvalidReservation);
     }
 
-    let catalog = LocalPackageCatalog::open(path).map_err(TargetPackageVerificationError::Open)?;
-    report_stage(TargetPackageVerificationStage::MetadataOpened);
+    let catalog = LocalPackageCatalog::open(path).map_err(TargetPackageAuditError::Open)?;
     if is_cancelled() {
-        return Err(TargetPackageVerificationError::Cancelled);
+        return Err(TargetPackageAuditError::Cancelled);
     }
     let exact = catalog
-        .validate_exact_supported_package(&mut is_cancelled)
-        .map_err(TargetPackageVerificationError::Exact)?;
-    report_stage(TargetPackageVerificationStage::ExactPackageVerified);
+        .validate_exact_supported_package_with_progress(&mut is_cancelled, |progress| {
+            report_progress(TargetPackageAuditProgress::Exact(progress));
+        })
+        .map_err(TargetPackageAuditError::Exact)?;
     if is_cancelled() {
-        return Err(TargetPackageVerificationError::Cancelled);
+        return Err(TargetPackageAuditError::Cancelled);
     }
-    let verified = exact
-        .validate_scientific_content(&mut is_cancelled)
-        .map_err(TargetPackageVerificationError::Scientific)?;
-    report_stage(TargetPackageVerificationStage::ScientificContentVerified);
-    Ok(verified)
+    let mut scientific_stage = ScientificValidationProgressStage::CanonicalBaseContent;
+    exact
+        .validate_scientific_content_with_progress(&mut is_cancelled, |progress| {
+            scientific_stage = progress.stage();
+            report_progress(TargetPackageAuditProgress::Scientific(progress));
+        })
+        .map_err(|source| TargetPackageAuditError::Scientific {
+            stage: scientific_stage,
+            source,
+        })
 }
 
-pub(crate) fn open_verified(
+pub(crate) fn open_published_with_broker(
     resource_policy: ResourcePolicy,
-    capability: VerifiedScientificPackageCapability,
-) -> Result<UnifiedVerifiedSource, UnifiedVerifiedSourceOpenError> {
+    capability: SelfConsistentPackageCapability,
+    broker: ProcessCpuBroker,
+) -> Result<UnifiedPublishedSource, UnifiedPublishedSourceOpenError> {
     let selected_path = capability.root_path().to_path_buf();
+    let locator_hint = selected_path
+        .to_str()
+        .and_then(|path| DatasetLocatorHint::new(path).ok());
+    let source_reference = DatasetReference::new(
+        capability.scientific_content_id(),
+        Some(capability.package_id()),
+        None,
+        locator_hint,
+    );
     let config = runtime_config(resource_policy)
-        .map_err(UnifiedVerifiedSourceOpenError::RuntimeConfiguration)?;
+        .map_err(UnifiedPublishedSourceOpenError::RuntimeConfiguration)?;
+    broker
+        .set_foreground_reserve(
+            interactive_foreground_reserve(config)
+                .map_err(UnifiedPublishedSourceOpenError::RuntimeConfiguration)?,
+        )
+        .map_err(|_| {
+            UnifiedPublishedSourceOpenError::RuntimeConfiguration(
+                RuntimeFaultCode::InvalidConfiguration,
+            )
+        })?;
     let source_error = Arc::new(Mutex::new(None));
     let worker_error = Arc::clone(&source_error);
     let captured_ledger = Arc::new(Mutex::new(None));
@@ -216,44 +294,45 @@ pub(crate) fn open_verified(
     let captured_source = Arc::new(Mutex::new(None));
     let worker_source = Arc::clone(&captured_source);
     let display_label = dataset_display_label(&selected_path);
-    let (runtime, catalog) = <dyn DatasetRuntime>::start(config, move |ledger| {
-        *worker_ledger
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&ledger));
-        match LocalDatasetSource::from_verified(capability, &display_label, ledger) {
-            Ok(source) => {
-                *worker_source
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&source));
-                let source_contract: Arc<dyn DatasetSource> = source;
-                Ok(source_contract)
+    let (runtime, catalog) =
+        <dyn DatasetRuntime>::start_with_broker(config, broker, move |ledger| {
+            *worker_ledger
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&ledger));
+            match LocalDatasetSource::from_published(capability, &display_label, ledger) {
+                Ok(source) => {
+                    *worker_source
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(&source));
+                    let source_contract: Arc<dyn DatasetSource> = source;
+                    Ok(source_contract)
+                }
+                Err(error) => {
+                    *worker_error
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) = Some(error);
+                    Err(RuntimeFault::new(RuntimeFaultCode::SourceRejected))
+                }
             }
-            Err(error) => {
-                *worker_error
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = Some(error);
-                Err(RuntimeFault::new(RuntimeFaultCode::SourceRejected))
-            }
-        }
-    })
-    .map_err(|runtime_error| {
-        source_error
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .take()
-            .map(UnifiedVerifiedSourceOpenError::Adapter)
-            .unwrap_or(UnifiedVerifiedSourceOpenError::Runtime(runtime_error))
-    })?;
+        })
+        .map_err(|runtime_error| {
+            source_error
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+                .map(UnifiedPublishedSourceOpenError::Adapter)
+                .unwrap_or(UnifiedPublishedSourceOpenError::Runtime(runtime_error))
+        })?;
     let cpu_ledger = captured_ledger
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .take()
-        .ok_or(UnifiedVerifiedSourceOpenError::MissingCpuLedger)?;
+        .ok_or(UnifiedPublishedSourceOpenError::MissingCpuLedger)?;
     let local_source = captured_source
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .take()
-        .ok_or(UnifiedVerifiedSourceOpenError::MissingLocalSource)?;
+        .ok_or(UnifiedPublishedSourceOpenError::MissingLocalSource)?;
     let resource_identity = catalog.resource_identity();
     let dataset = DatasetDemandState::new_local(
         runtime,
@@ -262,20 +341,28 @@ pub(crate) fn open_verified(
         selected_path,
         local_source,
     )
-    .map_err(UnifiedVerifiedSourceOpenError::DemandPlanner)?;
-    Ok(UnifiedVerifiedSource { dataset, catalog })
+    .map_err(UnifiedPublishedSourceOpenError::DemandPlanner)?;
+    Ok(UnifiedPublishedSource {
+        dataset,
+        catalog,
+        source_reference,
+    })
 }
 
-/// Expands an already-verified runtime into the complete state required for a
+/// Expands an importer-published runtime into the complete state required for a
 /// current-source replacement.
 ///
 /// Imported packages use this after consuming their one-shot publication
 /// transfer. No path is accepted here: the selected path already came from the
-/// destination-bound verified capability.
-pub(crate) fn prepare_verified_current_source(
-    opened: UnifiedVerifiedSource,
+/// destination-bound publication capability.
+pub(crate) fn prepare_published_current_source(
+    opened: UnifiedPublishedSource,
 ) -> anyhow::Result<UnifiedOpenedSource> {
-    let UnifiedVerifiedSource { dataset, catalog } = opened;
+    let UnifiedPublishedSource {
+        dataset,
+        catalog,
+        source_reference,
+    } = opened;
     let workspace = workspace_from_catalog(catalog.as_ref())?;
     let (render_coordination, analysis_runtime) =
         initial_runtime_state(catalog.as_ref(), &workspace)?;
@@ -286,6 +373,8 @@ pub(crate) fn prepare_verified_current_source(
         render_coordination,
         analysis_runtime,
         startup_diagnostics: collect_startup_diagnostics(),
+        source_reference,
+        content_address_origin: ContentAddressOrigin::ComputedDuringImport,
     })
 }
 
@@ -342,6 +431,29 @@ fn runtime_config(
         REQUEST_QUEUE_LIMIT,
         COMPLETION_QUEUE_LIMIT,
     )
+}
+
+fn interactive_foreground_reserve(config: DatasetRuntimeConfig) -> Result<u64, RuntimeFaultCode> {
+    let workers =
+        u64::try_from(config.worker_limit()).map_err(|_| RuntimeFaultCode::InvalidConfiguration)?;
+    let queue = u64::try_from(config.request_queue_limit())
+        .map_err(|_| RuntimeFaultCode::InvalidConfiguration)?;
+    let completion = u64::try_from(config.completion_queue_limit())
+        .map_err(|_| RuntimeFaultCode::InvalidConfiguration)?;
+    let decode_cohort = workers
+        .checked_mul(MAX_INTERACTIVE_DECODE_PATH_BYTES)
+        .ok_or(RuntimeFaultCode::InvalidConfiguration)?;
+    let request_records = queue
+        .checked_mul(RUNTIME_REQUEST_RECORD_BYTES + RUNTIME_SCOPE_RECORD_BYTES)
+        .ok_or(RuntimeFaultCode::InvalidConfiguration)?;
+    let retained_results = completion
+        .checked_mul(RUNTIME_CACHE_RECORD_BYTES)
+        .ok_or(RuntimeFaultCode::InvalidConfiguration)?;
+    decode_cohort
+        .checked_add(request_records)
+        .and_then(|bytes| bytes.checked_add(retained_results))
+        .filter(|bytes| *bytes <= config.total_cpu_bytes())
+        .ok_or(RuntimeFaultCode::MinimumWorkUnitExceedsBudget)
 }
 
 fn initial_runtime_state(

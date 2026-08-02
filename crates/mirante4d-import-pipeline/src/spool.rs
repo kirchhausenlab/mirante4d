@@ -348,10 +348,6 @@ enum SpoolFailpoint {
 }
 
 impl ImportSpool {
-    pub(crate) const fn directory_fd(&self) -> &OwnedFd {
-        &self._directory
-    }
-
     pub(crate) fn commit_expired(&mut self) -> Result<(), ImportError> {
         if self
             .pending_started

@@ -9,13 +9,100 @@
 use std::{cmp::Ordering, fmt, num::NonZeroU64, sync::Arc};
 
 use mirante4d_dataset::{
-    BrickKey, CpuByteLease, CpuByteLedger, CpuLedgerCategory, ResourceLease,
+    BrickKey, CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError, ResourceLease,
     ResourcePayloadDescriptor, ResourcePayloadFacts, ResourcePayloadView,
 };
 use thiserror::Error;
 
 mod ledger;
 mod production;
+
+/// Process-level managed CPU byte authority shared by optional dataset and
+/// preprocessing sessions. Purpose categories are diagnostic labels over one
+/// hard total.
+#[derive(Clone)]
+pub struct ProcessCpuBroker {
+    core: Arc<ledger::LedgerCore>,
+    work_available: Arc<ledger::ChangeSignal>,
+}
+
+impl ProcessCpuBroker {
+    pub fn new(total_cpu_bytes: u64) -> Result<Self, RuntimeFaultCode> {
+        let config = DatasetRuntimeConfig::new(total_cpu_bytes, 1, 1, 1)?;
+        let work_available = Arc::new(ledger::ChangeSignal::default());
+        let core = ledger::LedgerCore::new(config, Arc::clone(&work_available));
+        Ok(Self {
+            core,
+            work_available,
+        })
+    }
+
+    pub fn ledger(&self) -> Arc<dyn CpuByteLedger> {
+        self.foreground_ledger()
+    }
+
+    /// Admission authority for interactive dataset, source-open, and viewer
+    /// work. Foreground work may consume the declared reserve.
+    pub fn foreground_ledger(&self) -> Arc<dyn CpuByteLedger> {
+        Arc::new(ledger::LedgerHandle {
+            core: Arc::clone(&self.core),
+            class: ledger::LedgerClass::Foreground,
+        })
+    }
+
+    /// Admission authority for ordinary background work. It can borrow every
+    /// managed byte outside the current foreground reserve.
+    pub fn background_ledger(&self) -> Arc<dyn CpuByteLedger> {
+        Arc::new(ledger::LedgerHandle {
+            core: Arc::clone(&self.core),
+            class: ledger::LedgerClass::Background,
+        })
+    }
+
+    pub fn set_foreground_reserve(&self, bytes: u64) -> Result<(), CpuLedgerError> {
+        self.core.set_foreground_reserve(bytes)
+    }
+
+    pub fn foreground_reserve_bytes(&self) -> u64 {
+        self.core.foreground_reserve()
+    }
+
+    /// Atomically protects the minimum complete import path from other
+    /// background borrowers. The reservation owns capacity, not an eagerly
+    /// allocated buffer; its ledger converts that ownership into normal byte
+    /// leases without double charging.
+    pub fn reserve_import_progress(
+        &self,
+        bytes: u64,
+    ) -> Result<ImportProgressReservation, CpuLedgerError> {
+        Ok(ImportProgressReservation {
+            inner: self.core.reserve_progress(bytes)?,
+        })
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.core.config().total_cpu_bytes()
+    }
+
+    pub fn shutdown(&self) {
+        self.core.stop_accepting();
+    }
+}
+
+/// Run-scoped ownership of the importer's non-borrowable progress path.
+pub struct ImportProgressReservation {
+    inner: ledger::ProgressReservation,
+}
+
+impl ImportProgressReservation {
+    pub fn ledger(&self) -> Arc<dyn CpuByteLedger> {
+        Arc::new(self.inner.ledger())
+    }
+
+    pub fn reserved_bytes(&self) -> u64 {
+        self.inner.reserved_bytes()
+    }
+}
 
 /// One nonzero request identity assigned by the dataset runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -258,25 +345,6 @@ const fn category_index(category: CpuLedgerCategory) -> usize {
     }
 }
 
-const fn category_numerator(category: CpuLedgerCategory) -> u64 {
-    match category {
-        CpuLedgerCategory::DecodedResidency => 20,
-        CpuLedgerCategory::UploadStaging | CpuLedgerCategory::InFlightDecode => 5,
-        CpuLedgerCategory::MetadataAndIndexes => 4,
-        CpuLedgerCategory::QueuesAndResults
-        | CpuLedgerCategory::Prefetch
-        | CpuLedgerCategory::ImportWorkingSet => 2,
-    }
-}
-
-fn category_cap(total_cpu_bytes: u64, category: CpuLedgerCategory) -> u64 {
-    // Fortieths express every accepted percentage exactly. Widening before
-    // multiplication prevents overflow; flooring leaves at most 39 bytes
-    // unassigned and can therefore never exceed the total budget.
-    let cap = (u128::from(total_cpu_bytes) * u128::from(category_numerator(category))) / 40;
-    u64::try_from(cap).expect("a category fraction cannot exceed its u64 total")
-}
-
 /// Validated immutable bounds for one unified dataset runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatasetRuntimeConfig {
@@ -302,15 +370,10 @@ impl DatasetRuntimeConfig {
             return Err(RuntimeFaultCode::InvalidConfiguration);
         }
 
-        let category_caps =
-            CPU_LEDGER_CATEGORIES.map(|category| category_cap(total_cpu_bytes, category));
-        let allocated = category_caps.iter().try_fold(0_u64, |sum, cap| {
-            sum.checked_add(*cap)
-                .ok_or(RuntimeFaultCode::InvalidConfiguration)
-        })?;
-        if allocated > total_cpu_bytes {
-            return Err(RuntimeFaultCode::InvalidConfiguration);
-        }
+        // Purpose categories remain observable, but no longer reserve fixed
+        // fractions of the process budget. Every purpose borrows from this
+        // same hard total.
+        let category_caps = [total_cpu_bytes; CPU_LEDGER_CATEGORIES.len()];
 
         Ok(Self {
             total_cpu_bytes,
@@ -342,7 +405,7 @@ impl DatasetRuntimeConfig {
     }
 
     pub fn allocated_category_bytes(self) -> u64 {
-        self.category_caps.iter().copied().sum()
+        self.total_cpu_bytes
     }
 }
 
@@ -1107,7 +1170,9 @@ mod tests {
 
     fn key(region_origin: u64) -> BrickKey {
         BrickKey::new(
-            DatasetResourceIdentity::Verified(ScientificContentId::parse(SCIENTIFIC_ID).unwrap()),
+            DatasetResourceIdentity::ContentAddress(
+                ScientificContentId::parse(SCIENTIFIC_ID).unwrap(),
+            ),
             LogicalLayerKey::new(2),
             TimeIndex::new(3),
             ScaleLevel::new(1),
@@ -1818,29 +1883,19 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_uses_exact_hard_category_fractions() {
+    fn runtime_config_uses_one_hard_total_with_accounting_only_categories() {
         let config = DatasetRuntimeConfig::new(1_000, 3, 17, 11).unwrap();
         assert_eq!(config.total_cpu_bytes(), 1_000);
         assert_eq!(config.worker_limit(), 3);
         assert_eq!(config.request_queue_limit(), 17);
         assert_eq!(config.completion_queue_limit(), 11);
-        assert_eq!(
-            config.category_cap(CpuLedgerCategory::DecodedResidency),
-            500
-        );
-        assert_eq!(config.category_cap(CpuLedgerCategory::InFlightDecode), 125);
-        assert_eq!(config.category_cap(CpuLedgerCategory::UploadStaging), 125);
-        assert_eq!(
-            config.category_cap(CpuLedgerCategory::MetadataAndIndexes),
-            100
-        );
-        assert_eq!(config.category_cap(CpuLedgerCategory::QueuesAndResults), 50);
-        assert_eq!(config.category_cap(CpuLedgerCategory::Prefetch), 50);
-        assert_eq!(config.category_cap(CpuLedgerCategory::ImportWorkingSet), 50);
+        for category in CPU_LEDGER_CATEGORIES {
+            assert_eq!(config.category_cap(category), 1_000);
+        }
         assert_eq!(config.allocated_category_bytes(), 1_000);
 
         let rounded = DatasetRuntimeConfig::new(41, 1, 1, 1).unwrap();
-        assert_eq!(rounded.allocated_category_bytes(), 40);
+        assert_eq!(rounded.allocated_category_bytes(), 41);
         assert!(rounded.allocated_category_bytes() <= rounded.total_cpu_bytes());
         let maximum = DatasetRuntimeConfig::new(u64::MAX, 1, 1, 1).unwrap();
         assert!(maximum.allocated_category_bytes() <= maximum.total_cpu_bytes());
@@ -1860,6 +1915,55 @@ mod tests {
             DatasetRuntimeConfig::new(1_000, 1, 1, 0),
             Err(RuntimeFaultCode::InvalidConfiguration)
         );
+    }
+
+    #[test]
+    fn process_broker_protects_foreground_and_import_progress_without_double_charging() {
+        let broker = ProcessCpuBroker::new(1_000).unwrap();
+        broker.set_foreground_reserve(300).unwrap();
+        assert_eq!(broker.foreground_reserve_bytes(), 300);
+
+        let progress = broker.reserve_import_progress(200).unwrap();
+        assert_eq!(progress.reserved_bytes(), 200);
+        let background = broker.background_ledger();
+        let background_charge = background
+            .try_acquire(CpuLedgerCategory::ImportWorkingSet, 500)
+            .unwrap();
+        assert!(matches!(
+            background.try_acquire(CpuLedgerCategory::ImportWorkingSet, 1),
+            Err(CpuLedgerError::CapacityExceeded {
+                available_bytes: 0,
+                ..
+            })
+        ));
+
+        let foreground = broker.foreground_ledger();
+        let foreground_charge = foreground
+            .try_acquire(CpuLedgerCategory::InFlightDecode, 300)
+            .unwrap();
+        assert!(matches!(
+            foreground.try_acquire(CpuLedgerCategory::InFlightDecode, 1),
+            Err(CpuLedgerError::CapacityExceeded {
+                available_bytes: 0,
+                ..
+            })
+        ));
+
+        let progress_ledger = progress.ledger();
+        let progress_charge = progress_ledger
+            .try_acquire(CpuLedgerCategory::ImportWorkingSet, 200)
+            .unwrap();
+        assert_eq!(progress_charge.reserved_bytes(), 200);
+
+        drop(foreground_charge);
+        drop(progress_charge);
+        drop(progress_ledger);
+        drop(progress);
+        let borrowed = background
+            .try_acquire(CpuLedgerCategory::ImportWorkingSet, 200)
+            .unwrap();
+        drop(borrowed);
+        drop(background_charge);
     }
 
     #[test]
@@ -1894,7 +1998,7 @@ mod tests {
         assert_eq!(
             DatasetRuntimeDiagnostics::new(
                 config,
-                [501, 0, 0, 0, 0, 0, 0],
+                [1_001, 0, 0, 0, 0, 0, 0],
                 0,
                 0,
                 0,

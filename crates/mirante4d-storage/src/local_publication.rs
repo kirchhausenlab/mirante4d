@@ -34,7 +34,7 @@ use thiserror::Error;
 
 use crate::package_science::PreparedScientificPublication;
 use crate::range_io::PublishedPackageRootBinding;
-use crate::{PackagePath, VerifiedScientificPackageCapability};
+use crate::{PackagePath, SelfConsistentPackageCapability};
 
 const STAGE_CREATE_ATTEMPTS: u64 = 128;
 const SYNCFS_WRITEBACK_ERROR_KERNEL_MINIMUM: (u64, u64) = (5, 8);
@@ -64,6 +64,7 @@ pub(crate) struct LocalPublication {
     stage_identity: DirectoryIdentity,
     created_directories: BTreeSet<PathBuf>,
     owns_stage: bool,
+    cleanup_on_drop: bool,
 }
 
 #[derive(Debug, Error)]
@@ -184,6 +185,7 @@ impl LocalPublication {
                         stage_identity,
                         created_directories: BTreeSet::from([PathBuf::new()]),
                         owns_stage: true,
+                        cleanup_on_drop: true,
                     });
                 }
                 Err(Errno::EXIST) => continue,
@@ -200,8 +202,87 @@ impl LocalPublication {
         })
     }
 
+    /// Opens or creates one caller-named private stage next to the final
+    /// destination. Unlike `begin`, dropping this handle preserves the stage:
+    /// it is the durable checkpoint authority of a resumable producer.
+    pub(crate) fn open_or_create_persistent(
+        destination: impl AsRef<Path>,
+        stage_path: impl AsRef<Path>,
+    ) -> Result<Self, LocalPublicationError> {
+        let destination = destination.as_ref().to_path_buf();
+        let stage_path = stage_path.as_ref().to_path_buf();
+        let destination_name = destination
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| invalid_input("publication destination must name one package root"))?
+            .to_os_string();
+        let stage_name = stage_path
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| invalid_input("publication stage must name one private root"))?
+            .to_os_string();
+        let parent_path = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let stage_parent = stage_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if parent_path != stage_parent || destination_name == stage_name {
+            return Err(invalid_input(
+                "persistent publication stage and destination must be distinct siblings",
+            ));
+        }
+        let parent = openat(CWD, parent_path, DIRECTORY_OPEN_FLAGS, Mode::empty())
+            .map_err(|error| io_error("open the destination parent", error))?;
+        match statat(
+            &parent,
+            destination_name.as_os_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(_) => return Err(LocalPublicationError::DestinationExists),
+            Err(Errno::NOENT) => {}
+            Err(error) => return Err(io_error("inspect the publication destination", error)),
+        }
+        require_syncfs_writeback_error_reporting()?;
+
+        match mkdirat(&parent, stage_name.as_os_str(), Mode::RWXU) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(error) => return Err(io_error("create the persistent staging directory", error)),
+        }
+        let stage = openat(
+            &parent,
+            stage_name.as_os_str(),
+            DIRECTORY_OPEN_FLAGS,
+            Mode::empty(),
+        )
+        .map_err(|error| io_error("open the persistent staging directory", error))?;
+        let stage_identity = DirectoryIdentity::from_stat(
+            fstat(&stage).map_err(|error| io_error("identify the staging directory", error))?,
+        );
+        let created_directories = collect_directories(&stage)?;
+        Ok(Self {
+            parent,
+            destination_path: destination,
+            destination_name,
+            stage_path,
+            stage_name,
+            stage,
+            stage_identity,
+            created_directories,
+            owns_stage: true,
+            cleanup_on_drop: false,
+        })
+    }
+
     pub(crate) fn stage_path(&self) -> &Path {
         &self.stage_path
+    }
+
+    pub(crate) fn refresh_created_directories(&mut self) -> Result<(), LocalPublicationError> {
+        self.created_directories = collect_directories(&self.stage)?;
+        Ok(())
     }
 
     /// Creates one new regular object under the private stage.
@@ -265,11 +346,40 @@ impl LocalPublication {
         &self,
         is_cancelled: impl FnMut() -> bool,
     ) -> Result<PublicationSyncReport, LocalPublicationError> {
-        self.sync_stage_with(is_cancelled, |stage| syncfs(stage))
+        self.sync_directories_with(self.created_directories.clone(), is_cancelled, |stage| {
+            syncfs(stage)
+        })
     }
 
+    /// Flushes the bounded resumable suffix through one filesystem barrier.
+    /// Linux `syncfs` covers both object data and namespace metadata; the
+    /// final publication phase still performs its explicit full directory
+    /// walk once. Incremental commits therefore do not accumulate an
+    /// object- or directory-proportional durability cost.
+    pub(crate) fn sync_stage_paths<'a>(
+        &self,
+        _paths: impl IntoIterator<Item = &'a PackagePath>,
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<PublicationSyncReport, LocalPublicationError> {
+        self.sync_directories_with(BTreeSet::new(), is_cancelled, |stage| syncfs(stage))
+    }
+
+    #[cfg(test)]
     fn sync_stage_with(
         &self,
+        is_cancelled: impl FnMut() -> bool,
+        sync_filesystem: impl FnOnce(&OwnedFd) -> rustix::io::Result<()>,
+    ) -> Result<PublicationSyncReport, LocalPublicationError> {
+        self.sync_directories_with(
+            self.created_directories.clone(),
+            is_cancelled,
+            sync_filesystem,
+        )
+    }
+
+    fn sync_directories_with(
+        &self,
+        directories: BTreeSet<PathBuf>,
         mut is_cancelled: impl FnMut() -> bool,
         sync_filesystem: impl FnOnce(&OwnedFd) -> rustix::io::Result<()>,
     ) -> Result<PublicationSyncReport, LocalPublicationError> {
@@ -284,7 +394,7 @@ impl LocalPublication {
         if is_cancelled() {
             return Err(LocalPublicationError::Cancelled);
         }
-        let mut directories = self.created_directories.iter().cloned().collect::<Vec<_>>();
+        let mut directories = directories.into_iter().collect::<Vec<_>>();
         directories.sort_by(|left, right| {
             right
                 .components()
@@ -318,13 +428,13 @@ impl LocalPublication {
     /// Atomically publishes the exact directory owned by a prepared scientific
     /// capability, rebinds that capability to the destination, and returns it
     /// only after the destination parent is durable.
-    pub(crate) fn commit_verified(
+    pub(crate) fn commit_self_consistent(
         mut self,
         package_id: PackageId,
         prepared: PreparedScientificPublication,
         is_cancelled: &mut impl FnMut() -> bool,
         mut hook: impl FnMut(PublicationCheckpoint, PackageId) -> io::Result<()>,
-    ) -> Result<(PublicationSyncReport, VerifiedScientificPackageCapability), LocalPublicationError>
+    ) -> Result<(PublicationSyncReport, SelfConsistentPackageCapability), LocalPublicationError>
     {
         if prepared.package_id() != package_id
             || !prepared.root_matches(self.stage_identity.device, self.stage_identity.inode)
@@ -335,7 +445,7 @@ impl LocalPublication {
         }
         hook(PublicationCheckpoint::BeforeRename, package_id).map_err(|source| {
             LocalPublicationError::Io {
-                operation: "complete the verified pre-commit checkpoint",
+                operation: "complete the self-consistent pre-commit checkpoint",
                 source,
             }
         })?;
@@ -517,7 +627,7 @@ impl LocalPublication {
 
 impl Drop for LocalPublication {
     fn drop(&mut self) {
-        if !self.owns_stage {
+        if !self.owns_stage || !self.cleanup_on_drop {
             return;
         }
 
@@ -533,6 +643,51 @@ impl Drop for LocalPublication {
             );
         }
     }
+}
+
+fn collect_directories(root: &OwnedFd) -> Result<BTreeSet<PathBuf>, LocalPublicationError> {
+    fn visit(
+        directory: &OwnedFd,
+        relative: &Path,
+        found: &mut BTreeSet<PathBuf>,
+    ) -> Result<(), LocalPublicationError> {
+        found.insert(relative.to_path_buf());
+        let entries = Dir::read_from(directory)
+            .map_err(|error| io_error("enumerate the persistent staging directory", error))?
+            .map(|entry| entry.map(|entry| entry.file_name().to_owned()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| io_error("read the persistent staging directory", error))?;
+        for name in entries {
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            let metadata = statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|error| io_error("inspect a persistent staging entry", error))?;
+            match FileType::from_raw_mode(metadata.st_mode) {
+                FileType::Directory => {
+                    let child = openat(directory, &name, DIRECTORY_OPEN_FLAGS, Mode::empty())
+                        .map_err(|error| {
+                            io_error("open a persistent staging subdirectory", error)
+                        })?;
+                    let child_relative =
+                        relative.join(OsString::from_vec(name.to_bytes().to_vec()));
+                    visit(&child, &child_relative, found)?;
+                }
+                FileType::RegularFile => {}
+                _ => {
+                    return Err(invalid_input(
+                        "persistent publication stage contains a non-regular entry",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    use std::os::unix::ffi::OsStringExt;
+    let mut found = BTreeSet::new();
+    visit(root, Path::new(""), &mut found)?;
+    Ok(found)
 }
 
 impl DirectoryIdentity {

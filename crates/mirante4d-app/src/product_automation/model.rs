@@ -67,7 +67,8 @@ impl ProductAutomationScript {
 
     pub(super) fn requires_validation_capture(&self) -> bool {
         self.commands.iter().any(|command| match command {
-            ProductAutomationCommand::CaptureScreenshot { .. } => true,
+            ProductAutomationCommand::CaptureScreenshot { .. }
+            | ProductAutomationCommand::CaptureTemporalFrame { .. } => true,
             ProductAutomationCommand::Assert { condition } => {
                 condition.requires_validation_capture()
             }
@@ -263,18 +264,20 @@ pub(super) enum ProductAutomationCommand {
         stage: String,
     },
     HoldForExternalKill,
-    CancelSourceVerification,
-    CancelActiveSourceVerification,
-    RequestSourceVerification,
+    CancelPackageIntegrityAudit,
+    CancelActivePackageIntegrityAudit,
+    RequestPackageIntegrityAudit,
     BeginTiffImportSetup {
         source: PathBuf,
         output_parent: PathBuf,
+        source_kind: ProductAutomationTiffSourceKind,
     },
     StartReviewedImport {
         spacing_zyx_um: [f64; 3],
         time_step_seconds: Option<f64>,
-        no_data_sentinel: Option<u8>,
-        working_memory_bytes: u64,
+        #[serde(default)]
+        no_data_value_rule: Option<ProductAutomationNoDataValueRule>,
+        hide_constant_z_planes: bool,
     },
     WaitForImportProgress {
         stage: String,
@@ -307,6 +310,23 @@ pub(super) enum ProductAutomationCommand {
     },
     SetTimeIndex {
         time_index: u64,
+    },
+    SetPlaybackFps {
+        fps: u8,
+    },
+    SetPlaybackActive {
+        active: bool,
+    },
+    WaitForPresentedTimeIndex {
+        time_index: u64,
+        timeout_ms: u64,
+    },
+    WaitForTemporalTransitions {
+        minimum_transitions: u32,
+        timeout_ms: u64,
+    },
+    ObservePlaybackCadence {
+        duration_ms: u64,
     },
     SetLayerVisibility {
         layer_index: usize,
@@ -434,6 +454,11 @@ pub(super) enum ProductAutomationCommand {
         target: ProductAutomationPresentationTarget,
         name: Option<String>,
     },
+    CaptureTemporalFrame {
+        target: ProductAutomationPresentationTarget,
+        name: Option<String>,
+        min_different_pixels_from_previous: Option<usize>,
+    },
     Assert {
         condition: ProductAutomationAssertCondition,
     },
@@ -441,6 +466,24 @@ pub(super) enum ProductAutomationCommand {
         frames: u32,
     },
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProductAutomationTiffSourceKind {
+    #[serde(rename = "single_3d_tiff")]
+    Single3dTiff,
+    #[serde(rename = "folder_of_3d_tiffs")]
+    FolderOf3dTiffs,
+    #[serde(rename = "folder_of_2d_tiffs")]
+    FolderOf2dTiffs,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ProductAutomationNoDataValueRule {
+    Automatic,
+    ManualUint8 { value: u8 },
 }
 
 impl ProductAutomationCommand {
@@ -457,9 +500,9 @@ impl ProductAutomationCommand {
             Self::CloseProjectStore => "close_project_store",
             Self::WriteExternalKillCheckpoint { .. } => "write_external_kill_checkpoint",
             Self::HoldForExternalKill => "hold_for_external_kill",
-            Self::CancelSourceVerification => "cancel_source_verification",
-            Self::CancelActiveSourceVerification => "cancel_active_source_verification",
-            Self::RequestSourceVerification => "request_source_verification",
+            Self::CancelPackageIntegrityAudit => "cancel_package_integrity_audit",
+            Self::CancelActivePackageIntegrityAudit => "cancel_active_package_integrity_audit",
+            Self::RequestPackageIntegrityAudit => "request_package_integrity_audit",
             Self::BeginTiffImportSetup { .. } => "begin_tiff_import_setup",
             Self::StartReviewedImport { .. } => "start_reviewed_import",
             Self::WaitForImportProgress { .. } => "wait_for_import_progress",
@@ -471,6 +514,11 @@ impl ProductAutomationCommand {
             Self::SetRenderTargetSize { .. } => "set_render_target_size",
             Self::SetViewerLayout { .. } => "set_viewer_layout",
             Self::SetTimeIndex { .. } => "set_time_index",
+            Self::SetPlaybackFps { .. } => "set_playback_fps",
+            Self::SetPlaybackActive { .. } => "set_playback_active",
+            Self::WaitForPresentedTimeIndex { .. } => "wait_for_presented_time_index",
+            Self::WaitForTemporalTransitions { .. } => "wait_for_temporal_transitions",
+            Self::ObservePlaybackCadence { .. } => "observe_playback_cadence",
             Self::SetLayerVisibility { .. } => "set_layer_visibility",
             Self::SetLayerOrder { .. } => "set_layer_order",
             Self::SetRenderMode { .. } => "set_render_mode",
@@ -501,6 +549,7 @@ impl ProductAutomationCommand {
             Self::PrimaryClick { .. } => "primary_click",
             Self::CopyDiagnostics => "copy_diagnostics",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
+            Self::CaptureTemporalFrame { .. } => "capture_temporal_frame",
             Self::Assert { .. } => "assert",
             Self::SleepFrames { .. } => "sleep_frames",
             Self::Quit => "quit",
@@ -653,6 +702,47 @@ impl ProductAutomationCommand {
                 mirante4d_render_api::MAX_RENDER_LAYERS
             );
         }
+        if let Self::SetPlaybackFps { fps } = self
+            && mirante4d_application::PlaybackFps::new(*fps).is_none()
+        {
+            anyhow::bail!(
+                "playback FPS must be in {}..={}",
+                mirante4d_application::MIN_PLAYBACK_FPS,
+                mirante4d_application::MAX_PLAYBACK_FPS
+            );
+        }
+        if let Self::WaitForTemporalTransitions {
+            minimum_transitions,
+            timeout_ms,
+        } = self
+            && (*minimum_transitions == 0 || *timeout_ms == 0)
+        {
+            anyhow::bail!(
+                "temporal transition wait requires a nonzero transition count and timeout"
+            );
+        }
+        if let Self::ObservePlaybackCadence { duration_ms } = self
+            && (*duration_ms == 0 || *duration_ms > MAX_INPUT_SEQUENCE_DURATION_MS)
+        {
+            anyhow::bail!(
+                "playback cadence observation duration_ms must be in 1..={MAX_INPUT_SEQUENCE_DURATION_MS}"
+            );
+        }
+        if let Self::WaitForPresentedTimeIndex { timeout_ms, .. } = self
+            && *timeout_ms == 0
+        {
+            anyhow::bail!("presented-timepoint wait requires a nonzero timeout");
+        }
+        if let Self::Assert {
+            condition:
+                ProductAutomationAssertCondition::PlaybackAdvancedDuringPreviousInput {
+                    minimum_transitions,
+                },
+        } = self
+            && *minimum_transitions == 0
+        {
+            anyhow::bail!("playback/input assertion requires a nonzero transition count");
+        }
         Ok(())
     }
 }
@@ -665,9 +755,9 @@ pub(super) enum ProductAutomationWaitCondition {
     RuntimeIdle,
     FrameFreshnessCurrent,
     CoordinatedPresentationSettled,
-    SourceVerificationInactive,
-    SourceVerificationRequired,
-    SourceVerificationVerified,
+    PackageIntegrityAuditInactive,
+    PackageIntegrityAuditNotRun,
+    PackageIntegrityAuditSelfConsistent,
     ImportReviewReady,
     ImportIdle,
     ProjectStoreIdle,
@@ -675,6 +765,8 @@ pub(super) enum ProductAutomationWaitCondition {
     RecoveryReviewRequired,
     UnsavedAutosaveRecoveryExposed,
     ProjectStoreClosed,
+    InitialAutoDenseApplied,
+    PlaybackResidencyReleased,
 }
 
 impl ProductAutomationWaitCondition {
@@ -685,9 +777,9 @@ impl ProductAutomationWaitCondition {
             Self::RuntimeIdle => "runtime_idle",
             Self::FrameFreshnessCurrent => "frame_freshness_current",
             Self::CoordinatedPresentationSettled => "coordinated_presentation_settled",
-            Self::SourceVerificationInactive => "source_verification_inactive",
-            Self::SourceVerificationRequired => "source_verification_required",
-            Self::SourceVerificationVerified => "source_verification_verified",
+            Self::PackageIntegrityAuditInactive => "package_integrity_audit_inactive",
+            Self::PackageIntegrityAuditNotRun => "package_integrity_audit_not_run",
+            Self::PackageIntegrityAuditSelfConsistent => "package_integrity_audit_self_consistent",
             Self::ImportReviewReady => "import_review_ready",
             Self::ImportIdle => "import_idle",
             Self::ProjectStoreIdle => "project_store_idle",
@@ -695,6 +787,8 @@ impl ProductAutomationWaitCondition {
             Self::RecoveryReviewRequired => "recovery_review_required",
             Self::UnsavedAutosaveRecoveryExposed => "unsaved_autosave_recovery_exposed",
             Self::ProjectStoreClosed => "project_store_closed",
+            Self::InitialAutoDenseApplied => "initial_auto_dense_applied",
+            Self::PlaybackResidencyReleased => "playback_residency_released",
         }
     }
 
@@ -765,10 +859,10 @@ pub(super) enum ProductAutomationAssertCondition {
         min_different_pixels: Option<usize>,
     },
     CrossSectionRetired,
-    SourceVerificationEvidence {
-        min_accepted_progress_updates: u64,
+    PackageIntegrityAuditEvidence {
+        min_progress_updates: u64,
         min_cancelled_runs: u64,
-        min_accepted_successes: u64,
+        min_completed_runs: u64,
     },
     ImportWorkflowEvidence {
         required_stage_names: Vec<String>,
@@ -793,6 +887,11 @@ pub(super) enum ProductAutomationAssertCondition {
         manual: bool,
         autosave: bool,
     },
+    TemporalContinuity,
+    PlaybackAdvancedDuringPreviousInput {
+        minimum_transitions: u32,
+    },
+    PlaybackStoppedAndReleased,
 }
 
 impl ProductAutomationAssertCondition {
@@ -823,10 +922,15 @@ impl ProductAutomationAssertCondition {
             Self::CrossSectionPanelSchedule { .. } => "cross_section_panel_schedule",
             Self::FourPanelImagesDistinct { .. } => "four_panel_images_distinct",
             Self::CrossSectionRetired => "cross_section_retired",
-            Self::SourceVerificationEvidence { .. } => "source_verification_evidence",
+            Self::PackageIntegrityAuditEvidence { .. } => "package_integrity_audit_evidence",
             Self::ImportWorkflowEvidence { .. } => "import_workflow_evidence",
             Self::RenderTargetPixels { .. } => "render_target_pixels",
             Self::ProjectState { .. } => "project_state",
+            Self::TemporalContinuity => "temporal_continuity",
+            Self::PlaybackAdvancedDuringPreviousInput { .. } => {
+                "playback_advanced_during_previous_input"
+            }
+            Self::PlaybackStoppedAndReleased => "playback_stopped_and_released",
         }
     }
 

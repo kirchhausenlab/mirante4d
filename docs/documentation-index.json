@@ -146,7 +146,55 @@
       "listed_in": "docs/README.md"
     },
     {
+      "path": "docs/plans/active/PREPROCESSING_BOUNDED_TEMPORAL_PIPELINE.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/LARGE_DATASET_PREPROCESSING_AND_STORAGE_CUTOVER.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/PREPROCESSING_APPLICATION_AND_IMPORTER_CUTOVER.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/VIEWER_COMPOSED_PRESENTATION_SCHEDULER_CUTOVER.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/VIEWER_PLAYBACK_SESSION_AND_SOURCE_INTEGRITY_CUTOVER.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/TIME_SERIES_IMPORT_PROFILE_CORRECTION.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/GENERALIZED_NO_DATA_IMPORT.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
       "path": "docs/plans/active/PRE_ALPHA_RELIABILITY_AND_PACKAGING.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/VIEWER_MULTICHANNEL_PERFORMANCE_AND_VISIBLE_LAYER_AUTHORITY.md",
       "truth_scope": "target",
       "authorities": [],
       "listed_in": "docs/README.md"

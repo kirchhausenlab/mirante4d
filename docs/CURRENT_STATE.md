@@ -1,6 +1,6 @@
 # Current State
 
-Last reviewed: 2026-07-31
+Last reviewed: 2026-08-01
 
 Mirante4D is public, pre-alpha academic research software. Persisted formats
 and APIs can change through explicit hard cutovers; there is no supported
@@ -21,6 +21,8 @@ public release or public full microscopy dataset yet.
   playback prefetch, histogram, interactive readout, and analysis demand.
 - TIFF/OME-TIFF import plus exact whole-layer time traces and numeric box
   intensity statistics, with atomic table/plot project artifacts and CSV copy.
+- Dataset-optional native startup with a welcome launcher for opening an
+  existing package or configuring explicit per-channel TIFF preprocessing.
 - Linux release-directory, tarball, and AppImage build paths.
 - No segmentation or derived-label subsystem.
 
@@ -46,16 +48,59 @@ join, second synthetic close, guardian, or competing shutdown path.
 Earlier-launch provisional autosaves are discovered only as bounded canonical
 project-store locators. When any exist, startup opens the normal recovery
 panel and visibly reports that unsaved work is available. Recovery remains an
-explicit user choice, waits for current-source scientific verification, and
-uses the application reducer and project-store actor to validate the selected
-store. A recovered provisional branch opens dirty and still requires Save or
+explicit user choice and uses the application reducer and project-store actor
+to validate the selected store. It does not wait for a whole-package dataset
+scan. A recovered provisional branch opens dirty and still requires Save or
 Save As; startup never silently opens, repairs, advances, or deletes it.
 
-The importer now indexes the reviewed TIFF inventory once, traverses admitted
-native strips/tiles in source order, decodes each admitted native chunk once
-into a two-file canonical base cache, and derives base chunks, pyramids, and
-scientific identity without a second TIFF decode. Its sole checkpoint authority
-is that cache plus a four-file batched-durability spool. Eligible one-plane
+The normal native process now creates one dataset-independent application
+shell before any package is selected. Cancelling a package chooser leaves the
+window open. The centered launcher can open a strict `.m4d` package or start
+the same preprocessing workflow available from an open workbench. A dataset
+session is created only after a package opens successfully; no dummy catalog
+or runtime exists in the empty state. Successful preprocessing transfers its
+validated create-only publication directly into the ordinary source-open
+boundary.
+
+Preprocessing source structure is user-authored rather than inferred. Each of
+one through 64 named channels explicitly selects a single 3D TIFF, a folder of
+3D TIFF timepoints, or a folder of 2D TIFF Z planes. Immediate TIFF children
+are non-recursive and lexicographically ordered; filenames carry no channel,
+time, or Z semantics and unrelated channel filenames are valid. Asynchronous
+metadata inspection reports file progress, reads no pixel payload or whole-
+source hash, and suppresses stale row-generation completions. Channel
+validation requires unique normalized labels and common logical shape and
+dtype. The labels are persisted in optional canonical display metadata and
+become runtime layer labels after reopen.
+
+One process CPU broker now owns the managed-byte ceiling above optional
+dataset and preprocessing sessions. Purpose categories are accounting labels,
+not percentage partitions. An open dataset installs a derived foreground
+decode/queue reserve; preprocessing borrows the remaining capacity and
+atomically retains one maximum phase-minimum progress lane for the run. Unused
+progress capacity is protected from both ordinary background and foreground
+growth, and converts to normal leases without double charging. Ordered workers
+narrow their sliding window and retry transient capacity refusal instead of
+failing a running import. The product has no import-local working-memory
+selector.
+
+The importer now indexes the explicit reviewed TIFF manifest once, traverses
+admitted native strips/tiles in source order, decodes each admitted native
+chunk once into a two-file canonical base cache, and derives base chunks,
+pyramids, and the scientific content address without a second TIFF decode or
+raw-source hash pass. One canonical owner may additionally prepare exactly one
+future unit cache while it processes the current unit. That optional cache is
+admitted only from CPU bytes and filesystem headroom left after the serial
+progress path is protected; it has no spool, hashing, shard, journal, or
+publication authority and is consumed strictly in unit order. Its worker uses
+one slot from the existing system-parallelism ceiling, and temporary resource
+contraction simply returns scheduling to width one. Automatic no-data
+resolution is durable before decode-ahead begins. No second future lane or
+user concurrency control is shipped.
+
+The checkpoint authority remains the current cache, at most one ordinal-bound
+future decoded cache, and one four-file batched-durability spool.
+Eligible one-plane
 files, normalization, downsampling, scientific-tile preparation, and inner
 encoding use byte-ledger-admitted workers while one owner commits deterministic
 order; multipage inputs retain one exact-once streaming decoder.
@@ -78,17 +123,32 @@ and proof-derived snapshot sweep with zero codec decodes; product evidence also
 observes successfully started and failed ordinary-verifier runs instead of
 inferring their absence from accepted progress alone.
 
-Reviewed `uint8` sentinel imports now use one guarded policy at every product
-boundary. Base chunks and scientific-identity tiles classify exact source
-sentinel bytes through a clipped one-voxel halo, dilate invalidity in 2D or 3D,
-and store canonical zero for final invalid samples. Every coarse sentinel LOD
-uses valid-only aligned factor-two means with half-up rounding, derives support
-from final parent validity, and applies the same one-voxel invalid dilation.
+Reviewed no-data imports now use one first-volume resolver and typed guarded
+policy at every product boundary. The UI independently enables automatic
+spatial-mask detection (all admitted dtypes), manual uint8 entry, and exact
+constant-Z-plane hiding. Detection reads only channel zero at timepoint zero.
+The first uniform `5 x 5 x 5` block resolves an exact typed value; a complete
+second pass reconstructs every face-connected equal-value component containing
+such a block. Equal-valued voxels disconnected from all seeds remain valid. No
+uniform block is an ordinary no-match. The fixed reconstructed geometry and
+plane indices then apply unchanged to every channel/timepoint. Reconstruction
+uses row-packed exact-value, seed, and visited/final-mask bits plus a fixed
+in-memory run window and checkpoint-owned spill file. Spill I/O is fixed-size,
+its worst-case bytes are included in scratch preflight, and explicit
+checkpoint reset recognizes and removes that owned transient.
+
+Automatic base chunks and scientific-content tiles classify fixed spatial-mask
+membership through a clipped one-voxel halo; manual uint8 mode alone performs
+dataset-wide exact-value classification. Both exclude hidden planes from that
+morphology. Constant planes remain strictly plane-local. Every explicit-
+validity LOD uses valid-only aligned factor-two means, half-up integer or finite
+float rounding, value-support dilation, and geometric plane support.
 Fused workers read ordinary parent pixels separately from expanded
 validity-only halos; packed-index uniform facts avoid mask decoding, and
-halo-only parents never read pixel payloads. Sentinel mean LODs publish
-axis-aware centered transforms. Imports without a sentinel retain their
-existing point-decimation and origin-anchored transforms.
+halo-only parents never read pixel payloads. Validity-aware mean LODs publish
+axis-aware centered transforms. An automatic no-match with no hidden planes
+emits no validity arrays and retains point decimation and origin-anchored
+transforms.
 
 Source inspection admits grayscale `uint8`, `uint16`, and finite `float32`
 TIFF/OME-TIFF pages using uncompressed, LZW, Deflate (current or old TIFF
@@ -97,11 +157,13 @@ compression paths are rejected because their decoder workspaces are outside
 the audited memory authority. A cancellation-aware, fixed-read raw preflight
 bounds every primary IFD, eager decoder field, native chunk table, and the
 65,536-page retained-decoder authority before `tiff::Decoder` is constructed.
-Inspection, ingest, and the final exact SHA-256 pass compare the opened file
-descriptor's device/inode/generation facts with the guarded path generation
-before and after use; ingest and final revalidation also require the reviewed
-generation. None of these changes alters the active dataset or identity
-profiles.
+Inspection and ingest compare the opened file descriptor's
+device/inode/generation facts with the guarded path generation before and
+after use; final structural revalidation also requires the reviewed generation
+without rereading payload bytes. The canonical decoded-source digest is fused
+into ingest and is explicitly an identity of admitted values, not an
+authentication of biological authorship. None of these changes alters the
+scientific identity profile.
 
 `mirante4d-analysis-core` owns exact `uint8`, `uint16`, and finite `float32`
 intensity statistics and artifact payloads. `mirante4d-analysis-runtime` runs
@@ -219,7 +281,7 @@ resolution, preview upscaling, and visible timing probes are deleted. One
 gesture freezes the selected per-layer scale map, so timing or resource
 arrival cannot make its LOD or resolution flicker.
 
-The private 3D replacement renders the selected uniform exact body through one
+The private 3D replacement renders the selected exact per-layer-map body through one
 renderer-owned latest-only worker. It submits and waits for one bounded
 horizontal row batch at a time, adapts the next batch toward a 3 ms target,
 and checks cancellation between submissions. Partial rows publish no frame,
@@ -239,20 +301,23 @@ The terminal scale is a geometry contract, not a fixed ordinal. New imports
 factor-two reduce spatial dimensions until both the maximum dimension is at
 most 64 and the spatial volume is at most 262,144 voxels per layer/timepoint.
 Small datasets may remain S0; the largest representable dimension terminates
-within the profile's 64-level bound. The active terminal body remains in the
-ordinary global requirement union. When one canonical resource covers the
-complete layer, renderer control names that page directly and volume kernels
-bypass repeated sparse-directory hashing. Voxel-exact rays reuse its decoded
-address, and smooth-linear rays reuse the same address for all eight taps.
+within the profile's 64-level bound. Every visible layer's terminal body
+remains in the ordinary global requirement union. When one canonical resource
+covers the complete layer, renderer control names that page directly and
+volume kernels bypass repeated sparse-directory hashing. Voxel-exact rays
+reuse its decoded address, and smooth-linear rays reuse the same address for
+all eight taps.
 
-The 3D navigation planner keeps that terminal body mandatory and admits
-successively finer coherent full-volume rungs while an optional tail bounded
-to one quarter of the configured logical payload/resource limits, at most
-512 MiB and 16,384 resources, fits the exact global union. Each candidate
-wrapper ranks only its own one-scale body as frame-required. The rest of the
-same canonical aggregate is a permanently dormant residency-prefetch suffix:
-the sole renderer residency owner may upload it terminal-to-fine, but it
-cannot affect coverage, control, pixels, fidelity, or prefetch promotion.
+The static 3D navigation planner keeps that terminal map mandatory and admits
+successively finer coherent full-volume maps in deterministic max-min
+per-layer order while an optional tail bounded to one quarter of the
+configured logical payload/resource limits, at most 512 MiB and 16,384
+resources, fits the exact global union. Each candidate wrapper ranks only its
+own one-scale-per-layer body as frame-required. The rest of the same canonical
+aggregate is a permanently dormant residency-prefetch suffix: the sole
+renderer residency owner may upload it terminal-to-fine, but it cannot affect
+coverage, control, pixels, fidelity, or prefetch promotion. Playback retains
+its separate lockstep quality order.
 
 The transient mailbox is the sole render-revision allocator and now allocates
 the render API's `FrameIdentity` directly; the duplicate application
@@ -291,6 +356,49 @@ once; a discarded trial does not retain a false ledger charge. The renderer
 receives an explicit target-to-coarser scale chain per visible Plane layer.
 Already-resident intermediate scales may be sampled, but they are not load
 dependencies and do not delay the latest selected target.
+
+Playback is transient and now has one authoritative `PlaybackSession`.
+Warmup selects the finest sustainable full-volume scale map for the chosen
+1–24 FPS rate, active layout, exact CPU/GPU overlap, startup runway, and
+bounded rotating slot ring. The admitted session freezes that scale map and
+its target set until Pause or Stop; temporal length does not change
+steady-state memory. Each successor advances only after its complete
+same-scale bundle is resident and renderable. A late successor applies clock
+backpressure and leaves the predecessor visible instead of flashing a coarser
+rung, skipping time, blanking a target, or publishing a partial four-panel
+layout.
+
+Temporal frame contracts contain no camera or linked-plane geometry. The
+fixed-scale full-volume bodies therefore survive camera and linked-plane input
+without rebuilding or rebasing the slot ring. Four-panel playback also gives
+the linked panels geometry-independent bodies from that same session contract.
+That resource independence is implemented.
+
+One private application `ComposedPresentationScheduler` now owns semantic
+presentation transactions. Its temporal, 3D-spatial, linked-spatial, and
+retained-quality coordinates advance independently and are accepted
+componentwise monotonically. A ready due playback successor is composed with
+the latest spatial snapshots rather than waiting for newest whole-layout
+spatial settlement, so held 3D or linked input cannot turn that temporal action
+into `Wait` or rebuild the slot ring.
+
+Every transaction first assembles the complete fixed-shape logical target set
+from newly prepared and exactly compatible reused members. Only then does it
+derive the physical target delta and exact atomic publication group. An empty
+delta completes without artificial renderer work, while a partial delta cannot
+be mistaken for an incomplete four-panel frame. The renderer's private
+`FrameCoordinator` remains the sole GPU target, queue-submission, completion,
+and texture-swap authority.
+
+Pause or Stop starts a generic retained-quality transaction after the reducer
+has established the final post-reconciliation render revisions. The last
+coherent playback front stays visible until one complete, renderable stationary
+plan for the active layout is ready; future playback-only demand is released
+without routing the visible image through a coarse navigation rung. Recoverable
+candidate failures are scoped and latched by transaction fingerprint instead
+of blanking, downgrading, or repeatedly retrying the front. The
+[composed presentation scheduler plan](plans/active/VIEWER_COMPOSED_PRESENTATION_SCHEDULER_CUTOVER.md)
+owns the completed design and evidence handoff.
 
 Incremental linked-2D settlement keeps current-geometry floor coverage
 separate from installed exact-demand identity; fallback can make the newest
@@ -399,11 +507,10 @@ reserves every selected member's still-uncharged working bound, so an
 individually admissible set cannot form an aggregate batch that repeatedly
 fails before publishing any bytes. The runtime
 reports cohort membership plus cancelled decode execution count, time, and
-bytes as explicit waste. A short fixed post-interaction grace keeps background
-verification below warm resident navigation. Verification blocks on a
-condition variable instead of periodically polling, then resumes after
-interaction settles. If all workers are occupied by playback, analysis, or
-prefetch, newly admitted foreground work cancels one low-priority execution at
+bytes as explicit waste. There is no automatic verification job or
+post-interaction verification grace in this scheduler. If all workers are
+occupied by playback, analysis, or prefetch, newly admitted foreground work
+cancels one low-priority execution at
 a source checkpoint, preserves its logical job, ticket, waiters, and dedupe
 identity, runs the foreground cohort, and then resumes the interrupted job.
 
@@ -444,12 +551,14 @@ coalesces sequential and concurrent semantic consumers, including the sixteen
 stream through bounded writable spans directly into the runtime-owned sink
 without a payload-sized copy. Current-view cohort members share one fail-closed
 pre-use/post-use currentness transaction while preserving member-local faults
-and cancellation. Verified delivery trusts packed payload facts only after the
-scientific verifier has decoded and checked every pyramid scale. Reuse and
-batching do not weaken mutation detection or scientific identity. Native
-codec/range workspace is released immediately after physical decode; only the
-exact decoded-brick retention charge may survive a residency-capacity bypass
-while joined semantic consumers finish.
+and cancellation. For an externally opened package, packed payload facts are
+only acceleration hints until their corresponding payload is decoded and
+checked; they cannot suppress a first required payload read. The active
+importer's self-consistent publication capability may transfer already checked
+facts without another scan. Reuse and batching do not weaken per-object
+mutation detection. Native codec/range workspace is released immediately
+after physical decode; only the exact decoded-brick retention charge may
+survive a residency-capacity bypass while joined semantic consumers finish.
 
 ## Foundation Status
 
@@ -491,6 +600,60 @@ nonmutation, process, and artifact evidence.
 See [testing](TESTING.md) for commands and claim language.
 
 ## Viewer Performance And Development Recovery Status
+
+The 2026-08-02 static multichannel visible-layer correction is implemented and
+closed. The standard PR gate, renderer GPU equivalence checks, and fixed-LOD
+matrix pass. After normal product use, the owner explicitly accepted the
+correctness-first closeout while reporting materially worse static viewer
+performance. No controlled before/after product measurement exists, so this
+is qualitative negative evidence rather than a quantified regression, and no
+performance improvement is claimed. Static performance recovery is deferred
+to separately approved follow-up work. Durable active-layer selection is now analysis
+focus only and may be hidden. Ordered visible layers own render membership,
+and ideal, capacity-selected, navigation, and displayed fidelity are exact
+per-layer maps. Active-only changes preserve planning, residency, render
+revision, and presentation authority. Hiding the active channel leaves the
+remaining channels renderable; hiding all channels installs and publishes the
+explicit empty state. Uniform scalar LODs survive only as optional diagnostic
+summaries and cannot decide currentness or reuse.
+
+Static capacity refinement and navigation construction now use deterministic
+max-min normalized per-layer progress with authored-order ties. Playback keeps
+its prior active-first/lockstep quality ordering and its retention, runway,
+scheduling, memory, and presentation policies are unchanged. The old
+full-viewport `maximum dimension × taps` navigation estimate is replaced by a
+renderer-schedule-aligned analytical bound over projected affine coverage,
+transform-aware traversal, fixed ray work, per-layer samples/optics, and
+kernel-specific sharing. Native output resolution, complete-frame publication,
+the 12 ms interaction guideline, and existing CPU/GPU/resource ceilings are
+unchanged.
+
+The controlled warm-resident 1920x1080 matrix ran with 64x64x64 Float32
+channels, five warmups and thirty samples on the NVIDIA GeForce RTX 3070 Ti
+Laptop GPU/Vulkan adapter. The largest homogeneous four/eight-channel p95
+ratio normalized to ideal linear scaling was 1.0317 (eight-channel
+SmoothLinear MIP), below the predeclared 1.20 shader gate. Sampled work issued
+zero uploads or residency submissions; renderer-planning p95 was at most
+0.812712 ms, queue-submit p95 at most 0.309468 ms, and WGPU reported zero
+validation errors. No shader, storage, cache, upload, or playback overhaul was
+therefore made.
+
+Owner product use found one shared-path playback regression before closeout:
+starting playback could adopt the terminal rung of a static fair ladder and
+freeze the fixed contract at that coarse scale. Static and playback ladder
+baselines are now mode-local, incompatible ladders are rejected as a whole,
+and the pre-cutover playback work formula, active-first priority/rewarm input,
+and observation identity are isolated from the static work cut. The normal
+two-channel/three-timepoint application transition now proves an S0 playback
+contract after a mixed static rung, and the playback-filtered suite is a
+regression boundary rather than a new performance claim. Exact tables, model
+decisions, regression coverage, the owner closeout, and the deferred
+performance boundary are recorded in the
+[multichannel performance and visible-layer authority plan](plans/active/VIEWER_MULTICHANNEL_PERFORMANCE_AND_VISIBLE_LAYER_AUTHORITY.md).
+One ignored application GPU handoff check remains red at the identical
+immediate-refresh assertion on both the planning baseline and this tree; it is
+recorded as pre-existing harness debt, not counted as positive package
+evidence, and was not weakened.
 
 The development-simplification and viewer-recovery program is complete.
 EP-00/EP-01 qualification commands, selection, schemas, receipt/replay,
@@ -561,8 +724,11 @@ residency owner, and reported zero WGPU validation errors.
 
 The owner subsequently exercised the normal application and reported that the
 four-panel and 3D navigation behavior works as expected. This closes the
-viewer performance refactor as a product program on 2026-07-31. No rendering
-implementation or validation backlog remains. Smooth-linear sampling remains
+spatial viewer performance refactor as a product program on 2026-07-31. Its
+renderer, LOD, and ordinary-navigation scope remains closed. The separate
+playback-presentation coordination correction is also implemented and owner
+product-validated; it does not reopen those spatial performance results.
+Smooth-linear sampling remains
 functionally supported and covered, but its fine-scale refinement can be much
 slower than voxel-exact on the representative Cell workload; that is a known
 non-blocking limitation and any optimization or product-surface removal is a
@@ -837,8 +1003,42 @@ the refactor without broadening those public claims.
 
 ## Import And Preprocessing Performance
 
-The import/preprocessing hard cutover is implemented and automated-verified at
-immutable revision `eb5c9ffd12cbd9fce65bd03559b8e7f93170d72e`. Both
+The current working tree implements the
+[large-dataset preprocessing and storage cutover](plans/active/LARGE_DATASET_PREPROCESSING_AND_STORAGE_CUTOVER.md).
+`M4D-COMPOSITIONAL-1` is the sole admission contract; the predecessor
+aggregate dataset classes no longer select package support. Aggregate
+addressability is bounded by format/object constraints and by a 65,536-entry
+manifest descriptor ceiling derived from the smaller of wire capacity and an
+explicit 64 MiB recovery/duplicate-validation working set. Long `T/C` remains
+linear in output objects and time until one of those real authorities is
+reached.
+
+Import now retains one `(timepoint, channel)` decoded cache and encoded-inner
+spool, commits outer shards directly into one destination-bound resumable
+final-layout stage, and stores only compact unit, decoded-digest,
+packed-record, no-data, stage, and scientific-hash control history. The
+corrected placement planner computes each actual edge object's occupied-slot
+codec bound. Its whole-package ceiling is guidance only. Hard Start and
+runtime admission use one bounded unit, one compact increment, and
+finalization headroom; increasing only `T` or `C` cannot increase that hard
+unit requirement. Runtime subtracts exact current-unit payload already named
+by the durable stage journal and narrows to actual remaining finalization work
+after unit production.
+
+Setup and running projections label non-reserved package guidance separately
+from immediate additional headroom. A genuine capacity shortage or safe
+prepublication `ENOSPC` keeps the checkpoint and offers `Resume` without
+deletion; corruption keeps the separate confirmed `Reset and Restart` path.
+Focused suites and the bounded normal-app scenario pass durable-prefix
+cancel/resume, publication, direct open, navigation, exact generated-source
+preservation, and the corrected statistics surface. On 2026-08-01 the owner
+reported that the completed normal preprocessing workflows all worked
+correctly and accepted the result as product-validated. Private source facts
+remain outside repository evidence, and no universal throughput or maximum-
+dataset claim follows from that acceptance.
+
+The predecessor import-throughput boundary was automated-verified at immutable
+revision `eb5c9ffd12cbd9fce65bd03559b8e7f93170d72e`. Both
 qualification sets used the owner-accepted HW-2/ext4 tuple, a 256 MiB import
 budget, and declared warm-cache/no-competing-activity conditions. The public
 T2 workload passed five independent release sessions with a
@@ -857,12 +1057,20 @@ evidence, and accepted remaining risks. Revision
 `85350219efcc0c96b492f9a5029ba80752b49306`, the clean predecessor to the
 sentinel restoration, was documentation-only and was not performance-
 qualified. These claims attach only to the named qualification revision and
-its recorded release executables. The restored sentinel cutover now has the
-separate correctness evidence described below but does not inherit this
-historical T5 performance claim.
+its recorded release executables; the current dataset-optional shell,
+explicit-manifest, resource-broker, and automatic-mask implementation does not
+inherit them. The restored sentinel cutover now has the separate correctness
+evidence described below but does not inherit this historical T5 performance
+claim. The predecessor T5 configuration pin is intentionally cleared because
+its aggregate profile/checkpoint expectations no longer describe the current
+format; a new pin requires owner review after current product validation.
 
 ## Known Limitations
 
+- The large-dataset import/storage cutover is closed and owner product-
+  validated, but private-source geometry, actual compressed output size, and
+  workstation throughput are not repository evidence. The acceptance is not
+  a universal dataset-size or performance qualification.
 - The restored sentinel policy is implemented and closed. Generated 2D/3D
   fixtures cover boundaries and every LOD; clean revision `f73cb36` passed the
   complete repository/local set and accepted five-session T2 qualification;
@@ -878,10 +1086,17 @@ historical T5 performance claim.
   three-sample performance run remains optional and explicit. Routine runs do
   not recompute the oracle; the accepted T2 evidence remains attached to the
   unchanged production-importer boundary.
-- Target packages open provisionally while bounded exact-package and
-  scientific-content verification runs in the background. Project attach,
-  open, and save remain blocked until verification succeeds; observed source
-  drift invalidates that result and requires verification again.
+- Target packages now open after bounded structural admission. Ordinary open,
+  idle, project I/O, recovery, analysis, and export start no whole-package
+  scan. Consumed objects retain exact checksum and pre/post-use currentness
+  checks, and untrusted packed facts cannot suppress their first required
+  payload validation. The UI exposes a separate explicit, cancellable full
+  package-integrity audit with real object/byte/brick progress and exact
+  failure stages. A successful audit establishes agreement with the package's
+  own manifest and declared content address; it does not establish provenance,
+  authorship, biological correctness, or any externally anchored scientific
+  identity. Audit completion or failure does not promote/revoke the source or
+  clear its presentation.
 - Imported-package capability transfer is fail-closed within its cooperative
   local destination-parent namespace. Observed mutation, an unlisted object,
   root substitution, ambiguous rename binding, or durability failure yields no
@@ -889,8 +1104,8 @@ historical T5 performance claim.
   fallback. The contract does not defend against a hostile actor able to
   concurrently rename or unlink entries in that parent: Unix cannot atomically
   bind a source name to an already-open directory descriptor. A later explicit
-  external open remains an independent normal open and performs full
-  background verification.
+  external open remains an independent normal structurally admitted open with
+  lazy per-read integrity.
 - The target dataset profile and project-store format are experimental and
   carry no compatibility promise.
 - TIFF import and create-only dataset publication require Linux kernel 5.8 or
@@ -928,6 +1143,15 @@ historical T5 performance claim.
   owns that correctness handoff; the
   [closed corrective handoff](plans/active/VIEWER_LINKED_2D_LOD_TRUTH_AND_SETTLEMENT.md)
   owns the evidence correction and diagnostic handoff.
+- The composed presentation scheduler, fixed-LOD playback session, and bounded
+  temporal ring are implemented and owner product-validated on the
+  representative time-series workflow. The mapped 960x640 run on the NVIDIA
+  GeForce RTX 3070 Ti Laptop GPU passed seven stationary-versus-held-input
+  cadence comparisons, coherent four-panel publication, and direct retained-
+  front Stop traces. This qualifies that workload and workstation only; it is
+  not a universal cadence or all-hardware guarantee. The
+  [composed presentation scheduler plan](plans/active/VIEWER_COMPOSED_PRESENTATION_SCHEDULER_CUTOVER.md)
+  owns the exact evidence and thresholds.
 - Smooth-linear sampling remains scientifically supported and covered by the
   renderer/product checks, but fine-scale exact refinement on the
   representative Cell workload is substantially slower than voxel-exact.

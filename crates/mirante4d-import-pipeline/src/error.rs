@@ -21,8 +21,6 @@ pub enum ImportError {
     UnsupportedSource(String),
     #[error("invalid import request: {0}")]
     InvalidRequest(&'static str),
-    #[error("the inspected source does not fit any supported Mirante4D storage profile")]
-    NoSupportedProfile,
     #[error("source changed after inspection: {0}")]
     SourceChanged(PathBuf),
     #[error("checkpoint is corrupt or belongs to different inputs: {0}")]
@@ -33,11 +31,18 @@ pub enum ImportError {
         available_bytes: u64,
     },
     #[error(
-        "import working-memory budget is too small: need {required_bytes} bytes, configured {budget_bytes}"
+        "preprocessing paused before its next durable step: need {required_bytes} additional filesystem bytes, found {available_bytes}; free space and Resume to continue from the saved checkpoint"
     )]
-    WorkingMemoryExceeded {
+    CapacityPaused {
         required_bytes: u64,
-        budget_bytes: u64,
+        available_bytes: u64,
+    },
+    #[error(
+        "the minimum complete preprocessing path needs {required_bytes} managed CPU bytes, but this process provides {capacity_bytes}"
+    )]
+    ManagedCapacityInsufficient {
+        required_bytes: u64,
+        capacity_bytes: u64,
     },
     #[error("TIFF operation failed for {path}: {message}")]
     Tiff { path: PathBuf, message: String },

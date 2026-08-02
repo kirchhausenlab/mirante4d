@@ -49,6 +49,10 @@ impl RenderIntentBase {
     }
 }
 
+fn same_source(left: RenderIntentBase, right: RenderIntentBase) -> bool {
+    left.source_generation == right.source_generation
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderIntentTarget {
     ThreeD,
@@ -269,10 +273,11 @@ impl RenderIntentMailbox {
         self.record_family_revision(sample.target.family(), revision);
         self.raw_samples = self.raw_samples.saturating_add(1);
         if let Some(active) = self.active.as_mut()
-            && active.base == base
+            && same_source(active.base, base)
             && active.target == sample.target
             && active.kind == sample.kind
         {
+            active.base = base;
             active.payload = sample.payload;
             active.revision = revision;
             active.last_input_at_ns = now_ns;
@@ -301,7 +306,10 @@ impl RenderIntentMailbox {
         base: RenderIntentBase,
         target: RenderIntentTarget,
     ) -> Option<CompletedRenderIntent> {
-        if self.active.is_some_and(|active| active.base != base) {
+        if self
+            .active
+            .is_some_and(|active| !same_source(active.base, base))
+        {
             self.cancel();
             return None;
         }
@@ -317,7 +325,10 @@ impl RenderIntentMailbox {
         now_ns: u64,
         settle_ns: u64,
     ) -> Option<CompletedRenderIntent> {
-        if self.active.is_some_and(|active| active.base != base) {
+        if self
+            .active
+            .is_some_and(|active| !same_source(active.base, base))
+        {
             self.cancel();
             return None;
         }
@@ -335,13 +346,16 @@ impl RenderIntentMailbox {
         settle_ns: u64,
     ) -> Option<u64> {
         self.active.and_then(|active| {
-            (active.base == base && active.kind == RenderGestureKind::Scroll)
+            (same_source(active.base, base) && active.kind == RenderGestureKind::Scroll)
                 .then(|| settle_ns.saturating_sub(now_ns.saturating_sub(active.last_input_at_ns)))
         })
     }
 
     pub fn synchronize_base(&mut self, base: RenderIntentBase) -> bool {
-        if self.active.is_some_and(|active| active.base != base) {
+        if self
+            .active
+            .is_some_and(|active| !same_source(active.base, base))
+        {
             self.cancel();
             true
         } else {
@@ -359,6 +373,28 @@ impl RenderIntentMailbox {
         Ok(revision)
     }
 
+    /// Advances temporal frame identity without mutating spatial intent.
+    ///
+    /// An active gesture is source-bound, not timepoint-bound. Its own
+    /// revision and renderability remain unchanged while the temporal family
+    /// revision advances independently. The next render composes that latest
+    /// spatial payload with whichever temporal body is presented or ready.
+    pub fn observe_temporal_intent(
+        &mut self,
+        base: RenderIntentBase,
+        family: RenderIntentFamily,
+    ) -> Result<RenderIntentRevision, RenderIntentMailboxError> {
+        let revision = self.allocate_revision()?;
+        self.record_family_revision(family, revision);
+        if self
+            .active
+            .is_some_and(|active| !same_source(active.base, base))
+        {
+            self.cancel();
+        }
+        Ok(revision)
+    }
+
     pub fn cancel(&mut self) {
         if self.active.take().is_some() {
             self.cancelled_gestures = self.cancelled_gestures.saturating_add(1);
@@ -371,7 +407,7 @@ impl RenderIntentMailbox {
                 base: active_base,
                 payload: RenderIntentPayload::Camera(camera),
                 ..
-            }) if active_base == base => camera,
+            }) if same_source(active_base, base) => camera,
             _ => durable,
         }
     }
@@ -383,7 +419,7 @@ impl RenderIntentMailbox {
                 payload: RenderIntentPayload::Camera(camera),
                 renderable: true,
                 ..
-            }) if active_base == base => Some(camera),
+            }) if same_source(active_base, base) => Some(camera),
             _ => None,
         }
     }
@@ -396,7 +432,7 @@ impl RenderIntentMailbox {
         let Some(active) = self.active.as_mut() else {
             return false;
         };
-        if active.base != base || active.revision != revision || active.renderable {
+        if !same_source(active.base, base) || active.revision != revision || active.renderable {
             return false;
         }
         active.renderable = true;
@@ -405,14 +441,34 @@ impl RenderIntentMailbox {
 
     pub fn active_target(&self, base: RenderIntentBase) -> Option<RenderIntentTarget> {
         self.active
-            .filter(|active| active.base == base)
+            .filter(|active| same_source(active.base, base))
             .map(|active| active.target)
     }
 
     pub fn active_revision(&self, base: RenderIntentBase) -> Option<RenderIntentRevision> {
         self.active
-            .filter(|active| active.base == base)
+            .filter(|active| same_source(active.base, base))
             .map(|active| active.revision)
+    }
+
+    /// Returns the frame identity of the active spatial payload after it is
+    /// composed with the newest temporal intent for that presentation family.
+    ///
+    /// `active_revision` deliberately remains the gesture sample's own
+    /// identity: finish/renderability bookkeeping must still refer to that
+    /// exact sample. Demand and presentation work instead use this composed
+    /// identity so a playback tick cannot leave the retained spatial payload
+    /// planning under an older frame than the pixels it is meant to produce.
+    pub fn active_composed_revision(&self, base: RenderIntentBase) -> Option<RenderIntentRevision> {
+        self.active
+            .filter(|active| same_source(active.base, base))
+            .map(|active| match active.target.family() {
+                RenderIntentFamily::ThreeD => self.three_d_revision,
+                RenderIntentFamily::Linked2d => self.linked_2d_revision,
+                RenderIntentFamily::Both => {
+                    unreachable!("one spatial gesture cannot target both presentation families")
+                }
+            })
     }
 
     pub fn effective_cross_section(
@@ -425,7 +481,7 @@ impl RenderIntentMailbox {
                 base: active_base,
                 payload: RenderIntentPayload::CrossSection(cross_section),
                 ..
-            }) if active_base == base => cross_section,
+            }) if same_source(active_base, base) => cross_section,
             _ => durable,
         }
     }
@@ -513,6 +569,16 @@ mod tests {
         .unwrap()
     }
 
+    fn cross_section(scale: f64) -> CrossSectionView {
+        CrossSectionView::new(
+            WorldPoint3::new(1.0, 2.0, 3.0).unwrap(),
+            UnitQuaternion::identity(),
+            scale,
+            1.0,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn many_samples_overwrite_one_gesture_and_finish_latest_once() {
         let mut mailbox = RenderIntentMailbox::new();
@@ -548,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_base_cancels_instead_of_committing_old_input() {
+    fn stale_source_cancels_instead_of_committing_old_input() {
         let mut mailbox = RenderIntentMailbox::new();
         mailbox
             .sample(
@@ -559,9 +625,11 @@ mod tests {
             )
             .unwrap();
 
+        let replacement =
+            RenderIntentBase::new(SourceSessionGeneration::new(8), CurrentnessGeneration(5));
         assert!(
             mailbox
-                .finish(base(5), RenderIntentTarget::ThreeD)
+                .finish(replacement, RenderIntentTarget::ThreeD)
                 .is_none()
         );
         assert_eq!(mailbox.snapshot().cancelled_gestures, 1);
@@ -618,5 +686,106 @@ mod tests {
         assert_eq!(after_both.latest_revision, both);
         assert_eq!(after_both.three_d_revision, both);
         assert_eq!(after_both.linked_2d_revision, both);
+    }
+
+    #[test]
+    fn temporal_intent_advances_independently_of_active_camera_intent() {
+        let mut mailbox = RenderIntentMailbox::new();
+        let spatial_revision = mailbox
+            .sample(
+                base(4),
+                RenderIntentSample::camera(RenderGestureKind::Drag, camera(2.0)),
+                100,
+                true,
+            )
+            .unwrap();
+
+        let temporal_revision = mailbox
+            .observe_temporal_intent(base(5), RenderIntentFamily::Both)
+            .unwrap();
+
+        let active = mailbox.snapshot();
+        assert_eq!(active.cancelled_gestures, 0);
+        assert_eq!(active.three_d_revision, temporal_revision);
+        assert_eq!(active.linked_2d_revision, temporal_revision);
+        assert_eq!(mailbox.effective_camera(base(5), camera(1.0)), camera(2.0));
+        assert_eq!(mailbox.renderable_camera(base(5)), Some(camera(2.0)));
+        let completed = mailbox
+            .finish(base(5), RenderIntentTarget::ThreeD)
+            .expect("the independent camera gesture remains finishable");
+        assert_eq!(completed.revision(), spatial_revision);
+        assert_eq!(
+            completed.payload(),
+            RenderIntentPayload::Camera(camera(2.0))
+        );
+        assert_eq!(mailbox.snapshot().finished_gestures, 1);
+    }
+
+    #[test]
+    fn temporal_intent_composes_with_active_linked_geometry_under_the_new_family_revision() {
+        let mut mailbox = RenderIntentMailbox::new();
+        let spatial_revision = mailbox
+            .sample(
+                base(4),
+                RenderIntentSample::cross_section(
+                    CrossSectionPanelId::Xy,
+                    RenderGestureKind::Drag,
+                    cross_section(2.0),
+                ),
+                100,
+                true,
+            )
+            .unwrap();
+
+        let temporal_revision = mailbox
+            .observe_temporal_intent(base(5), RenderIntentFamily::Both)
+            .unwrap();
+
+        assert_eq!(mailbox.active_revision(base(5)), Some(spatial_revision));
+        assert_eq!(
+            mailbox.active_composed_revision(base(5)),
+            Some(temporal_revision)
+        );
+        assert_eq!(
+            mailbox.effective_cross_section(base(5), cross_section(1.0)),
+            cross_section(2.0)
+        );
+        let completed = mailbox
+            .finish(
+                base(5),
+                RenderIntentTarget::CrossSection(CrossSectionPanelId::Xy),
+            )
+            .expect("the linked gesture remains finishable after temporal composition");
+        assert_eq!(completed.revision(), spatial_revision);
+        assert_eq!(
+            completed.payload(),
+            RenderIntentPayload::CrossSection(cross_section(2.0))
+        );
+    }
+
+    #[test]
+    fn temporal_intent_still_cancels_an_active_gesture_from_an_old_source() {
+        let mut mailbox = RenderIntentMailbox::new();
+        mailbox
+            .sample(
+                base(4),
+                RenderIntentSample::camera(RenderGestureKind::Drag, camera(2.0)),
+                100,
+                true,
+            )
+            .unwrap();
+        let replacement_base =
+            RenderIntentBase::new(SourceSessionGeneration::new(8), CurrentnessGeneration(1));
+
+        mailbox
+            .observe_temporal_intent(replacement_base, RenderIntentFamily::Both)
+            .unwrap();
+
+        assert_eq!(mailbox.snapshot().cancelled_gestures, 1);
+        assert!(mailbox.snapshot().active_gesture.is_none());
+        assert_eq!(
+            mailbox.effective_camera(replacement_base, camera(1.0)),
+            camera(1.0)
+        );
     }
 }

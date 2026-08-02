@@ -42,6 +42,75 @@ pub enum RetainedFrameRenderPolicy {
     ExactFrameOnly,
 }
 
+/// Fixed targets that must publish one coherent semantic successor together.
+///
+/// The set is carried by every request participating in the transaction. The
+/// renderer may continue residency preparation and private 3D refinement while
+/// one or more members are unavailable, but it does not record any member's
+/// visible color pass until every member reaches the group's declared
+/// first-useful or exact publication threshold in the same coordinated cutoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordinatedPublicationGroup {
+    targets: u8,
+    exact_required: bool,
+}
+
+impl CoordinatedPublicationGroup {
+    const THREE_D_TARGETS: u8 = 1 << PresentationTarget::ThreeD.index();
+    const FULL_LAYOUT_TARGETS: u8 = Self::THREE_D_TARGETS
+        | (1 << PresentationTarget::Xy.index())
+        | (1 << PresentationTarget::Xz.index())
+        | (1 << PresentationTarget::Yz.index());
+
+    pub const THREE_D: Self = Self {
+        targets: Self::THREE_D_TARGETS,
+        exact_required: true,
+    };
+    pub const FULL_LAYOUT: Self = Self {
+        targets: Self::FULL_LAYOUT_TARGETS,
+        exact_required: true,
+    };
+    pub const THREE_D_FIRST_USEFUL: Self = Self {
+        targets: Self::THREE_D_TARGETS,
+        exact_required: false,
+    };
+    pub const FULL_LAYOUT_FIRST_USEFUL: Self = Self {
+        targets: Self::FULL_LAYOUT_TARGETS,
+        exact_required: false,
+    };
+
+    /// Builds the exact atomic group for a nonempty physical render delta.
+    ///
+    /// Logical frame assembly may prove that some targets are already
+    /// compatible immutable fronts. Those reused targets remain members of
+    /// the logical transaction, but only changed targets participate in the
+    /// renderer cutoff. Returning `None` for an empty delta lets the caller
+    /// complete an all-reused transaction without submitting artificial GPU
+    /// work.
+    pub fn exact_targets(targets: impl IntoIterator<Item = PresentationTarget>) -> Option<Self> {
+        let mut target_mask = 0_u8;
+        for target in targets {
+            target_mask |= 1 << target.index();
+        }
+        (target_mask != 0).then_some(Self {
+            targets: target_mask,
+            exact_required: true,
+        })
+    }
+
+    pub const fn contains(self, target: PresentationTarget) -> bool {
+        self.targets & (1 << target.index()) != 0
+    }
+
+    pub const fn exact_required(self) -> bool {
+        self.exact_required
+    }
+
+    const fn is_empty(self) -> bool {
+        self.targets == 0
+    }
+}
+
 /// Scheduling policy for one coordinated 3D color request.
 ///
 /// `InteractivePreview` renders a complete provisional volume at the physical
@@ -194,6 +263,7 @@ pub struct CoordinatedTargetRequest<'a> {
     volume_schedule: VolumeColorSchedule,
     measure_gpu_timing: bool,
     hidden_promotion_authorized: bool,
+    atomic_publication_group: Option<CoordinatedPublicationGroup>,
 }
 
 impl<'a> CoordinatedTargetRequest<'a> {
@@ -214,6 +284,7 @@ impl<'a> CoordinatedTargetRequest<'a> {
             volume_schedule: VolumeColorSchedule::Direct,
             measure_gpu_timing: false,
             hidden_promotion_authorized: true,
+            atomic_publication_group: None,
         }
     }
 
@@ -242,6 +313,22 @@ impl<'a> CoordinatedTargetRequest<'a> {
     /// has preflighted the matching dataset/residency promotion.
     pub const fn with_hidden_promotion_authorized(mut self, authorized: bool) -> Self {
         self.hidden_promotion_authorized = authorized;
+        self
+    }
+
+    /// Requires this target to cross the visible publication boundary in the
+    /// same coherent cutoff as every other member of `group`.
+    ///
+    /// All requests in one coordinated execution must name the same group and
+    /// use the matching retained-frame policy: `ExactFrameOnly` for an exact
+    /// group, or `EveryUsefulFrame` for a first-useful group. A missing or
+    /// below-threshold member is a normal not-ready state: residency work may
+    /// continue, while publication remains withheld.
+    pub const fn with_atomic_publication_group(
+        mut self,
+        group: CoordinatedPublicationGroup,
+    ) -> Self {
+        self.atomic_publication_group = Some(group);
         self
     }
 
@@ -279,6 +366,10 @@ impl<'a> CoordinatedTargetRequest<'a> {
 
     pub const fn hidden_promotion_authorized(self) -> bool {
         self.hidden_promotion_authorized
+    }
+
+    pub const fn atomic_publication_group(self) -> Option<CoordinatedPublicationGroup> {
+        self.atomic_publication_group
     }
 }
 
@@ -1405,6 +1496,8 @@ pub enum WgpuRenderRuntimeError {
     CoordinatedTargetViewMismatch { target: PresentationTarget },
     #[error("coordinated target {target:?} received an invalid 3D color schedule")]
     InvalidVolumeColorSchedule { target: PresentationTarget },
+    #[error("the coordinated atomic-publication group is inconsistent or invalid")]
+    InvalidCoordinatedPublicationGroup,
     #[error(
         "coordinated target {target:?} requested extent {requested:?}, but its desired layout is {desired:?}"
     )]
@@ -1924,6 +2017,21 @@ mod tests {
         .unwrap();
         assert_eq!(payload_allocation_bytes(all_valid), Ok(56));
         assert_eq!(payload_allocation_bytes(bitmask), Ok(60));
+    }
+
+    #[test]
+    fn exact_publication_group_represents_only_the_physical_delta() {
+        assert_eq!(CoordinatedPublicationGroup::exact_targets([]), None);
+        let group = CoordinatedPublicationGroup::exact_targets([
+            PresentationTarget::ThreeD,
+            PresentationTarget::Xz,
+        ])
+        .expect("a nonempty physical delta forms one exact group");
+        assert!(group.exact_required());
+        assert!(group.contains(PresentationTarget::ThreeD));
+        assert!(group.contains(PresentationTarget::Xz));
+        assert!(!group.contains(PresentationTarget::Xy));
+        assert!(!group.contains(PresentationTarget::Yz));
     }
 }
 

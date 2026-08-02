@@ -45,21 +45,25 @@ pub use workbench_viewer::{
 use std::{fmt::Display, hash::Hash, time::Duration};
 
 use eframe::egui::{self, Color32, RichText};
+#[cfg(test)]
+use mirante4d_application::import_workflow::ImportCapacitySnapshot;
 use mirante4d_application::{
     ApplicationCommand, ApplicationEvent, CrossSectionPanelId, OperationOutcome,
     PresentationPaintRequest, PresentationSlot, PresentationSurface, PresentationViewport,
     ProjectGenerationId, ProjectId, RenderExtent, RenderIntentSample, RenderIntentTarget,
     ResourcePolicy, VolumePickQuery,
     import_workflow::{
-        ImportCommand, ImportProgressSnapshot, ImportReviewDraft, ImportReviewId,
-        ImportReviewSnapshot, ImportSourceDtype, ImportSourceLayout, ImportWorkflowSnapshot,
+        ImportChannelSourceKind, ImportCommand, ImportNoDataValueRule, ImportProgressSnapshot,
+        ImportRecoveryAction, ImportReviewDraft, ImportReviewId, ImportReviewSnapshot,
+        ImportSetupSnapshot, ImportSourceDtype, ImportWorkflowSnapshot,
     },
     viewer_tools::{ScreenPosition, ViewerTool, ViewerToolContext, ViewerToolState},
     viewport_interaction::ViewportOrbitDrag,
 };
 
-const U8_SENTINEL_POLICY_DESCRIPTION: &str =
-    "exact sentinel match + one-voxel invalid dilation at base and every LOD";
+const MANUAL_NO_DATA_POLICY_DESCRIPTION: &str =
+    "dataset-wide exact value match + one-voxel invalid dilation";
+const AUTOMATIC_NO_DATA_POLICY_DESCRIPTION: &str = "first-volume 5x5x5 seeds + six-connected exact-value reconstruction; fixed spatial mask + one-voxel invalid dilation";
 
 /// Egui-local draft values and interaction state.
 #[derive(Debug)]
@@ -78,7 +82,7 @@ pub struct EguiUiState {
     pub analysis_workspace_open: bool,
     import_review: Option<ImportReviewUiState>,
     import_checkpoint_reset_confirmed: bool,
-    import_checkpoint_retry_id: Option<ImportReviewId>,
+    import_checkpoint_recovery_id: Option<ImportReviewId>,
 }
 
 impl EguiUiState {
@@ -101,7 +105,7 @@ impl EguiUiState {
             analysis_workspace_open: false,
             import_review: None,
             import_checkpoint_reset_confirmed: false,
-            import_checkpoint_retry_id: None,
+            import_checkpoint_recovery_id: None,
         }
     }
 
@@ -262,13 +266,12 @@ pub enum WorkbenchAnalysisKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkbenchUiAction {
     OpenDatasetDialog,
+    PreprocessDataset,
     NewProject,
     OpenProjectDialog,
     SaveProject,
     SaveProjectAs,
     OpenProjectRecovery,
-    ImportTiffDirectoryDialog,
-    ImportTiffFileDialog,
     CopySelectedAnalysisCsv,
     CancelAnalysis,
     SetAnalysisRoi { origin: [u64; 3], shape: [u64; 3] },
@@ -713,6 +716,51 @@ pub fn configure_visuals(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
+/// One launcher action emitted before a dataset session exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WelcomeShellAction {
+    LoadPreprocessedDataset,
+    PreprocessNewDataset,
+}
+
+/// Draws the dataset-independent application shell.
+pub fn show_welcome_shell(
+    ui: &mut egui::Ui,
+    status: Option<&str>,
+    busy: bool,
+) -> Option<WelcomeShellAction> {
+    let mut action = None;
+    ui.centered_and_justified(|ui| {
+        ui.vertical_centered(|ui| {
+            ui.heading("Mirante4D");
+            ui.add_space(8.0);
+            ui.label("Open an existing dataset or preprocess microscopy TIFF data.");
+            ui.add_space(18.0);
+            if ui
+                .add_enabled(!busy, egui::Button::new("Preprocess a new dataset"))
+                .clicked()
+            {
+                action = Some(WelcomeShellAction::PreprocessNewDataset);
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Load a preprocessed dataset"))
+                .clicked()
+            {
+                action = Some(WelcomeShellAction::LoadPreprocessedDataset);
+            }
+            if busy {
+                ui.add_space(12.0);
+                ui.spinner();
+            }
+            if let Some(status) = status {
+                ui.add_space(12.0);
+                ui.label(status);
+            }
+        });
+    });
+    action
+}
+
 pub fn application_problem_message(event: Option<&ApplicationEvent>) -> Option<String> {
     match event? {
         ApplicationEvent::OperationCompleted {
@@ -730,7 +778,7 @@ pub fn application_problem_message(event: Option<&ApplicationEvent>) -> Option<S
 }
 
 /// Presents the current import workflow and returns only framework-neutral commands.
-pub(crate) fn show_import_workflow_window(
+pub fn show_import_workflow_window(
     ctx: &egui::Context,
     state: &mut EguiUiState,
     snapshot: &ImportWorkflowSnapshot,
@@ -751,6 +799,9 @@ pub(crate) fn show_import_workflow_window(
                 .max_height((ctx.content_rect().height() - 80.0).max(240.0))
                 .show(ui, |ui| match snapshot {
                     ImportWorkflowSnapshot::Idle => {}
+                    ImportWorkflowSnapshot::Configure(setup) => {
+                        show_import_setup(ui, setup, &mut commands);
+                    }
                     ImportWorkflowSnapshot::Inspecting(inspection) => {
                         ui.horizontal(|ui| {
                             ui.add(egui::Spinner::new());
@@ -799,6 +850,83 @@ pub(crate) fn show_import_workflow_window(
                         });
                         property_row(ui, "destination", &import.destination);
                         property_row(ui, "progress", import_progress_message(import.progress));
+                        if let Some(storage) = import.storage {
+                            let active = match (storage.active_timepoint, storage.active_channel) {
+                                (Some(timepoint), Some(channel)) => format!(
+                                    "{}/{} complete; active t{} c{}",
+                                    storage.completed_temporal_units,
+                                    storage.total_temporal_units,
+                                    timepoint.saturating_add(1),
+                                    channel.saturating_add(1)
+                                ),
+                                _ => format!(
+                                    "{}/{} complete",
+                                    storage.completed_temporal_units, storage.total_temporal_units
+                                ),
+                            };
+                            property_row(ui, "temporal units", active);
+                            if let (Some(timepoint), Some(channel)) =
+                                (storage.preparing_timepoint, storage.preparing_channel)
+                            {
+                                let planes = if storage.preparing_total_planes == 0 {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " ({}/{})",
+                                        storage.preparing_completed_planes,
+                                        storage.preparing_total_planes
+                                    )
+                                };
+                                property_row(
+                                    ui,
+                                    "decode ahead",
+                                    format!(
+                                        "preparing t{} c{}{}; pipeline width {}",
+                                        timepoint.saturating_add(1),
+                                        channel.saturating_add(1),
+                                        planes,
+                                        storage.temporal_pipeline_width
+                                    ),
+                                );
+                            } else if storage.prepared_temporal_units != 0 {
+                                property_row(
+                                    ui,
+                                    "decode ahead",
+                                    format!(
+                                        "{} volume prepared; pipeline width {}",
+                                        storage.prepared_temporal_units,
+                                        storage.temporal_pipeline_width
+                                    ),
+                                );
+                            }
+                            property_row(
+                                ui,
+                                "stage payload",
+                                format_byte_quantity(storage.stage_payload_bytes),
+                            );
+                            property_row(
+                                ui,
+                                "remaining output ceiling (not reserved)",
+                                format_byte_quantity(storage.remaining_package_output_upper_bound),
+                            );
+                            property_row(
+                                ui,
+                                "current unit scratch",
+                                format_byte_quantity(storage.unit_scratch_bytes),
+                            );
+                            if storage.decode_ahead_scratch_bytes != 0 {
+                                property_row(
+                                    ui,
+                                    "decode-ahead scratch",
+                                    format_byte_quantity(storage.decode_ahead_scratch_bytes),
+                                );
+                            }
+                            property_row(
+                                ui,
+                                "immediate additional headroom",
+                                format_byte_quantity(storage.additional_headroom_required_bytes),
+                            );
+                        }
                         property_row(ui, "elapsed", format_import_elapsed(import.elapsed_ms));
                         if let Some(progress) = import_progress_fraction(import.progress) {
                             ui.add(egui::ProgressBar::new(progress).show_percentage());
@@ -817,35 +945,40 @@ pub(crate) fn show_import_workflow_window(
                         if let Some(checkpoint) = failure.checkpoint.as_deref() {
                             property_row(ui, "checkpoint", checkpoint);
                         }
-                        if let Some(retry_id) = failure.retry_id {
-                            ui.checkbox(
-                                &mut state.import_checkpoint_reset_confirmed,
-                                "I confirm this saved import checkpoint may be deleted",
-                            );
-                            ui.add_space(8.0);
-                            if toolbar_button(
-                                ui,
-                                "Reset and Restart",
-                                state.import_checkpoint_reset_confirmed,
-                            )
-                            .clicked()
-                            {
-                                commands.push(ImportCommand::ResetCheckpointAndRestart {
-                                    retry_id,
+                        if let Some(recovery) = failure.recovery {
+                            let enabled = match recovery.action {
+                                ImportRecoveryAction::Resume => true,
+                                ImportRecoveryAction::ResetAndRestart => {
+                                    ui.checkbox(
+                                        &mut state.import_checkpoint_reset_confirmed,
+                                        "I confirm this saved import checkpoint may be deleted",
+                                    );
+                                    ui.add_space(8.0);
+                                    state.import_checkpoint_reset_confirmed
+                                }
+                            };
+                            let label = match recovery.action {
+                                ImportRecoveryAction::Resume => "Resume",
+                                ImportRecoveryAction::ResetAndRestart => "Reset and Restart",
+                            };
+                            if toolbar_button(ui, label, enabled).clicked() {
+                                commands.push(ImportCommand::RecoverCheckpoint {
+                                    retry_id: recovery.retry_id,
+                                    action: recovery.action,
                                 });
                                 state.import_checkpoint_reset_confirmed = false;
                             }
                         } else {
                             muted_label(
                                 ui,
-                                "Select a supported grayscale TIFF file or an unambiguous TIFF directory.",
+                                "Correct the problem described above, then begin a new import.",
                             );
                         }
                         ui.add_space(8.0);
                         if toolbar_button(ui, "Dismiss", true).clicked() {
                             commands.push(ImportCommand::DismissProblem);
                             state.import_checkpoint_reset_confirmed = false;
-                            state.import_checkpoint_retry_id = None;
+                            state.import_checkpoint_recovery_id = None;
                         }
                     }
                 });
@@ -868,19 +1001,169 @@ impl EguiUiState {
                 }
             }
             ImportWorkflowSnapshot::Idle
+            | ImportWorkflowSnapshot::Configure(_)
             | ImportWorkflowSnapshot::Inspecting(_)
             | ImportWorkflowSnapshot::Importing(_) => self.import_review = None,
             ImportWorkflowSnapshot::Failed(_) => {}
         }
 
         let retry_id = match snapshot {
-            ImportWorkflowSnapshot::Failed(failure) => failure.retry_id,
+            ImportWorkflowSnapshot::Failed(failure) => {
+                failure.recovery.map(|recovery| recovery.retry_id)
+            }
             _ => None,
         };
-        if self.import_checkpoint_retry_id != retry_id {
+        if self.import_checkpoint_recovery_id != retry_id {
             self.import_checkpoint_reset_confirmed = false;
-            self.import_checkpoint_retry_id = retry_id;
+            self.import_checkpoint_recovery_id = retry_id;
         }
+    }
+}
+
+fn show_import_setup(
+    ui: &mut egui::Ui,
+    setup: &ImportSetupSnapshot,
+    commands: &mut Vec<ImportCommand>,
+) {
+    ui.heading("Preprocess a new dataset");
+    ui.label("Declare each logical channel and exactly how its TIFF source should be interpreted.");
+    ui.add_space(8.0);
+
+    let mut channel_count = setup.channels.len();
+    ui.horizontal(|ui| {
+        ui.label("Channels");
+        if ui
+            .add(
+                egui::DragValue::new(&mut channel_count)
+                    .range(1..=64)
+                    .speed(1),
+            )
+            .changed()
+        {
+            commands.push(ImportCommand::SetChannelCount {
+                count: channel_count,
+            });
+        }
+    });
+
+    ui.add_space(8.0);
+    for (channel, row) in setup.channels.iter().enumerate() {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let mut label = row.label.clone();
+                ui.label(format!("Channel {}", channel + 1));
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut label)
+                            .desired_width(150.0)
+                            .hint_text("channel name"),
+                    )
+                    .changed()
+                {
+                    commands.push(ImportCommand::SetChannelLabel { channel, label });
+                }
+
+                let mut kind = row.source_kind;
+                egui::ComboBox::from_id_salt(("preprocess-source-kind", setup.setup_id, channel))
+                    .selected_text(import_channel_source_kind_label(kind))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut kind,
+                            ImportChannelSourceKind::Single3dTiff,
+                            "Single 3D TIFF",
+                        );
+                        ui.selectable_value(
+                            &mut kind,
+                            ImportChannelSourceKind::FolderOf3dTiffs,
+                            "Folder of 3D TIFFs",
+                        );
+                        ui.selectable_value(
+                            &mut kind,
+                            ImportChannelSourceKind::FolderOf2dTiffs,
+                            "Folder of 2D TIFFs",
+                        );
+                    });
+                if kind != row.source_kind {
+                    commands.push(ImportCommand::SetChannelSourceKind { channel, kind });
+                }
+
+                let inspecting = setup.active_inspection == Some(channel);
+                if ui
+                    .add_enabled(
+                        setup.active_inspection.is_none(),
+                        egui::Button::new(if inspecting {
+                            "Inspecting…"
+                        } else {
+                            "Choose…"
+                        }),
+                    )
+                    .clicked()
+                {
+                    commands.push(ImportCommand::ChooseChannelSource { channel });
+                }
+                if inspecting {
+                    ui.spinner();
+                    if let Some(progress) = setup.active_inspection_progress {
+                        ui.label(format!(
+                            "{}/{} files",
+                            progress.inspected_files, progress.total_files
+                        ));
+                    }
+                }
+            });
+
+            if let Some(path) = row.selected_path.as_deref() {
+                ui.label(egui::RichText::new(path).weak().small());
+            }
+            if let Some(inspection) = row.inspection.as_ref() {
+                let source_count = match row.source_kind {
+                    ImportChannelSourceKind::Single3dTiff => "1 3D volume".to_owned(),
+                    ImportChannelSourceKind::FolderOf3dTiffs => {
+                        format!("{} 3D volumes", inspection.timepoints)
+                    }
+                    ImportChannelSourceKind::FolderOf2dTiffs => {
+                        format!("{} 2D planes", inspection.file_count)
+                    }
+                };
+                ui.label(format!(
+                    "{source_count} · [X,Y,Z] = [{},{},{}] · {} · {}",
+                    inspection.width,
+                    inspection.height,
+                    inspection.depth,
+                    import_source_dtype_label(inspection.dtype),
+                    format_byte_quantity(inspection.source_bytes),
+                ));
+            }
+            if let Some(error) = row.error.as_deref() {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+        });
+        ui.add_space(6.0);
+    }
+
+    if let Some(error) = setup.validation_error.as_deref() {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+        ui.add_space(6.0);
+    }
+    let can_validate = setup.active_inspection.is_none()
+        && !setup.channels.is_empty()
+        && setup.channels.iter().all(|row| row.inspection.is_some());
+    ui.horizontal(|ui| {
+        if toolbar_button(ui, "Cancel", true).clicked() {
+            commands.push(ImportCommand::CancelSetup);
+        }
+        if toolbar_button(ui, "Validate channels", can_validate).clicked() {
+            commands.push(ImportCommand::ValidateChannels);
+        }
+    });
+}
+
+const fn import_channel_source_kind_label(kind: ImportChannelSourceKind) -> &'static str {
+    match kind {
+        ImportChannelSourceKind::Single3dTiff => "Single 3D TIFF",
+        ImportChannelSourceKind::FolderOf3dTiffs => "Folder of 3D TIFFs",
+        ImportChannelSourceKind::FolderOf2dTiffs => "Folder of 2D TIFFs",
     }
 }
 
@@ -894,11 +1177,6 @@ fn show_import_review(
     ui.add_space(6.0);
     property_row(ui, "source", &review.source);
     property_row(ui, "destination", &review.destination);
-    property_row(
-        ui,
-        "layout",
-        import_source_layout_label(review.source_layout),
-    );
     property_row(
         ui,
         "shape",
@@ -916,7 +1194,60 @@ fn show_import_review(
         "source dtype",
         import_source_dtype_label(review.source_dtype),
     );
-    property_row(ui, "source size", format_byte_quantity(review.source_bytes));
+    property_row(
+        ui,
+        "selected TIFF files (compressed)",
+        format_byte_quantity(review.source_bytes),
+    );
+    property_row(
+        ui,
+        "decoded base data",
+        format_byte_quantity(review.capacity.decoded_base_bytes),
+    );
+    property_row(
+        ui,
+        "logical pyramid output",
+        format_byte_quantity(review.capacity.logical_output_bytes),
+    );
+    property_row(
+        ui,
+        "final package ceiling (guidance; not reserved)",
+        format_byte_quantity(review.capacity.final_package_upper_bound),
+    );
+    property_row(
+        ui,
+        "maximum active-unit scratch",
+        format_byte_quantity(review.capacity.bounded_unit_scratch_bytes),
+    );
+    property_row(
+        ui,
+        "maximum next-unit encoded commit",
+        format_byte_quantity(review.capacity.maximum_unit_output_upper_bound),
+    );
+    property_row(
+        ui,
+        "finalization reserve",
+        format_byte_quantity(review.capacity.finalization_headroom_bytes),
+    );
+    property_row(
+        ui,
+        "destination filesystem",
+        review.capacity.destination_available_bytes.map_or_else(
+            || {
+                format!(
+                    "{} immediate headroom required; available space unavailable",
+                    format_byte_quantity(review.capacity.start_required_headroom_bytes)
+                )
+            },
+            |available| {
+                format!(
+                    "{} immediate headroom required / {} available",
+                    format_byte_quantity(review.capacity.start_required_headroom_bytes),
+                    format_byte_quantity(available)
+                )
+            },
+        ),
+    );
     property_row(
         ui,
         "calibration metadata",
@@ -971,55 +1302,71 @@ fn show_import_review(
     }
 
     ui.add_space(6.0);
-    let sentinel_supported = review.source_dtype == ImportSourceDtype::Uint8;
-    if !sentinel_supported {
-        state.draft.no_data_sentinel = None;
-    }
-    let mut sentinel_enabled = state.draft.no_data_sentinel.is_some();
+    let mut value_rule_enabled = state.draft.no_data_value_rule.is_some();
     if ui
-        .add_enabled(
-            sentinel_supported,
-            egui::Checkbox::new(&mut sentinel_enabled, "uint8 no-data sentinel"),
-        )
+        .checkbox(&mut value_rule_enabled, "no-data value")
         .changed()
     {
-        state.draft.no_data_sentinel = sentinel_enabled.then_some(255);
+        state.draft.no_data_value_rule =
+            value_rule_enabled.then_some(ImportNoDataValueRule::Automatic);
     }
-    if let Some(sentinel) = state.draft.no_data_sentinel.as_mut() {
-        let mut value = u16::from(*sentinel);
+    if value_rule_enabled {
+        if review.source_dtype != ImportSourceDtype::Uint8 {
+            state.draft.no_data_value_rule = Some(ImportNoDataValueRule::Automatic);
+        }
         ui.horizontal(|ui| {
-            ui.label("sentinel value");
-            if ui
-                .add(egui::DragValue::new(&mut value).range(0..=255))
-                .changed()
-            {
-                *sentinel = value as u8;
+            ui.label("value rule");
+            ui.selectable_value(
+                &mut state.draft.no_data_value_rule,
+                Some(ImportNoDataValueRule::Automatic),
+                "detect automatically",
+            );
+            if review.source_dtype == ImportSourceDtype::Uint8 {
+                let manual = matches!(
+                    state.draft.no_data_value_rule,
+                    Some(ImportNoDataValueRule::ManualUint8(_))
+                );
+                if ui.selectable_label(manual, "enter manually").clicked() && !manual {
+                    state.draft.no_data_value_rule = Some(ImportNoDataValueRule::ManualUint8(255));
+                }
             }
         });
-        property_row(
-            ui,
-            "selected no-data policy",
-            U8_SENTINEL_POLICY_DESCRIPTION,
-        );
-    } else if !sentinel_supported {
-        property_row(ui, "no-data sentinel", "available only for uint8 sources");
-    }
-
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.label("working memory");
-        egui::ComboBox::from_id_salt("tiff-import-working-memory")
-            .selected_text(format_byte_quantity(state.draft.working_memory_bytes))
-            .show_ui(ui, |ui| {
-                for bytes in review.working_memory_choices {
-                    ui.selectable_value(
-                        &mut state.draft.working_memory_bytes,
-                        bytes,
-                        format_byte_quantity(bytes),
-                    );
+        if let Some(ImportNoDataValueRule::ManualUint8(sentinel)) =
+            state.draft.no_data_value_rule.as_mut()
+        {
+            let mut value = u16::from(*sentinel);
+            ui.horizontal(|ui| {
+                ui.label("manual uint8 value");
+                if ui
+                    .add(egui::DragValue::new(&mut value).range(0..=255))
+                    .changed()
+                {
+                    *sentinel = value as u8;
                 }
             });
-    });
+        }
+        let description = match state.draft.no_data_value_rule {
+            Some(ImportNoDataValueRule::Automatic) => AUTOMATIC_NO_DATA_POLICY_DESCRIPTION,
+            Some(ImportNoDataValueRule::ManualUint8(_)) => MANUAL_NO_DATA_POLICY_DESCRIPTION,
+            None => "disabled",
+        };
+        property_row(ui, "selected no-data policy", description);
+    }
+    ui.checkbox(
+        &mut state.draft.hide_constant_z_planes,
+        "Hide constant Z planes",
+    );
+    property_row(
+        ui,
+        "constant-plane scope",
+        "exact planes from the first volume; no neighboring-plane dilation",
+    );
+
+    ui.add_space(6.0);
+    muted_label(
+        ui,
+        "Preprocessing memory and concurrency are managed automatically.",
+    );
     property_row(
         ui,
         "publication",
@@ -1051,18 +1398,10 @@ fn import_review_ready(review: &ImportReviewSnapshot, draft: ImportReviewDraft) 
         && draft
             .time_step_seconds
             .is_none_or(|value| value.is_finite() && value > 0.0)
-        && (draft.no_data_sentinel.is_none() || review.source_dtype == ImportSourceDtype::Uint8)
-        && review
-            .working_memory_choices
-            .contains(&draft.working_memory_bytes)
-}
-
-fn import_source_layout_label(layout: ImportSourceLayout) -> &'static str {
-    match layout {
-        ImportSourceLayout::Automatic => "automatic",
-        ImportSourceLayout::MultipageStacks => "multipage stacks",
-        ImportSourceLayout::ChannelFoldersOfPlanes => "channel folders of planes",
-    }
+        && (!matches!(
+            draft.no_data_value_rule,
+            Some(ImportNoDataValueRule::ManualUint8(_))
+        ) || review.source_dtype == ImportSourceDtype::Uint8)
 }
 
 fn import_source_dtype_label(dtype: ImportSourceDtype) -> &'static str {
@@ -1288,7 +1627,9 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use egui_kittest::{Harness, kittest::Queryable};
-    use mirante4d_application::import_workflow::{ImportFailureSnapshot, ImportShapeSnapshot};
+    use mirante4d_application::import_workflow::{
+        ImportFailureSnapshot, ImportRecoverySnapshot, ImportShapeSnapshot,
+    };
 
     use super::*;
 
@@ -1332,8 +1673,8 @@ mod tests {
             spacing_zyx_um: [spacing; 3],
             calibration_confirmed: true,
             time_step_seconds: Some(1.5),
-            no_data_sentinel: None,
-            working_memory_bytes: 256 * 1024 * 1024,
+            no_data_value_rule: None,
+            hide_constant_z_planes: false,
         }
     }
 
@@ -1342,7 +1683,6 @@ mod tests {
             review_id: ImportReviewId::new(review_id),
             source: "/source/cells.ome.tiff".to_owned(),
             destination: "/output/cells.m4d".to_owned(),
-            source_layout: ImportSourceLayout::MultipageStacks,
             shape: ImportShapeSnapshot {
                 timepoints: 3,
                 channels: 2,
@@ -1352,14 +1692,18 @@ mod tests {
             },
             source_dtype: ImportSourceDtype::Uint8,
             source_bytes: 4096,
+            capacity: ImportCapacitySnapshot {
+                decoded_base_bytes: 8192,
+                logical_output_bytes: 12_288,
+                final_package_upper_bound: 16_384,
+                bounded_unit_scratch_bytes: 2_048,
+                maximum_unit_output_upper_bound: 4_096,
+                finalization_headroom_bytes: 8_192,
+                start_required_headroom_bytes: 14_336,
+                destination_available_bytes: Some(1 << 30),
+            },
             ome_spacing_zyx_um: Some([0.5, 0.2, 0.2]),
             initial_draft,
-            working_memory_choices: [
-                128 * 1024 * 1024,
-                256 * 1024 * 1024,
-                512 * 1024 * 1024,
-                1024 * 1024 * 1024,
-            ],
         })
     }
 
@@ -1502,9 +1846,9 @@ mod tests {
     }
 
     #[test]
-    fn sentinel_import_review_states_the_guarded_policy() {
+    fn no_data_import_review_states_the_guarded_policy() {
         let mut draft = import_draft(0.5);
-        draft.no_data_sentinel = Some(255);
+        draft.no_data_value_rule = Some(ImportNoDataValueRule::ManualUint8(255));
         let harness = Harness::builder()
             .with_size(egui::vec2(800.0, 700.0))
             .build_ui_state(
@@ -1519,7 +1863,42 @@ mod tests {
                 },
             );
 
-        harness.get_by_label(U8_SENTINEL_POLICY_DESCRIPTION);
+        harness.get_by_label(MANUAL_NO_DATA_POLICY_DESCRIPTION);
+
+        let mut automatic_draft = import_draft(0.5);
+        automatic_draft.no_data_value_rule = Some(ImportNoDataValueRule::Automatic);
+        let automatic_harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut ImportWindowHarnessState| {
+                    state.commands =
+                        show_import_workflow_window(ui.ctx(), &mut state.ui, &state.snapshot);
+                },
+                ImportWindowHarnessState {
+                    ui: EguiUiState::new(256, 128),
+                    snapshot: import_review(13, automatic_draft),
+                    commands: Vec::new(),
+                },
+            );
+        automatic_harness.get_by_label(AUTOMATIC_NO_DATA_POLICY_DESCRIPTION);
+    }
+
+    #[test]
+    fn automatic_no_data_is_ready_for_float_while_manual_entry_remains_uint8_only() {
+        let mut draft = import_draft(0.5);
+        draft.no_data_value_rule = Some(ImportNoDataValueRule::Automatic);
+        draft.hide_constant_z_planes = true;
+        let ImportWorkflowSnapshot::Review(mut review) = import_review(13, draft) else {
+            unreachable!()
+        };
+        review.source_dtype = ImportSourceDtype::Float32;
+        assert!(import_review_ready(&review, draft));
+
+        draft.no_data_value_rule = Some(ImportNoDataValueRule::ManualUint8(7));
+        assert!(!import_review_ready(&review, draft));
+
+        draft.no_data_value_rule = None;
+        assert!(import_review_ready(&review, draft));
     }
 
     #[test]
@@ -1536,7 +1915,10 @@ mod tests {
                     snapshot: ImportWorkflowSnapshot::Failed(ImportFailureSnapshot {
                         message: "the saved checkpoint is invalid".to_owned(),
                         checkpoint: Some("/output/.cells.m4d.import-checkpoint".to_owned()),
-                        retry_id: Some(ImportReviewId::new(19)),
+                        recovery: Some(ImportRecoverySnapshot {
+                            retry_id: ImportReviewId::new(19),
+                            action: ImportRecoveryAction::ResetAndRestart,
+                        }),
                     }),
                     commands: Vec::new(),
                 },
@@ -1552,9 +1934,79 @@ mod tests {
         harness.step();
         assert_eq!(
             harness.state().commands,
-            vec![ImportCommand::ResetCheckpointAndRestart {
+            vec![ImportCommand::RecoverCheckpoint {
                 retry_id: ImportReviewId::new(19),
+                action: ImportRecoveryAction::ResetAndRestart,
             }]
+        );
+    }
+
+    #[test]
+    fn capacity_pause_offers_resume_without_checkpoint_deletion_confirmation() {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 500.0))
+            .build_ui_state(
+                |ui, state: &mut ImportWindowHarnessState| {
+                    state.commands =
+                        show_import_workflow_window(ui.ctx(), &mut state.ui, &state.snapshot);
+                },
+                ImportWindowHarnessState {
+                    ui: EguiUiState::new(256, 128),
+                    snapshot: ImportWorkflowSnapshot::Failed(ImportFailureSnapshot {
+                        message: "free space and Resume".to_owned(),
+                        checkpoint: Some("/output/.cells.m4d.import-checkpoint".to_owned()),
+                        recovery: Some(ImportRecoverySnapshot {
+                            retry_id: ImportReviewId::new(23),
+                            action: ImportRecoveryAction::Resume,
+                        }),
+                    }),
+                    commands: Vec::new(),
+                },
+            );
+
+        assert!(
+            harness
+                .query_by_label("I confirm this saved import checkpoint may be deleted")
+                .is_none()
+        );
+        harness.get_by_label("Resume").click();
+        harness.step();
+        assert_eq!(
+            harness.state().commands,
+            vec![ImportCommand::RecoverCheckpoint {
+                retry_id: ImportReviewId::new(23),
+                action: ImportRecoveryAction::Resume,
+            }]
+        );
+    }
+
+    #[test]
+    fn non_checkpoint_failure_guidance_does_not_relabel_capacity_as_tiff_selection() {
+        let harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 500.0))
+            .build_ui_state(
+                |ui, state: &mut ImportWindowHarnessState| {
+                    state.commands =
+                        show_import_workflow_window(ui.ctx(), &mut state.ui, &state.snapshot);
+                },
+                ImportWindowHarnessState {
+                    ui: EguiUiState::new(256, 128),
+                    snapshot: ImportWorkflowSnapshot::Failed(ImportFailureSnapshot {
+                        message:
+                            "package addressability exceeds logical bricks: observed 10, maximum 9"
+                                .to_owned(),
+                        checkpoint: None,
+                        recovery: None,
+                    }),
+                    commands: Vec::new(),
+                },
+            );
+
+        harness.get_by_label("Correct the problem described above, then begin a new import.");
+        assert!(
+            harness
+                .query_by_label("Select a supported grayscale TIFF file")
+                .is_none()
         );
     }
 
@@ -1578,15 +2030,15 @@ mod tests {
         );
         assert_eq!(
             import_progress_message(ImportProgressSnapshot::Stage {
-                name: "source-scientific-identity",
+                name: "source-ingest",
                 completed_work_units: Some(0),
                 total_work_units: None,
             }),
-            "source-scientific-identity"
+            "source-ingest"
         );
         assert_eq!(
             import_progress_fraction(ImportProgressSnapshot::Stage {
-                name: "source-scientific-identity",
+                name: "source-ingest",
                 completed_work_units: Some(0),
                 total_work_units: None,
             }),

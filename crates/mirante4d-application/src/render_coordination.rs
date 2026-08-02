@@ -17,6 +17,7 @@ pub enum RenderBackend {
     GpuCameraMip,
     GpuCameraIso,
     GpuCameraDvr,
+    GpuCameraMixed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,10 +85,11 @@ pub struct DisplayRefreshTiming {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrameFidelityStatus {
-    /// Finest scale justified by projected screen footprint.
-    pub ideal_scale_level: u32,
-    /// Finest complete scale selected under current aggregate capacity.
-    pub target_scale_level: u32,
+    /// Uniform projected scale, or `None` for an empty or mixed visible set.
+    /// Per-layer truth is carried by `LayerPresentationStatus`.
+    pub ideal_scale_level: Option<u32>,
+    /// Uniform selected scale, or `None` for an empty or mixed visible set.
+    pub target_scale_level: Option<u32>,
     pub displayed_scale_level: Option<u32>,
     pub adaptive_capacity_limited: bool,
     pub refinement_pending: bool,
@@ -135,8 +137,8 @@ impl FrameFidelityStatus {
         presentation_viewport: PresentationViewport,
     ) -> Self {
         Self {
-            ideal_scale_level: 0,
-            target_scale_level: 0,
+            ideal_scale_level: None,
+            target_scale_level: None,
             displayed_scale_level: None,
             adaptive_capacity_limited: false,
             refinement_pending: false,

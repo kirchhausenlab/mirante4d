@@ -25,8 +25,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisError {
-    #[error("analysis requires a verified scientific source identity")]
-    UnverifiedSource,
+    #[error("analysis requires a declared or computed source content address")]
+    MissingContentAddress,
     #[error("the requested logical layer is absent")]
     UnknownLayer,
     #[error("the analysis time range is empty or outside the layer")]

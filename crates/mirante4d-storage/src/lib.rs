@@ -2,8 +2,8 @@
 //!
 //! This crate owns immutable profile facts, strict control primitives, checked
 //! limits, portable package paths, packed indexes and shards, strict Zarr/OME
-//! metadata, authenticated bounded catalog and range reads, exact-package and
-//! scientific verification, and create-only local publication.
+//! metadata, checksum-checked bounded catalog and range reads, exact-package
+//! integrity and canonical-content validation, and create-only local publication.
 
 #![forbid(unsafe_code)]
 
@@ -49,36 +49,46 @@ pub use control::{
 };
 pub use dataset_source::{
     LocalDatasetSource, LocalDatasetSourceDiagnostics, LocalDatasetSourceOpenError,
-    LocalDatasetSourcePromotionError, LocalDatasetSourcePromotionFailure,
     PACKAGE_VALIDATION_WORKING_BYTES,
 };
 pub use directory_inventory::{DirectoryInventory, DirectoryInventoryError};
 pub use error::StorageProfileError;
 pub use limits::{
+    COMPOSITIONAL_DIRECTORIES_MAX, COMPOSITIONAL_DIRECTORY_FAN_OUT_MAX,
+    COMPOSITIONAL_LOGICAL_BRICKS_MAX, COMPOSITIONAL_PHYSICAL_OBJECTS_MAX,
+    COMPOSITIONAL_SHARDS_PER_COMPONENT_MAX, COMPOSITIONAL_ZARR_METADATA_OBJECTS_MAX,
     DatasetGeometry, ELIDED_ALL_FILL_AMPLIFICATION, ElidedAllFillAmplification,
     FIXED_CONTROL_OBJECTS, GLOBAL_ENCODED_OUTER_SHARD_BYTES_MAX,
-    GLOBAL_UNCOMPRESSED_OUTER_SHARD_BYTES_MAX, MANIFEST_DESCRIPTORS_PER_PAGE_GUARANTEED,
-    OneBrickAmplification, PACKED_INDEX_RECORD_BYTES, PACKED_INDEX_RECORDS_PER_INNER_CHUNK,
-    PACKED_INDEX_RECORDS_PER_OUTER_SHARD, PORTABLE_PROVENANCE_RECORDS_MAX, PackageCounts,
-    ProfileLimits, ScaleCounts, amplification_2d, amplification_3d, checked_ceil_div,
-    count_3d_pyramid, encoded_inner_payload_limit, encoded_outer_shard_limit,
+    GLOBAL_UNCOMPRESSED_OUTER_SHARD_BYTES_MAX, MANIFEST_DESCRIPTOR_WORKING_BYTES,
+    MANIFEST_DESCRIPTOR_WORKING_SET_BYTES_MAX, MANIFEST_DESCRIPTORS_MAX,
+    MANIFEST_DESCRIPTORS_PER_PAGE_GUARANTEED, MANIFEST_FORMAT_DESCRIPTORS_MAX,
+    MANIFEST_PAGE_REFERENCES_MAX, OneBrickAmplification, PACKED_INDEX_RECORD_BYTES,
+    PACKED_INDEX_RECORDS_PER_INNER_CHUNK, PACKED_INDEX_RECORDS_PER_OUTER_SHARD,
+    PORTABLE_PROVENANCE_RECORDS_MAX, PROFILE_PYRAMID_SCALE_COUNT_MAX,
+    PROFILE_PYRAMID_TERMINAL_MAX_DIMENSION, PROFILE_PYRAMID_TERMINAL_VOXELS_PER_TIMEPOINT,
+    PackageCounts, ProfileLimits, ScaleCounts, amplification_2d, amplification_3d,
+    checked_ceil_div, count_3d_profile_pyramid, count_3d_pyramid, encoded_inner_payload_limit,
+    encoded_outer_shard_limit, profile_pyramid_shape_is_terminal, profile_pyramid_shapes,
 };
 pub use ome_metadata::{OmeImageGroupMetadata, OmeLevelTransform};
 pub use package_admission::{DatasetProfileAdmission, PackageAdmissionError};
 pub use package_catalog::{LocalPackageCatalog, PackageOpenError};
-pub use package_integrity::{ExactPackageCapability, PackageValidationError};
+pub use package_integrity::{
+    ExactPackageCapability, ExactPackageValidationProgress, PackageValidationError,
+};
 pub use package_read::{LocalBrickRead, PackageReadError};
 pub use package_science::{
     SCIENTIFIC_PUBLICATION_CURRENTNESS_CONTRACT_ID, ScientificPackageValidationError,
     ScientificPublicationTransferError, ScientificPublicationTransferEvidence,
-    ScientificValidationReport, VerifiedScientificPackageCapability,
+    ScientificValidationProgress, ScientificValidationProgressStage, ScientificValidationReport,
+    SelfConsistentPackageCapability,
 };
 pub use package_structure::PackageStructureError;
 pub use package_validation_reads::{PackageCodecReport, PackageValidationReadReport};
 pub use package_write::{
     LocalPackageWriter, PackageArrayInput, PackageShardInput, PackageWriteError, PackageWriteEvent,
     PackageWriteInput, PackageWriteReceipt, PackageWriteStage, PackageWriteStageTiming,
-    PublishedScientificPackageTransfer,
+    PublishedScientificPackageTransfer, ResumableLocalPackageStage,
 };
 pub use packed_index::{
     PackedIndexCoordinates, PackedIndexError, PackedIndexRecord, PackedIndexStatistics,

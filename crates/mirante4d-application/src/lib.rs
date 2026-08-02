@@ -50,7 +50,7 @@ use std::{
     sync::Arc,
 };
 
-use mirante4d_dataset::{DatasetCatalog, DatasetSourceId, ScientificIdentityStatus};
+use mirante4d_dataset::{ContentAddressStatus, DatasetCatalog};
 use mirante4d_domain::LogicalLayerKey;
 pub use mirante4d_domain::{
     CameraView, CrossSectionView, DisplayWindow, DvrOpacityTransfer, IsoLightState,
@@ -88,6 +88,56 @@ pub const MAX_ACTIVE_OPERATIONS: usize = 64;
 pub const MAX_ANALYSIS_TABLES: usize = 1_024;
 /// Maximum number of transient analysis plots retained in one source session.
 pub const MAX_ANALYSIS_PLOTS: usize = 1_024;
+/// Lowest user-selectable temporal playback cadence.
+pub const MIN_PLAYBACK_FPS: u8 = 1;
+/// Highest user-selectable temporal playback cadence.
+pub const MAX_PLAYBACK_FPS: u8 = 24;
+/// Product-default temporal playback cadence.
+pub const DEFAULT_PLAYBACK_FPS: u8 = 24;
+
+/// Validated temporal playback cadence. Spatial rendering cadence remains
+/// independently driven by the native repaint/render pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PlaybackFps(u8);
+
+impl PlaybackFps {
+    pub const DEFAULT: Self = Self(DEFAULT_PLAYBACK_FPS);
+
+    pub const fn new(value: u8) -> Option<Self> {
+        if value >= MIN_PLAYBACK_FPS && value <= MAX_PLAYBACK_FPS {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl Default for PlaybackFps {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The transient temporal transport lifecycle. `Warming` retains the current
+/// complete presentation while composition establishes a bounded successor
+/// runway; only `Playing` advances the effective cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PlaybackPhase {
+    #[default]
+    Stopped,
+    Warming,
+    Playing,
+}
+
+impl PlaybackPhase {
+    pub const fn is_active(self) -> bool {
+        !matches!(self, Self::Stopped)
+    }
+}
 /// Maximum number of series described by one transient analysis plot.
 pub const MAX_ANALYSIS_PLOT_SERIES: usize = 1_024;
 /// Maximum number of points described by one transient analysis plot.
@@ -380,7 +430,7 @@ impl SettingsChangeToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperationKind {
     DatasetOpen,
-    SourceVerification,
+    PackageIntegrityAudit,
     ProjectOpen,
     ProjectSave,
     ProjectSaveAs,
@@ -469,10 +519,9 @@ pub enum OperationFailureCode {
     DatasetUnsupported,
     DatasetCapacityExceeded,
     DatasetReadFailed,
-    SourceChanged,
-    SourceVerificationInvalid,
-    SourceVerificationCapacityExceeded,
-    SourceVerificationReadFailed,
+    PackageIntegrityAuditInvalid,
+    PackageIntegrityAuditCapacityExceeded,
+    PackageIntegrityAuditReadFailed,
     ProjectNotFound,
     ProjectPermissionDenied,
     ProjectInvalidDocument,
@@ -498,6 +547,151 @@ pub enum OperationFailureCode {
     ImportExecutionFailed,
 }
 
+/// Where the current package's content address came from.
+///
+/// Neither variant authenticates the scientific meaning, producer, or raw
+/// acquisition. The distinction is retained only so UI and project tooling do
+/// not describe a package-declared address as independently verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentAddressOrigin {
+    DeclaredByPackage,
+    ComputedDuringImport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PackageIntegrityAuditStage {
+    ExactObjectBytes,
+    CanonicalBaseContent,
+    PyramidAccelerationFacts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackageIntegrityAuditProgress {
+    stage: PackageIntegrityAuditStage,
+    objects_hashed: u64,
+    bytes_hashed: u64,
+    decoded_bricks: u64,
+    decoded_bytes: u64,
+}
+
+impl PackageIntegrityAuditProgress {
+    pub const fn new(
+        stage: PackageIntegrityAuditStage,
+        objects_hashed: u64,
+        bytes_hashed: u64,
+        decoded_bricks: u64,
+        decoded_bytes: u64,
+    ) -> Self {
+        Self {
+            stage,
+            objects_hashed,
+            bytes_hashed,
+            decoded_bricks,
+            decoded_bytes,
+        }
+    }
+
+    pub const fn stage(self) -> PackageIntegrityAuditStage {
+        self.stage
+    }
+
+    pub const fn objects_hashed(self) -> u64 {
+        self.objects_hashed
+    }
+
+    pub const fn bytes_hashed(self) -> u64 {
+        self.bytes_hashed
+    }
+
+    pub const fn decoded_bricks(self) -> u64 {
+        self.decoded_bricks
+    }
+
+    pub const fn decoded_bytes(self) -> u64 {
+        self.decoded_bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageIntegrityAuditReport {
+    content_id: ScientificContentId,
+    objects_hashed: u64,
+    bytes_hashed: u64,
+    decoded_bricks: u64,
+    decoded_bytes: u64,
+}
+
+impl PackageIntegrityAuditReport {
+    pub const fn new(
+        content_id: ScientificContentId,
+        objects_hashed: u64,
+        bytes_hashed: u64,
+        decoded_bricks: u64,
+        decoded_bytes: u64,
+    ) -> Self {
+        Self {
+            content_id,
+            objects_hashed,
+            bytes_hashed,
+            decoded_bricks,
+            decoded_bytes,
+        }
+    }
+
+    pub const fn content_id(&self) -> ScientificContentId {
+        self.content_id
+    }
+
+    pub const fn objects_hashed(&self) -> u64 {
+        self.objects_hashed
+    }
+
+    pub const fn bytes_hashed(&self) -> u64 {
+        self.bytes_hashed
+    }
+
+    pub const fn decoded_bricks(&self) -> u64 {
+        self.decoded_bricks
+    }
+
+    pub const fn decoded_bytes(&self) -> u64 {
+        self.decoded_bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageIntegrityAuditFailure {
+    stage: Option<PackageIntegrityAuditStage>,
+    object: Option<String>,
+    reason: String,
+}
+
+impl PackageIntegrityAuditFailure {
+    pub fn new(
+        stage: Option<PackageIntegrityAuditStage>,
+        object: Option<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage,
+            object,
+            reason: reason.into(),
+        }
+    }
+
+    pub const fn stage(&self) -> Option<PackageIntegrityAuditStage> {
+        self.stage
+    }
+
+    pub fn object(&self) -> Option<&str> {
+        self.object.as_deref()
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum OperationCompletion {
     Succeeded,
@@ -507,24 +701,11 @@ pub enum OperationCompletion {
         source_generation: SourceSessionGeneration,
         catalog: Arc<DatasetCatalog>,
         workspace: Box<UnboundWorkspace>,
-    },
-    /// A newly opened source whose exact package and scientific identity were
-    /// already proved before this completion was prepared.
-    ///
-    /// The catalog, durable dataset reference, and initial workspace are
-    /// admitted as one atomic source replacement. This is distinct from
-    /// `DatasetOpened`, which deliberately accepts only a provisional catalog.
-    VerifiedDatasetOpened {
-        source_generation: SourceSessionGeneration,
-        catalog: Arc<DatasetCatalog>,
-        workspace: Box<UnboundWorkspace>,
         dataset: DatasetReference,
+        content_address_origin: ContentAddressOrigin,
     },
-    SourceVerified {
-        source_generation: SourceSessionGeneration,
-        catalog: Arc<DatasetCatalog>,
-        dataset: DatasetReference,
-    },
+    PackageIntegrityAuditCompleted(PackageIntegrityAuditReport),
+    PackageIntegrityAuditFailed(PackageIntegrityAuditFailure),
     AnalysisCommitted {
         projection: Box<ProjectGenerationProjection>,
         table: AnalysisTableDescriptor,
@@ -551,7 +732,9 @@ pub enum CrossSectionPanelId {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransientApplicationState {
-    playback_active: bool,
+    playback_phase: PlaybackPhase,
+    playback_fps: PlaybackFps,
+    playback_timepoint: Option<TimeIndex>,
     last_playback_tick: Option<u64>,
     active_tool: ToolKind,
     selected_channel_preset: Option<ChannelPresetId>,
@@ -567,7 +750,9 @@ pub struct TransientApplicationState {
 impl Default for TransientApplicationState {
     fn default() -> Self {
         Self {
-            playback_active: false,
+            playback_phase: PlaybackPhase::Stopped,
+            playback_fps: PlaybackFps::DEFAULT,
+            playback_timepoint: None,
             last_playback_tick: None,
             active_tool: ToolKind::Navigate,
             selected_channel_preset: None,
@@ -584,7 +769,19 @@ impl Default for TransientApplicationState {
 
 impl TransientApplicationState {
     pub const fn playback_active(&self) -> bool {
-        self.playback_active
+        self.playback_phase.is_active()
+    }
+
+    pub const fn playback_phase(&self) -> PlaybackPhase {
+        self.playback_phase
+    }
+
+    pub const fn playback_fps(&self) -> PlaybackFps {
+        self.playback_fps
+    }
+
+    pub const fn playback_timepoint(&self) -> Option<TimeIndex> {
+        self.playback_timepoint
     }
 
     pub const fn last_playback_tick(&self) -> Option<u64> {
@@ -631,16 +828,12 @@ impl TransientApplicationState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApplicationCommand {
     RequestDatasetOpen,
-    RequestSourceVerification,
-    UpdateSourceVerificationProgress {
+    RequestPackageIntegrityAudit,
+    UpdatePackageIntegrityAuditProgress {
         token: OperationToken,
-        completed_work: u64,
-        total_work: u64,
+        progress: PackageIntegrityAuditProgress,
     },
-    InvalidateSourceVerification {
-        source_generation: SourceSessionGeneration,
-    },
-    AttachVerifiedDataset,
+    AttachDataset,
     SetActiveLayer(LogicalLayerKey),
     SetTimepoint(TimeIndex),
     SetLayerView(LayerViewState),
@@ -660,6 +853,8 @@ pub enum ApplicationCommand {
     UpsertArtifact(ArtifactReference),
     RemoveArtifact(ArtifactHandleId),
     SetPlaybackActive(bool),
+    SetPlaybackFps(PlaybackFps),
+    MarkPlaybackPrepared,
     AdvancePlaybackTick(u64),
     SetActiveTool(ToolKind),
     SelectChannelPreset(Option<ChannelPresetId>),
@@ -705,10 +900,9 @@ pub enum ApplicationCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationCommandKind {
     RequestDatasetOpen,
-    RequestSourceVerification,
-    UpdateSourceVerificationProgress,
-    InvalidateSourceVerification,
-    AttachVerifiedDataset,
+    RequestPackageIntegrityAudit,
+    UpdatePackageIntegrityAuditProgress,
+    AttachDataset,
     SetActiveLayer,
     SetTimepoint,
     SetLayerView,
@@ -723,6 +917,8 @@ pub enum ApplicationCommandKind {
     UpsertArtifact,
     RemoveArtifact,
     SetPlaybackActive,
+    SetPlaybackFps,
+    MarkPlaybackPrepared,
     AdvancePlaybackTick,
     SetActiveTool,
     SelectChannelPreset,
@@ -750,14 +946,13 @@ impl ApplicationCommand {
     pub const fn kind(&self) -> ApplicationCommandKind {
         match self {
             Self::RequestDatasetOpen => ApplicationCommandKind::RequestDatasetOpen,
-            Self::RequestSourceVerification => ApplicationCommandKind::RequestSourceVerification,
-            Self::UpdateSourceVerificationProgress { .. } => {
-                ApplicationCommandKind::UpdateSourceVerificationProgress
+            Self::RequestPackageIntegrityAudit => {
+                ApplicationCommandKind::RequestPackageIntegrityAudit
             }
-            Self::InvalidateSourceVerification { .. } => {
-                ApplicationCommandKind::InvalidateSourceVerification
+            Self::UpdatePackageIntegrityAuditProgress { .. } => {
+                ApplicationCommandKind::UpdatePackageIntegrityAuditProgress
             }
-            Self::AttachVerifiedDataset => ApplicationCommandKind::AttachVerifiedDataset,
+            Self::AttachDataset => ApplicationCommandKind::AttachDataset,
             Self::SetActiveLayer(_) => ApplicationCommandKind::SetActiveLayer,
             Self::SetTimepoint(_) => ApplicationCommandKind::SetTimepoint,
             Self::SetLayerView(_) => ApplicationCommandKind::SetLayerView,
@@ -772,6 +967,8 @@ impl ApplicationCommand {
             Self::UpsertArtifact(_) => ApplicationCommandKind::UpsertArtifact,
             Self::RemoveArtifact(_) => ApplicationCommandKind::RemoveArtifact,
             Self::SetPlaybackActive(_) => ApplicationCommandKind::SetPlaybackActive,
+            Self::SetPlaybackFps(_) => ApplicationCommandKind::SetPlaybackFps,
+            Self::MarkPlaybackPrepared => ApplicationCommandKind::MarkPlaybackPrepared,
             Self::AdvancePlaybackTick(_) => ApplicationCommandKind::AdvancePlaybackTick,
             Self::SetActiveTool(_) => ApplicationCommandKind::SetActiveTool,
             Self::SelectChannelPreset(_) => ApplicationCommandKind::SelectChannelPreset,
@@ -807,7 +1004,7 @@ impl ApplicationCommand {
     fn mutates_durable_project(&self) -> bool {
         matches!(
             self,
-            Self::AttachVerifiedDataset
+            Self::AttachDataset
                 | Self::SetActiveLayer(_)
                 | Self::SetTimepoint(_)
                 | Self::SetLayerView(_)
@@ -821,7 +1018,7 @@ impl ApplicationCommand {
                 | Self::ApplyChannelPreset(_)
                 | Self::UpsertArtifact(_)
                 | Self::RemoveArtifact(_)
-                | Self::AdvancePlaybackTick(_)
+                | Self::SetPlaybackActive(_)
                 | Self::Undo
                 | Self::Redo
                 | Self::RequestProjectOpen
@@ -836,7 +1033,7 @@ impl ApplicationCommand {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationFaultCode {
-    IdentityVerificationRequired,
+    SourceAdmissionRequired,
     SourceSessionMismatch,
     SourceGenerationNotAdvanced,
     DatasetIdentityMismatch,
@@ -918,20 +1115,12 @@ pub enum ApplicationEvent {
         source_generation: SourceSessionGeneration,
         provisional_project_id: ProjectId,
     },
-    SourceVerificationRequested {
+    PackageIntegrityAuditRequested {
         token: OperationToken,
     },
-    SourceVerificationProgress {
+    PackageIntegrityAuditProgress {
         token: OperationToken,
-        completed_work: u64,
-        total_work: u64,
-    },
-    SourceVerified {
-        source_generation: SourceSessionGeneration,
-        scientific_content_id: ScientificContentId,
-    },
-    SourceVerificationInvalidated {
-        source_generation: SourceSessionGeneration,
+        progress: PackageIntegrityAuditProgress,
     },
     WorkspaceChanged {
         currentness: CurrentnessGeneration,
@@ -1004,8 +1193,8 @@ pub enum OperationOutcome {
     Cancelled,
     Failed(OperationFailureCode),
     DatasetOpened,
-    VerifiedDatasetOpened,
-    SourceVerified,
+    PackageIntegrityAuditCompleted,
+    PackageIntegrityAuditFailed,
     AnalysisCommitted,
     ProjectOpened,
     ProjectSaved,
@@ -1076,15 +1265,18 @@ impl BoundWorkspace {
         }
     }
 
-    fn restored_for_verified_source(
+    fn restored_for_admitted_source(
         projection: ProjectGenerationProjection,
-        verified_source: &DatasetReference,
+        source_reference: &DatasetReference,
     ) -> Result<(Self, Option<ProjectRevisionId>), ApplicationFaultCode> {
         let (saved_revision, mut high_water, state) = projection.into_parts();
-        if !state.dataset().has_same_scientific_content(verified_source) {
+        if !state
+            .dataset()
+            .has_same_scientific_content(source_reference)
+        {
             return Err(ApplicationFaultCode::DatasetIdentityMismatch);
         }
-        if state.dataset() == verified_source {
+        if state.dataset() == source_reference {
             return Ok((
                 Self {
                     history: VecDeque::from([HistoryEntry {
@@ -1100,12 +1292,12 @@ impl BoundWorkspace {
         }
 
         // Locator/package/release differences are not scientific-identity
-        // mismatches. Rebind to the verifier-owned current reference as one
+        // mismatches. Rebind to the admitted current reference as one
         // dirty revision, without retaining an undo route to the persisted
         // non-current reference as a second live dataset authority.
         let rebound = ProjectState::new(
             state.project_id(),
-            verified_source.clone(),
+            source_reference.clone(),
             state.view().clone(),
             state.channel_presets().to_vec(),
             state.artifacts().to_vec(),
@@ -1141,25 +1333,28 @@ impl BoundWorkspace {
         }
     }
 
-    fn recovered_for_verified_source(
+    fn recovered_for_admitted_source(
         projection: ProjectGenerationProjection,
-        verified_source: &DatasetReference,
+        source_reference: &DatasetReference,
         expected_project_id: Option<ProjectId>,
     ) -> Result<Self, ApplicationFaultCode> {
         let (recovered_revision, mut high_water, state) = projection.into_parts();
         if expected_project_id.is_some_and(|expected| state.project_id() != expected) {
             return Err(ApplicationFaultCode::InvalidProjectTransition);
         }
-        if !state.dataset().has_same_scientific_content(verified_source) {
+        if !state
+            .dataset()
+            .has_same_scientific_content(source_reference)
+        {
             return Err(ApplicationFaultCode::DatasetIdentityMismatch);
         }
 
-        let (revision, state) = if state.dataset() == verified_source {
+        let (revision, state) = if state.dataset() == source_reference {
             (recovered_revision, state)
         } else {
             let rebound = ProjectState::new(
                 state.project_id(),
-                verified_source.clone(),
+                source_reference.clone(),
                 state.view().clone(),
                 state.channel_presets().to_vec(),
                 state.artifacts().to_vec(),
@@ -1281,19 +1476,26 @@ struct AnalysisBundleHandles {
     plot: Option<ArtifactHandleId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SourceVerificationProgressState {
-    operation_id: OperationId,
-    completed_work: u64,
-    total_work: u64,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum PackageIntegrityAuditState {
+    #[default]
+    NotRun,
+    Running {
+        operation_id: OperationId,
+        progress: Option<PackageIntegrityAuditProgress>,
+    },
+    SelfConsistent(PackageIntegrityAuditReport),
+    Failed(PackageIntegrityAuditFailure),
+    Cancelled,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct ApplicationState {
     source_generation: SourceSessionGeneration,
     catalog: Arc<DatasetCatalog>,
-    verified_source: Option<DatasetReference>,
-    source_verification_progress: Option<SourceVerificationProgressState>,
+    source_reference: DatasetReference,
+    content_address_origin: ContentAddressOrigin,
+    package_integrity_audit: PackageIntegrityAuditState,
     workspace: Workspace,
     transient: TransientApplicationState,
     analysis_table_catalog: BTreeMap<AnalysisTableId, AnalysisTableDescriptor>,
@@ -1309,25 +1511,23 @@ pub struct ApplicationState {
     latest_problem: Option<ApplicationEvent>,
 }
 
-enum OpenedSourceBinding {
-    Provisional,
-    Verified(DatasetReference),
-}
-
 impl ApplicationState {
     pub fn new_unbound(
         source_generation: SourceSessionGeneration,
         catalog: DatasetCatalog,
+        source_reference: DatasetReference,
+        content_address_origin: ContentAddressOrigin,
         workspace: UnboundWorkspace,
         resource_policy: ResourcePolicy,
     ) -> Result<Self, ApplicationFaultCode> {
-        require_unverified_catalog(&catalog, source_generation)?;
+        require_catalog_source_binding(&catalog, source_generation, &source_reference)?;
         validate_view_against_catalog(&catalog, workspace.view())?;
         Ok(Self {
             source_generation,
             catalog: Arc::new(catalog),
-            verified_source: None,
-            source_verification_progress: None,
+            source_reference,
+            content_address_origin,
+            package_integrity_audit: PackageIntegrityAuditState::NotRun,
             workspace: Workspace::Unbound(Arc::new(workspace)),
             transient: TransientApplicationState::default(),
             analysis_table_catalog: BTreeMap::new(),
@@ -1348,8 +1548,9 @@ impl ApplicationState {
         Self {
             source_generation: self.source_generation,
             catalog: Arc::clone(&self.catalog),
-            verified_source: self.verified_source.clone(),
-            source_verification_progress: self.source_verification_progress,
+            source_reference: self.source_reference.clone(),
+            content_address_origin: self.content_address_origin,
+            package_integrity_audit: self.package_integrity_audit.clone(),
             workspace: self.workspace.clone(),
             transient: self.transient.clone(),
             analysis_table_catalog: self.analysis_table_catalog.clone(),
@@ -1376,7 +1577,7 @@ impl ApplicationState {
         let fault_token = match &command {
             ApplicationCommand::StageAnalysisBundle { token, .. }
             | ApplicationCommand::CompleteOperation { token, .. }
-            | ApplicationCommand::UpdateSourceVerificationProgress { token, .. } => {
+            | ApplicationCommand::UpdatePackageIntegrityAuditProgress { token, .. } => {
                 Some(token.clone())
             }
             _ => None,
@@ -1393,6 +1594,7 @@ impl ApplicationState {
     }
 
     pub fn snapshot(&self) -> ApplicationSnapshot {
+        let effective_view = self.effective_view();
         let workspace = match &self.workspace {
             Workspace::Unbound(workspace) => WorkspaceSnapshot::Unbound {
                 workspace: Arc::clone(workspace),
@@ -1408,15 +1610,25 @@ impl ApplicationState {
                 retained_history_entries: workspace.history.len(),
             },
         };
-        let source = match self.source_verification_progress {
-            Some(progress) => SourceVerificationSnapshot::Verifying {
-                operation_id: progress.operation_id,
-                completed_work: progress.completed_work,
-                total_work: progress.total_work,
-            },
-            None => match &self.verified_source {
-                Some(dataset) => SourceVerificationSnapshot::Verified(dataset.clone()),
-                None => SourceVerificationSnapshot::Required,
+        let source = SourceAdmissionSnapshot {
+            dataset: self.source_reference.clone(),
+            content_address_origin: self.content_address_origin,
+            integrity_audit: match &self.package_integrity_audit {
+                PackageIntegrityAuditState::NotRun => PackageIntegrityAuditSnapshot::NotRun,
+                PackageIntegrityAuditState::Running {
+                    operation_id,
+                    progress,
+                } => PackageIntegrityAuditSnapshot::Running {
+                    operation_id: *operation_id,
+                    progress: *progress,
+                },
+                PackageIntegrityAuditState::SelfConsistent(report) => {
+                    PackageIntegrityAuditSnapshot::SelfConsistent(report.clone())
+                }
+                PackageIntegrityAuditState::Failed(failure) => {
+                    PackageIntegrityAuditSnapshot::Failed(failure.clone())
+                }
+                PackageIntegrityAuditState::Cancelled => PackageIntegrityAuditSnapshot::Cancelled,
             },
         };
         let operations = self
@@ -1429,6 +1641,7 @@ impl ApplicationState {
             catalog: Arc::clone(&self.catalog),
             source,
             workspace,
+            effective_view,
             transient: self.transient.clone(),
             currentness: self.currentness,
             active_operations: operations,
@@ -1465,22 +1678,19 @@ impl ApplicationState {
         }
         match command {
             ApplicationCommand::RequestDatasetOpen => self.request_dataset_open(),
-            ApplicationCommand::RequestSourceVerification => self.request_source_verification(),
-            ApplicationCommand::UpdateSourceVerificationProgress {
-                token,
-                completed_work,
-                total_work,
-            } => self.update_source_verification_progress(token, completed_work, total_work),
-            ApplicationCommand::InvalidateSourceVerification { source_generation } => {
-                self.invalidate_source_verification(source_generation)
+            ApplicationCommand::RequestPackageIntegrityAudit => {
+                self.request_package_integrity_audit()
             }
-            ApplicationCommand::AttachVerifiedDataset => self.attach_verified_dataset(),
+            ApplicationCommand::UpdatePackageIntegrityAuditProgress { token, progress } => {
+                self.update_package_integrity_audit_progress(token, progress)
+            }
+            ApplicationCommand::AttachDataset => self.attach_dataset(),
             ApplicationCommand::SetActiveLayer(layer) => self.update_view(command_kind, |view| {
                 rebuild_view(view, ViewUpdate::Active(layer))
             }),
-            ApplicationCommand::SetTimepoint(timepoint) => self.update_view(command_kind, |view| {
-                rebuild_view(view, ViewUpdate::Timepoint(timepoint))
-            }),
+            ApplicationCommand::SetTimepoint(timepoint) => {
+                self.set_timepoint(command_kind, timepoint)
+            }
             ApplicationCommand::SetLayerView(layer) => self.update_view(command_kind, |view| {
                 rebuild_view(view, ViewUpdate::Layer(layer))
             }),
@@ -1514,10 +1724,12 @@ impl ApplicationState {
                 self.upsert_artifact(command_kind, artifact)
             }
             ApplicationCommand::RemoveArtifact(id) => self.remove_artifact(command_kind, &id),
-            ApplicationCommand::SetPlaybackActive(active) => self.set_playback_active(active),
-            ApplicationCommand::AdvancePlaybackTick(tick) => {
-                self.advance_playback_tick(command_kind, tick)
+            ApplicationCommand::SetPlaybackActive(active) => {
+                self.set_playback_active(command_kind, active)
             }
+            ApplicationCommand::SetPlaybackFps(fps) => self.set_playback_fps(fps),
+            ApplicationCommand::MarkPlaybackPrepared => self.mark_playback_prepared(),
+            ApplicationCommand::AdvancePlaybackTick(tick) => self.advance_playback_tick(tick),
             ApplicationCommand::SetActiveTool(tool) => self.set_active_tool(tool),
             ApplicationCommand::SelectChannelPreset(id) => self.select_channel_preset(id),
             ApplicationCommand::SelectArtifact(id) => self.select_artifact(id),
@@ -1541,7 +1753,7 @@ impl ApplicationState {
                 if matches!(
                     kind,
                     OperationKind::DatasetOpen
-                        | OperationKind::SourceVerification
+                        | OperationKind::PackageIntegrityAudit
                         | OperationKind::ProjectOpen
                         | OperationKind::ProjectSave
                         | OperationKind::ProjectSaveAs
@@ -1581,62 +1793,20 @@ impl ApplicationState {
         source_generation: SourceSessionGeneration,
         catalog: Arc<DatasetCatalog>,
         workspace: UnboundWorkspace,
-    ) -> Result<CommandEffect, ApplicationFaultCode> {
-        self.install_opened_source(
-            source_generation,
-            catalog,
-            workspace,
-            OpenedSourceBinding::Provisional,
-        )
-    }
-
-    fn admit_verified_opened_source(
-        &mut self,
-        source_generation: SourceSessionGeneration,
-        catalog: Arc<DatasetCatalog>,
-        workspace: UnboundWorkspace,
         dataset: DatasetReference,
-    ) -> Result<CommandEffect, ApplicationFaultCode> {
-        self.install_opened_source(
-            source_generation,
-            catalog,
-            workspace,
-            OpenedSourceBinding::Verified(dataset),
-        )
-    }
-
-    fn install_opened_source(
-        &mut self,
-        source_generation: SourceSessionGeneration,
-        catalog: Arc<DatasetCatalog>,
-        workspace: UnboundWorkspace,
-        binding: OpenedSourceBinding,
+        content_address_origin: ContentAddressOrigin,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
         if source_generation.get() <= self.source_generation.get() {
             return Err(ApplicationFaultCode::SourceGenerationNotAdvanced);
         }
-        let verified_identity = match &binding {
-            OpenedSourceBinding::Provisional => {
-                require_unverified_catalog(&catalog, source_generation)?;
-                None
-            }
-            OpenedSourceBinding::Verified(dataset) => {
-                let identity = *dataset.scientific_content_id();
-                if catalog.scientific_identity().verified_id() != Some(&identity) {
-                    return Err(ApplicationFaultCode::DatasetIdentityMismatch);
-                }
-                Some(identity)
-            }
-        };
+        require_catalog_source_binding(&catalog, source_generation, &dataset)?;
         validate_view_against_catalog(&catalog, workspace.view())?;
         let provisional_project_id = workspace.provisional_project_id();
         self.source_generation = source_generation;
         self.catalog = catalog;
-        self.verified_source = match binding {
-            OpenedSourceBinding::Provisional => None,
-            OpenedSourceBinding::Verified(dataset) => Some(dataset),
-        };
-        self.source_verification_progress = None;
+        self.source_reference = dataset;
+        self.content_address_origin = content_address_origin;
+        self.package_integrity_audit = PackageIntegrityAuditState::NotRun;
         self.workspace = Workspace::Unbound(Arc::new(workspace));
         self.transient = TransientApplicationState::default();
         self.analysis_table_catalog.clear();
@@ -1646,12 +1816,6 @@ impl ApplicationState {
             source_generation,
             provisional_project_id,
         })?;
-        if let Some(scientific_content_id) = verified_identity {
-            self.push_event(ApplicationEvent::SourceVerified {
-                source_generation,
-                scientific_content_id,
-            })?;
-        }
         Ok(CommandEffect::Changed)
     }
 
@@ -1664,136 +1828,58 @@ impl ApplicationState {
         Ok(CommandEffect::Changed)
     }
 
-    fn request_source_verification(&mut self) -> Result<CommandEffect, ApplicationFaultCode> {
-        if self.verified_source.is_some() {
-            return Ok(CommandEffect::NoChange);
-        }
-        if self.source_verification_progress.is_some() || !self.operations.is_empty() {
+    fn request_package_integrity_audit(&mut self) -> Result<CommandEffect, ApplicationFaultCode> {
+        if matches!(
+            self.package_integrity_audit,
+            PackageIntegrityAuditState::Running { .. }
+        ) || !self.operations.is_empty()
+        {
             return Err(ApplicationFaultCode::OperationConflict);
         }
-        require_unverified_catalog(&self.catalog, self.source_generation)?;
-        let token = self.create_operation(OperationKind::SourceVerification)?;
-        self.source_verification_progress = Some(SourceVerificationProgressState {
+        let token = self.create_operation(OperationKind::PackageIntegrityAudit)?;
+        self.package_integrity_audit = PackageIntegrityAuditState::Running {
             operation_id: token.operation_id,
-            completed_work: 0,
-            total_work: 0,
-        });
-        self.push_event(ApplicationEvent::SourceVerificationRequested { token })?;
+            progress: None,
+        };
+        self.push_event(ApplicationEvent::PackageIntegrityAuditRequested { token })?;
         Ok(CommandEffect::Changed)
     }
 
-    fn update_source_verification_progress(
+    fn update_package_integrity_audit_progress(
         &mut self,
         token: OperationToken,
-        completed_work: u64,
-        total_work: u64,
+        progress: PackageIntegrityAuditProgress,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
-        self.validate_source_verification_token_current(&token)?;
-        if total_work == 0 || completed_work > total_work {
+        self.validate_package_integrity_audit_token_current(&token)?;
+        let PackageIntegrityAuditState::Running {
+            operation_id,
+            progress: current,
+        } = &mut self.package_integrity_audit
+        else {
+            return Err(ApplicationFaultCode::InvalidOperationProgress);
+        };
+        if *operation_id != token.operation_id {
             return Err(ApplicationFaultCode::InvalidOperationProgress);
         }
-        let progress = self
-            .source_verification_progress
-            .as_mut()
-            .ok_or(ApplicationFaultCode::InvalidOperationProgress)?;
-        if progress.operation_id != token.operation_id
-            || completed_work < progress.completed_work
-            || (progress.total_work != 0 && progress.total_work != total_work)
-        {
+        if current.as_ref().is_some_and(|current| {
+            progress.stage() < current.stage()
+                || progress.objects_hashed() < current.objects_hashed()
+                || progress.bytes_hashed() < current.bytes_hashed()
+                || progress.decoded_bricks() < current.decoded_bricks()
+                || progress.decoded_bytes() < current.decoded_bytes()
+        }) {
             return Err(ApplicationFaultCode::InvalidOperationProgress);
         }
-        if progress.completed_work == completed_work && progress.total_work == total_work {
+        if *current == Some(progress) {
             return Ok(CommandEffect::NoChange);
         }
-        progress.completed_work = completed_work;
-        progress.total_work = total_work;
-        self.push_event(ApplicationEvent::SourceVerificationProgress {
-            token,
-            completed_work,
-            total_work,
-        })?;
+        *current = Some(progress);
+        self.push_event(ApplicationEvent::PackageIntegrityAuditProgress { token, progress })?;
         Ok(CommandEffect::Changed)
     }
 
-    fn invalidate_source_verification(
-        &mut self,
-        source_generation: SourceSessionGeneration,
-    ) -> Result<CommandEffect, ApplicationFaultCode> {
-        if source_generation != self.source_generation {
-            return Err(ApplicationFaultCode::SourceSessionMismatch);
-        }
-
-        let retained_analysis_ids = self
-            .operations
-            .iter()
-            .filter_map(|(operation_id, operation)| {
-                (operation.token.kind == OperationKind::Analysis
-                    && operation.retained_projection.is_some())
-                .then_some(*operation_id)
-            })
-            .collect::<Vec<_>>();
-        let mut cancellation_tokens = Vec::new();
-        for operation_id in &retained_analysis_ids {
-            let operation = self
-                .operations
-                .get_mut(operation_id)
-                .expect("retained analysis operation was collected");
-            if !operation.cancellation_requested {
-                operation.cancellation_requested = true;
-                cancellation_tokens.push(operation.token.clone());
-            }
-        }
-
-        let cancelled_ids = self
-            .operations
-            .iter()
-            .filter_map(|(operation_id, operation)| {
-                matches!(
-                    operation.token.kind,
-                    OperationKind::DatasetOpen
-                        | OperationKind::SourceVerification
-                        | OperationKind::ProjectOpen
-                        | OperationKind::ProjectSave
-                        | OperationKind::ProjectSaveAs
-                        | OperationKind::ProjectRecovery
-                        | OperationKind::Analysis
-                )
-                .then_some(*operation_id)
-                .filter(|operation_id| !retained_analysis_ids.contains(operation_id))
-            })
-            .collect::<Vec<_>>();
-        let cancelled_operations = cancelled_ids
-            .into_iter()
-            .filter_map(|operation_id| self.operations.remove(&operation_id))
-            .collect::<Vec<_>>();
-        cancellation_tokens.extend(
-            cancelled_operations
-                .into_iter()
-                .map(|operation| operation.token),
-        );
-        let was_verified = self.verified_source.take().is_some();
-        if cancellation_tokens.is_empty() && !was_verified {
-            return Ok(CommandEffect::NoChange);
-        }
-
-        self.catalog = Arc::new(catalog_with_identity(
-            &self.catalog,
-            ScientificIdentityStatus::Unverified(DatasetSourceId::new(source_generation.get())),
-        )?);
-        self.source_verification_progress = None;
-        for token in cancellation_tokens {
-            self.push_event(ApplicationEvent::OperationCancellationRequested { token })?;
-        }
-        self.advance_currentness()?;
-        self.push_event(ApplicationEvent::SourceVerificationInvalidated { source_generation })?;
-        Ok(CommandEffect::Changed)
-    }
-
-    fn attach_verified_dataset(&mut self) -> Result<CommandEffect, ApplicationFaultCode> {
-        let dataset = self
-            .verified_source
-            .clone()
-            .ok_or(ApplicationFaultCode::IdentityVerificationRequired)?;
+    fn attach_dataset(&mut self) -> Result<CommandEffect, ApplicationFaultCode> {
+        let dataset = self.source_reference.clone();
         let Workspace::Unbound(unbound) = &self.workspace else {
             return Err(ApplicationFaultCode::WorkspaceAlreadyBound);
         };
@@ -1820,12 +1906,19 @@ impl ApplicationState {
 
     fn update_view(
         &mut self,
-        _command_kind: ApplicationCommandKind,
+        command_kind: ApplicationCommandKind,
         update: impl FnOnce(&ViewState) -> Result<ViewState, ApplicationFaultCode>,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
+        let playback_timepoint = self.transient.playback_timepoint;
         match &self.workspace {
             Workspace::Unbound(unbound) => {
-                let view = update(&unbound.view)?;
+                let base = view_at_transient_timepoint(&unbound.view, playback_timepoint)?;
+                let mut view = update(&base)?;
+                if playback_timepoint.is_some()
+                    && command_kind != ApplicationCommandKind::SetTimepoint
+                {
+                    view = rebuild_view(&view, ViewUpdate::Timepoint(unbound.view.timepoint()))?;
+                }
                 validate_view_against_catalog(&self.catalog, &view)?;
                 if view == unbound.view {
                     return Ok(CommandEffect::NoChange);
@@ -1842,7 +1935,14 @@ impl ApplicationState {
                 Ok(CommandEffect::Changed)
             }
             Workspace::Bound(bound) => {
-                let view = update(bound.current_state().view())?;
+                let durable_view = bound.current_state().view();
+                let base = view_at_transient_timepoint(durable_view, playback_timepoint)?;
+                let mut view = update(&base)?;
+                if playback_timepoint.is_some()
+                    && command_kind != ApplicationCommandKind::SetTimepoint
+                {
+                    view = rebuild_view(&view, ViewUpdate::Timepoint(durable_view.timepoint()))?;
+                }
                 validate_view_against_catalog(&self.catalog, &view)?;
                 if &view == bound.current_state().view() {
                     return Ok(CommandEffect::NoChange);
@@ -1851,6 +1951,27 @@ impl ApplicationState {
                 self.commit_project(project)
             }
         }
+    }
+
+    fn set_timepoint(
+        &mut self,
+        command_kind: ApplicationCommandKind,
+        timepoint: TimeIndex,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
+        let stopped_playback = self.transient.playback_phase.is_active();
+        if stopped_playback {
+            self.transient.playback_phase = PlaybackPhase::Stopped;
+            self.transient.playback_timepoint = None;
+            self.transient.last_playback_tick = None;
+        }
+        let effect = self.update_view(command_kind, |view| {
+            rebuild_view(view, ViewUpdate::Timepoint(timepoint))
+        })?;
+        if stopped_playback {
+            self.push_event(ApplicationEvent::TransientStateChanged)?;
+            return Ok(CommandEffect::Changed);
+        }
+        Ok(effect)
     }
 
     fn upsert_channel_preset(
@@ -2002,23 +2123,66 @@ impl ApplicationState {
         self.commit_project(project)
     }
 
-    fn set_playback_active(&mut self, active: bool) -> Result<CommandEffect, ApplicationFaultCode> {
+    fn set_playback_active(
+        &mut self,
+        command_kind: ApplicationCommandKind,
+        active: bool,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
         let active = active && catalog_timepoint_count(&self.catalog) > 1;
-        if self.transient.playback_active == active {
+        if self.transient.playback_phase.is_active() == active {
             return Ok(CommandEffect::NoChange);
         }
-        self.transient.playback_active = active;
+        if active {
+            let cursor = self.durable_view().timepoint();
+            self.transient.playback_phase = PlaybackPhase::Warming;
+            self.transient.playback_timepoint = Some(cursor);
+            self.transient.last_playback_tick = None;
+            self.push_event(ApplicationEvent::TransientStateChanged)?;
+            return Ok(CommandEffect::Changed);
+        }
+
+        let final_timepoint = self
+            .transient
+            .playback_timepoint
+            .unwrap_or_else(|| self.durable_view().timepoint());
+        self.transient.playback_phase = PlaybackPhase::Stopped;
+        self.transient.playback_timepoint = None;
+        self.transient.last_playback_tick = None;
+        self.update_view(command_kind, |view| {
+            rebuild_view(view, ViewUpdate::Timepoint(final_timepoint))
+        })?;
+        self.push_event(ApplicationEvent::TransientStateChanged)?;
+        Ok(CommandEffect::Changed)
+    }
+
+    fn set_playback_fps(
+        &mut self,
+        fps: PlaybackFps,
+    ) -> Result<CommandEffect, ApplicationFaultCode> {
+        if self.transient.playback_fps == fps {
+            return Ok(CommandEffect::NoChange);
+        }
+        self.transient.playback_fps = fps;
+        if self.transient.playback_phase.is_active() {
+            self.transient.playback_phase = PlaybackPhase::Warming;
+            self.transient.last_playback_tick = None;
+        }
+        self.push_event(ApplicationEvent::TransientStateChanged)?;
+        Ok(CommandEffect::Changed)
+    }
+
+    fn mark_playback_prepared(&mut self) -> Result<CommandEffect, ApplicationFaultCode> {
+        if self.transient.playback_phase != PlaybackPhase::Warming {
+            return Ok(CommandEffect::NoChange);
+        }
+        self.transient.playback_phase = PlaybackPhase::Playing;
         self.transient.last_playback_tick = None;
         self.push_event(ApplicationEvent::TransientStateChanged)?;
         Ok(CommandEffect::Changed)
     }
 
-    fn advance_playback_tick(
-        &mut self,
-        command_kind: ApplicationCommandKind,
-        tick: u64,
-    ) -> Result<CommandEffect, ApplicationFaultCode> {
-        if !self.transient.playback_active {
+    fn advance_playback_tick(&mut self, tick: u64) -> Result<CommandEffect, ApplicationFaultCode> {
+        if self.transient.playback_phase != PlaybackPhase::Playing {
             return Ok(CommandEffect::NoChange);
         }
         if self
@@ -2037,21 +2201,34 @@ impl ApplicationState {
 
         let count = catalog_timepoint_count(&self.catalog);
         if count <= 1 {
-            self.transient.playback_active = false;
+            self.transient.playback_phase = PlaybackPhase::Stopped;
+            self.transient.playback_timepoint = None;
             self.transient.last_playback_tick = None;
             self.push_event(ApplicationEvent::TransientStateChanged)?;
             return Ok(CommandEffect::Changed);
         }
-        let current = match &self.workspace {
-            Workspace::Unbound(workspace) => workspace.view.timepoint(),
-            Workspace::Bound(workspace) => workspace.current_state().view().timepoint(),
-        };
+        let current = self
+            .transient
+            .playback_timepoint
+            .unwrap_or_else(|| self.durable_view().timepoint());
         let next = TimeIndex::new((current.get() + 1) % count);
-        self.update_view(command_kind, |view| {
-            rebuild_view(view, ViewUpdate::Timepoint(next))
-        })?;
+        self.transient.playback_timepoint = Some(next);
         self.transient.last_playback_tick = Some(tick);
+        self.advance_currentness()?;
+        self.push_event(ApplicationEvent::TransientStateChanged)?;
         Ok(CommandEffect::Changed)
+    }
+
+    fn durable_view(&self) -> &ViewState {
+        match &self.workspace {
+            Workspace::Unbound(workspace) => workspace.view(),
+            Workspace::Bound(workspace) => workspace.current_state().view(),
+        }
+    }
+
+    fn effective_view(&self) -> ViewState {
+        view_at_transient_timepoint(self.durable_view(), self.transient.playback_timepoint)
+            .expect("a validated transient playback cursor must rebuild the current view")
     }
 
     fn set_active_tool(&mut self, tool: ToolKind) -> Result<CommandEffect, ApplicationFaultCode> {
@@ -2364,9 +2541,6 @@ impl ApplicationState {
         if !matches!(self.workspace, Workspace::Unbound(_)) {
             return Err(ApplicationFaultCode::WorkspaceAlreadyBound);
         }
-        if self.verified_source.is_none() {
-            return Err(ApplicationFaultCode::IdentityVerificationRequired);
-        }
         if !self.operations.is_empty() {
             return Err(ApplicationFaultCode::OperationConflict);
         }
@@ -2376,9 +2550,6 @@ impl ApplicationState {
     }
 
     fn request_project_save(&mut self) -> Result<CommandEffect, ApplicationFaultCode> {
-        if self.verified_source.is_none() {
-            return Err(ApplicationFaultCode::IdentityVerificationRequired);
-        }
         if self.operations.values().any(|operation| {
             matches!(
                 operation.token.kind,
@@ -2390,7 +2561,7 @@ impl ApplicationState {
             return Err(ApplicationFaultCode::OperationConflict);
         }
         let Workspace::Bound(bound) = &self.workspace else {
-            return Err(ApplicationFaultCode::IdentityVerificationRequired);
+            return Err(ApplicationFaultCode::WorkspaceUnbound);
         };
         if !bound.dirty() {
             return Ok(CommandEffect::NoChange);
@@ -2413,10 +2584,7 @@ impl ApplicationState {
         &mut self,
         new_project_id: ProjectId,
     ) -> Result<CommandEffect, ApplicationFaultCode> {
-        let verified_source = self
-            .verified_source
-            .as_ref()
-            .ok_or(ApplicationFaultCode::IdentityVerificationRequired)?;
+        let source_reference = &self.source_reference;
         if !self.operations.is_empty() {
             return Err(ApplicationFaultCode::OperationConflict);
         }
@@ -2427,7 +2595,7 @@ impl ApplicationState {
             || !bound
                 .current_state()
                 .dataset()
-                .has_same_scientific_content(verified_source)
+                .has_same_scientific_content(source_reference)
         {
             return Err(ApplicationFaultCode::InvalidProjectTransition);
         }
@@ -2460,10 +2628,7 @@ impl ApplicationState {
     }
 
     fn request_project_recovery(&mut self) -> Result<CommandEffect, ApplicationFaultCode> {
-        let verified_source = self
-            .verified_source
-            .as_ref()
-            .ok_or(ApplicationFaultCode::IdentityVerificationRequired)?;
+        let source_reference = &self.source_reference;
         if !self.operations.is_empty() {
             return Err(ApplicationFaultCode::OperationConflict);
         }
@@ -2471,7 +2636,7 @@ impl ApplicationState {
             && !bound
                 .current_state()
                 .dataset()
-                .has_same_scientific_content(verified_source)
+                .has_same_scientific_content(source_reference)
         {
             return Err(ApplicationFaultCode::DatasetIdentityMismatch);
         }
@@ -2527,10 +2692,7 @@ impl ApplicationState {
             operation_id,
             task_id,
             kind,
-            source_identity: self
-                .verified_source
-                .as_ref()
-                .map(|source| *source.scientific_content_id()),
+            source_identity: Some(*self.source_reference.scientific_content_id()),
             source_session_generation: self.source_generation,
             project_id,
             project_revision,
@@ -2563,9 +2725,6 @@ impl ApplicationState {
             return Err(ApplicationFaultCode::InvalidOperationCompletion);
         }
         self.validate_token_current(&token)?;
-        if self.verified_source.is_none() {
-            return Err(ApplicationFaultCode::IdentityVerificationRequired);
-        }
         let Workspace::Bound(bound) = &self.workspace else {
             return Err(ApplicationFaultCode::WorkspaceUnbound);
         };
@@ -2731,8 +2890,8 @@ impl ApplicationState {
                 // package. Viewer/project edits do not make that result
                 // stale, so only the exact active operation token above is
                 // relevant to its terminal outcome.
-            } else if token.kind == OperationKind::SourceVerification {
-                self.validate_source_verification_token_current(&token)?;
+            } else if token.kind == OperationKind::PackageIntegrityAudit {
+                self.validate_package_integrity_audit_token_current(&token)?;
             } else if token.kind == OperationKind::ProjectSave {
                 self.validate_save_token_current(&token)?;
             } else {
@@ -2745,30 +2904,19 @@ impl ApplicationState {
         let outcome = match completion {
             OperationCompletion::Succeeded => OperationOutcome::Succeeded,
             OperationCompletion::Cancelled => {
-                if token.kind == OperationKind::SourceVerification {
-                    self.source_verification_progress = None;
+                if token.kind == OperationKind::PackageIntegrityAudit {
+                    self.package_integrity_audit = PackageIntegrityAuditState::Cancelled;
                 }
                 OperationOutcome::Cancelled
             }
             OperationCompletion::Failed(code) => {
-                if token.kind == OperationKind::SourceVerification {
-                    self.source_verification_progress = None;
-                    if code == OperationFailureCode::SourceChanged {
-                        let binding_changed = self.verified_source.take().is_some()
-                            || self.catalog.scientific_identity().is_verified();
-                        self.catalog = Arc::new(catalog_with_identity(
-                            &self.catalog,
-                            ScientificIdentityStatus::Unverified(DatasetSourceId::new(
-                                self.source_generation.get(),
-                            )),
-                        )?);
-                        if binding_changed {
-                            self.advance_currentness()?;
-                        }
-                        self.push_event(ApplicationEvent::SourceVerificationInvalidated {
-                            source_generation: self.source_generation,
-                        })?;
-                    }
+                if token.kind == OperationKind::PackageIntegrityAudit {
+                    self.package_integrity_audit =
+                        PackageIntegrityAuditState::Failed(PackageIntegrityAuditFailure::new(
+                            None,
+                            None,
+                            format!("package integrity audit failed: {code:?}"),
+                        ));
                 }
                 OperationOutcome::Failed(code)
             }
@@ -2776,32 +2924,31 @@ impl ApplicationState {
                 source_generation,
                 catalog,
                 workspace,
+                dataset,
+                content_address_origin,
             } => {
                 if token.kind != OperationKind::DatasetOpen {
                     return Err(ApplicationFaultCode::InvalidOperationCompletion);
                 }
-                self.admit_opened_source(source_generation, catalog, *workspace)?;
+                self.admit_opened_source(
+                    source_generation,
+                    catalog,
+                    *workspace,
+                    dataset,
+                    content_address_origin,
+                )?;
                 OperationOutcome::DatasetOpened
             }
-            OperationCompletion::VerifiedDatasetOpened {
-                source_generation,
-                catalog,
-                workspace,
-                dataset,
-            } => {
-                if token.kind != OperationKind::DatasetOpen {
-                    return Err(ApplicationFaultCode::InvalidOperationCompletion);
+            OperationCompletion::PackageIntegrityAuditCompleted(report) => {
+                if report.content_id() != *self.source_reference.scientific_content_id() {
+                    return Err(ApplicationFaultCode::DatasetIdentityMismatch);
                 }
-                self.admit_verified_opened_source(source_generation, catalog, *workspace, dataset)?;
-                OperationOutcome::VerifiedDatasetOpened
+                self.package_integrity_audit = PackageIntegrityAuditState::SelfConsistent(report);
+                OperationOutcome::PackageIntegrityAuditCompleted
             }
-            OperationCompletion::SourceVerified {
-                source_generation,
-                catalog,
-                dataset,
-            } => {
-                self.admit_verified_source(source_generation, catalog, dataset)?;
-                OperationOutcome::SourceVerified
+            OperationCompletion::PackageIntegrityAuditFailed(failure) => {
+                self.package_integrity_audit = PackageIntegrityAuditState::Failed(failure);
+                OperationOutcome::PackageIntegrityAuditFailed
             }
             OperationCompletion::AnalysisCommitted {
                 projection,
@@ -2818,13 +2965,10 @@ impl ApplicationState {
                 let Workspace::Unbound(_) = self.workspace else {
                     return Err(ApplicationFaultCode::WorkspaceAlreadyBound);
                 };
-                let source = self
-                    .verified_source
-                    .as_ref()
-                    .ok_or(ApplicationFaultCode::IdentityVerificationRequired)?;
+                let source = &self.source_reference;
                 validate_view_against_catalog(&self.catalog, projection.state().view())?;
                 let (bound, rebound_revision) =
-                    BoundWorkspace::restored_for_verified_source(*projection, source)?;
+                    BoundWorkspace::restored_for_admitted_source(*projection, source)?;
                 let project_id = bound.current_state().project_id();
                 let dirty = bound.dirty();
                 self.workspace = Workspace::Bound(bound);
@@ -2864,10 +3008,7 @@ impl ApplicationState {
                 if retained.as_ref() != projection.as_ref() {
                     return Err(ApplicationFaultCode::InvalidOperationCompletion);
                 }
-                let source = self
-                    .verified_source
-                    .as_ref()
-                    .ok_or(ApplicationFaultCode::IdentityVerificationRequired)?;
+                let source = &self.source_reference;
                 if !projection
                     .state()
                     .dataset()
@@ -2899,12 +3040,9 @@ impl ApplicationState {
                     Workspace::Unbound(_) => None,
                     Workspace::Bound(current) => Some(current.current_state().project_id()),
                 };
-                let source = self
-                    .verified_source
-                    .as_ref()
-                    .ok_or(ApplicationFaultCode::IdentityVerificationRequired)?;
+                let source = &self.source_reference;
                 validate_view_against_catalog(&self.catalog, projection.state().view())?;
-                let recovered = BoundWorkspace::recovered_for_verified_source(
+                let recovered = BoundWorkspace::recovered_for_admitted_source(
                     *projection,
                     source,
                     expected_project_id,
@@ -2924,52 +3062,6 @@ impl ApplicationState {
         self.operations.remove(&token.operation_id);
         self.push_event(ApplicationEvent::OperationCompleted { token, outcome })?;
         Ok(CommandEffect::Changed)
-    }
-
-    fn admit_verified_source(
-        &mut self,
-        source_generation: SourceSessionGeneration,
-        catalog: Arc<DatasetCatalog>,
-        dataset: DatasetReference,
-    ) -> Result<(), ApplicationFaultCode> {
-        if source_generation != self.source_generation {
-            return Err(ApplicationFaultCode::SourceSessionMismatch);
-        }
-        let identity = *dataset.scientific_content_id();
-        if catalog.scientific_identity().verified_id() != Some(&identity) {
-            return Err(ApplicationFaultCode::DatasetIdentityMismatch);
-        }
-        let expected_runtime_catalog =
-            catalog_with_identity(&self.catalog, ScientificIdentityStatus::Verified(identity))?;
-        let expected_scientific_catalog = DatasetCatalog::new(
-            self.catalog.label(),
-            ScientificIdentityStatus::Verified(identity),
-            self.catalog.layers().cloned().collect(),
-        )
-        .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)?;
-        if catalog.as_ref() != &expected_runtime_catalog
-            && catalog.as_ref() != &expected_scientific_catalog
-        {
-            return Err(ApplicationFaultCode::DatasetIdentityMismatch);
-        }
-        if let Workspace::Bound(bound) = &self.workspace
-            && !bound
-                .current_state()
-                .dataset()
-                .has_same_scientific_content(&dataset)
-        {
-            return Err(ApplicationFaultCode::DatasetIdentityMismatch);
-        }
-
-        self.catalog = Arc::new(expected_runtime_catalog);
-        self.verified_source = Some(dataset);
-        self.source_verification_progress = None;
-        self.advance_currentness()?;
-        self.push_event(ApplicationEvent::SourceVerified {
-            source_generation,
-            scientific_content_id: identity,
-        })?;
-        Ok(())
     }
 
     fn admit_committed_analysis(
@@ -3076,8 +3168,8 @@ impl ApplicationState {
             .operations
             .remove(&operation_id)
             .ok_or(ApplicationFaultCode::OperationNotFound)?;
-        if operation.token.kind == OperationKind::SourceVerification {
-            self.source_verification_progress = None;
+        if operation.token.kind == OperationKind::PackageIntegrityAudit {
+            self.package_integrity_audit = PackageIntegrityAuditState::Cancelled;
         }
         self.push_event(ApplicationEvent::OperationCancellationRequested {
             token: operation.token,
@@ -3085,7 +3177,7 @@ impl ApplicationState {
         Ok(CommandEffect::Changed)
     }
 
-    fn validate_source_verification_token_current(
+    fn validate_package_integrity_audit_token_current(
         &self,
         token: &OperationToken,
     ) -> Result<(), ApplicationFaultCode> {
@@ -3095,8 +3187,9 @@ impl ApplicationState {
         if active.token != *token {
             return Err(ApplicationFaultCode::OperationTokenMismatch);
         }
-        if token.kind != OperationKind::SourceVerification
+        if token.kind != OperationKind::PackageIntegrityAudit
             || token.source_session_generation != self.source_generation
+            || token.source_identity != Some(*self.source_reference.scientific_content_id())
         {
             return Err(ApplicationFaultCode::StaleOperationCompletion);
         }
@@ -3104,10 +3197,7 @@ impl ApplicationState {
     }
 
     fn validate_token_current(&self, token: &OperationToken) -> Result<(), ApplicationFaultCode> {
-        let source_identity = self
-            .verified_source
-            .as_ref()
-            .map(|source| *source.scientific_content_id());
+        let source_identity = Some(*self.source_reference.scientific_content_id());
         let (project_id, project_revision) = match &self.workspace {
             Workspace::Unbound(_) => (None, None),
             Workspace::Bound(bound) => (
@@ -3130,10 +3220,7 @@ impl ApplicationState {
         &self,
         token: &OperationToken,
     ) -> Result<(), ApplicationFaultCode> {
-        let source_identity = self
-            .verified_source
-            .as_ref()
-            .map(|source| *source.scientific_content_id());
+        let source_identity = Some(*self.source_reference.scientific_content_id());
         let Workspace::Bound(bound) = &self.workspace else {
             return Err(ApplicationFaultCode::StaleOperationCompletion);
         };
@@ -3225,7 +3312,7 @@ impl ApplicationState {
             }
             ApplicationEvent::OperationStarted { .. }
             | ApplicationEvent::DatasetOpenRequested { .. }
-            | ApplicationEvent::SourceVerificationRequested { .. }
+            | ApplicationEvent::PackageIntegrityAuditRequested { .. }
             | ApplicationEvent::ProjectOpenRequested { .. }
             | ApplicationEvent::ProjectSaveRequested { .. }
             | ApplicationEvent::ProjectSaveAsRequested { .. }
@@ -3259,15 +3346,37 @@ impl ApplicationState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum SourceVerificationSnapshot {
-    Required,
-    Verifying {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageIntegrityAuditSnapshot {
+    NotRun,
+    Running {
         operation_id: OperationId,
-        completed_work: u64,
-        total_work: u64,
+        progress: Option<PackageIntegrityAuditProgress>,
     },
-    Verified(DatasetReference),
+    SelfConsistent(PackageIntegrityAuditReport),
+    Failed(PackageIntegrityAuditFailure),
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceAdmissionSnapshot {
+    dataset: DatasetReference,
+    content_address_origin: ContentAddressOrigin,
+    integrity_audit: PackageIntegrityAuditSnapshot,
+}
+
+impl SourceAdmissionSnapshot {
+    pub const fn dataset(&self) -> &DatasetReference {
+        &self.dataset
+    }
+
+    pub const fn content_address_origin(&self) -> ContentAddressOrigin {
+        self.content_address_origin
+    }
+
+    pub const fn integrity_audit(&self) -> &PackageIntegrityAuditSnapshot {
+        &self.integrity_audit
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3378,8 +3487,9 @@ impl PresentationSnapshot {
 pub struct ApplicationSnapshot {
     source_generation: SourceSessionGeneration,
     catalog: Arc<DatasetCatalog>,
-    source: SourceVerificationSnapshot,
+    source: SourceAdmissionSnapshot,
     workspace: WorkspaceSnapshot,
+    effective_view: ViewState,
     transient: TransientApplicationState,
     currentness: CurrentnessGeneration,
     active_operations: Vec<OperationToken>,
@@ -3400,7 +3510,7 @@ impl ApplicationSnapshot {
         &self.catalog
     }
 
-    pub fn source(&self) -> &SourceVerificationSnapshot {
+    pub fn source(&self) -> &SourceAdmissionSnapshot {
         &self.source
     }
 
@@ -3409,10 +3519,7 @@ impl ApplicationSnapshot {
     }
 
     pub fn view(&self) -> &ViewState {
-        match &self.workspace {
-            WorkspaceSnapshot::Unbound { workspace } => workspace.view(),
-            WorkspaceSnapshot::Bound { project, .. } => project.view(),
-        }
+        &self.effective_view
     }
 
     pub fn channel_presets(&self) -> &[ChannelPreset] {
@@ -3557,6 +3664,18 @@ fn rebuild_view(view: &ViewState, update: ViewUpdate) -> Result<ViewState, Appli
     .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)
 }
 
+fn view_at_transient_timepoint(
+    view: &ViewState,
+    timepoint: Option<TimeIndex>,
+) -> Result<ViewState, ApplicationFaultCode> {
+    match timepoint {
+        Some(timepoint) if timepoint != view.timepoint() => {
+            rebuild_view(view, ViewUpdate::Timepoint(timepoint))
+        }
+        Some(_) | None => Ok(view.clone()),
+    }
+}
+
 fn rebuild_project(
     project: &ProjectState,
     view: Option<ViewState>,
@@ -3597,29 +3716,26 @@ fn validate_view_against_catalog(
     Ok(())
 }
 
-fn require_unverified_catalog(
+fn require_catalog_source_binding(
     catalog: &DatasetCatalog,
     source_generation: SourceSessionGeneration,
+    source_reference: &DatasetReference,
 ) -> Result<(), ApplicationFaultCode> {
-    match catalog.scientific_identity() {
-        ScientificIdentityStatus::Unverified(source_id)
+    match catalog.content_address_status() {
+        ContentAddressStatus::SessionLocal(source_id)
             if source_id.get() == source_generation.get() =>
         {
             Ok(())
         }
-        ScientificIdentityStatus::Unverified(_) | ScientificIdentityStatus::Verified(_) => {
+        ContentAddressStatus::ContentAddress(identity)
+            if identity == source_reference.scientific_content_id() =>
+        {
+            Ok(())
+        }
+        ContentAddressStatus::SessionLocal(_) | ContentAddressStatus::ContentAddress(_) => {
             Err(ApplicationFaultCode::DatasetIdentityMismatch)
         }
     }
-}
-
-fn catalog_with_identity(
-    catalog: &DatasetCatalog,
-    scientific_identity: ScientificIdentityStatus,
-) -> Result<DatasetCatalog, ApplicationFaultCode> {
-    catalog
-        .with_scientific_identity(scientific_identity)
-        .map_err(|_| ApplicationFaultCode::InvalidProjectTransition)
 }
 
 fn catalog_timepoint_count(catalog: &DatasetCatalog) -> u64 {
@@ -3788,13 +3904,13 @@ fn completion_matches_kind(kind: OperationKind, completion: &OperationCompletion
     match kind {
         OperationKind::DatasetOpen => matches!(
             completion,
-            OperationCompletion::DatasetOpened { .. }
-                | OperationCompletion::VerifiedDatasetOpened { .. }
-                | OperationCompletion::Cancelled
+            OperationCompletion::DatasetOpened { .. } | OperationCompletion::Cancelled
         ),
-        OperationKind::SourceVerification => matches!(
+        OperationKind::PackageIntegrityAudit => matches!(
             completion,
-            OperationCompletion::SourceVerified { .. } | OperationCompletion::Cancelled
+            OperationCompletion::PackageIntegrityAuditCompleted(_)
+                | OperationCompletion::PackageIntegrityAuditFailed(_)
+                | OperationCompletion::Cancelled
         ),
         OperationKind::ProjectOpen => matches!(
             completion,
@@ -3836,12 +3952,11 @@ const fn failure_code_matches_kind(kind: OperationKind, code: OperationFailureCo
                 | OperationFailureCode::DatasetCapacityExceeded
                 | OperationFailureCode::DatasetReadFailed
         ),
-        OperationKind::SourceVerification => matches!(
+        OperationKind::PackageIntegrityAudit => matches!(
             code,
-            OperationFailureCode::SourceChanged
-                | OperationFailureCode::SourceVerificationInvalid
-                | OperationFailureCode::SourceVerificationCapacityExceeded
-                | OperationFailureCode::SourceVerificationReadFailed
+            OperationFailureCode::PackageIntegrityAuditInvalid
+                | OperationFailureCode::PackageIntegrityAuditCapacityExceeded
+                | OperationFailureCode::PackageIntegrityAuditReadFailed
         ),
         OperationKind::ProjectOpen => matches!(
             code,

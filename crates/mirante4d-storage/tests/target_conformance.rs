@@ -8,7 +8,7 @@ use mirante4d_domain::IntensityDType;
 use mirante4d_identity::{SCIENTIFIC_TILE_SHAPE_TZYX, Sha256Hasher};
 use mirante4d_storage::{
     LocalPackageCatalog, OmeInteroperabilityBase, PackedIndexCoordinates, ProfileKind,
-    ProfileValidityMode, ShardProfileKind, VerifiedScientificPackageCapability,
+    ProfileValidityMode, SelfConsistentPackageCapability, ShardProfileKind,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -235,7 +235,7 @@ fn exercise_case(repository: &Path, archive: &ArchiveAuthority, facts: &CaseFact
     assert_amplification(maxima, facts);
 }
 
-fn assert_scientific_report(capability: &VerifiedScientificPackageCapability, facts: &CaseFacts) {
+fn assert_scientific_report(capability: &SelfConsistentPackageCapability, facts: &CaseFacts) {
     assert_eq!(
         capability.scientific_content_id().to_string(),
         facts.scientific_content_id
@@ -285,16 +285,16 @@ fn assert_scientific_report(capability: &VerifiedScientificPackageCapability, fa
     );
 }
 
-fn validate_target_package(root: &Path) -> VerifiedScientificPackageCapability {
+fn validate_target_package(root: &Path) -> SelfConsistentPackageCapability {
     LocalPackageCatalog::open(root)
         .expect("production catalog opens the independent package")
-        .validate_exact_package(ProfileKind::Ds0, || false)
+        .validate_exact_package(ProfileKind::Current, || false)
         .expect("production exact validation accepts the independent package")
         .validate_scientific_content(|| false)
         .expect("production scientific validation accepts the independent package")
 }
 
-fn assert_layout(capability: &VerifiedScientificPackageCapability, facts: &CaseFacts) {
+fn assert_layout(capability: &SelfConsistentPackageCapability, facts: &CaseFacts) {
     let catalog = capability.catalog();
     let profile = catalog.profile();
     assert_eq!(profile.images().len(), 1);
@@ -376,7 +376,7 @@ fn assert_layout(capability: &VerifiedScientificPackageCapability, facts: &CaseF
 }
 
 fn assert_package_accounting(
-    capability: &VerifiedScientificPackageCapability,
+    capability: &SelfConsistentPackageCapability,
     archive: &ArchiveAuthority,
     facts: &CaseFacts,
 ) {
@@ -444,7 +444,7 @@ fn assert_package_accounting(
 }
 
 fn assert_all_bricks(
-    capability: &VerifiedScientificPackageCapability,
+    capability: &SelfConsistentPackageCapability,
     facts: &CaseFacts,
 ) -> AmplificationMaxima {
     let image = &capability.catalog().profile().images()[0];

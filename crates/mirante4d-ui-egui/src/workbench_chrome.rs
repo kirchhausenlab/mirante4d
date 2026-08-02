@@ -2,8 +2,9 @@ use eframe::egui;
 use mirante4d_application::{
     ApplicationCommand, ApplicationSnapshot, CameraView, CrossSectionView,
     DEFAULT_DVR_OPACITY_GAMMA, DvrOpacityTransfer, IsoShadingPolicy, LayerViewState,
-    PresentationViewport, Projection, RenderMode, RenderState, SourceVerificationSnapshot,
-    TimeIndex, TransferCurve, ViewerLayout, channel_preset_from_view,
+    MAX_PLAYBACK_FPS, MIN_PLAYBACK_FPS, PackageIntegrityAuditSnapshot, PackageIntegrityAuditStage,
+    PlaybackFps, PlaybackPhase, PresentationViewport, Projection, RenderMode, RenderState,
+    SourceAdmissionSnapshot, TimeIndex, TransferCurve, ViewerLayout, channel_preset_from_view,
     import_workflow::{ImportCommand, ImportWorkflowSnapshot},
     next_user_channel_preset_id, stepped_timepoint,
     viewport_interaction::{fit_active_layer_camera, reset_active_layer_view},
@@ -39,7 +40,7 @@ pub struct TopToolbarView<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct LeftWorkbenchView<'a> {
     pub application: &'a ApplicationSnapshot,
-    pub source_verification_available: bool,
+    pub package_integrity_audit_available: bool,
     pub composite_fidelity: &'a str,
     pub dataset_path: &'a str,
 }
@@ -72,19 +73,19 @@ pub(crate) fn show_top_toolbar(
                     output.actions.push(WorkbenchUiAction::OpenDatasetDialog);
                 }
                 if toolbar_button(ui, "New Project", !workflow_busy && view.project.can_new)
-                    .on_hover_text("Start an unsaved project for the verified dataset")
+                    .on_hover_text("Start an unsaved project for the admitted dataset")
                     .clicked()
                 {
                     output.actions.push(WorkbenchUiAction::NewProject);
                 }
                 if toolbar_button(ui, "Open Project", !workflow_busy && view.project.can_open)
-                    .on_hover_text("Requires a verified scientific dataset identity")
+                    .on_hover_text("Requires the current dataset content address")
                     .clicked()
                 {
                     output.actions.push(WorkbenchUiAction::OpenProjectDialog);
                 }
                 if toolbar_button(ui, "Save Project", !workflow_busy && view.project.can_save)
-                    .on_hover_text("Requires a verified scientific dataset identity")
+                    .on_hover_text("Requires the current dataset content address")
                     .clicked()
                 {
                     output.actions.push(WorkbenchUiAction::SaveProject);
@@ -109,19 +110,11 @@ pub(crate) fn show_top_toolbar(
                 {
                     output.actions.push(WorkbenchUiAction::OpenProjectRecovery);
                 }
-                if toolbar_button(ui, "Import Dir", !workflow_busy)
-                    .on_hover_text("Import TIFF directory")
+                if toolbar_button(ui, "Preprocess", !workflow_busy)
+                    .on_hover_text("Preprocess a new microscopy TIFF dataset")
                     .clicked()
                 {
-                    output
-                        .actions
-                        .push(WorkbenchUiAction::ImportTiffDirectoryDialog);
-                }
-                if toolbar_button(ui, "Import File", !workflow_busy)
-                    .on_hover_text("Import TIFF file")
-                    .clicked()
-                {
-                    output.actions.push(WorkbenchUiAction::ImportTiffFileDialog);
+                    output.actions.push(WorkbenchUiAction::PreprocessDataset);
                 }
                 if import_active {
                     let cancellation_pending = matches!(
@@ -210,29 +203,40 @@ pub(crate) fn show_left_workbench_panel(
                     property_row(ui, "name", snapshot.catalog().label());
                     property_row(ui, "layers", snapshot.catalog().len().to_string());
                     property_row(ui, "timepoints", timepoint_count.to_string());
-                    property_row(
-                        ui,
-                        "scientific identity",
-                        source_verification_label(snapshot.source()),
-                    );
-                    if let SourceVerificationSnapshot::Verifying { operation_id, .. } =
-                        snapshot.source()
-                        && toolbar_button(ui, "Cancel Verification", true).clicked()
+                    property_row(ui, "content ID", content_id_label(snapshot.source()));
+                    property_row(ui, "structure", "admitted");
+                    property_row(ui, "read integrity", "checked as used");
+                    property_row(ui, "full integrity audit", audit_label(snapshot.source()));
+                    if let PackageIntegrityAuditSnapshot::Running { operation_id, .. } =
+                        snapshot.source().integrity_audit()
+                        && toolbar_button(ui, "Cancel Audit", true).clicked()
                     {
                         output
                             .application_commands
                             .push(ApplicationCommand::CancelOperation(*operation_id));
                     }
-                    if matches!(snapshot.source(), SourceVerificationSnapshot::Required)
-                        && toolbar_button(ui, "Verify Source", view.source_verification_available)
-                            .clicked()
+                    if !matches!(
+                        snapshot.source().integrity_audit(),
+                        PackageIntegrityAuditSnapshot::Running { .. }
+                    ) && toolbar_button(
+                        ui,
+                        "Run Full Integrity Audit",
+                        view.package_integrity_audit_available,
+                    )
+                    .clicked()
                     {
                         output
                             .application_commands
-                            .push(ApplicationCommand::RequestSourceVerification);
+                            .push(ApplicationCommand::RequestPackageIntegrityAudit);
                     }
                 });
                 section(ui, "Status", |ui| {
+                    show_playback_controls(
+                        ui,
+                        snapshot,
+                        workflow_busy,
+                        &mut output.application_commands,
+                    );
                     show_import_status(ui, import_snapshot);
                     property_row(ui, "fidelity", view.composite_fidelity);
                     if let Some(hover) = state.hovered_pixel {
@@ -245,20 +249,12 @@ pub(crate) fn show_left_workbench_panel(
                         ui,
                         "playback",
                         playback_status_label(
-                            snapshot.transient().playback_active(),
+                            snapshot.transient().playback_phase(),
                             canonical_view.timepoint(),
                             timepoint_count,
                         ),
                     );
                     property_row(ui, "path", view.dataset_path);
-                    ui.horizontal_wrapped(|ui| {
-                        show_playback_controls(
-                            ui,
-                            snapshot,
-                            workflow_busy,
-                            &mut output.application_commands,
-                        );
-                    });
                 });
                 section(ui, "Layers", |ui| {
                     for layer in canonical_view.layers() {
@@ -416,23 +412,46 @@ fn workflow_busy(snapshot: &ApplicationSnapshot) -> bool {
             .any(|token| token.kind() == mirante4d_application::OperationKind::DatasetOpen)
 }
 
-fn source_verification_label(source: &SourceVerificationSnapshot) -> String {
-    match source {
-        SourceVerificationSnapshot::Required => {
-            "verification required; project open/save unavailable".to_owned()
+fn content_id_label(source: &SourceAdmissionSnapshot) -> String {
+    let origin = match source.content_address_origin() {
+        mirante4d_application::ContentAddressOrigin::DeclaredByPackage => "declared",
+        mirante4d_application::ContentAddressOrigin::ComputedDuringImport => {
+            "computed during this import"
         }
-        SourceVerificationSnapshot::Verifying {
-            completed_work,
-            total_work,
+    };
+    format!("{origin} · {}", source.dataset().scientific_content_id())
+}
+
+fn audit_label(source: &SourceAdmissionSnapshot) -> String {
+    match source.integrity_audit() {
+        PackageIntegrityAuditSnapshot::NotRun => "not run".to_owned(),
+        PackageIntegrityAuditSnapshot::Running { progress: None, .. } => "starting".to_owned(),
+        PackageIntegrityAuditSnapshot::Running {
+            progress: Some(progress),
             ..
-        } => completed_work
-            .saturating_mul(100)
-            .checked_div(*total_work)
-            .map_or_else(
-                || "verifying".to_owned(),
-                |percent| format!("verifying ({percent}%)"),
-            ),
-        SourceVerificationSnapshot::Verified(_) => "verified".to_owned(),
+        } => {
+            let stage = match progress.stage() {
+                PackageIntegrityAuditStage::ExactObjectBytes => "exact objects",
+                PackageIntegrityAuditStage::CanonicalBaseContent => "canonical content",
+                PackageIntegrityAuditStage::PyramidAccelerationFacts => "acceleration facts",
+            };
+            format!(
+                "running: {stage} · {} objects / {} bytes · {} bricks / {} decoded bytes",
+                progress.objects_hashed(),
+                progress.bytes_hashed(),
+                progress.decoded_bricks(),
+                progress.decoded_bytes(),
+            )
+        }
+        PackageIntegrityAuditSnapshot::SelfConsistent(report) => format!(
+            "self-consistent · {} objects · {} decoded bricks",
+            report.objects_hashed(),
+            report.decoded_bricks()
+        ),
+        PackageIntegrityAuditSnapshot::Failed(failure) => {
+            format!("failed: {}", failure.reason())
+        }
+        PackageIntegrityAuditSnapshot::Cancelled => "cancelled".to_owned(),
     }
 }
 
@@ -449,6 +468,9 @@ fn show_import_status(ui: &mut egui::Ui, snapshot: &ImportWorkflowSnapshot) {
         ),
         ImportWorkflowSnapshot::Inspecting(_) => {
             status_badge(ui, StatusTone::Warning, "inspecting TIFF input");
+        }
+        ImportWorkflowSnapshot::Configure(_) => {
+            status_badge(ui, StatusTone::Warning, "setting up preprocessing");
         }
         ImportWorkflowSnapshot::Review(_) => {
             status_badge(ui, StatusTone::Warning, "review TIFF import settings");
@@ -637,62 +659,85 @@ fn show_playback_controls(
         muted_label(ui, "time t 1/1");
         return;
     }
-    if toolbar_button(ui, "First", !workflow_busy).clicked() {
-        commands.push(ApplicationCommand::SetTimepoint(TimeIndex::new(0)));
-    }
-    if toolbar_button(ui, "Prev", !workflow_busy).clicked() {
-        commands.push(ApplicationCommand::SetTimepoint(stepped_timepoint(
-            active_timepoint,
-            timepoint_count,
-            -1,
-        )));
-    }
-    let playback_active = snapshot.transient().playback_active();
-    if toolbar_button(
-        ui,
-        if playback_active { "Pause" } else { "Play" },
-        !workflow_busy,
-    )
-    .clicked()
-    {
-        commands.push(ApplicationCommand::SetPlaybackActive(!playback_active));
-    }
-    if toolbar_button(ui, "Next", !workflow_busy).clicked() {
-        commands.push(ApplicationCommand::SetTimepoint(stepped_timepoint(
-            active_timepoint,
-            timepoint_count,
-            1,
-        )));
-    }
-    if toolbar_button(ui, "Last", !workflow_busy).clicked() {
-        commands.push(ApplicationCommand::SetTimepoint(TimeIndex::new(
-            timepoint_count - 1,
-        )));
-    }
+    ui.horizontal_wrapped(|ui| {
+        if toolbar_button(ui, "First", !workflow_busy).clicked() {
+            commands.push(ApplicationCommand::SetTimepoint(TimeIndex::new(0)));
+        }
+        if toolbar_button(ui, "Prev", !workflow_busy).clicked() {
+            commands.push(ApplicationCommand::SetTimepoint(stepped_timepoint(
+                active_timepoint,
+                timepoint_count,
+                -1,
+            )));
+        }
+        let playback_active = snapshot.transient().playback_active();
+        if toolbar_button(
+            ui,
+            if playback_active { "Pause" } else { "Play" },
+            !workflow_busy,
+        )
+        .clicked()
+        {
+            commands.push(ApplicationCommand::SetPlaybackActive(!playback_active));
+        }
+        if toolbar_button(ui, "Next", !workflow_busy).clicked() {
+            commands.push(ApplicationCommand::SetTimepoint(stepped_timepoint(
+                active_timepoint,
+                timepoint_count,
+                1,
+            )));
+        }
+        if toolbar_button(ui, "Last", !workflow_busy).clicked() {
+            commands.push(ApplicationCommand::SetTimepoint(TimeIndex::new(
+                timepoint_count - 1,
+            )));
+        }
+    });
 
-    let mut timepoint = active_timepoint.get().min(timepoint_count - 1);
-    let slider_width = ui.available_width().clamp(120.0, 360.0);
-    let response = ui.add_sized(
-        [
-            slider_width,
-            crate::UiTokens::default().spacing.control_height,
-        ],
-        egui::Slider::new(&mut timepoint, 0..=timepoint_count - 1).text("t"),
-    );
-    if response.changed() {
-        commands.push(ApplicationCommand::SetTimepoint(TimeIndex::new(timepoint)));
-    }
-    muted_label(
-        ui,
-        format!("t {}/{}", active_timepoint.get() + 1, timepoint_count),
-    );
+    ui.horizontal_wrapped(|ui| {
+        let mut timepoint = active_timepoint.get().min(timepoint_count - 1);
+        let slider_width = ui.available_width().clamp(120.0, 360.0);
+        let response = ui.add_sized(
+            [
+                slider_width,
+                crate::UiTokens::default().spacing.control_height,
+            ],
+            egui::Slider::new(&mut timepoint, 0..=timepoint_count - 1).text("t"),
+        );
+        if response.changed() {
+            commands.push(ApplicationCommand::SetTimepoint(TimeIndex::new(timepoint)));
+        }
+        muted_label(
+            ui,
+            format!("t {}/{}", active_timepoint.get() + 1, timepoint_count),
+        );
+    });
+
+    ui.horizontal_wrapped(|ui| {
+        let mut fps = snapshot.transient().playback_fps().get();
+        let response = ui.add_enabled(
+            !workflow_busy,
+            egui::Slider::new(&mut fps, MIN_PLAYBACK_FPS..=MAX_PLAYBACK_FPS)
+                .integer()
+                .text("FPS"),
+        );
+        if response.changed() {
+            commands.push(ApplicationCommand::SetPlaybackFps(
+                PlaybackFps::new(fps).expect("the FPS slider is bounded by the playback type"),
+            ));
+        }
+    });
 }
 
-pub fn playback_status_label(playing: bool, active: TimeIndex, count: u64) -> String {
+pub fn playback_status_label(phase: PlaybackPhase, active: TimeIndex, count: u64) -> String {
     if count <= 1 {
         return "playback stopped | t 1/1".to_owned();
     }
-    let state = if playing { "playing" } else { "stopped" };
+    let state = match phase {
+        PlaybackPhase::Stopped => "stopped",
+        PlaybackPhase::Warming => "warming",
+        PlaybackPhase::Playing => "playing",
+    };
     format!("playback {state} | t {}/{}", active.get() + 1, count)
 }
 
@@ -746,15 +791,19 @@ mod tests {
     #[test]
     fn playback_status_reports_state_and_timepoint() {
         assert_eq!(
-            playback_status_label(false, TimeIndex::new(0), 3),
+            playback_status_label(PlaybackPhase::Stopped, TimeIndex::new(0), 3),
             "playback stopped | t 1/3"
         );
         assert_eq!(
-            playback_status_label(true, TimeIndex::new(1), 3),
+            playback_status_label(PlaybackPhase::Warming, TimeIndex::new(1), 3),
+            "playback warming | t 2/3"
+        );
+        assert_eq!(
+            playback_status_label(PlaybackPhase::Playing, TimeIndex::new(1), 3),
             "playback playing | t 2/3"
         );
         assert_eq!(
-            playback_status_label(true, TimeIndex::new(0), 1),
+            playback_status_label(PlaybackPhase::Playing, TimeIndex::new(0), 1),
             "playback stopped | t 1/1"
         );
     }

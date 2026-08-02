@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use mirante4d_dataset::{CpuByteLease, CpuByteLedger, CpuLedgerCategory};
+use mirante4d_dataset::{CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError};
 
 use crate::{ImportCancellation, ImportError};
 
@@ -33,15 +33,34 @@ pub(crate) struct OrderedWorkerPolicy {
 }
 
 impl OrderedWorkerPolicy {
+    #[cfg(test)]
     pub(crate) fn for_system(
-        working_memory_bytes: u64,
+        managed_capacity_bytes: u64,
         resident_bytes: u64,
         task_charge_bytes: u64,
     ) -> Result<Self, ImportError> {
-        let available_parallelism = available_parallelism();
+        let available_parallelism = system_parallelism();
         Self::derive(
             available_parallelism,
-            working_memory_bytes,
+            managed_capacity_bytes,
+            resident_bytes,
+            task_charge_bytes,
+        )
+    }
+
+    /// Derives the ordinary byte-accounted policy while respecting a
+    /// run-local CPU ceiling. The temporal importer uses this to give each
+    /// active source-ingest lane one of the process's existing slots rather
+    /// than adding another thread on top of all transform workers.
+    pub(crate) fn for_system_with_parallelism_limit(
+        parallelism_limit: usize,
+        managed_capacity_bytes: u64,
+        resident_bytes: u64,
+        task_charge_bytes: u64,
+    ) -> Result<Self, ImportError> {
+        Self::derive(
+            system_parallelism().min(parallelism_limit.max(1)),
+            managed_capacity_bytes,
             resident_bytes,
             task_charge_bytes,
         )
@@ -49,7 +68,7 @@ impl OrderedWorkerPolicy {
 
     fn derive(
         available_parallelism: usize,
-        working_memory_bytes: u64,
+        managed_capacity_bytes: u64,
         resident_bytes: u64,
         task_charge_bytes: u64,
     ) -> Result<Self, ImportError> {
@@ -58,19 +77,19 @@ impl OrderedWorkerPolicy {
                 "an import CPU task must have a positive byte charge",
             ));
         }
-        let available_bytes = working_memory_bytes.checked_sub(resident_bytes).ok_or(
-            ImportError::WorkingMemoryExceeded {
+        let available_bytes = managed_capacity_bytes.checked_sub(resident_bytes).ok_or(
+            ImportError::ManagedCapacityInsufficient {
                 required_bytes: resident_bytes,
-                budget_bytes: working_memory_bytes,
+                capacity_bytes: managed_capacity_bytes,
             },
         )?;
         let byte_slots = available_bytes / task_charge_bytes;
         if byte_slots == 0 {
-            return Err(ImportError::WorkingMemoryExceeded {
+            return Err(ImportError::ManagedCapacityInsufficient {
                 required_bytes: resident_bytes
                     .checked_add(task_charge_bytes)
                     .ok_or(ImportError::Overflow)?,
-                budget_bytes: working_memory_bytes,
+                capacity_bytes: managed_capacity_bytes,
             });
         }
         let byte_slots = usize::try_from(byte_slots).unwrap_or(usize::MAX);
@@ -92,7 +111,7 @@ impl OrderedWorkerPolicy {
     }
 }
 
-fn available_parallelism() -> usize {
+pub(crate) fn system_parallelism() -> usize {
     #[cfg(test)]
     if let Some(worker_count) = TEST_WORKER_COUNT.with(std::cell::Cell::get) {
         return worker_count;
@@ -256,6 +275,7 @@ where
         let mut outstanding = 0_usize;
         let mut awaiting_results = 0_usize;
         let mut exhausted = false;
+        let mut pending_specification = None;
         let mut first_error = None;
         let mut reorder = BTreeMap::new();
 
@@ -265,12 +285,16 @@ where
             {
                 first_error = Some(error);
             }
+            let mut capacity_blocked = false;
             while first_error.is_none() && !exhausted && outstanding < policy.in_flight_limit {
                 if cancellation.is_cancelled() {
                     first_error = Some(ImportError::Cancelled);
                     break;
                 }
-                let Some(specification) = specifications.next() else {
+                let Some(specification) = pending_specification
+                    .take()
+                    .or_else(|| specifications.next())
+                else {
                     exhausted = true;
                     break;
                 };
@@ -279,6 +303,18 @@ where
                     policy.task_charge_bytes,
                 ) {
                     Ok(lease) => lease,
+                    Err(CpuLedgerError::CapacityExceeded { .. }) => {
+                        // Ordinary process contention narrows the contiguous
+                        // sliding window. Retain the earliest unadmitted task,
+                        // drain useful work, and retry after capacity changes.
+                        pending_specification = Some(specification);
+                        capacity_blocked = true;
+                        break;
+                    }
+                    Err(CpuLedgerError::ShuttingDown) => {
+                        first_error = Some(ImportError::Cancelled);
+                        break;
+                    }
                     Err(error) => {
                         first_error = Some(error.into());
                         break;
@@ -319,6 +355,17 @@ where
             }
 
             if awaiting_results == 0 {
+                if capacity_blocked && first_error.is_none() && !cancellation.is_cancelled() {
+                    let observed = ledger.capacity_epoch();
+                    maintain_owner(owner)?;
+                    // The ledger boundary intentionally stays scheduler-free.
+                    // A short bounded park keeps cancellation responsive while
+                    // another subsystem owns the bytes that must be released.
+                    if ledger.capacity_epoch() == observed {
+                        thread::sleep(OWNER_MAINTENANCE_INTERVAL);
+                    }
+                    continue;
+                }
                 break;
             }
             let result = match result_receiver.recv_timeout(OWNER_MAINTENANCE_INTERVAL) {
@@ -504,6 +551,38 @@ mod tests {
         )
     }
 
+    struct TemporarilyRefusingLedger {
+        inner: TestLedger,
+        refusals_remaining: AtomicU64,
+    }
+
+    impl CpuByteLedger for TemporarilyRefusingLedger {
+        fn try_acquire(
+            &self,
+            category: CpuLedgerCategory,
+            bytes: u64,
+        ) -> Result<Box<dyn CpuByteLease>, CpuLedgerError> {
+            if self
+                .refusals_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(CpuLedgerError::CapacityExceeded {
+                    category,
+                    requested_bytes: bytes,
+                    available_bytes: 0,
+                });
+            }
+            self.inner.try_acquire(category, bytes)
+        }
+
+        fn capacity_bytes(&self) -> u64 {
+            self.inner.budget
+        }
+    }
+
     #[test]
     fn policy_is_capped_by_cores_bytes_and_fixed_limits() {
         let memory_limited = OrderedWorkerPolicy::derive(8, 256, 16, 32).unwrap();
@@ -542,12 +621,21 @@ mod tests {
     }
 
     #[test]
+    fn run_local_parallelism_limit_reserves_an_existing_slot() {
+        with_test_worker_count(8, || {
+            let policy =
+                OrderedWorkerPolicy::for_system_with_parallelism_limit(7, 1_024, 0, 1).unwrap();
+            assert_eq!(policy.worker_count, 7);
+        });
+    }
+
+    #[test]
     fn policy_rejects_a_task_that_cannot_fit_beside_resident_state() {
         assert!(matches!(
             OrderedWorkerPolicy::derive(8, 255, 224, 32),
-            Err(ImportError::WorkingMemoryExceeded {
+            Err(ImportError::ManagedCapacityInsufficient {
                 required_bytes: 256,
-                budget_bytes: 255
+                capacity_bytes: 255
             })
         ));
     }
@@ -661,5 +749,35 @@ mod tests {
         )
         .unwrap();
         assert!(maintenance_ticks >= 2);
+    }
+
+    #[test]
+    fn temporary_capacity_refusal_drains_retries_and_never_becomes_a_failure() {
+        let policy = OrderedWorkerPolicy::derive(2, 4 * 1_024, 0, 1_024).unwrap();
+        let (inner, state) = ledger(4 * 1_024);
+        let ledger = TemporarilyRefusingLedger {
+            inner,
+            refusals_remaining: AtomicU64::new(3),
+        };
+        let cancellation = ImportCancellation::new();
+        let mut output = Vec::new();
+        let diagnostics = run_ordered(
+            policy,
+            &ledger,
+            &cancellation,
+            0_u64..6,
+            &mut output,
+            |_, value| Ok(value),
+            |value, _| Ok(value + 10),
+            |_| Ok(()),
+            |output, value| {
+                output.push(value);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(output, (10_u64..16).collect::<Vec<_>>());
+        assert_eq!(diagnostics.committed_tasks, 6);
+        assert_eq!(state.used.load(Ordering::Acquire), 0);
     }
 }

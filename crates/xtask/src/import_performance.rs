@@ -23,9 +23,10 @@ use mirante4d_identity::{
 };
 use mirante4d_import_pipeline::{
     ImportCancellation, ImportOptions, ImportStage, ImportStatistics, NoDataPolicy,
-    SpatialCalibration, TiffSource, import_tiff, inspect_tiff, select_supported_profile,
+    SpatialCalibration, TiffChannelSource, TiffSource, import_tiff, inspect_tiff,
+    select_supported_profile,
 };
-use mirante4d_storage::{PackedIndexCoordinates, ProfileKind, VerifiedScientificPackageCapability};
+use mirante4d_storage::{PackedIndexCoordinates, ProfileKind, SelfConsistentPackageCapability};
 use rustix::time::{ClockId, clock_gettime};
 use serde_json::{Value, json};
 use tiff::encoder::{TiffEncoder, colortype};
@@ -536,7 +537,7 @@ pub(crate) fn run_worker(args: Vec<String>) -> anyhow::Result<()> {
 
     let inspection_started = Instant::now();
     let inspection_cpu_started_ns = process_cpu_time_ns()?;
-    let inspection = inspect_tiff(TiffSource::auto(&source))?;
+    let inspection = inspect_tiff(t2_source_manifest(&source)?)?;
     let inspection_wall_time_ns = duration_ns(inspection_started.elapsed())?;
     let inspection_cpu_time_ns = process_cpu_time_ns()?
         .checked_sub(inspection_cpu_started_ns)
@@ -550,11 +551,10 @@ pub(crate) fn run_worker(args: Vec<String>) -> anyhow::Result<()> {
         inspection,
         destination: destination.clone(),
         checkpoint_directory: checkpoint,
-        profile: ProfileKind::Ds0,
+        profile: ProfileKind::Current,
         calibration: SpatialCalibration::new([0.4, 0.2, 0.1]),
         time_step_seconds: None,
-        no_data: Some(NoDataPolicy::U8Sentinel(T2_SENTINEL)),
-        working_memory_bytes: WORKING_MEMORY_BYTES,
+        no_data: Some(NoDataPolicy::manual_uint8(T2_SENTINEL)),
     };
     options.profile = select_supported_profile(&options)?;
     let profile = options.profile;
@@ -575,14 +575,14 @@ pub(crate) fn run_worker(args: Vec<String>) -> anyhow::Result<()> {
     let published = import_tiff(options, &ledger, &ImportCancellation::new(), |_| {})?;
     let (receipt, transfer) = published.into_parts();
     if receipt.scientific_content_id.to_string() != T2_EXPECTED_SCIENTIFIC_CONTENT_ID {
-        bail!("T2 import differs from the independently frozen scientific identity");
+        bail!("T2 import differs from the independently frozen scientific content address");
     }
     let counter_reconciliation =
         validate_counter_reconciliation(&receipt.statistics, ledger.peak_bytes())?;
     let runtime_gates = validate_t2_runtime_gates(&receipt.statistics, source_bytes)?;
     let publication_transfer_started = Instant::now();
     let publication_transfer_cpu_started_ns = process_cpu_time_ns()?;
-    let (verified, publication_currentness) = transfer.consume(|| false)?;
+    let (self_consistent, publication_currentness) = transfer.consume(|| false)?;
     let publication_transfer_wall_time_ns = duration_ns(publication_transfer_started.elapsed())?;
     let publication_transfer_cpu_time_ns = process_cpu_time_ns()?
         .checked_sub(publication_transfer_cpu_started_ns)
@@ -593,12 +593,12 @@ pub(crate) fn run_worker(args: Vec<String>) -> anyhow::Result<()> {
         .context("primary process CPU clock moved backwards")?;
     fs::remove_file(&primary_marker)
         .with_context(|| format!("failed to remove {}", primary_marker.display()))?;
-    if verified.package_id() != receipt.package_id
-        || verified.scientific_content_id() != receipt.scientific_content_id
+    if self_consistent.package_id() != receipt.package_id
+        || self_consistent.scientific_content_id() != receipt.scientific_content_id
     {
         bail!("published capability transfer disagrees with the import receipt");
     }
-    let independent_pyramid_validation = validate_imported_t2_scales(&verified)?;
+    let independent_pyramid_validation = validate_imported_t2_scales(&self_consistent)?;
     if ledger.current_bytes() != 0 {
         bail!("the T2 import leaked a CPU-ledger charge");
     }
@@ -714,7 +714,7 @@ fn validate_publication_capability_transfer(transfer: &Value) -> anyhow::Result<
 }
 
 fn validate_imported_t2_scales(
-    verified: &VerifiedScientificPackageCapability,
+    self_consistent: &SelfConsistentPackageCapability,
 ) -> anyhow::Result<Value> {
     const INNER: u64 = 64;
     if u64::try_from(T2_SCALE_FACT_SLAB_Z)? != INNER
@@ -747,7 +747,7 @@ fn validate_imported_t2_scales(
                 }
                 let mut records = vec![0_u8; usize::try_from(slab_bytes)?];
                 for x_chunk in 0..grid[2] {
-                    let brick = verified.read_brick(
+                    let brick = self_consistent.read_brick(
                         PackedIndexCoordinates::new(
                             0,
                             u32::try_from(scale)?,
@@ -846,6 +846,7 @@ fn statistics_json(statistics: &ImportStatistics) -> Value {
         "source_revalidation_bytes_read": statistics.source_revalidation_bytes_read,
         "native_decoded_bytes": statistics.native_decoded_bytes,
         "base_native_decoded_bytes": statistics.base_native_decoded_bytes,
+        "no_data_detection_native_decoded_bytes": statistics.no_data_detection_native_decoded_bytes,
         "scientific_identity_native_decoded_bytes": statistics.scientific_identity_native_decoded_bytes,
         "tiff_open_count": statistics.tiff_open_count,
         "native_chunk_decode_count": statistics.native_chunk_decode_count,
@@ -878,13 +879,24 @@ fn statistics_json(statistics: &ImportStatistics) -> Value {
         "sampled_peak_open_file_descriptors": statistics.sampled_peak_open_file_descriptors,
         "open_file_descriptor_structural_bound": statistics.open_file_descriptor_structural_bound,
         "peak_open_file_descriptors": statistics.peak_open_file_descriptors,
-        "preflight_temporary_bytes_bound": statistics.preflight_temporary_bytes_bound,
+        "preflight_required_headroom_bytes": statistics.preflight_required_headroom_bytes,
         "peak_temporary_bytes": statistics.peak_temporary_bytes,
         "peak_checkpoint_regular_files": statistics.peak_checkpoint_regular_files,
         "peak_working_bytes": statistics.peak_working_bytes,
         "peak_process_rss_bytes": statistics.peak_process_rss_bytes,
         "resumed_work_units": statistics.resumed_work_units,
         "produced_work_units": statistics.produced_work_units,
+        "maximum_temporal_pipeline_width": statistics.maximum_temporal_pipeline_width,
+        "prefetch_units_admitted": statistics.prefetch_units_admitted,
+        "prefetch_units_consumed": statistics.prefetch_units_consumed,
+        "prefetch_cache_hits": statistics.prefetch_cache_hits,
+        "temporal_ingest_busy_time_ns": statistics.temporal_ingest_busy_time_ns,
+        "temporal_canonical_processing_time_ns": statistics.temporal_canonical_processing_time_ns,
+        "prefetch_ingest_busy_time_ns": statistics.prefetch_ingest_busy_time_ns,
+        "prefetch_overlap_time_ns": statistics.prefetch_overlap_time_ns,
+        "prefetch_cpu_capacity_deferrals": statistics.prefetch_cpu_capacity_deferrals,
+        "prefetch_disk_headroom_deferrals": statistics.prefetch_disk_headroom_deferrals,
+        "prefetch_queue_capacity_deferrals": statistics.prefetch_queue_capacity_deferrals,
         "primary_wall_time_ns": statistics.primary_wall_time_ns,
         "primary_cpu_time_ns": statistics.primary_cpu_time_ns,
         "stages": statistics.stages.iter().map(|timing| json!({
@@ -906,7 +918,10 @@ fn validate_counter_reconciliation(
     if statistics.native_decoded_bytes
         != statistics
             .base_native_decoded_bytes
-            .checked_add(statistics.scientific_identity_native_decoded_bytes)
+            .checked_add(statistics.no_data_detection_native_decoded_bytes)
+            .and_then(|value| {
+                value.checked_add(statistics.scientific_identity_native_decoded_bytes)
+            })
             .context("native decoded byte counters overflow")?
     {
         bail!("native decoded byte stage counters do not reconcile");
@@ -983,7 +998,7 @@ fn validate_t2_runtime_gates(
         bail!("T2 native decode amplification exceeds 1.10x");
     }
     if statistics.scientific_identity_native_decoded_bytes != 0 {
-        bail!("T2 scientific identity performed an additional TIFF native decode");
+        bail!("T2 scientific content addressing performed an additional TIFF native decode");
     }
     let source_bytes_read_max = source_bytes
         .checked_mul(5)
@@ -1001,8 +1016,8 @@ fn validate_t2_runtime_gates(
     if statistics.peak_open_file_descriptors > 64 {
         bail!("T2 import exceeded the open-file bound");
     }
-    if statistics.peak_temporary_bytes > statistics.preflight_temporary_bytes_bound {
-        bail!("T2 import exceeded its preflight temporary-byte bound");
+    if statistics.preflight_required_headroom_bytes == 0 {
+        bail!("T2 import did not report its incremental filesystem headroom contract");
     }
     if statistics.peak_checkpoint_regular_files > 8 {
         bail!("T2 checkpoint exceeded the eight-file object bound");
@@ -1046,9 +1061,9 @@ fn validate_t2_runtime_gates(
             "maximum": 64_u64,
             "passed": true,
         },
-        "temporary_bytes": {
+        "incremental_headroom": {
             "actual_peak": statistics.peak_temporary_bytes,
-            "preflight_bound": statistics.preflight_temporary_bytes_bound,
+            "start_required": statistics.preflight_required_headroom_bytes,
             "passed": true,
         },
         "checkpoint_objects": {
@@ -1138,6 +1153,12 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<RunArgs> {
         bail!("--competing-activity must not be empty");
     }
     Ok(parsed)
+}
+
+pub(crate) fn t2_source_manifest(root: &Path) -> anyhow::Result<TiffSource> {
+    let channel = TiffChannelSource::folder_of_2d("channel 1", root.join("channel-000"))
+        .map_err(anyhow::Error::msg)?;
+    TiffSource::new(vec![channel]).map_err(anyhow::Error::msg)
 }
 
 pub(crate) fn generate_t2_source(root: &Path, z: u32, y: u32, x: u32) -> anyhow::Result<()> {
@@ -2060,7 +2081,7 @@ fn t2_expected_facts(z: u32, y: u32, x: u32, scratch: &Path) -> anyhow::Result<V
     let is_full_t2 = (z, y, x) == (T2_Z, T2_Y, T2_X);
     if is_full_t2 && scientific_content_id != T2_EXPECTED_SCIENTIFIC_CONTENT_ID {
         bail!(
-            "restored-policy T2 scientific identity {scientific_content_id} differs from its frozen expected fact"
+            "restored-policy T2 scientific content address {scientific_content_id} differs from its frozen expected fact"
         );
     }
 
@@ -2508,7 +2529,7 @@ mod tests {
         let source = temporary.path().join("source");
         generate_t2_source(&source, 3, 5, 7).unwrap();
 
-        let inspection = inspect_tiff(TiffSource::auto(&source)).unwrap();
+        let inspection = inspect_tiff(t2_source_manifest(&source).unwrap()).unwrap();
         assert_eq!(inspection.shape.dimensions(), [1, 3, 5, 7]);
         assert_eq!(inspection.channels, 1);
         assert_eq!(fs::read_dir(&source).unwrap().count(), 1);

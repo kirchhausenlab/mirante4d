@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use mirante4d_dataset::{
-    BrickKey, DatasetCatalog, DatasetLayer, DatasetResourceIdentity, DatasetSourceId,
-    ResourceRegion, ScientificIdentityStatus,
+    BrickKey, ContentAddressStatus, DatasetCatalog, DatasetLayer, DatasetResourceIdentity,
+    DatasetSourceId, ResourceRegion,
 };
 use mirante4d_domain::{
     CameraView, CrossSectionView, DisplayWindow, GridToWorld, IntensityDType, IsoLightState,
@@ -33,7 +33,7 @@ fn snapshot_carries_four_fixed_backend_neutral_presentation_slots() {
     assert_eq!(snapshot.presentations(), &PresentationSnapshot::default());
     assert_eq!(snapshot.presentations().iter().count(), 0);
 
-    let resource_identity = DatasetResourceIdentity::Verified(
+    let resource_identity = DatasetResourceIdentity::ContentAddress(
         ScientificContentId::parse(&format!(
             "{}{}",
             ScientificContentId::PREFIX,
@@ -131,7 +131,7 @@ fn composition_can_attach_import_facts_without_mutating_application_state() {
         import_workflow::ImportFailureSnapshot {
             message: "inspection failed".to_owned(),
             checkpoint: None,
-            retry_id: None,
+            recovery: None,
         },
     ));
 
@@ -200,7 +200,7 @@ fn catalog_is_owned_by_snapshot_and_closes_every_view_transition() {
 
     let missing_layer_catalog = DatasetCatalog::new(
         "incomplete",
-        ScientificIdentityStatus::Unverified(DatasetSourceId::new(1)),
+        ContentAddressStatus::SessionLocal(DatasetSourceId::new(1)),
         vec![dataset_layer(0, 4)],
     )
     .unwrap();
@@ -208,6 +208,8 @@ fn catalog_is_owned_by_snapshot_and_closes_every_view_transition() {
         ApplicationState::new_unbound(
             SourceSessionGeneration::new(1),
             missing_layer_catalog,
+            dataset_reference('1'),
+            ContentAddressOrigin::DeclaredByPackage,
             unbound_workspace(project_id(1)),
             ResourcePolicy::default(),
         )
@@ -218,6 +220,8 @@ fn catalog_is_owned_by_snapshot_and_closes_every_view_transition() {
     let mut bounded = ApplicationState::new_unbound(
         SourceSessionGeneration::new(1),
         catalog_with_timepoints(3),
+        dataset_reference('1'),
+        ContentAddressOrigin::DeclaredByPackage,
         unbound_workspace(project_id(2)),
         ResourcePolicy::default(),
     )
@@ -299,12 +303,21 @@ fn logical_playback_ticks_replace_wall_clock_state_and_obey_catalog_bounds() {
     let mut application = ApplicationState::new_unbound(
         SourceSessionGeneration::new(1),
         catalog_with_timepoints(3),
+        dataset_reference('1'),
+        ContentAddressOrigin::DeclaredByPackage,
         unbound_workspace(project_id(2)),
         ResourcePolicy::default(),
     )
     .unwrap();
     application
         .dispatch(ApplicationCommand::SetPlaybackActive(true))
+        .unwrap();
+    assert_eq!(
+        application.snapshot().transient().playback_phase(),
+        PlaybackPhase::Warming
+    );
+    application
+        .dispatch(ApplicationCommand::MarkPlaybackPrepared)
         .unwrap();
     application.drain_events(MAX_PENDING_EVENTS);
 
@@ -360,6 +373,8 @@ fn logical_playback_ticks_replace_wall_clock_state_and_obey_catalog_bounds() {
     let mut single = ApplicationState::new_unbound(
         SourceSessionGeneration::new(1),
         catalog_with_timepoints(1),
+        dataset_reference('1'),
+        ContentAddressOrigin::DeclaredByPackage,
         unbound_workspace(project_id(3)),
         ResourcePolicy::default(),
     )
@@ -373,450 +388,277 @@ fn logical_playback_ticks_replace_wall_clock_state_and_obey_catalog_bounds() {
 }
 
 #[test]
-fn all_project_io_and_attachment_are_identity_gated_before_verification() {
-    let mut application = application();
-    for command in [
-        ApplicationCommand::AttachVerifiedDataset,
-        ApplicationCommand::RequestProjectOpen,
-        ApplicationCommand::RequestProjectSave,
-        ApplicationCommand::RequestProjectSaveAs {
-            new_project_id: project_id(5),
-        },
-        ApplicationCommand::RequestProjectRecovery,
-    ] {
-        let before = application.fork_for_dispatch();
-        assert_eq!(
-            application.dispatch(command).unwrap_err().code(),
-            ApplicationFaultCode::IdentityVerificationRequired
-        );
-        assert_eq!(application, before);
-    }
-}
+fn playback_fps_is_closed_and_an_active_change_restarts_only_warmup() {
+    assert!(PlaybackFps::new(0).is_none());
+    assert_eq!(PlaybackFps::new(1).unwrap().get(), 1);
+    assert_eq!(PlaybackFps::new(24).unwrap().get(), 24);
+    assert!(PlaybackFps::new(25).is_none());
 
-#[test]
-fn source_verification_requires_the_exact_current_session_generation() {
-    let mut application = application();
-    let token = request_source_verification(&mut application);
-    application
-        .dispatch(ApplicationCommand::UpdateSourceVerificationProgress {
-            token: token.clone(),
-            completed_work: 1,
-            total_work: 1,
-        })
-        .unwrap();
-    let before = application.fork_for_dispatch();
-    let dataset = dataset_reference('1');
-    let catalog = verified_catalog(application.snapshot().catalog(), &dataset);
-    let fault = application
-        .dispatch(ApplicationCommand::CompleteOperation {
-            token: token.clone(),
-            completion: OperationCompletion::SourceVerified {
-                source_generation: SourceSessionGeneration::new(2),
-                catalog: Arc::clone(&catalog),
-                dataset: dataset.clone(),
-            },
-        })
-        .unwrap_err();
-    assert_eq!(fault.code(), ApplicationFaultCode::SourceSessionMismatch);
-    assert_eq!(application, before);
-
-    let identity = *dataset.scientific_content_id();
-    application
-        .dispatch(ApplicationCommand::CompleteOperation {
-            token,
-            completion: OperationCompletion::SourceVerified {
-                source_generation: SourceSessionGeneration::new(1),
-                catalog,
-                dataset,
-            },
-        })
-        .unwrap();
-    assert!(matches!(
-        application.snapshot().source(),
-        SourceVerificationSnapshot::Verified(_)
-    ));
-    assert_eq!(
-        application
-            .snapshot()
-            .catalog()
-            .scientific_identity()
-            .verified_id(),
-        Some(&identity)
-    );
-
-    let verified_catalog = DatasetCatalog::new(
-        "preverified",
-        ScientificIdentityStatus::Verified(identity),
-        vec![dataset_layer(0, 4), dataset_layer(1, 4)],
+    let mut application = ApplicationState::new_unbound(
+        SourceSessionGeneration::new(1),
+        catalog_with_timepoints(3),
+        dataset_reference('1'),
+        ContentAddressOrigin::DeclaredByPackage,
+        unbound_workspace(project_id(2)),
+        ResourcePolicy::default(),
     )
     .unwrap();
-    assert_eq!(
-        ApplicationState::new_unbound(
-            SourceSessionGeneration::new(1),
-            verified_catalog,
-            unbound_workspace(project_id(3)),
-            ResourcePolicy::default(),
-        )
-        .unwrap_err(),
-        ApplicationFaultCode::DatasetIdentityMismatch
-    );
-}
-
-#[test]
-fn source_verification_progress_is_one_bounded_monotonic_observation() {
-    let mut application = application();
-    let token = request_source_verification(&mut application);
-    assert!(matches!(
-        application.snapshot().source(),
-        SourceVerificationSnapshot::Verifying {
-            operation_id,
-            completed_work: 0,
-            total_work: 0,
-        } if *operation_id == token.operation_id()
-    ));
-
     application
-        .dispatch(ApplicationCommand::UpdateSourceVerificationProgress {
-            token: token.clone(),
-            completed_work: 4,
-            total_work: 10,
-        })
+        .dispatch(ApplicationCommand::SetPlaybackActive(true))
         .unwrap();
-    assert!(matches!(
-        application.snapshot().source(),
-        SourceVerificationSnapshot::Verifying {
-            completed_work: 4,
-            total_work: 10,
-            ..
-        }
-    ));
-
-    for (completed_work, total_work) in [(3, 10), (4, 11), (11, 10), (0, 0)] {
-        let before = application.fork_for_dispatch();
-        assert_eq!(
-            application
-                .dispatch(ApplicationCommand::UpdateSourceVerificationProgress {
-                    token: token.clone(),
-                    completed_work,
-                    total_work,
-                })
-                .unwrap_err()
-                .code(),
-            ApplicationFaultCode::InvalidOperationProgress
-        );
-        assert_eq!(application, before);
-    }
-
-    let dataset = dataset_reference('1');
-    let catalog = verified_catalog(application.snapshot().catalog(), &dataset);
     application
-        .dispatch(ApplicationCommand::CompleteOperation {
-            token,
-            completion: OperationCompletion::SourceVerified {
-                source_generation: SourceSessionGeneration::new(1),
-                catalog,
-                dataset,
-            },
-        })
+        .dispatch(ApplicationCommand::MarkPlaybackPrepared)
         .unwrap();
-    assert!(matches!(
-        application.snapshot().source(),
-        SourceVerificationSnapshot::Verified(_)
-    ));
-}
-
-#[test]
-fn source_verification_completion_ignores_view_currentness_but_not_source_generation() {
-    let mut application = application();
-    let token = request_source_verification(&mut application);
     application
-        .dispatch(ApplicationCommand::UpdateSourceVerificationProgress {
-            token: token.clone(),
-            completed_work: 7,
-            total_work: 7,
-        })
+        .dispatch(ApplicationCommand::AdvancePlaybackTick(10))
         .unwrap();
-    let request_currentness = token.currentness_generation();
     application
-        .dispatch(ApplicationCommand::SetTimepoint(TimeIndex::new(1)))
+        .dispatch(ApplicationCommand::AdvancePlaybackTick(11))
         .unwrap();
-    assert_ne!(application.snapshot().currentness(), request_currentness);
-
-    let dataset = dataset_reference('1');
-    let catalog = verified_catalog(application.snapshot().catalog(), &dataset);
-    application
-        .dispatch(ApplicationCommand::CompleteOperation {
-            token,
-            completion: OperationCompletion::SourceVerified {
-                source_generation: SourceSessionGeneration::new(1),
-                catalog,
-                dataset,
-            },
-        })
-        .unwrap();
-    assert!(matches!(
-        application.snapshot().source(),
-        SourceVerificationSnapshot::Verified(_)
-    ));
-    assert_eq!(unbound_view(&application.snapshot()).timepoint().get(), 1);
-}
-
-#[test]
-fn source_verification_rejects_catalog_or_reference_drift_atomically() {
-    let mut application = application();
-    let token = request_source_verification(&mut application);
-    application
-        .dispatch(ApplicationCommand::UpdateSourceVerificationProgress {
-            token: token.clone(),
-            completed_work: 1,
-            total_work: 1,
-        })
-        .unwrap();
-    let dataset = dataset_reference('1');
-    let wrong_catalog = Arc::new(
-        DatasetCatalog::new(
-            "changed-label",
-            ScientificIdentityStatus::Verified(*dataset.scientific_content_id()),
-            application.snapshot().catalog().layers().cloned().collect(),
-        )
-        .unwrap(),
-    );
-    let before = application.fork_for_dispatch();
-    assert_eq!(
-        application
-            .dispatch(ApplicationCommand::CompleteOperation {
-                token: token.clone(),
-                completion: OperationCompletion::SourceVerified {
-                    source_generation: SourceSessionGeneration::new(1),
-                    catalog: wrong_catalog,
-                    dataset: dataset.clone(),
-                },
-            })
-            .unwrap_err()
-            .code(),
-        ApplicationFaultCode::DatasetIdentityMismatch
-    );
-    assert_eq!(application, before);
-
-    let mismatched_catalog = verified_catalog(application.snapshot().catalog(), &dataset);
-    assert_eq!(
-        application
-            .dispatch(ApplicationCommand::CompleteOperation {
-                token,
-                completion: OperationCompletion::SourceVerified {
-                    source_generation: SourceSessionGeneration::new(1),
-                    catalog: mismatched_catalog,
-                    dataset: dataset_reference('2'),
-                },
-            })
-            .unwrap_err()
-            .code(),
-        ApplicationFaultCode::DatasetIdentityMismatch
-    );
-    assert_eq!(application, before);
-}
-
-#[test]
-fn cancelled_source_verification_suppresses_its_late_prepared_completion() {
-    let mut application = application();
-    let token = request_source_verification(&mut application);
-    application
-        .dispatch(ApplicationCommand::CancelOperation(token.operation_id()))
-        .unwrap();
-    assert!(matches!(
-        application.snapshot().source(),
-        SourceVerificationSnapshot::Required
-    ));
-
-    let dataset = dataset_reference('1');
-    let catalog = verified_catalog(application.snapshot().catalog(), &dataset);
-    let before = application.fork_for_dispatch();
-    assert_eq!(
-        application
-            .dispatch(ApplicationCommand::CompleteOperation {
-                token,
-                completion: OperationCompletion::SourceVerified {
-                    source_generation: SourceSessionGeneration::new(1),
-                    catalog,
-                    dataset,
-                },
-            })
-            .unwrap_err()
-            .code(),
-        ApplicationFaultCode::OperationNotFound
-    );
-    assert_eq!(application, before);
-}
-
-#[test]
-fn invalidated_source_verification_cannot_displace_its_successor() {
-    let mut application = application();
-    let superseded = request_source_verification(&mut application);
-    let dataset = dataset_reference('1');
-    let catalog = verified_catalog(application.snapshot().catalog(), &dataset);
+    assert_eq!(application.snapshot().view().timepoint(), TimeIndex::new(1));
 
     application
-        .dispatch(ApplicationCommand::InvalidateSourceVerification {
-            source_generation: SourceSessionGeneration::new(1),
-        })
-        .unwrap();
-    let events = application.drain_events(MAX_PENDING_EVENTS);
-    assert!(events.iter().any(|event| matches!(
-        event,
-        ApplicationEvent::OperationCancellationRequested { token }
-            if token == &superseded
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        ApplicationEvent::SourceVerificationInvalidated {
-            source_generation
-        } if *source_generation == SourceSessionGeneration::new(1)
-    )));
-
-    let successor = request_source_verification(&mut application);
-    let before_late = application.fork_for_dispatch();
-    assert_eq!(
-        application
-            .dispatch(ApplicationCommand::CompleteOperation {
-                token: superseded,
-                completion: OperationCompletion::SourceVerified {
-                    source_generation: SourceSessionGeneration::new(1),
-                    catalog: Arc::clone(&catalog),
-                    dataset: dataset.clone(),
-                },
-            })
-            .unwrap_err()
-            .code(),
-        ApplicationFaultCode::OperationNotFound
-    );
-    assert_eq!(application, before_late);
-
-    application
-        .dispatch(ApplicationCommand::CompleteOperation {
-            token: successor,
-            completion: OperationCompletion::SourceVerified {
-                source_generation: SourceSessionGeneration::new(1),
-                catalog,
-                dataset,
-            },
-        })
-        .unwrap();
-    assert!(matches!(
-        application.snapshot().source(),
-        SourceVerificationSnapshot::Verified(_)
-    ));
-}
-
-#[test]
-fn failed_source_verification_never_admits_a_late_prepared_binding() {
-    let mut application = application();
-    let token = request_source_verification(&mut application);
-    application
-        .dispatch(ApplicationCommand::CompleteOperation {
-            token: token.clone(),
-            completion: OperationCompletion::Failed(OperationFailureCode::SourceChanged),
-        })
-        .unwrap();
-    assert!(matches!(
-        application.snapshot().source(),
-        SourceVerificationSnapshot::Required
-    ));
-    assert!(
-        application
-            .drain_events(MAX_PENDING_EVENTS)
-            .iter()
-            .any(|event| matches!(
-                event,
-                ApplicationEvent::SourceVerificationInvalidated {
-                    source_generation
-                } if *source_generation == SourceSessionGeneration::new(1)
-            ))
-    );
-
-    let dataset = dataset_reference('1');
-    let catalog = verified_catalog(application.snapshot().catalog(), &dataset);
-    let before = application.fork_for_dispatch();
-    assert_eq!(
-        application
-            .dispatch(ApplicationCommand::CompleteOperation {
-                token,
-                completion: OperationCompletion::SourceVerified {
-                    source_generation: SourceSessionGeneration::new(1),
-                    catalog,
-                    dataset,
-                },
-            })
-            .unwrap_err()
-            .code(),
-        ApplicationFaultCode::OperationNotFound
-    );
-    assert_eq!(application, before);
-}
-
-#[test]
-fn observed_source_drift_invalidates_identity_and_cancels_project_persistence() {
-    let mut application = bound_application();
-    application.drain_events(MAX_PENDING_EVENTS);
-    application
-        .dispatch(ApplicationCommand::RequestProjectSave)
-        .unwrap();
-    let (save_token, captured_revision) = save_request(&mut application);
-
-    application
-        .dispatch(ApplicationCommand::InvalidateSourceVerification {
-            source_generation: SourceSessionGeneration::new(1),
-        })
+        .dispatch(ApplicationCommand::SetPlaybackFps(
+            PlaybackFps::new(12).unwrap(),
+        ))
         .unwrap();
     let snapshot = application.snapshot();
-    assert!(matches!(
-        snapshot.source(),
-        SourceVerificationSnapshot::Required
-    ));
+    assert_eq!(snapshot.transient().playback_fps().get(), 12);
     assert_eq!(
-        snapshot.catalog().scientific_identity(),
-        &ScientificIdentityStatus::Unverified(DatasetSourceId::new(1))
+        snapshot.transient().playback_phase(),
+        PlaybackPhase::Warming
     );
-    assert_eq!(
-        application
-            .dispatch(ApplicationCommand::RequestProjectSave)
-            .unwrap_err()
-            .code(),
-        ApplicationFaultCode::IdentityVerificationRequired
-    );
-
-    let before_late = application.fork_for_dispatch();
-    assert_eq!(
-        application
-            .dispatch(ApplicationCommand::CompleteOperation {
-                token: save_token,
-                completion: OperationCompletion::ProjectSaved(captured_revision),
-            })
-            .unwrap_err()
-            .code(),
-        ApplicationFaultCode::OperationNotFound
-    );
-    assert_eq!(application, before_late);
-
-    let before_wrong_generation = application.fork_for_dispatch();
-    assert_eq!(
-        application
-            .dispatch(ApplicationCommand::InvalidateSourceVerification {
-                source_generation: SourceSessionGeneration::new(2),
-            })
-            .unwrap_err()
-            .code(),
-        ApplicationFaultCode::SourceSessionMismatch
-    );
-    assert_eq!(application, before_wrong_generation);
+    assert_eq!(snapshot.transient().last_playback_tick(), None);
+    assert_eq!(snapshot.view().timepoint(), TimeIndex::new(1));
 }
 
 #[test]
-fn verified_attachment_creates_the_only_project_state_and_revision_authority() {
-    let mut application = application();
-    verify(&mut application, dataset_reference('1'));
+fn bound_playback_is_transient_until_stop_commits_the_final_cursor_once() {
+    let mut application = bound_application_with_catalog(catalog_with_timepoints(3));
+    let before = application.snapshot();
+    let WorkspaceSnapshot::Bound {
+        revision: before_revision,
+        retained_history_entries: before_history,
+        ..
+    } = before.workspace()
+    else {
+        panic!("workspace was not bound");
+    };
 
     application
-        .dispatch(ApplicationCommand::AttachVerifiedDataset)
+        .dispatch(ApplicationCommand::SetPlaybackActive(true))
+        .unwrap();
+    application
+        .dispatch(ApplicationCommand::MarkPlaybackPrepared)
+        .unwrap();
+    application
+        .dispatch(ApplicationCommand::AdvancePlaybackTick(100))
+        .unwrap();
+    application
+        .dispatch(ApplicationCommand::AdvancePlaybackTick(101))
+        .unwrap();
+    let during = application.snapshot();
+    assert_eq!(during.view().timepoint(), TimeIndex::new(1));
+    let WorkspaceSnapshot::Bound {
+        project,
+        revision,
+        retained_history_entries,
+        ..
+    } = during.workspace()
+    else {
+        panic!("workspace was not bound");
+    };
+    assert_eq!(project.view().timepoint(), TimeIndex::new(0));
+    assert_eq!(revision, before_revision);
+    assert_eq!(retained_history_entries, before_history);
+
+    let camera = CameraView::new(
+        Projection::Perspective,
+        WorldPoint3::origin(),
+        UnitQuaternion::identity(),
+        1.0,
+        320.0,
+        10.0,
+    )
+    .unwrap();
+    application
+        .dispatch(ApplicationCommand::SetCamera(camera))
+        .unwrap();
+    assert_eq!(application.snapshot().view().timepoint(), TimeIndex::new(1));
+    assert_eq!(application.snapshot().view().camera(), &camera);
+
+    application
+        .dispatch(ApplicationCommand::SetPlaybackActive(false))
+        .unwrap();
+    let after = application.snapshot();
+    assert_eq!(after.transient().playback_phase(), PlaybackPhase::Stopped);
+    assert_eq!(after.view().timepoint(), TimeIndex::new(1));
+    let WorkspaceSnapshot::Bound {
+        project,
+        retained_history_entries,
+        ..
+    } = after.workspace()
+    else {
+        panic!("workspace was not bound");
+    };
+    assert_eq!(project.view().timepoint(), TimeIndex::new(1));
+    assert_eq!(*retained_history_entries, before_history + 2);
+}
+
+#[test]
+fn structurally_admitted_sources_do_not_wait_for_a_full_integrity_audit() {
+    let mut attachment = application();
+    assert!(matches!(
+        attachment.snapshot().source().integrity_audit(),
+        PackageIntegrityAuditSnapshot::NotRun
+    ));
+    assert_eq!(
+        attachment
+            .dispatch(ApplicationCommand::AttachDataset)
+            .unwrap(),
+        CommandEffect::Changed
+    );
+    assert!(matches!(
+        attachment.snapshot().workspace(),
+        WorkspaceSnapshot::Bound { .. }
+    ));
+
+    let mut project_open = application();
+    assert_eq!(
+        project_open
+            .dispatch(ApplicationCommand::RequestProjectOpen)
+            .unwrap(),
+        CommandEffect::Changed
+    );
+    assert!(matches!(
+        project_open.drain_events(MAX_PENDING_EVENTS).as_slice(),
+        [ApplicationEvent::ProjectOpenRequested { .. }]
+    ));
+}
+
+#[test]
+fn explicit_integrity_audit_progress_and_completion_never_rebind_the_source() {
+    let mut application = application();
+    let before = application.snapshot();
+    let token = request_package_integrity_audit(&mut application);
+    let progress = PackageIntegrityAuditProgress::new(
+        PackageIntegrityAuditStage::ExactObjectBytes,
+        4,
+        4096,
+        0,
+        0,
+    );
+    application
+        .dispatch(ApplicationCommand::UpdatePackageIntegrityAuditProgress {
+            token: token.clone(),
+            progress,
+        })
+        .unwrap();
+    assert!(matches!(
+        application.snapshot().source().integrity_audit(),
+        PackageIntegrityAuditSnapshot::Running {
+            progress: Some(observed),
+            ..
+        } if *observed == progress
+    ));
+
+    let before_regression = application.fork_for_dispatch();
+    let regression = PackageIntegrityAuditProgress::new(
+        PackageIntegrityAuditStage::ExactObjectBytes,
+        3,
+        4096,
+        0,
+        0,
+    );
+    assert_eq!(
+        application
+            .dispatch(ApplicationCommand::UpdatePackageIntegrityAuditProgress {
+                token: token.clone(),
+                progress: regression,
+            })
+            .unwrap_err()
+            .code(),
+        ApplicationFaultCode::InvalidOperationProgress
+    );
+    assert_eq!(application, before_regression);
+
+    let report = PackageIntegrityAuditReport::new(
+        *before.source().dataset().scientific_content_id(),
+        12,
+        4096,
+        8,
+        2048,
+    );
+    application
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::PackageIntegrityAuditCompleted(report.clone()),
+        })
+        .unwrap();
+    let after = application.snapshot();
+    assert_eq!(after.source().dataset(), before.source().dataset());
+    assert_eq!(
+        after.source().content_address_origin(),
+        before.source().content_address_origin()
+    );
+    assert!(Arc::ptr_eq(after.catalog(), before.catalog()));
+    assert_eq!(
+        after.source().integrity_audit(),
+        &PackageIntegrityAuditSnapshot::SelfConsistent(report)
+    );
+}
+
+#[test]
+fn cancelled_or_failed_integrity_audit_preserves_the_admitted_source() {
+    let mut cancelled = application();
+    let admitted = cancelled.snapshot().source().clone();
+    let token = request_package_integrity_audit(&mut cancelled);
+    cancelled
+        .dispatch(ApplicationCommand::CancelOperation(token.operation_id()))
+        .unwrap();
+    assert_eq!(cancelled.snapshot().source().dataset(), admitted.dataset());
+    assert_eq!(
+        cancelled.snapshot().source().content_address_origin(),
+        admitted.content_address_origin()
+    );
+    assert!(matches!(
+        cancelled.snapshot().source().integrity_audit(),
+        PackageIntegrityAuditSnapshot::Cancelled
+    ));
+
+    let mut failed = application();
+    let admitted = failed.snapshot().source().clone();
+    let token = request_package_integrity_audit(&mut failed);
+    let failure = PackageIntegrityAuditFailure::new(
+        Some(PackageIntegrityAuditStage::ExactObjectBytes),
+        Some("objects/shard-0".to_owned()),
+        "digest mismatch",
+    );
+    failed
+        .dispatch(ApplicationCommand::CompleteOperation {
+            token,
+            completion: OperationCompletion::PackageIntegrityAuditFailed(failure.clone()),
+        })
+        .unwrap();
+    assert_eq!(failed.snapshot().source().dataset(), admitted.dataset());
+    assert_eq!(
+        failed.snapshot().source().content_address_origin(),
+        admitted.content_address_origin()
+    );
+    assert_eq!(
+        failed.snapshot().source().integrity_audit(),
+        &PackageIntegrityAuditSnapshot::Failed(failure)
+    );
+}
+
+// Package-integrity audit tests follow the hard-cut admission semantics.
+
+#[test]
+fn admitted_attachment_creates_the_only_project_state_and_revision_authority() {
+    let mut application = application();
+
+    application
+        .dispatch(ApplicationCommand::AttachDataset)
         .unwrap();
     let snapshot = application.snapshot();
     let WorkspaceSnapshot::Bound {
@@ -1133,7 +975,7 @@ fn save_as_rejects_a_nonexact_completion_and_failure_retains_the_old_project() {
 }
 
 #[test]
-fn recovery_blocks_mutation_and_is_dirty_even_with_the_exact_verified_locator() {
+fn recovery_blocks_mutation_and_is_dirty_even_with_the_exact_locator() {
     let mut application = bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     application
@@ -1255,9 +1097,9 @@ fn recovery_rebinds_a_same_science_locator_and_rejects_other_science_atomically(
 }
 
 #[test]
-fn verified_unbound_workspace_can_request_and_admit_a_dirty_recovery() {
+fn admitted_unbound_workspace_can_request_and_admit_a_dirty_recovery() {
     let mut application = application();
-    verify(&mut application, dataset_reference('1'));
+    assert_admitted_dataset(&application, dataset_reference('1'));
     application.drain_events(MAX_PENDING_EVENTS);
     application
         .dispatch(ApplicationCommand::RequestProjectRecovery)
@@ -1325,55 +1167,16 @@ fn project_open_can_complete_directly_with_a_dirty_recovery_projection() {
 }
 
 #[test]
-fn source_invalidation_cancels_save_as_and_recovery_operations() {
-    for save_as in [true, false] {
-        let mut application = bound_application();
-        application.drain_events(MAX_PENDING_EVENTS);
-        let expected_kind = if save_as {
-            application
-                .dispatch(ApplicationCommand::RequestProjectSaveAs {
-                    new_project_id: project_id(5),
-                })
-                .unwrap();
-            OperationKind::ProjectSaveAs
-        } else {
-            application
-                .dispatch(ApplicationCommand::RequestProjectRecovery)
-                .unwrap();
-            OperationKind::ProjectRecovery
-        };
-        application.drain_events(MAX_PENDING_EVENTS);
-
-        application
-            .dispatch(ApplicationCommand::InvalidateSourceVerification {
-                source_generation: SourceSessionGeneration::new(1),
-            })
-            .unwrap();
-        assert!(application.snapshot().active_operations().is_empty());
-        assert!(
-            application
-                .drain_events(MAX_PENDING_EVENTS)
-                .iter()
-                .any(|event| matches!(
-                    event,
-                    ApplicationEvent::OperationCancellationRequested { token }
-                        if token.kind() == expected_kind
-                ))
-        );
-    }
-}
-
-#[test]
-fn verified_project_open_restores_revision_and_rejects_another_scientific_identity() {
+fn admitted_project_open_restores_revision_and_rejects_another_content_address() {
     let mut application = application();
-    let verified = dataset_reference('1');
-    verify(&mut application, verified.clone());
+    let current_reference = dataset_reference('1');
+    assert_admitted_dataset(&application, current_reference.clone());
     application.drain_events(MAX_PENDING_EVENTS);
     application
         .dispatch(ApplicationCommand::RequestProjectOpen)
         .unwrap();
     let token = project_open_token(&mut application);
-    let opened_projection = projection(project_id(8), verified, 5, 7);
+    let opened_projection = projection(project_id(8), current_reference, 5, 7);
     application
         .dispatch(ApplicationCommand::CompleteOperation {
             token,
@@ -1401,11 +1204,11 @@ fn verified_project_open_restores_revision_and_rejects_another_scientific_identi
 }
 
 #[test]
-fn project_open_rebinds_same_content_to_the_verified_reference_as_dirty() {
-    let verified = dataset_reference('1');
+fn project_open_rebinds_same_content_to_the_admitted_reference_as_dirty() {
+    let admitted = dataset_reference('1');
     let relocated = dataset_reference_at('1', "relocated-dataset.m4d");
-    assert!(verified.has_same_scientific_content(&relocated));
-    assert_ne!(verified, relocated);
+    assert!(admitted.has_same_scientific_content(&relocated));
+    assert_ne!(admitted, relocated);
 
     let mut application = application_for_project_open('1');
     let token = project_open_token(&mut application);
@@ -1434,7 +1237,7 @@ fn project_open_rebinds_same_content_to_the_verified_reference_as_dirty() {
     else {
         panic!("workspace was not bound");
     };
-    assert_eq!(project.dataset(), &verified);
+    assert_eq!(project.dataset(), &admitted);
     assert_eq!(revision.sequence(), 1);
     assert_eq!(revision_high_water.sequence(), 1);
     assert_eq!(saved_revision.map(ProjectRevisionId::sequence), Some(0));
@@ -1457,25 +1260,28 @@ fn project_open_rebinds_same_content_to_the_verified_reference_as_dirty() {
 }
 
 #[test]
-fn unverified_analysis_can_start_but_cannot_stage_artifacts() {
-    let mut application = application();
+fn admitted_analysis_can_stage_artifacts_without_a_full_integrity_audit() {
+    let mut application = bound_application();
     application
         .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
         .unwrap();
     let token = started_token(&mut application, OperationKind::Analysis);
-    assert_eq!(token.source_identity(), None);
-    let before = application.fork_for_dispatch();
-    let fault = application
+    assert_eq!(
+        token.source_identity(),
+        Some(
+            *application
+                .snapshot()
+                .source()
+                .dataset()
+                .scientific_content_id()
+        )
+    );
+    application
         .dispatch(ApplicationCommand::StageAnalysisBundle {
             token: token.clone(),
             artifacts: vec![analysis_artifact(7, ArtifactSchema::AnalysisTableV1)],
         })
-        .unwrap_err();
-    assert_eq!(
-        fault.code(),
-        ApplicationFaultCode::IdentityVerificationRequired
-    );
-    assert_eq!(application, before);
+        .unwrap();
     application
         .dispatch(ApplicationCommand::CompleteOperation {
             token,
@@ -1576,8 +1382,8 @@ fn operation_failure_codes_are_closed_over_their_operation_kind() {
             OperationFailureCode::AnalysisExecutionFailed,
         ),
         (
-            OperationKind::SourceVerification,
-            OperationFailureCode::SourceChanged,
+            OperationKind::PackageIntegrityAudit,
+            OperationFailureCode::PackageIntegrityAuditReadFailed,
             OperationFailureCode::DatasetReadFailed,
         ),
         (
@@ -2133,48 +1939,6 @@ fn failed_staged_analysis_leaves_project_and_descriptors_unchanged() {
 }
 
 #[test]
-fn source_invalidation_cancels_staged_analysis_without_exposing_results() {
-    let mut application = bound_application();
-    application.drain_events(MAX_PENDING_EVENTS);
-    application
-        .dispatch(ApplicationCommand::BeginOperation(OperationKind::Analysis))
-        .unwrap();
-    let token = started_token(&mut application, OperationKind::Analysis);
-    stage_analysis_bundle(
-        &mut application,
-        token.clone(),
-        vec![analysis_artifact(7, ArtifactSchema::AnalysisTableV1)],
-    );
-
-    application
-        .dispatch(ApplicationCommand::InvalidateSourceVerification {
-            source_generation: SourceSessionGeneration::new(1),
-        })
-        .unwrap();
-    let snapshot = application.snapshot();
-    assert_eq!(snapshot.active_operations(), std::slice::from_ref(&token));
-    assert!(bound_project_arc(&snapshot).artifacts().is_empty());
-    assert!(snapshot.transient().analysis_tables().is_empty());
-    assert!(
-        application
-            .drain_events(MAX_PENDING_EVENTS)
-            .iter()
-            .any(|event| matches!(
-                event,
-                ApplicationEvent::OperationCancellationRequested { token: event_token }
-                    if event_token == &token
-            ))
-    );
-    application
-        .dispatch(ApplicationCommand::CompleteOperation {
-            token,
-            completion: OperationCompletion::Cancelled,
-        })
-        .unwrap();
-    assert!(application.snapshot().active_operations().is_empty());
-}
-
-#[test]
 fn analysis_plot_descriptors_remain_bounded() {
     let id = AnalysisPlotId::from_artifact_handle(
         analysis_artifact(8, ArtifactSchema::AnalysisPlotV1).handle_id(),
@@ -2551,14 +2315,17 @@ fn source_replacement_is_central_generation_guarded_and_resets_bound_transients(
                 catalog: Arc::new(catalog_for_source(4, 2)),
                 workspace: Box::new(unbound_workspace(project_id(9))),
                 source_generation: SourceSessionGeneration::new(2),
+                dataset: dataset_reference('4'),
+                content_address_origin: ContentAddressOrigin::DeclaredByPackage,
             },
         })
         .unwrap();
     let snapshot = application.snapshot();
     assert!(!snapshot.is_bound());
+    assert_eq!(snapshot.source().dataset(), &dataset_reference('4'));
     assert!(matches!(
-        snapshot.source(),
-        SourceVerificationSnapshot::Required
+        snapshot.source().integrity_audit(),
+        PackageIntegrityAuditSnapshot::NotRun
     ));
     assert_eq!(snapshot.source_generation().get(), 2);
     assert_eq!(snapshot.catalog().label(), "catalog-4");
@@ -2577,6 +2344,8 @@ fn source_replacement_is_central_generation_guarded_and_resets_bound_transients(
                     catalog: Arc::new(catalog(5)),
                     workspace: Box::new(unbound_workspace(project_id(10))),
                     source_generation: SourceSessionGeneration::new(2),
+                    dataset: dataset_reference('5'),
+                    content_address_origin: ContentAddressOrigin::DeclaredByPackage,
                 },
             })
             .unwrap_err()
@@ -2589,7 +2358,7 @@ fn source_replacement_is_central_generation_guarded_and_resets_bound_transients(
 #[test]
 fn dataset_open_freezes_durable_edits_but_allows_transient_state_and_exact_completion() {
     let mut application = application();
-    verify(&mut application, dataset_reference('1'));
+    assert_admitted_dataset(&application, dataset_reference('1'));
     application.drain_events(MAX_PENDING_EVENTS);
     application
         .dispatch(ApplicationCommand::RequestDatasetOpen)
@@ -2597,7 +2366,7 @@ fn dataset_open_freezes_durable_edits_but_allows_transient_state_and_exact_compl
     let token = dataset_open_token(&mut application);
 
     for command in [
-        ApplicationCommand::AttachVerifiedDataset,
+        ApplicationCommand::AttachDataset,
         ApplicationCommand::SetTimepoint(TimeIndex::new(1)),
     ] {
         let before = application.fork_for_dispatch();
@@ -2624,6 +2393,8 @@ fn dataset_open_freezes_durable_edits_but_allows_transient_state_and_exact_compl
                     catalog: Arc::new(catalog_for_source(4, 2)),
                     workspace: Box::new(unbound_workspace(project_id(9))),
                     source_generation: SourceSessionGeneration::new(2),
+                    dataset: dataset_reference('4'),
+                    content_address_origin: ContentAddressOrigin::DeclaredByPackage,
                 },
             })
             .unwrap(),
@@ -2666,55 +2437,6 @@ fn dataset_open_can_still_be_cancelled_while_the_durable_freeze_is_active() {
 }
 
 #[test]
-fn source_invalidation_cancels_dataset_open_before_advancing_currentness() {
-    let mut application = application();
-    verify(&mut application, dataset_reference('1'));
-    application.drain_events(MAX_PENDING_EVENTS);
-    application
-        .dispatch(ApplicationCommand::RequestDatasetOpen)
-        .unwrap();
-    let token = dataset_open_token(&mut application);
-
-    application
-        .dispatch(ApplicationCommand::InvalidateSourceVerification {
-            source_generation: SourceSessionGeneration::new(1),
-        })
-        .unwrap();
-    assert!(application.snapshot().active_operations().is_empty());
-    assert_ne!(
-        application.snapshot().currentness(),
-        token.currentness_generation()
-    );
-    assert!(
-        application
-            .drain_events(MAX_PENDING_EVENTS)
-            .iter()
-            .any(|event| matches!(
-                event,
-                ApplicationEvent::OperationCancellationRequested { token: cancelled }
-                    if cancelled == &token
-            ))
-    );
-
-    let before_late = application.fork_for_dispatch();
-    assert_eq!(
-        application
-            .dispatch(ApplicationCommand::CompleteOperation {
-                token,
-                completion: OperationCompletion::DatasetOpened {
-                    catalog: Arc::new(catalog_for_source(4, 2)),
-                    workspace: Box::new(unbound_workspace(project_id(9))),
-                    source_generation: SourceSessionGeneration::new(2),
-                },
-            })
-            .unwrap_err()
-            .code(),
-        ApplicationFaultCode::OperationNotFound
-    );
-    assert_eq!(application, before_late);
-}
-
-#[test]
 fn dataset_open_request_rejects_while_an_operation_is_active() {
     let mut application = application();
     application
@@ -2732,7 +2454,7 @@ fn dataset_open_request_rejects_while_an_operation_is_active() {
 }
 
 #[test]
-fn verified_dataset_open_atomically_replaces_and_verifies_the_source() {
+fn admitted_dataset_open_atomically_replaces_the_source_without_running_an_audit() {
     let mut application = bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     application
@@ -2747,18 +2469,19 @@ fn verified_dataset_open_atomically_replaces_and_verifies_the_source() {
     let token = dataset_open_token(&mut application);
     let dataset = dataset_reference_at('7', "imported.m4d");
     let scientific_content_id = *dataset.scientific_content_id();
-    let catalog = verified_catalog(&catalog_for_source(4, 2), &dataset);
+    let catalog = content_addressed_catalog(&catalog_for_source(4, 2), &dataset);
     let provisional_project_id = project_id(9);
 
     assert_eq!(
         application
             .dispatch(ApplicationCommand::CompleteOperation {
                 token: token.clone(),
-                completion: OperationCompletion::VerifiedDatasetOpened {
+                completion: OperationCompletion::DatasetOpened {
                     source_generation: SourceSessionGeneration::new(2),
                     catalog,
                     workspace: Box::new(unbound_workspace(provisional_project_id)),
                     dataset: dataset.clone(),
+                    content_address_origin: ContentAddressOrigin::ComputedDuringImport,
                 },
             })
             .unwrap(),
@@ -2770,24 +2493,32 @@ fn verified_dataset_open_atomically_replaces_and_verifies_the_source() {
         snapshot.source_generation(),
         SourceSessionGeneration::new(2)
     );
+    assert_eq!(snapshot.source().dataset(), &dataset);
     assert_eq!(
-        snapshot.source(),
-        &SourceVerificationSnapshot::Verified(dataset)
+        snapshot.source().content_address_origin(),
+        ContentAddressOrigin::ComputedDuringImport
     );
+    assert!(matches!(
+        snapshot.source().integrity_audit(),
+        PackageIntegrityAuditSnapshot::NotRun
+    ));
     assert_eq!(snapshot.catalog().label(), "catalog-4");
     assert_eq!(
-        snapshot.catalog().scientific_identity().verified_id(),
+        snapshot
+            .catalog()
+            .content_address_status()
+            .content_address(),
         Some(&scientific_content_id)
     );
     assert_eq!(snapshot.transient(), &TransientApplicationState::default());
     let WorkspaceSnapshot::Unbound { workspace } = snapshot.workspace() else {
-        panic!("verified dataset open did not install an unbound workspace");
+        panic!("dataset open did not install an unbound workspace");
     };
     assert_eq!(workspace.provisional_project_id(), provisional_project_id);
     assert!(snapshot.active_operations().is_empty());
 
     let events = application.drain_events(MAX_PENDING_EVENTS);
-    assert_eq!(events.len(), 3);
+    assert_eq!(events.len(), 2);
     assert!(matches!(
         &events[0],
         ApplicationEvent::CurrentSourceReplaced {
@@ -2798,49 +2529,34 @@ fn verified_dataset_open_atomically_replaces_and_verifies_the_source() {
     ));
     assert!(matches!(
         &events[1],
-        ApplicationEvent::SourceVerified {
-            source_generation,
-            scientific_content_id: event_identity,
-        } if *source_generation == SourceSessionGeneration::new(2)
-            && *event_identity == scientific_content_id
-    ));
-    assert!(matches!(
-        &events[2],
         ApplicationEvent::OperationCompleted {
             token: completed,
-            outcome: OperationOutcome::VerifiedDatasetOpened,
+            outcome: OperationOutcome::DatasetOpened,
         } if completed == &token
     ));
-
-    assert_eq!(
-        application
-            .dispatch(ApplicationCommand::RequestSourceVerification)
-            .unwrap(),
-        CommandEffect::NoChange
-    );
-    assert!(application.drain_events(MAX_PENDING_EVENTS).is_empty());
 }
 
 #[test]
-fn verified_dataset_open_rejects_identity_drift_atomically_and_can_retry() {
+fn admitted_dataset_open_rejects_content_address_drift_atomically_and_can_retry() {
     let mut application = application();
     application
         .dispatch(ApplicationCommand::RequestDatasetOpen)
         .unwrap();
     let token = dataset_open_token(&mut application);
     let dataset = dataset_reference_at('7', "imported.m4d");
-    let catalog = verified_catalog(&catalog_for_source(4, 2), &dataset);
+    let catalog = content_addressed_catalog(&catalog_for_source(4, 2), &dataset);
     let before = application.fork_for_dispatch();
 
     assert_eq!(
         application
             .dispatch(ApplicationCommand::CompleteOperation {
                 token: token.clone(),
-                completion: OperationCompletion::VerifiedDatasetOpened {
+                completion: OperationCompletion::DatasetOpened {
                     source_generation: SourceSessionGeneration::new(2),
                     catalog: Arc::clone(&catalog),
                     workspace: Box::new(unbound_workspace(project_id(9))),
                     dataset: dataset_reference_at('8', "imported.m4d"),
+                    content_address_origin: ContentAddressOrigin::DeclaredByPackage,
                 },
             })
             .unwrap_err()
@@ -2852,40 +2568,39 @@ fn verified_dataset_open_rejects_identity_drift_atomically_and_can_retry() {
     application
         .dispatch(ApplicationCommand::CompleteOperation {
             token,
-            completion: OperationCompletion::VerifiedDatasetOpened {
+            completion: OperationCompletion::DatasetOpened {
                 source_generation: SourceSessionGeneration::new(2),
                 catalog,
                 workspace: Box::new(unbound_workspace(project_id(9))),
-                dataset,
+                dataset: dataset.clone(),
+                content_address_origin: ContentAddressOrigin::DeclaredByPackage,
             },
         })
         .unwrap();
-    assert!(matches!(
-        application.snapshot().source(),
-        SourceVerificationSnapshot::Verified(_)
-    ));
+    assert_eq!(application.snapshot().source().dataset(), &dataset);
 }
 
 #[test]
-fn verified_dataset_open_completion_is_valid_only_for_dataset_open() {
+fn dataset_open_completion_is_valid_only_for_dataset_open() {
     let mut application = application();
     application
         .dispatch(ApplicationCommand::BeginOperation(OperationKind::Import))
         .unwrap();
     let token = started_token(&mut application, OperationKind::Import);
     let dataset = dataset_reference_at('7', "imported.m4d");
-    let catalog = verified_catalog(&catalog_for_source(4, 2), &dataset);
+    let catalog = content_addressed_catalog(&catalog_for_source(4, 2), &dataset);
     let before = application.fork_for_dispatch();
 
     assert_eq!(
         application
             .dispatch(ApplicationCommand::CompleteOperation {
                 token,
-                completion: OperationCompletion::VerifiedDatasetOpened {
+                completion: OperationCompletion::DatasetOpened {
                     source_generation: SourceSessionGeneration::new(2),
                     catalog,
                     workspace: Box::new(unbound_workspace(project_id(9))),
                     dataset,
+                    content_address_origin: ContentAddressOrigin::DeclaredByPackage,
                 },
             })
             .unwrap_err()
@@ -2993,7 +2708,7 @@ fn project_execution_failure_is_distinct_from_reducer_rejection() {
 }
 
 #[test]
-fn dataset_open_completion_rejects_verified_or_view_incompatible_catalogs_atomically() {
+fn dataset_open_completion_rejects_content_address_or_view_incompatible_catalogs_atomically() {
     let mut incompatible = application();
     incompatible
         .dispatch(ApplicationCommand::RequestDatasetOpen)
@@ -3002,7 +2717,7 @@ fn dataset_open_completion_rejects_verified_or_view_incompatible_catalogs_atomic
     let before = incompatible.fork_for_dispatch();
     let incomplete = DatasetCatalog::new(
         "incomplete",
-        ScientificIdentityStatus::Unverified(DatasetSourceId::new(2)),
+        ContentAddressStatus::SessionLocal(DatasetSourceId::new(2)),
         vec![dataset_layer(0, 4)],
     )
     .unwrap();
@@ -3014,6 +2729,8 @@ fn dataset_open_completion_rejects_verified_or_view_incompatible_catalogs_atomic
                     source_generation: SourceSessionGeneration::new(2),
                     catalog: Arc::new(incomplete),
                     workspace: Box::new(unbound_workspace(project_id(7))),
+                    dataset: dataset_reference('7'),
+                    content_address_origin: ContentAddressOrigin::DeclaredByPackage,
                 },
             })
             .unwrap_err()
@@ -3022,34 +2739,36 @@ fn dataset_open_completion_rejects_verified_or_view_incompatible_catalogs_atomic
     );
     assert_eq!(incompatible, before);
 
-    let mut preverified = application();
-    preverified
+    let mut content_addressed = application();
+    content_addressed
         .dispatch(ApplicationCommand::RequestDatasetOpen)
         .unwrap();
-    let token = dataset_open_token(&mut preverified);
+    let token = dataset_open_token(&mut content_addressed);
     let reference = dataset_reference('7');
     let catalog = DatasetCatalog::new(
-        "preverified",
-        ScientificIdentityStatus::Verified(*reference.scientific_content_id()),
+        "content-addressed",
+        ContentAddressStatus::ContentAddress(*reference.scientific_content_id()),
         vec![dataset_layer(0, 4), dataset_layer(1, 4)],
     )
     .unwrap();
-    let before = preverified.fork_for_dispatch();
+    let before = content_addressed.fork_for_dispatch();
     assert_eq!(
-        preverified
+        content_addressed
             .dispatch(ApplicationCommand::CompleteOperation {
                 token,
                 completion: OperationCompletion::DatasetOpened {
                     source_generation: SourceSessionGeneration::new(2),
                     catalog: Arc::new(catalog),
                     workspace: Box::new(unbound_workspace(project_id(8))),
+                    dataset: dataset_reference('8'),
+                    content_address_origin: ContentAddressOrigin::DeclaredByPackage,
                 },
             })
             .unwrap_err()
             .code(),
         ApplicationFaultCode::DatasetIdentityMismatch
     );
-    assert_eq!(preverified, before);
+    assert_eq!(content_addressed, before);
 }
 
 #[test]
@@ -3084,6 +2803,8 @@ fn application() -> ApplicationState {
     ApplicationState::new_unbound(
         SourceSessionGeneration::new(1),
         catalog(3),
+        dataset_reference('1'),
+        ContentAddressOrigin::DeclaredByPackage,
         unbound_workspace(project_id(4)),
         ResourcePolicy::new(4 * GIB, GIB).unwrap(),
     )
@@ -3092,16 +2813,31 @@ fn application() -> ApplicationState {
 
 fn bound_application() -> ApplicationState {
     let mut application = application();
-    verify(&mut application, dataset_reference('1'));
     application
-        .dispatch(ApplicationCommand::AttachVerifiedDataset)
+        .dispatch(ApplicationCommand::AttachDataset)
+        .unwrap();
+    application
+}
+
+fn bound_application_with_catalog(catalog: DatasetCatalog) -> ApplicationState {
+    let mut application = ApplicationState::new_unbound(
+        SourceSessionGeneration::new(1),
+        catalog,
+        dataset_reference('1'),
+        ContentAddressOrigin::DeclaredByPackage,
+        unbound_workspace(project_id(4)),
+        ResourcePolicy::new(4 * GIB, GIB).unwrap(),
+    )
+    .unwrap();
+    application
+        .dispatch(ApplicationCommand::AttachDataset)
         .unwrap();
     application
 }
 
 fn application_for_project_open(identity_digit: char) -> ApplicationState {
     let mut application = application();
-    verify(&mut application, dataset_reference(identity_digit));
+    assert_admitted_dataset(&application, dataset_reference(identity_digit));
     application.drain_events(MAX_PENDING_EVENTS);
     application
         .dispatch(ApplicationCommand::RequestProjectOpen)
@@ -3109,50 +2845,45 @@ fn application_for_project_open(identity_digit: char) -> ApplicationState {
     application
 }
 
-fn verify(application: &mut ApplicationState, dataset: DatasetReference) {
-    let token = request_source_verification(application);
-    application
-        .dispatch(ApplicationCommand::UpdateSourceVerificationProgress {
-            token: token.clone(),
-            completed_work: 1,
-            total_work: 1,
-        })
-        .unwrap();
-    let catalog = verified_catalog(application.snapshot().catalog(), &dataset);
-    let source_generation = application.snapshot().source_generation();
-    application
-        .dispatch(ApplicationCommand::CompleteOperation {
-            token,
-            completion: OperationCompletion::SourceVerified {
-                source_generation,
-                catalog,
-                dataset,
-            },
-        })
-        .unwrap();
+fn assert_admitted_dataset(application: &ApplicationState, dataset: DatasetReference) {
+    assert_eq!(application.snapshot().source().dataset(), &dataset);
 }
 
-fn request_source_verification(application: &mut ApplicationState) -> OperationToken {
+fn request_package_integrity_audit(application: &mut ApplicationState) -> OperationToken {
     application
-        .dispatch(ApplicationCommand::RequestSourceVerification)
+        .dispatch(ApplicationCommand::RequestPackageIntegrityAudit)
         .unwrap();
     application
         .drain_events(MAX_PENDING_EVENTS)
         .into_iter()
         .find_map(|event| match event {
-            ApplicationEvent::SourceVerificationRequested { token } => Some(token),
+            ApplicationEvent::PackageIntegrityAuditRequested { token } => Some(token),
             _ => None,
         })
-        .expect("source-verification request event")
+        .expect("package-integrity-audit request event")
 }
 
-fn verified_catalog(catalog: &DatasetCatalog, dataset: &DatasetReference) -> Arc<DatasetCatalog> {
+fn content_addressed_catalog(
+    catalog: &DatasetCatalog,
+    dataset: &DatasetReference,
+) -> Arc<DatasetCatalog> {
     Arc::new(
         catalog_with_identity(
             catalog,
-            ScientificIdentityStatus::Verified(*dataset.scientific_content_id()),
+            ContentAddressStatus::ContentAddress(*dataset.scientific_content_id()),
         )
         .unwrap(),
+    )
+}
+
+fn catalog_with_identity(
+    catalog: &DatasetCatalog,
+    identity: ContentAddressStatus,
+) -> Result<DatasetCatalog, mirante4d_dataset::DatasetCatalogError> {
+    DatasetCatalog::new(
+        catalog.label(),
+        identity,
+        catalog.layers().cloned().collect(),
     )
 }
 
@@ -3277,7 +3008,7 @@ fn catalog_named_with_timepoints_and_source(
 ) -> DatasetCatalog {
     DatasetCatalog::new(
         label,
-        ScientificIdentityStatus::Unverified(DatasetSourceId::new(source_id)),
+        ContentAddressStatus::SessionLocal(DatasetSourceId::new(source_id)),
         [0, 1]
             .into_iter()
             .map(|ordinal| dataset_layer(ordinal, timepoints))

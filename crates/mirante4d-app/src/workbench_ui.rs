@@ -3,6 +3,11 @@ use mirante4d_render_api::{CameraFrame, RenderExtent};
 
 use crate::viewer_layout::{PanelId, cross_section_schedule_status_label};
 
+fn uniform_some_scale(mut scales: impl Iterator<Item = Option<u32>>) -> Option<u32> {
+    let first = scales.next()??;
+    scales.all(|scale| scale == Some(first)).then_some(first)
+}
+
 #[derive(Clone)]
 struct ViewerUiSnapshot {
     presentation_viewport: PresentationViewport,
@@ -26,7 +31,6 @@ impl MiranteWorkbenchApp {
         snapshot: &ApplicationSnapshot,
     ) -> ui_kit::Linked2dFidelityStatus {
         let view = application_view(snapshot);
-        let active_layer = view.active_layer();
         let demand_currentness = self.visible_demand_plan_currentness();
         let demand_renderability = self.visible_demand_renderability();
         let planning_or_data_work = self.pending_visible_demand_plan.is_some()
@@ -47,19 +51,46 @@ impl MiranteWorkbenchApp {
                     )
                     .ok()
                 })
-                .and_then(|scales| scales.get(&active_layer).copied())
+                .as_ref()
+                .and_then(crate::dataset_demand_plan::uniform_layer_scale)
                 .map(ScaleLevel::get);
             let schedule = surface.cross_section_schedule();
             let selected_scale_level = schedule.and_then(|schedule| schedule.target_scale_level);
-            let displayed_scale_level = surface
-                .layer_presentations()
-                .iter()
-                .find(|layer| layer.layer_ordinal == active_layer.ordinal())
-                .and_then(|layer| layer.displayed_scale_level);
-            let layer_presentation = surface
-                .layer_presentations()
-                .iter()
-                .find(|layer| layer.layer_ordinal == active_layer.ordinal());
+            let visible_presentations = || {
+                view.layers()
+                    .iter()
+                    .filter(|layer| layer.visible())
+                    .map(|layer| {
+                        surface
+                            .layer_presentations()
+                            .iter()
+                            .find(|status| status.layer_ordinal == layer.layer_key().ordinal())
+                    })
+            };
+            let displayed_scale_level = uniform_some_scale(
+                visible_presentations()
+                    .map(|status| status.and_then(|status| status.displayed_scale_level)),
+            );
+            let finest_fallback_scale_level = uniform_some_scale(
+                visible_presentations()
+                    .map(|status| status.and_then(|status| status.finest_fallback_scale_level)),
+            );
+            let fallback_scale_level = uniform_some_scale(
+                visible_presentations()
+                    .map(|status| status.and_then(|status| status.fallback_scale_level)),
+            );
+            let target_available_requirements = visible_presentations()
+                .flatten()
+                .fold(0_u64, |total, layer| {
+                    total.saturating_add(layer.target_available_requirements)
+                });
+            let target_total_requirements = visible_presentations()
+                .flatten()
+                .fold(0_u64, |total, layer| {
+                    total.saturating_add(layer.target_total_requirements)
+                });
+            let mixed = visible_presentations().flatten().any(|layer| layer.mixed);
+            let missing_visible_presentation = visible_presentations().any(|layer| layer.is_none());
             let exact = demand_currentness.cross_section(panel);
             let provisional = schedule.is_some_and(|schedule| {
                 schedule.status
@@ -67,25 +98,20 @@ impl MiranteWorkbenchApp {
             }) || (demand_renderability.cross_section(panel) && !exact);
             let refining = !exact
                 && (planning_or_data_work
-                    || layer_presentation.is_some_and(|layer| layer.mixed)
-                    || layer_presentation.is_some_and(|layer| {
-                        layer.target_available_requirements < layer.target_total_requirements
-                    })
+                    || missing_visible_presentation
+                    || mixed
+                    || target_available_requirements < target_total_requirements
                     || selected_scale_level != displayed_scale_level
                     || selected_scale_level != ideal_scale_level);
             ui_kit::LinkedPanelFidelityStatus {
                 ideal_scale_level,
                 selected_scale_level,
                 displayed_scale_level,
-                finest_fallback_scale_level: layer_presentation
-                    .and_then(|layer| layer.finest_fallback_scale_level),
-                fallback_scale_level: layer_presentation
-                    .and_then(|layer| layer.fallback_scale_level),
-                target_available_requirements: layer_presentation
-                    .map_or(0, |layer| layer.target_available_requirements),
-                target_total_requirements: layer_presentation
-                    .map_or(0, |layer| layer.target_total_requirements),
-                mixed: layer_presentation.is_some_and(|layer| layer.mixed),
+                finest_fallback_scale_level,
+                fallback_scale_level,
+                target_available_requirements,
+                target_total_requirements,
+                mixed,
                 exact,
                 provisional,
                 refining,
@@ -319,8 +345,8 @@ impl eframe::App for MiranteWorkbenchApp {
         let settings_ui_view = self.settings_ui_view();
         let dataset_open_pending = self.pending_dataset_open.is_some();
         let project_status_message = self.project_status_message.clone();
-        let source_verification_available = self
-            .source_verification_service
+        let package_integrity_audit_available = self
+            .package_integrity_audit_service
             .as_ref()
             .is_some_and(|service| service.active_token().is_none());
         let runtime_diagnostics_view =
@@ -331,16 +357,21 @@ impl eframe::App for MiranteWorkbenchApp {
         let mut application_commands = Vec::new();
         workbench_playback_runtime::enqueue_playback_command_if_due(
             &application_snapshot,
+            &mut self.playback_session,
             &self.dataset,
+            &self.render_coordination,
+            &self.native_presentation,
             &mut application_commands,
             ui.ctx(),
         );
 
         let active_layer_histogram_for_ui = self.active_histogram_summary(&application_snapshot);
-        let project_actions_available = matches!(
-            application_snapshot.source(),
-            SourceVerificationSnapshot::Verified(_)
-        );
+        if let Some(command) =
+            self.initial_auto_dense_command(&application_snapshot, &active_layer_histogram_for_ui)
+        {
+            application_commands.push(command);
+        }
+        let project_actions_available = true;
         let project_is_bound = application_snapshot.is_bound();
         let project_store_status = self.project_store.as_ref().map(|service| service.status());
         let project_store_idle = project_store_status.as_ref().is_some_and(|status| {
@@ -418,7 +449,7 @@ impl eframe::App for MiranteWorkbenchApp {
                 },
                 left: ui_kit::LeftWorkbenchView {
                     application: &application_snapshot,
-                    source_verification_available,
+                    package_integrity_audit_available,
                     composite_fidelity: &viewer_ui_snapshot.composite_fidelity,
                     dataset_path: &viewer_ui_snapshot.dataset_path,
                 },
@@ -475,8 +506,6 @@ impl eframe::App for MiranteWorkbenchApp {
 
         self.drain_brick_results(ui.ctx());
         self.pump_viewer_pick(ui.ctx());
-        self.update_source_verification_interactive_busy();
-
         let snapshot = self.application.snapshot();
         let project_store_pending = self
             .project_store
@@ -535,12 +564,10 @@ impl eframe::App for MiranteWorkbenchApp {
             ui.ctx()
                 .request_repaint_after(FOREGROUND_VISIBLE_WORK_REPAINT_INTERVAL);
         } else if background_work_active
-            || workbench_playback_runtime::source_verification_polling_required(
-                self.pending_automatic_source_verification.is_some(),
-                self.source_verification_service
-                    .as_ref()
-                    .is_some_and(|service| service.active_token().is_some()),
-            )
+            || self
+                .package_integrity_audit_service
+                .as_ref()
+                .is_some_and(|service| service.active_token().is_some())
             || project_store_pending
         {
             request_background_work_repaint_after(ui.ctx());
@@ -561,10 +588,7 @@ impl eframe::App for MiranteWorkbenchApp {
         let final_snapshot = self.application.snapshot();
         let four_panel =
             application_view(&final_snapshot).layout() == CanonicalViewerLayout::FourPanel;
-        let source_verified = matches!(
-            final_snapshot.source(),
-            SourceVerificationSnapshot::Verified(_)
-        );
+        let source_admitted = true;
         let complete =
             self.render_coordination.frame_fidelity.completeness == FrameCompleteness::Complete;
         let current = self.render_coordination.frame_fidelity.display_freshness
@@ -581,13 +605,13 @@ impl eframe::App for MiranteWorkbenchApp {
             .displayed_scale_level;
         let selected_scale = self.render_coordination.frame_fidelity.target_scale_level;
         let ideal_scale = self.render_coordination.frame_fidelity.ideal_scale_level;
-        // Source verification and hidden refinement are deliberately not
+        // Optional package auditing and hidden refinement are deliberately not
         // readiness prerequisites. The owner-visible failure occurs while the
         // normal app is usable, and those background services must not turn
         // this finite interaction check into another idle launch protocol.
         let ready = four_panel && complete && current && displayed_scale == Some(3);
         let state_flags = u64::from(four_panel)
-            | (u64::from(source_verified) << 1)
+            | (u64::from(source_admitted) << 1)
             | (u64::from(complete) << 2)
             | (u64::from(current) << 3)
             | (u64::from(all_presentations) << 4)
@@ -615,7 +639,6 @@ impl eframe::App for MiranteWorkbenchApp {
             let demand_currentness = self.visible_demand_plan_currentness();
             let demand_renderability = self.visible_demand_renderability();
             let view = application_view(&final_snapshot);
-            let active_layer = view.active_layer();
             let linked = [PanelId::Xy, PanelId::Xz, PanelId::Yz].map(|panel| {
                 let surface = self.render_coordination.surface(panel.presentation_slot());
                 let ideal = surface
@@ -631,7 +654,8 @@ impl eframe::App for MiranteWorkbenchApp {
                         )
                         .ok()
                     })
-                    .and_then(|scales| scales.get(&active_layer).copied())
+                    .as_ref()
+                    .and_then(crate::dataset_demand_plan::uniform_layer_scale)
                     .map(ScaleLevel::get);
                 let scope = match panel {
                     PanelId::Xy => crate::dataset_requests::SCOPE_CROSS_SECTION_XY,
@@ -642,14 +666,18 @@ impl eframe::App for MiranteWorkbenchApp {
                 let installed = self
                     .dataset
                     .scope_layer_scales(scope)
-                    .and_then(|scales| scales.get(&active_layer))
-                    .copied()
+                    .and_then(crate::dataset_demand_plan::uniform_layer_scale)
                     .map(ScaleLevel::get);
-                let displayed = surface
-                    .layer_presentations()
-                    .iter()
-                    .find(|layer| layer.layer_ordinal == active_layer.ordinal())
-                    .and_then(|layer| layer.displayed_scale_level);
+                let displayed =
+                    uniform_some_scale(view.layers().iter().filter(|layer| layer.visible()).map(
+                        |layer| {
+                            surface
+                                .layer_presentations()
+                                .iter()
+                                .find(|status| status.layer_ordinal == layer.layer_key().ordinal())
+                                .and_then(|status| status.displayed_scale_level)
+                        },
+                    ));
                 let exact = demand_currentness.cross_section(panel);
                 let provisional = demand_renderability.cross_section(panel) && !exact;
                 (
@@ -806,10 +834,10 @@ impl eframe::App for MiranteWorkbenchApp {
         {
             tracing::warn!(%error, "dataset open service shutdown failed");
         }
-        if let Some(source_verification_service) = self.source_verification_service.take()
-            && let Err(error) = source_verification_service.shutdown()
+        if let Some(package_integrity_audit_service) = self.package_integrity_audit_service.take()
+            && let Err(error) = package_integrity_audit_service.shutdown()
         {
-            tracing::warn!(%error, "source-verification service shutdown failed");
+            tracing::warn!(%error, "package integrity audit service shutdown failed");
         }
         if let Err(error) = self.settings_connection.shutdown() {
             tracing::warn!(%error, "settings actor shutdown failed");

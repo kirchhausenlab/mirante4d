@@ -1,7 +1,7 @@
 use mirante4d_application::ApplicationSnapshot;
 #[cfg(test)]
 use mirante4d_domain::RenderMode;
-use mirante4d_domain::{LogicalLayerKey, RenderState};
+use mirante4d_domain::{LogicalLayerKey, RenderState, SamplingPolicy};
 
 use crate::application_view;
 
@@ -49,6 +49,15 @@ impl DisplayGraph {
         };
         modes.any(|mode| mode != first)
     }
+
+    pub(crate) fn uniform_sampling_policy(&self) -> Option<SamplingPolicy> {
+        let mut sampling = self
+            .channels
+            .iter()
+            .map(|channel| channel.render_state.sampling_policy());
+        let first = sampling.next()?;
+        sampling.all(|policy| policy == first).then_some(first)
+    }
 }
 
 #[cfg(test)]
@@ -89,5 +98,21 @@ mod tests {
             vec![LogicalLayerKey::new(1)]
         );
         assert!(graph.is_mixed_mode());
+        assert_eq!(
+            graph.uniform_sampling_policy(),
+            Some(SamplingPolicy::VoxelExact)
+        );
+
+        let mut mixed_sampling = graph;
+        mixed_sampling.channels[1].render_state = RenderState::dvr(
+            SamplingPolicy::SmoothLinear,
+            DvrOpacityTransfer::new(
+                DisplayWindow::new(0.0, 1.0).unwrap(),
+                TransferCurve::linear(),
+            ),
+            18.0,
+        )
+        .unwrap();
+        assert_eq!(mixed_sampling.uniform_sampling_policy(), None);
     }
 }

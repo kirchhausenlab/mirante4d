@@ -18,11 +18,10 @@ use crate::{
         PreparedChunk, checked_voxels, chunk_extent, chunk_shape, compact_byte_len,
         copy_padded_region, prepare_chunk, validity_kind,
     },
+    model::ResolvedNoDataPolicy,
+    no_data::{GuardedRegion, downsample_guarded, guarded_base_core},
     pyramid::downsample_region,
-    sentinel::{
-        GuardedU8Region, Region3, clipped_halo, downsample_guarded_u8, guarded_u8_core,
-        invalid_dilation_radius,
-    },
+    sentinel::{Region3, clipped_halo, invalid_dilation_radius},
     spool::{SpoolPayloadReader, SpoolWorkUnitDescriptor, SpoolWorkUnitKey},
 };
 
@@ -42,7 +41,7 @@ pub(crate) struct BaseChunkCpuTask {
     pub(crate) timepoint: u64,
     pub(crate) origin_zyx: [u64; 3],
     pub(crate) source_shape_zyx: [u64; 3],
-    pub(crate) u8_sentinel: Option<u8>,
+    pub(crate) no_data: Arc<ResolvedNoDataPolicy>,
 }
 
 #[derive(Clone, Copy)]
@@ -69,6 +68,8 @@ pub(crate) struct PyramidChunkCpuTask {
     pub(crate) target_level_shape_zyx: [u64; 3],
     pub(crate) target_origin_zyx: [u64; 3],
     pub(crate) target_shape_zyx: [u64; 3],
+    pub(crate) target_scale: u32,
+    pub(crate) no_data: Arc<ResolvedNoDataPolicy>,
 }
 
 pub(crate) const fn pyramid_pixel_source_chunks_max(is_2d: bool) -> usize {
@@ -83,11 +84,12 @@ pub(crate) struct ScientificTileCpuTask {
     pub(crate) canonical: Arc<CanonicalBaseReader>,
     pub(crate) descriptor: ScientificLayerDescriptor,
     pub(crate) linear_index: u64,
-    pub(crate) channel: u32,
+    pub(crate) source_channel: u32,
+    pub(crate) source_timepoint: u64,
     pub(crate) origin_tzyx: [u64; 4],
     pub(crate) extent_tzyx: [u64; 4],
     pub(crate) source_shape_zyx: [u64; 3],
-    pub(crate) u8_sentinel: Option<u8>,
+    pub(crate) no_data: Arc<ResolvedNoDataPolicy>,
 }
 
 pub(crate) struct EncodedPreparedWorkUnit {
@@ -113,37 +115,30 @@ pub(crate) fn prepare_base_chunk(
     cancellation: &ImportCancellation,
 ) -> Result<EncodedPreparedWorkUnit, ImportError> {
     check_cancelled(cancellation)?;
-    let (pixels_le, validity) = match task.u8_sentinel {
-        Some(sentinel) => {
-            if task.dtype != IntensityDType::Uint8 {
-                return Err(ImportError::InvalidRequest(
-                    "the guarded sentinel policy requires uint8 pixels",
-                ));
-            }
-            let guarded = read_guarded_u8_core(
-                &task.canonical,
-                task.channel,
-                task.timepoint,
-                task.source_shape_zyx,
-                Region3 {
-                    origin: task.origin_zyx,
-                    shape: task.logical_shape_zyx,
-                },
-                sentinel,
-            )?;
-            (guarded.pixels, Some(guarded.validity))
-        }
-        None => {
-            let mut pixels = vec![0; compact_byte_len(task.dtype, task.logical_shape_zyx)?];
-            task.canonical.read_region_into(
-                task.channel,
-                task.timepoint,
-                task.origin_zyx,
-                task.logical_shape_zyx,
-                &mut pixels,
-            )?;
-            (pixels, None)
-        }
+    let (pixels_le, validity) = if task.no_data.explicit_validity() {
+        let guarded = read_guarded_core(
+            &task.canonical,
+            task.channel,
+            task.timepoint,
+            task.dtype,
+            task.source_shape_zyx,
+            Region3 {
+                origin: task.origin_zyx,
+                shape: task.logical_shape_zyx,
+            },
+            &task.no_data,
+        )?;
+        (guarded.pixels_le, Some(guarded.validity))
+    } else {
+        let mut pixels = vec![0; compact_byte_len(task.dtype, task.logical_shape_zyx)?];
+        task.canonical.read_region_into(
+            task.channel,
+            task.timepoint,
+            task.origin_zyx,
+            task.logical_shape_zyx,
+            &mut pixels,
+        )?;
+        (pixels, None)
     };
     check_cancelled(cancellation)?;
     let prepared = prepare_chunk(
@@ -173,17 +168,13 @@ pub(crate) fn prepare_pyramid_chunk(
     check_cancelled(cancellation)?;
     let decoded = read_spooled_region(&task, cancellation)?;
     let (pixels_le, validity) = if task.explicit_validity {
-        if task.dtype != IntensityDType::Uint8 {
-            return Err(ImportError::InvalidRequest(
-                "the guarded pyramid policy requires uint8 pixels",
-            ));
-        }
         let parent_validity = decoded.validity.as_deref().ok_or_else(|| {
             ImportError::InvalidCheckpoint(
                 "a guarded pyramid task has no parent validity".to_owned(),
             )
         })?;
-        let guarded = downsample_guarded_u8(
+        let guarded = downsample_guarded(
+            task.dtype,
             &decoded.pixels_le,
             Region3 {
                 origin: task.source_origin_zyx,
@@ -200,8 +191,10 @@ pub(crate) fn prepare_pyramid_chunk(
                 origin: task.target_origin_zyx,
                 shape: task.target_shape_zyx,
             },
+            task.target_scale,
+            &task.no_data,
         )?;
-        (guarded.pixels, Some(guarded.validity))
+        (guarded.pixels_le, Some(guarded.validity))
     } else {
         let downsampled = downsample_region(task.dtype, task.source_shape_zyx, &decoded.pixels_le)?;
         if downsampled.shape_zyx != task.target_shape_zyx {
@@ -250,35 +243,28 @@ pub(crate) fn prepare_scientific_tile(
         ],
         shape: extent,
     };
-    let (pixels, per_voxel_validity) = match task.u8_sentinel {
-        Some(sentinel) => {
-            if task.descriptor.dtype() != IntensityDType::Uint8 {
-                return Err(ImportError::InvalidRequest(
-                    "the guarded scientific sentinel policy requires uint8 pixels",
-                ));
-            }
-            let guarded = read_guarded_u8_core(
-                &task.canonical,
-                task.channel,
-                task.origin_tzyx[0],
-                task.source_shape_zyx,
-                core,
-                sentinel,
-            )?;
-            (guarded.pixels, guarded.validity)
-        }
-        None => {
-            let mut pixels = vec![0; compact_byte_len(task.descriptor.dtype(), extent)?];
-            task.canonical.read_region_into(
-                task.channel,
-                task.origin_tzyx[0],
-                core.origin,
-                extent,
-                &mut pixels,
-            )?;
-            let validity = vec![1; checked_voxels(extent)?];
-            (pixels, validity)
-        }
+    let (pixels, per_voxel_validity) = if task.no_data.explicit_validity() {
+        let guarded = read_guarded_core(
+            &task.canonical,
+            task.source_channel,
+            task.source_timepoint,
+            task.descriptor.dtype(),
+            task.source_shape_zyx,
+            core,
+            &task.no_data,
+        )?;
+        (guarded.pixels_le, guarded.validity)
+    } else {
+        let mut pixels = vec![0; compact_byte_len(task.descriptor.dtype(), extent)?];
+        task.canonical.read_region_into(
+            task.source_channel,
+            task.source_timepoint,
+            core.origin,
+            extent,
+            &mut pixels,
+        )?;
+        let validity = vec![1; checked_voxels(extent)?];
+        (pixels, validity)
     };
     check_cancelled(cancellation)?;
     let validity = pack_scientific_validity(&per_voxel_validity)?;
@@ -291,20 +277,30 @@ pub(crate) fn prepare_scientific_tile(
     Ok(prepared)
 }
 
-fn read_guarded_u8_core(
+fn read_guarded_core(
     canonical: &CanonicalBaseReader,
     channel: u32,
     timepoint: u64,
+    dtype: IntensityDType,
     source_shape_zyx: [u64; 3],
     core: Region3,
-    sentinel: u8,
-) -> Result<GuardedU8Region, ImportError> {
-    let window = clipped_halo(
-        core,
-        source_shape_zyx,
-        invalid_dilation_radius(source_shape_zyx),
-    )?;
-    let mut window_pixels = vec![0; checked_voxels(window.shape)?];
+    policy: &ResolvedNoDataPolicy,
+) -> Result<GuardedRegion, ImportError> {
+    let window = if policy.value().is_some() {
+        clipped_halo(
+            core,
+            source_shape_zyx,
+            invalid_dilation_radius(source_shape_zyx),
+        )?
+    } else {
+        core
+    };
+    let mut window_pixels = vec![
+        0;
+        checked_voxels(window.shape)?
+            .checked_mul(usize::from(dtype.bytes_per_sample()))
+            .ok_or(ImportError::Overflow)?
+    ];
     canonical.read_region_into(
         channel,
         timepoint,
@@ -312,7 +308,14 @@ fn read_guarded_u8_core(
         window.shape,
         &mut window_pixels,
     )?;
-    guarded_u8_core(&window_pixels, window, source_shape_zyx, core, sentinel)
+    guarded_base_core(
+        dtype,
+        &window_pixels,
+        window,
+        source_shape_zyx,
+        core,
+        policy,
+    )
 }
 
 fn encode_prepared(

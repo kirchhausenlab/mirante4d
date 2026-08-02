@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 
+#[cfg(test)]
+use crate::profile_pyramid_shapes;
 use crate::{
     DirectoryInventory, DirectoryInventoryError, PackageCounts, PackageObjectDescriptor,
     PackageObjectKind, PackagePath, ProfileHeader, ProfileKind, ScaleCountRule, ScienceDescriptor,
@@ -80,17 +82,7 @@ pub enum PackageAdmissionError {
         pixel: u64,
         validity: u64,
     },
-    #[error("package does not fit any supported dataset profile")]
-    NoSupportedProfile,
 }
-
-const SUPPORTED_PROFILE_ORDER: [ProfileKind; 5] = [
-    ProfileKind::Ds0,
-    ProfileKind::Ds1,
-    ProfileKind::Ds2,
-    ProfileKind::Ds3,
-    ProfileKind::Ds4,
-];
 
 #[derive(Clone, Debug)]
 struct AddressedArray {
@@ -132,15 +124,7 @@ fn select_supported_dataset_profile(
     counts: PackageCounts,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<DatasetProfileAdmission, PackageAdmissionError> {
-    for requested in SUPPORTED_PROFILE_ORDER {
-        match admit_derived_dataset_profile(profile, counts, requested, is_cancelled) {
-            Ok(admission) => return Ok(admission),
-            Err(error) if is_profile_mismatch(&error) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    check_cancelled(is_cancelled)?;
-    Err(PackageAdmissionError::NoSupportedProfile)
+    admit_derived_dataset_profile(profile, counts, ProfileKind::Current, is_cancelled)
 }
 
 fn derive_dataset_profile_counts(
@@ -326,16 +310,6 @@ fn admit_derived_dataset_profile(
         profile: requested,
         counts,
     })
-}
-
-fn is_profile_mismatch(error: &PackageAdmissionError) -> bool {
-    matches!(
-        error,
-        PackageAdmissionError::Profile(
-            StorageProfileError::CeilingExceeded { .. }
-                | StorageProfileError::ExactCountMismatch { .. }
-        )
-    )
 }
 
 fn validate_scale_rules(
@@ -658,21 +632,18 @@ mod tests {
     }
 
     #[test]
-    fn supported_profile_selection_is_fixed_and_only_skips_envelope_mismatches() {
-        let above_ds0_bytes = profile_limits(ProfileKind::Ds0)
-            .logical_s0_bytes_max
-            .unwrap()
-            + 1;
+    fn supported_admission_uses_one_compositional_contract() {
+        let large_s0_bytes = u64::from(u32::MAX) + 1;
         let profile = profile_with_scales(1);
         let admission = select_supported_dataset_profile(
             &profile,
-            minimal_counts(1, above_ds0_bytes),
+            minimal_counts(1, large_s0_bytes),
             &mut || false,
         )
         .unwrap();
-        assert_eq!(admission.profile(), ProfileKind::Ds1);
+        assert_eq!(admission.profile(), ProfileKind::Current);
 
-        let mut inconsistent = minimal_counts(1, above_ds0_bytes);
+        let mut inconsistent = minimal_counts(1, large_s0_bytes);
         inconsistent.total_physical_objects += 1;
         assert!(matches!(
             select_supported_dataset_profile(&profile, inconsistent, &mut || false),
@@ -685,22 +656,26 @@ mod tests {
         assert_eq!(
             select_supported_dataset_profile(
                 &six_scale_profile,
-                minimal_counts(6, above_ds0_bytes),
+                minimal_counts(6, large_s0_bytes),
                 &mut || false,
             )
             .unwrap()
             .profile(),
-            ProfileKind::Ds1
+            ProfileKind::Current
         );
-        assert_eq!(
+        assert!(matches!(
             select_supported_dataset_profile(
                 &six_scale_profile,
-                minimal_counts(65, above_ds0_bytes),
+                minimal_counts(65, large_s0_bytes),
                 &mut || false,
             ),
-            Err(PackageAdmissionError::NoSupportedProfile),
-            "every current dataset profile must reject a scale count above the 64-level bound"
-        );
+            Err(PackageAdmissionError::Profile(
+                StorageProfileError::CeilingExceeded {
+                    metric: "scales per image",
+                    ..
+                }
+            ))
+        ));
     }
 
     #[test]
@@ -726,11 +701,7 @@ mod tests {
             ProfileHeader::new(scientific_id(), images, 0, OmeInteroperabilityBase::Io2).unwrap();
 
         assert_eq!(
-            validate_scale_rules(&profile, ProfileKind::Ds0, &mut || false),
-            Ok(())
-        );
-        assert_eq!(
-            validate_scale_rules(&profile, ProfileKind::Ds3, &mut || false),
+            validate_scale_rules(&profile, ProfileKind::Current, &mut || false),
             Ok(())
         );
     }
@@ -739,49 +710,49 @@ mod tests {
     fn admission_arithmetic_reproduces_frozen_3d_boundaries() {
         let cases = [
             (
-                (4, 1, 119, 383, 518, 4),
+                (4, 1, 119, 383, 518),
                 IntensityDType::Uint16,
-                (524, 40, 4),
+                (528, 44, 5),
                 188_871_088,
             ),
             (
-                (1, 1, 600, 1_148, 998, 5),
+                (1, 1, 600, 1_148, 998),
                 IntensityDType::Uint8,
-                (3_314, 76, 5),
+                (3_315, 77, 6),
                 687_422_400,
             ),
             (
-                (8, 4, 256, 256, 256, 1),
+                (8, 4, 256, 256, 256),
                 IntensityDType::Float32,
-                (2_048, 32, 1),
+                (2_336, 96, 3),
                 2_147_483_648,
             ),
             (
-                (1, 1, 2_563, 2_240, 4_183, 7),
+                (1, 1, 2_563, 2_240, 4_183),
                 IntensityDType::Uint8,
-                (109_196, 2_014, 12),
+                (109_197, 2_015, 13),
                 24_015_104_960,
             ),
             (
-                (365, 1, 74, 608, 600, 4),
+                (365, 1, 74, 608, 600),
                 IntensityDType::Float32,
-                (86_870, 5_475, 8),
+                (87_235, 5_840, 9),
                 39_412_992_000,
             ),
         ];
-        for ((t, c, z, y, x, scales), dtype, expected_counts, expected_s0_bytes) in cases {
+        for ((t, c, z, y, x), dtype, expected_counts, expected_s0_bytes) in cases {
             let kind = match dtype {
                 IntensityDType::Uint8 => ShardProfileKind::Pixel3dUint8,
                 IntensityDType::Uint16 => ShardProfileKind::Pixel3dUint16,
                 IntensityDType::Float32 => ShardProfileKind::Pixel3dFloat32,
             };
             let (inner, outer) = pixel_shapes(kind).unwrap();
-            let mut dimensions = [z, y, x];
             let mut logical_bricks = 0_u64;
             let mut pixel_shards = 0_u64;
             let mut packed_shards = 0_u64;
-            for _ in 0..scales {
-                let shape = [t, c, dimensions[0], dimensions[1], dimensions[2]];
+            let base = Shape4D::new(t, z, y, x).unwrap();
+            for level in profile_pyramid_shapes(base).unwrap() {
+                let shape = [level.t(), c, level.z(), level.y(), level.x()];
                 let level_bricks =
                     checked_product("test logical bricks", &grid_counts(&shape, &inner).unwrap())
                         .unwrap();
@@ -792,7 +763,6 @@ mod tests {
                 packed_shards +=
                     checked_ceil_div(level_bricks, crate::PACKED_INDEX_RECORDS_PER_OUTER_SHARD)
                         .unwrap();
-                dimensions = dimensions.map(|dimension| checked_ceil_div(dimension, 2).unwrap());
             }
             assert_eq!(
                 (logical_bricks, pixel_shards, packed_shards),

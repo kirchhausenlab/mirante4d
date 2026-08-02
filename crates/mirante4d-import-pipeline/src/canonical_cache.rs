@@ -33,7 +33,6 @@ const BATCH_PLANES_MAX: u64 = 16;
 const BATCH_BYTES_MAX: u64 = 64 * 1024 * 1024;
 pub(crate) const CANONICAL_PLANE_BYTES_MAX: u64 = BATCH_BYTES_MAX;
 const BATCH_AGE_MAX: Duration = Duration::from_secs(15);
-#[cfg(test)]
 const DIRECTORY_OPEN_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::CLOEXEC)
@@ -57,6 +56,7 @@ impl CanonicalCacheBinding {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct CanonicalCacheDiagnostics {
     pub(crate) durable_planes: u64,
     pub(crate) pending_planes: u64,
@@ -80,6 +80,7 @@ pub(crate) struct CanonicalBaseCache {
     total_planes: u64,
     durable_planes: u64,
     completed_planes: u64,
+    batch_digests: Vec<(u64, Sha256Digest)>,
     pending_started: Option<Instant>,
     committed_batches: u64,
     sync_calls: u64,
@@ -101,7 +102,6 @@ pub(crate) struct CanonicalBaseReader {
 }
 
 impl CanonicalBaseCache {
-    #[cfg(test)]
     pub(crate) fn open_or_create(
         directory: &Path,
         binding: CanonicalCacheBinding,
@@ -193,6 +193,7 @@ impl CanonicalBaseCache {
                 total_planes,
                 durable_planes: 0,
                 completed_planes: 0,
+                batch_digests: Vec::new(),
                 pending_started: None,
                 committed_batches: 0,
                 sync_calls: 0,
@@ -248,6 +249,7 @@ impl CanonicalBaseCache {
         let complete_record_bytes = state_len.saturating_sub(header_bytes) / record_bytes;
         let mut durable_planes = 0_u64;
         let mut valid_records = 0_u64;
+        let mut batch_digests = Vec::new();
         let mut scratch = vec![0; COPY_BUFFER_BYTES];
         for _ in 0..complete_record_bytes {
             let mut record = [0; STATE_RECORD_BYTES];
@@ -283,6 +285,7 @@ impl CanonicalBaseCache {
                         .to_owned(),
                 ));
             }
+            batch_digests.push((completed, digest));
             durable_planes = completed;
             valid_records = valid_records.checked_add(1).ok_or(ImportError::Overflow)?;
         }
@@ -316,6 +319,7 @@ impl CanonicalBaseCache {
             total_planes,
             durable_planes,
             completed_planes: durable_planes,
+            batch_digests,
             pending_started: None,
             committed_batches: valid_records,
             sync_calls: 0,
@@ -333,6 +337,33 @@ impl CanonicalBaseCache {
 
     pub(crate) fn is_complete(&self) -> bool {
         self.durable_planes == self.total_planes
+    }
+
+    /// Path-free identity of the exact canonical decoded source stream.
+    /// Batch digests are produced by the cache's existing durability pass, so
+    /// this adds no source decode or raw-data traversal.
+    pub(crate) fn decoded_source_digest(&self) -> Result<Sha256Digest, ImportError> {
+        if !self.is_complete() {
+            return Err(ImportError::InvalidCheckpoint(
+                "canonical source identity requested before ingest completed".to_owned(),
+            ));
+        }
+        let mut hasher = Sha256Hasher::new();
+        hasher.update(b"mirante4d-canonical-decoded-source-v1\0");
+        for dimension in self.shape.dimensions() {
+            hasher.update(dimension.to_le_bytes());
+        }
+        hasher.update(self.channels.to_le_bytes());
+        hasher.update([match self.dtype {
+            IntensityDType::Uint8 => 1,
+            IntensityDType::Uint16 => 2,
+            IntensityDType::Float32 => 3,
+        }]);
+        for (completed, digest) in &self.batch_digests {
+            hasher.update(completed.to_le_bytes());
+            hasher.update(digest.as_bytes());
+        }
+        Ok(hasher.finalize())
     }
 
     pub(crate) fn plane_ordinal(
@@ -486,6 +517,7 @@ impl CanonicalBaseCache {
             .committed_batches
             .checked_add(1)
             .ok_or(ImportError::Overflow)?;
+        self.batch_digests.push((self.completed_planes, digest));
         Ok(())
     }
 
@@ -579,6 +611,7 @@ impl CanonicalBaseCache {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn diagnostics(&self) -> Result<CanonicalCacheDiagnostics, ImportError> {
         Ok(CanonicalCacheDiagnostics {
             durable_planes: self.durable_planes,

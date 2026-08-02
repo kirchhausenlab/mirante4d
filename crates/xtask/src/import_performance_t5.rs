@@ -107,13 +107,13 @@ const SOURCE_ENTRY_MAX: usize = 4_096;
 const T5_SAMPLE_GATE_NAMES: [&str; 25] = [
     "base_decode_amplification",
     "canonical_base_pixel_bytes",
-    "complete_source_revalidation",
+    "generation_only_source_revalidation",
     "counter_reconciliation",
     "durability_calls",
     "durable_checkpoint_prefix",
     "exact_correctness",
     "external_rss_delta",
-    "fixed_six_checkpoint_files",
+    "bounded_final_layout_checkpoint_files",
     "fresh_checkpoint_not_resumed",
     "frozen_centered_transforms",
     "independent_scientific_locality",
@@ -127,15 +127,16 @@ const T5_SAMPLE_GATE_NAMES: [&str; 25] = [
     "source_scientific_traversal",
     "staged_scientific_locality",
     "storage_binding_stable",
-    "temporary_byte_bound",
+    "incremental_headroom_reported",
     "timed_source_traffic",
     "working_memory",
 ];
 
-/// Owner-accepted after two independent full source-oracle derivations
-/// produced byte-identical schema-v2 configurations.
-pub(crate) const OWNER_ACCEPTED_T5_CONFIG_SHA256: Option<&str> =
-    Some("dd04964ed3062e88d8e3a9325ef9241369d9ac91983cea447158a7667058b4e8");
+/// The predecessor T5 configuration named an aggregate DS profile and its
+/// whole-dataset checkpoint contract. The compositional storage/import
+/// cutover deliberately invalidates that product qualification until the
+/// owner reviews and pins a new current-format configuration.
+pub(crate) const OWNER_ACCEPTED_T5_CONFIG_SHA256: Option<&str> = None;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QualificationKind {
@@ -717,7 +718,7 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
             "fresh_release_process_per_sample": true,
             "fresh_checkpoint_and_absent_destination_per_sample": true,
             "normal_product_import_route": true,
-            "primary_clock": "worker_spawn_origin_through_product_verified_open_ready",
+            "primary_clock": "worker_spawn_origin_through_product_admitted_open_ready",
             "rss_sample_interval_ms": RSS_SAMPLE_INTERVAL.as_millis(),
         },
         "build": {
@@ -1769,8 +1770,11 @@ fn validate_config(config: &T5Config) -> anyhow::Result<()> {
             bail!("private T5 configuration {field} must be absolute");
         }
     }
-    if config.expected_profile != "DS-3" {
-        bail!("private T5 qualification is frozen to expected_profile DS-3");
+    if config.expected_profile != ProfileKind::Current.name() {
+        bail!(
+            "private T5 qualification requires expected_profile {}",
+            ProfileKind::Current.name()
+        );
     }
     if config.working_memory_bytes != WORKING_MEMORY_BYTES {
         bail!("private T5 qualification requires the exact 256 MiB import budget");
@@ -2386,7 +2390,8 @@ fn run_sample(
     create_private_directory(&sample_root)?;
     let output_parent = sample_root.join("output");
     create_private_directory(&output_parent)?;
-    let destination = deterministic_tiff_destination(&TiffSource::auto(source), &output_parent);
+    let destination =
+        deterministic_tiff_destination(&TiffSource::single_3d(source), &output_parent);
     let checkpoint = checkpoint_directory(&destination)?;
     if destination.exists() || checkpoint.exists() {
         bail!("T5 sample destination or checkpoint was stale before launch");
@@ -2551,17 +2556,17 @@ fn run_sample(
     if primary.get("start_boundary").and_then(Value::as_str)
         != Some("accepted_start_import_command_immediately_before_worker_spawn")
         || primary.get("end_boundary").and_then(Value::as_str)
-            != Some("published_destination_verified_and_open_ready_for_normal_product_use")
+            != Some("published_destination_admitted_and_open_ready_for_normal_product_use")
     {
         bail!("T5 app primary-clock boundaries drifted");
     }
     validate_publication_currentness_execution(publication_to_open_ready)?;
     for field in [
-        "source_verification_started_runs",
-        "source_verification_progress_updates",
-        "source_verification_cancelled_runs",
-        "source_verification_failed_runs",
-        "source_verification_successes",
+        "package_integrity_audit_started_runs",
+        "package_integrity_audit_progress_updates",
+        "package_integrity_audit_cancelled_runs",
+        "package_integrity_audit_failed_runs",
+        "package_integrity_audit_completed_runs",
     ] {
         if required_u64(publication_to_open_ready, field)? != 0 {
             bail!("T5 imported capability unexpectedly performed {field}");
@@ -2574,7 +2579,7 @@ fn run_sample(
         || publication_to_open_ready
             .get("end_boundary")
             .and_then(Value::as_str)
-            != Some("published_destination_verified_and_open_ready_for_normal_product_use")
+            != Some("published_destination_admitted_and_open_ready_for_normal_product_use")
         || publication_to_open_ready
             .get("included_in_primary_clock")
             .and_then(Value::as_bool)
@@ -2582,7 +2587,7 @@ fn run_sample(
         || publication_to_open_ready
             .get("transfer_mode")
             .and_then(Value::as_str)
-            != Some("staged_verified_capability")
+            != Some("staged_self_consistent_capability")
         || published_epoch_ms < primary_started_epoch_ms
         || published_epoch_ms > open_ready_epoch_ms
         || post_open_ready_epoch_ms != open_ready_epoch_ms
@@ -2671,14 +2676,15 @@ fn run_sample(
     let source_revalidation_bytes_read =
         required_u64(statistics, "source_revalidation_bytes_read")?;
     let base_native_decoded_bytes = required_u64(statistics, "base_native_decoded_bytes")?;
+    let no_data_detection_native_decoded_bytes =
+        required_u64(statistics, "no_data_detection_native_decoded_bytes")?;
     let scientific_identity_native_decoded_bytes =
         required_u64(statistics, "scientific_identity_native_decoded_bytes")?;
     let sync_calls = required_u64(statistics, "sync_calls")?;
     let scientific_brick_reads = required_u64(statistics, "scientific_brick_reads")?;
     let peak_open_file_descriptors = required_u64(statistics, "peak_open_file_descriptors")?;
-    let peak_temporary_bytes = required_u64(statistics, "peak_temporary_bytes")?;
-    let preflight_temporary_bytes_bound =
-        required_u64(statistics, "preflight_temporary_bytes_bound")?;
+    let preflight_required_headroom_bytes =
+        required_u64(statistics, "preflight_required_headroom_bytes")?;
     let peak_checkpoint_regular_files = required_u64(statistics, "peak_checkpoint_regular_files")?;
     let peak_working_bytes = required_u64(statistics, "peak_working_bytes")?;
     let stages_truthful =
@@ -2704,7 +2710,8 @@ fn run_sample(
     );
     gates.insert(
         "source_scientific_traversal".to_owned(),
-        scientific_identity_native_decoded_bytes == 0,
+        scientific_identity_native_decoded_bytes == 0
+            && no_data_detection_native_decoded_bytes == 0,
     );
     gates.insert(
         "reviewed_source_workload_binding".to_owned(),
@@ -2716,8 +2723,8 @@ fn run_sample(
         ratio_at_most(source_bytes_read, source_inventory.source_bytes, 250, 100),
     );
     gates.insert(
-        "complete_source_revalidation".to_owned(),
-        source_revalidation_bytes_read == reviewed_source_bytes,
+        "generation_only_source_revalidation".to_owned(),
+        source_revalidation_bytes_read == 0,
     );
     gates.insert("durability_calls".to_owned(), sync_calls < 5_000);
     gates.insert(
@@ -2742,13 +2749,12 @@ fn run_sample(
         peak_open_file_descriptors <= 64,
     );
     gates.insert(
-        "temporary_byte_bound".to_owned(),
-        preflight_temporary_bytes_bound > 0
-            && peak_temporary_bytes <= preflight_temporary_bytes_bound,
+        "incremental_headroom_reported".to_owned(),
+        preflight_required_headroom_bytes > 0,
     );
     gates.insert(
-        "fixed_six_checkpoint_files".to_owned(),
-        peak_checkpoint_regular_files == 6,
+        "bounded_final_layout_checkpoint_files".to_owned(),
+        (1..=16).contains(&peak_checkpoint_regular_files),
     );
     gates.insert(
         "staged_scientific_locality".to_owned(),
@@ -2909,17 +2915,19 @@ fn automation_script(
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 10_000 },
             { "command": "set_mapped_client_pixels", "width": MAPPED_WIDTH, "height": MAPPED_HEIGHT },
             { "command": "set_render_target_size", "width": MAPPED_WIDTH, "height": MAPPED_HEIGHT },
-            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 60_000 },
             { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 60_000 },
-            { "command": "begin_tiff_import_setup", "source": source, "output_parent": output_parent },
+            { "command": "begin_tiff_import_setup", "source": source, "output_parent": output_parent, "source_kind": "folder_of_3d_tiffs" },
             { "command": "wait_for", "condition": "import_review_ready", "timeout_ms": inspection_timeout_ms },
             { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 60_000 },
             {
                 "command": "start_reviewed_import",
                 "spacing_zyx_um": config.spacing_zyx_um,
                 "time_step_seconds": config.time_step_seconds,
-                "no_data_sentinel": config.no_data_sentinel,
-                "working_memory_bytes": WORKING_MEMORY_BYTES
+                "no_data_value_rule": {
+                    "kind": "manual_uint8",
+                    "value": config.no_data_sentinel
+                },
+                "hide_constant_z_planes": false
             },
             { "command": "wait_for_imported_open_ready", "path": destination, "timeout_ms": primary_timeout_ms },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 120_000 },
@@ -3519,6 +3527,7 @@ fn validate_required_statistics(statistics: &Value) -> anyhow::Result<()> {
         "source_revalidation_bytes_read",
         "native_decoded_bytes",
         "base_native_decoded_bytes",
+        "no_data_detection_native_decoded_bytes",
         "scientific_identity_native_decoded_bytes",
         "tiff_open_count",
         "native_chunk_decode_count",
@@ -3547,7 +3556,7 @@ fn validate_required_statistics(statistics: &Value) -> anyhow::Result<()> {
         "sampled_peak_open_file_descriptors",
         "open_file_descriptor_structural_bound",
         "peak_open_file_descriptors",
-        "preflight_temporary_bytes_bound",
+        "preflight_required_headroom_bytes",
         "peak_temporary_bytes",
         "peak_checkpoint_regular_files",
         "peak_working_bytes",
@@ -3594,8 +3603,8 @@ fn required_stage_evidence_present(
         "planning-and-preflight".to_owned(),
         "source-revalidation-1".to_owned(),
         "checkpoint-open-or-resume".to_owned(),
+        "source-ingest".to_owned(),
         "base-production".to_owned(),
-        "source-scientific-identity".to_owned(),
         "source-revalidation-2".to_owned(),
         "shard-publication".to_owned(),
         "staged-structure-validation".to_owned(),
@@ -3630,8 +3639,8 @@ fn progress_truthfulness_present(
         "planning-and-preflight".to_owned(),
         "source-revalidation".to_owned(),
         "checkpoint-open-or-resume".to_owned(),
+        "source-ingest".to_owned(),
         "base-production".to_owned(),
-        "source-scientific-identity".to_owned(),
         "shard-publication".to_owned(),
         "staged-structure-validation".to_owned(),
         "staged-exact-validation".to_owned(),
@@ -3642,7 +3651,8 @@ fn progress_truthfulness_present(
     if has_pyramid {
         required_emitted.insert("pyramid-production".to_owned());
     }
-    let mut required_projected = BTreeSet::from(["base-production".to_owned()]);
+    let mut required_projected =
+        BTreeSet::from(["source-ingest".to_owned(), "base-production".to_owned()]);
     if has_pyramid {
         required_projected.insert("pyramid-production".to_owned());
     }
@@ -3673,11 +3683,11 @@ fn progress_truthfulness_present(
 
 fn import_counters_reconciled(report: &Value, statistics: &Value) -> anyhow::Result<bool> {
     let native_decoded = required_u64(statistics, "native_decoded_bytes")?;
+    let detection_decoded = required_u64(statistics, "no_data_detection_native_decoded_bytes")?;
+    let scientific_decoded = required_u64(statistics, "scientific_identity_native_decoded_bytes")?;
     let decoded_by_stage = required_u64(statistics, "base_native_decoded_bytes")?
-        .checked_add(required_u64(
-            statistics,
-            "scientific_identity_native_decoded_bytes",
-        )?)
+        .checked_add(detection_decoded)
+        .and_then(|value| value.checked_add(scientific_decoded))
         .context("T5 native decoded-byte counter overflowed")?;
     let object_reads = required_u64(statistics, "object_reads")?;
     let object_reads_by_stage = required_u64(statistics, "staged_structure_object_reads")?
@@ -4012,16 +4022,16 @@ fn independently_validate_package(
     let catalog = LocalPackageCatalog::open(destination)
         .context("T5 independent post-open package catalog rejected the destination")?;
     let exact = catalog
-        .validate_exact_package(ProfileKind::Ds3, || cancelled.load(Ordering::Acquire))
+        .validate_exact_package(ProfileKind::Current, || cancelled.load(Ordering::Acquire))
         .context("T5 independent exact package validation failed")?;
     let package_id = exact.package_id().to_string();
-    let verified = exact
+    let self_consistent = exact
         .validate_scientific_content(|| cancelled.load(Ordering::Acquire))
         .context("T5 independent scientific package validation failed")?;
-    let scientific_content_id = verified.scientific_content_id().to_string();
+    let scientific_content_id = self_consistent.scientific_content_id().to_string();
     let scientific_id_matches = scientific_content_id == expected.scientific_content_id;
 
-    let mut actual_roots = verified
+    let mut actual_roots = self_consistent
         .layer_roots()
         .iter()
         .map(|root| ExpectedLayerRoot {
@@ -4045,11 +4055,11 @@ fn independently_validate_package(
 
     let mut actual_scales = Vec::new();
     let mut canonical_base_pixel_bytes = 0_u64;
-    for image in verified.catalog().profile().images() {
+    for image in self_consistent.catalog().profile().images() {
         for level in image.levels() {
             require_not_cancelled(cancelled, "independent per-scale validation")?;
             let (fact, canonical_pixel_bytes) =
-                scale_fact(&verified, image.image_ordinal(), level, cancelled)?;
+                scale_fact(&self_consistent, image.image_ordinal(), level, cancelled)?;
             if level.scale_ordinal() == 0 {
                 canonical_base_pixel_bytes = canonical_base_pixel_bytes
                     .checked_add(canonical_pixel_bytes)
@@ -4077,15 +4087,15 @@ fn independently_validate_package(
             })
         })
         .collect();
-    let actual_transforms = package_transform_facts(&verified)?;
+    let actual_transforms = package_transform_facts(&self_consistent)?;
     let config_transform_facts_match =
         expected_transform_facts_match(&actual_transforms, &expected.transforms);
     let transform_facts = actual_transforms
         .iter()
         .map(|fact| serde_json::to_value(fact).expect("transform fact is JSON-safe"))
         .collect();
-    let scientific_brick_reads = verified.validation_report().brick_reads();
-    verified
+    let scientific_brick_reads = self_consistent.validation_report().brick_reads();
+    self_consistent
         .revalidate_complete(|| cancelled.load(Ordering::Acquire))
         .context("T5 package changed during independent per-scale readback")?;
     require_not_cancelled(cancelled, "independent package validation")?;
@@ -4106,16 +4116,16 @@ fn independently_validate_package(
 }
 
 fn package_transform_facts(
-    verified: &mirante4d_storage::VerifiedScientificPackageCapability,
+    self_consistent: &mirante4d_storage::SelfConsistentPackageCapability,
 ) -> anyhow::Result<Vec<ObservedTransformFact>> {
-    let images = verified.catalog().profile().images();
+    let images = self_consistent.catalog().profile().images();
     if images.len() != 1 || images[0].image_ordinal() != 0 {
         bail!("T5 source-oracle transform authority requires exactly physical image zero");
     }
     let image = &images[0];
     let metadata_path =
         mirante4d_storage::PackagePath::parse(&format!("{}/zarr.json", image.image_group_path()))?;
-    let ome = verified
+    let ome = self_consistent
         .catalog()
         .ome_image(&metadata_path)
         .context("T5 package lacks its OME image-group transform metadata")?;
@@ -4192,14 +4202,14 @@ fn expected_transform_facts_match(
 }
 
 fn scale_fact(
-    verified: &mirante4d_storage::VerifiedScientificPackageCapability,
+    self_consistent: &mirante4d_storage::SelfConsistentPackageCapability,
     image_ordinal: u32,
     level: &mirante4d_storage::ProfileLevel,
     cancelled: &AtomicBool,
 ) -> anyhow::Result<(ExpectedScaleFact, u64)> {
     let metadata_path =
         mirante4d_storage::PackagePath::parse(&format!("{}/zarr.json", level.pixel_path()))?;
-    let array = verified
+    let array = self_consistent
         .catalog()
         .zarr_array(&metadata_path)
         .context("T5 profile level lacks its opened pixel array")?;
@@ -4271,7 +4281,7 @@ fn scale_fact(
                             u32::try_from(y_chunk)?,
                             u32::try_from(x_chunk)?,
                         );
-                        let brick = verified
+                        let brick = self_consistent
                             .read_brick(coordinates, || cancelled.load(Ordering::Acquire))
                             .context("T5 independent per-scale brick read failed")?;
                         observed_bricks = observed_bricks
@@ -4776,7 +4786,7 @@ mod tests {
             "source": root.join("source"),
             "scratch_root": root.join("scratch"),
             "qualification_profile": root.join("profile.json"),
-            "expected_profile": "DS-3",
+            "expected_profile": ProfileKind::Current.name(),
             "spacing_zyx_um": [1.0, 1.0, 1.0],
             "time_step_seconds": null,
             "no_data_sentinel": 255,
@@ -4854,7 +4864,7 @@ mod tests {
     }
 
     #[test]
-    fn t5_automation_v8_binds_the_exact_canonical_hard_safety_echo() {
+    fn t5_automation_v10_binds_the_exact_canonical_hard_safety_echo() {
         let tempdir = tempfile::tempdir().unwrap();
         let config: T5Config = serde_json::from_value(valid_config_json(tempdir.path())).unwrap();
         let script = automation_script(
@@ -4866,8 +4876,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(script["schema"], PRODUCT_AUTOMATION_SCRIPT_SCHEMA);
-        assert_eq!(SCRIPT_SCHEMA_VERSION, 8);
-        assert_eq!(script["schema_version"], 8);
+        assert_eq!(SCRIPT_SCHEMA_VERSION, 10);
+        assert_eq!(script["schema_version"], SCRIPT_SCHEMA_VERSION);
         assert!(script.get("limits").is_none());
         let hard_safety_limits = script["hard_safety_limits"].as_object().unwrap();
         assert_eq!(
@@ -4949,13 +4959,13 @@ mod tests {
         )
         .unwrap();
         let plan = ProductAutomationProgressPlan::from_script(&script).unwrap();
-        assert_eq!(plan.command_count(), 21);
+        assert_eq!(plan.command_count(), 20);
         assert_eq!(
-            plan.command_budget(10),
+            plan.command_budget(9),
             Some(Duration::from_secs(config.primary_timeout_seconds))
         );
         assert_eq!(
-            plan.command_budget(7),
+            plan.command_budget(6),
             Some(Duration::from_secs(INSPECTION_TIMEOUT_SECONDS))
         );
 
@@ -4963,14 +4973,14 @@ mod tests {
             heartbeat_sequence: 7,
             command_count: plan.command_count(),
             state: SafeProgressState::Command {
-                index: 10,
+                index: 9,
                 command_kind: "wait_for_imported_open_ready",
                 elapsed_ms: 123,
             },
         });
         assert_eq!(
             line,
-            "automation_progress scope=t5 scenario=import_preprocessing heartbeat_sequence=7 command_count=21 state=command command_index=10 command_kind=wait_for_imported_open_ready elapsed_ms=123"
+            "automation_progress scope=t5 scenario=import_preprocessing heartbeat_sequence=7 command_count=20 state=command command_index=9 command_kind=wait_for_imported_open_ready elapsed_ms=123"
         );
         assert!(!line.contains("/private"));
 
@@ -5277,13 +5287,10 @@ mod tests {
             OWNER_ACCEPTED_IMPORT_QUALIFICATION_PROFILE_SHA256,
             Some("50d18c8d3f695a90ff879fc6cdea210b273cc52f97f63350931e42fdd2b38abe")
         );
+        assert_eq!(OWNER_ACCEPTED_T5_CONFIG_SHA256, None);
         assert_eq!(
-            OWNER_ACCEPTED_T5_CONFIG_SHA256,
-            Some("dd04964ed3062e88d8e3a9325ef9241369d9ac91983cea447158a7667058b4e8")
-        );
-        assert_eq!(
-            config_binding_status(OWNER_ACCEPTED_T5_CONFIG_SHA256.unwrap()),
-            "matched"
+            config_binding_status("unreviewed-current-format-configuration"),
+            "pending_owner_acceptance"
         );
     }
 
@@ -5621,7 +5628,7 @@ mod tests {
     #[test]
     fn destination_and_checkpoint_match_the_normal_app_policy() {
         let destination = deterministic_tiff_destination(
-            &TiffSource::auto("/private/My Cells.ome.tif"),
+            &TiffSource::single_3d("/private/My Cells.ome.tif"),
             Path::new("/scratch/sample"),
         );
         assert_eq!(destination, Path::new("/scratch/sample/my-cells-ome.m4d"));

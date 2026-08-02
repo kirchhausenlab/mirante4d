@@ -1,12 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{File, Metadata},
-    io::{self, Write},
+    fs::{self, File, Metadata, OpenOptions},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-use mirante4d_identity::{ExactBytesHasher, IdentityHashError, PackageId};
+use mirante4d_identity::{
+    ExactBytesHasher, IdentityHashError, PackageId, Sha256Digest, Sha256Hasher,
+};
 use rustix::time::{ClockId, clock_gettime};
 use thiserror::Error;
 
@@ -20,7 +22,7 @@ use crate::{
     PackageObjectKind, PackageOpenError, PackagePath, PackageStructureError,
     PackageValidationError, PortableRecord, ProfileHeader, ProfileKind, RangeReadError,
     ScienceDescriptor, ScientificPackageValidationError, ScientificPublicationTransferError,
-    ShardCodecError, ShardProfileKind, StorageProfileError, VerifiedScientificPackageCapability,
+    SelfConsistentPackageCapability, ShardCodecError, ShardProfileKind, StorageProfileError,
     ZarrArrayMetadata, ZarrGroupMetadata, ZarrMetadataError, encode_inner_payload,
     manifest_page_path, pack_manifest_pages, profile_limits,
 };
@@ -127,6 +129,493 @@ pub struct PackageWriteInput<I> {
     shards: I,
 }
 
+const RESUMABLE_CONTROL_DIRECTORY: &str = ".mirante4d-import-control";
+const RESUMABLE_STAGE_HEADER: &str = "stage-header";
+const RESUMABLE_STAGE_JOURNAL: &str = "stage-journal";
+const RESUMABLE_STAGE_SCHEMA: &[u8] = b"mirante4d-final-layout-stage-v1\0";
+const RESUMABLE_JOURNAL_RECORD_MAX: usize = 8 + 1 + 4 + 512 + 32;
+
+/// One destination-layout package stage whose completed shard prefix survives
+/// cancellation or process loss.
+///
+/// The stage is the sole durable encoded payload authority. Callers retain
+/// only bounded per-unit scratch and compact identity/index control state.
+/// Every committed input record follows a stage-wide durability barrier, so a
+/// journal prefix never names bytes that were only present in page cache.
+pub struct ResumableLocalPackageStage {
+    publication: LocalPublication,
+    control_directory: PathBuf,
+    journal: File,
+    durable_inputs: u64,
+    durable_payload_bytes: u64,
+    /// Cumulative durable payload after each input ordinal. Entry zero is the
+    /// empty prefix; missing/all-fill shard inputs repeat the prior value.
+    durable_payload_prefix: Vec<u64>,
+    pending: Vec<StageJournalRecord>,
+    descriptors: Vec<PackageObjectDescriptor>,
+    written_paths: BTreeSet<PackagePath>,
+    syncs: PackageSyncCounters,
+    codecs: PackageCodecCounters,
+}
+
+#[derive(Clone)]
+struct StageJournalRecord {
+    ordinal: u64,
+    descriptor: Option<PackageObjectDescriptor>,
+}
+
+impl ResumableLocalPackageStage {
+    /// Opens or creates the caller-named hidden stage. `stage_path` and the
+    /// destination must be distinct siblings; this is what makes final
+    /// publication a create-only atomic rename rather than a copy.
+    pub fn open_or_create(
+        destination: impl AsRef<Path>,
+        stage_path: impl AsRef<Path>,
+        binding: Sha256Digest,
+    ) -> Result<Self, PackageWriteError> {
+        let stage_path = stage_path.as_ref().to_path_buf();
+        recover_control_excursion(&stage_path)?;
+        if let Ok(metadata) = fs::symlink_metadata(&stage_path) {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return invalid_input("resumable stage path is not a real directory");
+            }
+            let control = stage_path.join(RESUMABLE_CONTROL_DIRECTORY);
+            if !control.exists()
+                && fs::read_dir(&stage_path)
+                    .map_err(|source| PackageWriteError::Io {
+                        operation: "inspect an unbound resumable stage",
+                        source,
+                    })?
+                    .next()
+                    .is_some()
+            {
+                return invalid_input("unbound resumable stage is not empty");
+            }
+        }
+        let mut publication = LocalPublication::open_or_create_persistent(destination, &stage_path)
+            .map_err(map_publication_error_without_commit)?;
+        let control_directory = stage_path.join(RESUMABLE_CONTROL_DIRECTORY);
+        open_or_create_control_directory(&control_directory)?;
+        let header_path = control_directory.join(RESUMABLE_STAGE_HEADER);
+        open_or_validate_stage_header(&header_path, binding)?;
+        let journal_path = control_directory.join(RESUMABLE_STAGE_JOURNAL);
+        let (journal, records) = open_stage_journal(&journal_path)?;
+        let durable_inputs =
+            u64::try_from(records.len()).map_err(|_| PackageWriteError::InvalidInput {
+                reason: "resumable stage journal record count exceeds u64",
+            })?;
+        let mut descriptors = Vec::new();
+        let mut written_paths = BTreeSet::new();
+        let mut durable_payload_bytes = 0_u64;
+        let mut durable_payload_prefix = Vec::with_capacity(records.len().saturating_add(1));
+        durable_payload_prefix.push(0);
+        for record in &records {
+            if let Some(descriptor) = &record.descriptor {
+                if !written_paths.insert(descriptor.path().clone()) {
+                    return invalid_input("resumable stage journal repeats an object path");
+                }
+                durable_payload_bytes = durable_payload_bytes
+                    .checked_add(descriptor.raw().byte_length())
+                    .ok_or(PackageWriteError::InvalidInput {
+                        reason: "resumable stage payload byte count overflowed",
+                    })?;
+                descriptors.push(descriptor.clone());
+            }
+            durable_payload_prefix.push(durable_payload_bytes);
+        }
+        remove_uncommitted_stage_entries(&stage_path, &written_paths)?;
+        validate_committed_descriptors(&stage_path, &descriptors)?;
+        publication
+            .refresh_created_directories()
+            .map_err(map_publication_error_without_commit)?;
+        Ok(Self {
+            publication,
+            control_directory,
+            journal,
+            durable_inputs,
+            durable_payload_bytes,
+            durable_payload_prefix,
+            pending: Vec::new(),
+            descriptors,
+            written_paths,
+            syncs: PackageSyncCounters::default(),
+            codecs: PackageCodecCounters::default(),
+        })
+    }
+
+    pub const fn durable_shard_inputs(&self) -> u64 {
+        self.durable_inputs
+    }
+
+    /// Exact regular-file payload bytes named by the durable shard journal.
+    /// Private control and not-yet-produced metadata are intentionally
+    /// excluded so import progress can report them separately.
+    pub const fn durable_payload_bytes(&self) -> u64 {
+        self.durable_payload_bytes
+    }
+
+    /// Exact payload bytes already made durable for a half-open shard-input
+    /// ordinal range. This lets a resumable producer reserve only the missing
+    /// suffix of its current bounded unit instead of charging its completed
+    /// prefix again.
+    pub fn durable_payload_bytes_in_input_range(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, PackageWriteError> {
+        if start > end || end > self.durable_inputs {
+            return invalid_input("durable payload range is outside the committed input prefix");
+        }
+        let start = usize::try_from(start).map_err(|_| PackageWriteError::InvalidInput {
+            reason: "durable payload range start is not addressable",
+        })?;
+        let end = usize::try_from(end).map_err(|_| PackageWriteError::InvalidInput {
+            reason: "durable payload range end is not addressable",
+        })?;
+        self.durable_payload_prefix[end]
+            .checked_sub(self.durable_payload_prefix[start])
+            .ok_or(PackageWriteError::InvalidInput {
+                reason: "durable payload prefix is not monotonic",
+            })
+    }
+
+    pub fn next_shard_input_ordinal(&self) -> Result<u64, PackageWriteError> {
+        self.durable_inputs
+            .checked_add(u64::try_from(self.pending.len()).map_err(|_| {
+                PackageWriteError::InvalidInput {
+                    reason: "pending stage input count exceeds u64",
+                }
+            })?)
+            .ok_or(PackageWriteError::InvalidInput {
+                reason: "stage input ordinal overflowed",
+            })
+    }
+
+    /// Writes one deterministic shard input to its final package-relative
+    /// location. The object becomes resumable only after `commit_pending`.
+    pub fn append_shard(
+        &mut self,
+        expected_ordinal: u64,
+        shard: PackageShardInput,
+        object_kind: PackageObjectKind,
+        codec_kind: ShardProfileKind,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<(), PackageWriteError> {
+        if expected_ordinal != self.next_shard_input_ordinal()? {
+            return invalid_input("resumable stage shard input arrived out of order");
+        }
+        if !matches!(
+            object_kind,
+            PackageObjectKind::PixelShard
+                | PackageObjectKind::ValidityShard
+                | PackageObjectKind::PackedIndexShard
+        ) {
+            return invalid_input("resumable stage accepts only package shard objects");
+        }
+        let expected_coordinates = if object_kind == PackageObjectKind::PackedIndexShard {
+            2
+        } else {
+            5
+        };
+        if shard.outer_coordinates.len() != expected_coordinates
+            || (object_kind == PackageObjectKind::PackedIndexShard
+                && shard.outer_coordinates[1] != 0)
+            || shard.chunks.len() != codec_kind.chunks_per_shard()
+        {
+            return invalid_input("resumable stage shard geometry is inconsistent");
+        }
+        check_cancelled(&mut is_cancelled)?;
+        let descriptor = if shard.chunks.iter().all(Option::is_none) {
+            if object_kind == PackageObjectKind::PackedIndexShard {
+                return invalid_input("a packed-index shard cannot contain only missing slots");
+            }
+            None
+        } else {
+            let path = shard_path(&shard.array_path, &shard.outer_coordinates)?;
+            if self.written_paths.contains(&path)
+                || self.pending.iter().any(|record| {
+                    record
+                        .descriptor
+                        .as_ref()
+                        .is_some_and(|descriptor| descriptor.path() == &path)
+                })
+            {
+                return invalid_input("two resumable shard inputs derive the same object path");
+            }
+            let (descriptor, _snapshot) = write_shard(
+                &mut self.publication,
+                path,
+                object_kind,
+                codec_kind,
+                shard.chunks,
+                &mut is_cancelled,
+                &mut self.codecs,
+            )?;
+            Some(descriptor)
+        };
+        self.pending.push(StageJournalRecord {
+            ordinal: expected_ordinal,
+            descriptor,
+        });
+        Ok(())
+    }
+
+    /// Makes the current bounded suffix durable and advances the compact
+    /// completion journal. A crash before this returns merely redoes that
+    /// suffix; it cannot expose a partial public package.
+    pub fn commit_pending(
+        &mut self,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<(), PackageWriteError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let report = self
+            .publication
+            .sync_stage_paths(
+                self.pending
+                    .iter()
+                    .filter_map(|record| record.descriptor.as_ref())
+                    .map(PackageObjectDescriptor::path),
+                &mut is_cancelled,
+            )
+            .map_err(map_publication_error_without_commit)?;
+        self.syncs.record_publication(report);
+        for record in &self.pending {
+            append_stage_record(&mut self.journal, record)?;
+        }
+        let started = Instant::now();
+        self.journal
+            .sync_data()
+            .map_err(|source| PackageWriteError::Io {
+                operation: "synchronize the resumable stage journal",
+                source,
+            })?;
+        self.syncs.record(started.elapsed());
+        for record in self.pending.drain(..) {
+            self.durable_inputs =
+                self.durable_inputs
+                    .checked_add(1)
+                    .ok_or(PackageWriteError::InvalidInput {
+                        reason: "durable stage input count overflowed",
+                    })?;
+            if let Some(descriptor) = record.descriptor {
+                self.durable_payload_bytes = self
+                    .durable_payload_bytes
+                    .checked_add(descriptor.raw().byte_length())
+                    .ok_or(PackageWriteError::InvalidInput {
+                        reason: "resumable stage payload byte count overflowed",
+                    })?;
+                self.written_paths.insert(descriptor.path().clone());
+                self.descriptors.push(descriptor);
+            }
+            self.durable_payload_prefix.push(self.durable_payload_bytes);
+        }
+        Ok(())
+    }
+
+    /// Completes metadata and manifest authority, validates the exact staged
+    /// package, and atomically publishes the already-produced final layout.
+    /// `input.shards` must be empty: payload production belongs exclusively to
+    /// `append_shard`, which is what prevents a second dataset-scale copy.
+    pub fn finalize_scientifically_validated<I>(
+        mut self,
+        input: PackageWriteInput<I>,
+        mut is_cancelled: impl FnMut() -> bool,
+        mut observer: impl FnMut(PackageWriteEvent),
+    ) -> Result<PublishedScientificPackageTransfer, PackageWriteError>
+    where
+        I: IntoIterator<Item = PackageShardInput>,
+    {
+        self.commit_pending(&mut is_cancelled)?;
+        check_cancelled(&mut is_cancelled)?;
+        let publication_clock =
+            PackageWriteStageClock::start(PackageWriteStage::ShardPublication, &mut observer);
+        let PackageWriteInput {
+            profile_kind,
+            profile,
+            science,
+            display_defaults,
+            portable_records,
+            ome_images,
+            arrays,
+            shards,
+        } = input;
+        if shards.into_iter().next().is_some() {
+            return invalid_input("resumable finalization received a second shard stream");
+        }
+        let PreparedMetadata { objects, arrays } = prepare_metadata(
+            &profile,
+            &science,
+            &display_defaults,
+            &portable_records,
+            &ome_images,
+            arrays,
+        )?;
+        drop((science, display_defaults, portable_records, ome_images));
+        validate_staged_shard_descriptors(&self.descriptors, &arrays)?;
+        let limits = profile_limits(profile_kind);
+        let mut snapshots = Vec::new();
+        for object in objects {
+            check_cancelled(&mut is_cancelled)?;
+            require_descriptor_capacity(self.descriptors.len(), limits.total_physical_objects)?;
+            require_new_path(&mut self.written_paths, &object.path)?;
+            let (descriptor, snapshot) = write_object_bytes(
+                &mut self.publication,
+                object.path,
+                object.kind,
+                &object.bytes,
+            )?;
+            self.descriptors.push(descriptor);
+            snapshots.push(snapshot);
+        }
+        drop(arrays);
+        check_cancelled(&mut is_cancelled)?;
+        let pages = pack_manifest_pages(self.descriptors)?;
+        let root = ManifestRoot::new(&pages)?;
+        for (ordinal, page) in pages.iter().enumerate() {
+            check_cancelled(&mut is_cancelled)?;
+            let ordinal = u32::try_from(ordinal).map_err(|_| PackageWriteError::InvalidInput {
+                reason: "manifest page ordinal exceeds u32",
+            })?;
+            let path = manifest_page_path(ordinal)?;
+            let snapshot =
+                write_authority_bytes(&mut self.publication, path, &page.canonical_bytes()?)?;
+            snapshots.push(snapshot);
+        }
+        drop(pages);
+        let root_path = profile.manifest_root_path().clone();
+        drop(profile);
+        let root_snapshot =
+            write_authority_bytes(&mut self.publication, root_path, &root.canonical_bytes()?)?;
+        snapshots.push(root_snapshot);
+        let package_id = root.package_id()?;
+
+        // A complete package inventory cannot contain private import control.
+        // Move it to a private sibling for validation; the guard restores it
+        // after any prepublication failure or removes it after success.
+        drop(self.journal);
+        let mut control =
+            ControlExcursion::begin(self.publication.stage_path(), &self.control_directory)?;
+        self.publication
+            .refresh_created_directories()
+            .map_err(map_publication_error_without_commit)?;
+        let report = self
+            .publication
+            .sync_stage(&mut is_cancelled)
+            .map_err(map_publication_error_without_commit)?;
+        self.syncs.record_publication(report);
+        check_cancelled(&mut is_cancelled)?;
+        publication_clock.finish(&mut observer);
+
+        let structure_clock = PackageWriteStageClock::start(
+            PackageWriteStage::StagedStructureValidation,
+            &mut observer,
+        );
+        let catalog = LocalPackageCatalog::open(self.publication.stage_path())?;
+        if catalog.declared_package_id() != package_id {
+            return invalid_input("the staged manifest root changed before validation");
+        }
+        let admission = catalog
+            .validate_package_structure(profile_kind, &mut is_cancelled)
+            .map_err(map_structure_error)?;
+        for snapshot in &snapshots {
+            check_cancelled(&mut is_cancelled)?;
+            catalog.reader().revalidate_snapshot(snapshot)?;
+        }
+        structure_clock.finish(&mut observer);
+        let structure_object_reads = catalog.reader().object_open_operations();
+
+        let exact_clock =
+            PackageWriteStageClock::start(PackageWriteStage::StagedExactValidation, &mut observer);
+        let exact = catalog
+            .validate_exact_package(profile_kind, &mut is_cancelled)
+            .map_err(map_exact_validation_error)?;
+        if exact.package_id() != package_id || exact.admission() != admission {
+            return invalid_input("staged exact validation disagrees with writer admission");
+        }
+        let exact_finished = exact.catalog().reader().object_open_operations();
+        let exact_object_reads = exact_finished.checked_sub(structure_object_reads).ok_or(
+            PackageWriteError::InvalidInput {
+                reason: "staged exact object-read counter regressed",
+            },
+        )?;
+        exact_clock.finish(&mut observer);
+
+        let scientific_clock = PackageWriteStageClock::start(
+            PackageWriteStage::StagedScientificValidation,
+            &mut observer,
+        );
+        let self_consistent = exact
+            .validate_scientific_content(&mut is_cancelled)
+            .map_err(map_scientific_validation_error)?;
+        let scientific_validation_report = Some(self_consistent.validation_report());
+        let scientific_finished = self_consistent.catalog().reader().object_open_operations();
+        let scientific_object_reads = scientific_finished.checked_sub(exact_finished).ok_or(
+            PackageWriteError::InvalidInput {
+                reason: "staged scientific object-read counter regressed",
+            },
+        )?;
+        check_cancelled(&mut is_cancelled)?;
+        scientific_clock.finish(&mut observer);
+
+        let commit_clock = PackageWriteStageClock::start(PackageWriteStage::Commit, &mut observer);
+        let publication_currentness_started =
+            self_consistent.catalog().reader().object_open_operations();
+        let validation_codec_decode_operations =
+            self_consistent.catalog().reader().codec_decode_operations();
+        let validation_codec_decode_time_ns =
+            self_consistent.catalog().reader().codec_decode_time_ns();
+        let prepared = self_consistent
+            .prepare_atomic_publication(self.publication.stage_path(), &mut is_cancelled)
+            .map_err(map_scientific_publication_transfer_error)?;
+        let publication_currentness_reads = prepared
+            .object_open_operations()
+            .checked_sub(publication_currentness_started)
+            .ok_or(PackageWriteError::InvalidInput {
+                reason: "prepublication object-read counter regressed",
+            })?;
+        let validation_read_report = crate::PackageValidationReadReport::new(
+            structure_object_reads,
+            exact_object_reads,
+            scientific_object_reads
+                .checked_add(publication_currentness_reads)
+                .ok_or(PackageWriteError::InvalidInput {
+                    reason: "staged scientific object-read counter overflowed",
+                })?,
+        );
+        let codec_report = crate::PackageCodecReport::new(
+            self.codecs.encode_calls,
+            self.codecs.encode_time_ns,
+            validation_codec_decode_operations,
+            validation_codec_decode_time_ns,
+        );
+        let mut hook = |_, _| Ok(());
+        let (commit_syncs, capability) = self
+            .publication
+            .commit_self_consistent(package_id, prepared, &mut is_cancelled, &mut hook)
+            .map_err(|error| map_publication_error(error, package_id))?;
+        self.syncs.record_publication(commit_syncs);
+        commit_clock.finish(&mut observer);
+        control.discard_after_publication();
+        let receipt = PackageWriteReceipt {
+            package_id,
+            admission,
+            scientific_validation_report,
+            validation_read_report,
+            codec_report,
+            sync_calls: self.syncs.calls,
+            sync_time_ns: self.syncs.time_ns,
+        };
+        let destination = capability.root_path().to_path_buf();
+        Ok(PublishedScientificPackageTransfer {
+            receipt,
+            destination,
+            capability,
+        })
+    }
+}
+
 impl<I> PackageWriteInput<I> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -228,11 +717,11 @@ impl PackageWriteReceipt {
 /// deliberately not `Clone`; callers must consume it through the final
 /// metadata-only currentness sandwich before obtaining the capability.
 #[derive(Debug)]
-#[must_use = "a scientific publication must consume its one-shot verified-package transfer"]
+#[must_use = "a scientific publication must consume its one-shot self-consistent-package transfer"]
 pub struct PublishedScientificPackageTransfer {
     receipt: PackageWriteReceipt,
     destination: PathBuf,
-    capability: VerifiedScientificPackageCapability,
+    capability: SelfConsistentPackageCapability,
 }
 
 impl PublishedScientificPackageTransfer {
@@ -261,7 +750,7 @@ impl PublishedScientificPackageTransfer {
         mut is_cancelled: impl FnMut() -> bool,
     ) -> Result<
         (
-            VerifiedScientificPackageCapability,
+            SelfConsistentPackageCapability,
             crate::ScientificPublicationTransferEvidence,
         ),
         ScientificPublicationTransferError,
@@ -311,6 +800,13 @@ impl PackageSyncCounters {
         // evidence collection infallible, particularly after atomic rename.
         self.calls = self.calls.saturating_add(report.calls);
         self.time_ns = self.time_ns.saturating_add(report.time_ns);
+    }
+
+    fn record(&mut self, elapsed: Duration) {
+        self.calls = self.calls.saturating_add(1);
+        self.time_ns = self
+            .time_ns
+            .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
     }
 }
 
@@ -390,14 +886,14 @@ impl LocalPackageWriter {
         I: IntoIterator<Item = PackageShardInput>,
     {
         let mut observer = |_| {};
-        let mut verified_commit_hook = |_, _| Ok(());
+        let mut self_consistent_commit_hook = |_, _| Ok(());
         match Self::write_new_with_validation(
             destination,
             input,
             &mut is_cancelled,
             StagedValidation::Structure,
             &mut observer,
-            &mut verified_commit_hook,
+            &mut self_consistent_commit_hook,
         )? {
             PackageWriteOutcome::Structure(receipt) => Ok(*receipt),
             PackageWriteOutcome::Scientific(_) => unreachable!("structure writer outcome"),
@@ -405,7 +901,7 @@ impl LocalPackageWriter {
     }
 
     /// Writes a new package, proves its exact-byte closure and declared
-    /// scientific identity while it is staged, and publishes it atomically
+    /// declared content-address consistency while it is staged, and publishes it atomically
     /// only after both validations succeed.
     pub fn write_new_scientifically_validated<I>(
         destination: impl AsRef<Path>,
@@ -416,14 +912,14 @@ impl LocalPackageWriter {
         I: IntoIterator<Item = PackageShardInput>,
     {
         let mut observer = |_| {};
-        let mut verified_commit_hook = |_, _| Ok(());
+        let mut self_consistent_commit_hook = |_, _| Ok(());
         match Self::write_new_with_validation(
             destination,
             input,
             &mut is_cancelled,
             StagedValidation::Scientific,
             &mut observer,
-            &mut verified_commit_hook,
+            &mut self_consistent_commit_hook,
         )? {
             PackageWriteOutcome::Scientific(transfer) => Ok(*transfer),
             PackageWriteOutcome::Structure(_) => unreachable!("scientific writer outcome"),
@@ -441,14 +937,14 @@ impl LocalPackageWriter {
     where
         I: IntoIterator<Item = PackageShardInput>,
     {
-        let mut verified_commit_hook = |_, _| Ok(());
+        let mut self_consistent_commit_hook = |_, _| Ok(());
         match Self::write_new_with_validation(
             destination,
             input,
             &mut is_cancelled,
             StagedValidation::Scientific,
             &mut observer,
-            &mut verified_commit_hook,
+            &mut self_consistent_commit_hook,
         )? {
             PackageWriteOutcome::Scientific(transfer) => Ok(*transfer),
             PackageWriteOutcome::Structure(_) => unreachable!("scientific writer outcome"),
@@ -461,7 +957,7 @@ impl LocalPackageWriter {
         mut is_cancelled: &mut impl FnMut() -> bool,
         staged_validation: StagedValidation,
         observer: &mut impl FnMut(PackageWriteEvent),
-        verified_commit_hook: &mut impl FnMut(PublicationCheckpoint, PackageId) -> io::Result<()>,
+        self_consistent_commit_hook: &mut impl FnMut(PublicationCheckpoint, PackageId) -> io::Result<()>,
     ) -> Result<PackageWriteOutcome, PackageWriteError>
     where
         I: IntoIterator<Item = PackageShardInput>,
@@ -639,7 +1135,7 @@ impl LocalPackageWriter {
             catalog.reader().codec_decode_operations(),
             catalog.reader().codec_decode_time_ns(),
         );
-        let verified = if staged_validation == StagedValidation::Scientific {
+        let self_consistent = if staged_validation == StagedValidation::Scientific {
             let exact_clock =
                 PackageWriteStageClock::start(PackageWriteStage::StagedExactValidation, observer);
             let exact = catalog
@@ -659,11 +1155,11 @@ impl LocalPackageWriter {
                 PackageWriteStage::StagedScientificValidation,
                 observer,
             );
-            let verified = exact
+            let self_consistent = exact
                 .validate_scientific_content(&mut is_cancelled)
                 .map_err(map_scientific_validation_error)?;
-            scientific_validation_report = Some(verified.validation_report());
-            let scientific_finished = verified.catalog().reader().object_open_operations();
+            scientific_validation_report = Some(self_consistent.validation_report());
+            let scientific_finished = self_consistent.catalog().reader().object_open_operations();
             let scientific_object_reads = scientific_finished.checked_sub(exact_finished).ok_or(
                 PackageWriteError::InvalidInput {
                     reason: "staged scientific object-read counter regressed",
@@ -677,12 +1173,12 @@ impl LocalPackageWriter {
             codec_report = crate::PackageCodecReport::new(
                 codecs.encode_calls,
                 codecs.encode_time_ns,
-                verified.catalog().reader().codec_decode_operations(),
-                verified.catalog().reader().codec_decode_time_ns(),
+                self_consistent.catalog().reader().codec_decode_operations(),
+                self_consistent.catalog().reader().codec_decode_time_ns(),
             );
             check_cancelled(&mut is_cancelled)?;
             scientific_clock.finish(observer);
-            Some(verified)
+            Some(self_consistent)
         } else {
             None
         };
@@ -692,11 +1188,11 @@ impl LocalPackageWriter {
         drop(shards);
 
         let commit_clock = PackageWriteStageClock::start(PackageWriteStage::Commit, observer);
-        match verified {
-            Some(verified) => {
+        match self_consistent {
+            Some(self_consistent) => {
                 let publication_currentness_started =
-                    verified.catalog().reader().object_open_operations();
-                let prepared = verified
+                    self_consistent.catalog().reader().object_open_operations();
+                let prepared = self_consistent
                     .prepare_atomic_publication(publication.stage_path(), &mut is_cancelled)
                     .map_err(map_scientific_publication_transfer_error)?;
                 let publication_currentness_reads = prepared
@@ -717,11 +1213,11 @@ impl LocalPackageWriter {
                     scientific_object_reads,
                 );
                 let (commit_syncs, capability) = publication
-                    .commit_verified(
+                    .commit_self_consistent(
                         package_id,
                         prepared,
                         &mut is_cancelled,
-                        verified_commit_hook,
+                        self_consistent_commit_hook,
                     )
                     .map_err(|error| map_publication_error(error, package_id))?;
                 syncs.record_publication(commit_syncs);
@@ -1083,6 +1579,412 @@ fn write_authority_bytes(
     .map(|(_facts, snapshot)| snapshot)
 }
 
+fn open_or_create_control_directory(path: &Path) -> Result<(), PackageWriteError> {
+    match fs::create_dir(path) {
+        Ok(()) => {
+            let mut permissions = fs::metadata(path)
+                .map_err(|source| PackageWriteError::Io {
+                    operation: "inspect the new resumable control directory",
+                    source,
+                })?
+                .permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                permissions.set_mode(0o700);
+                fs::set_permissions(path, permissions).map_err(|source| PackageWriteError::Io {
+                    operation: "protect the resumable control directory",
+                    source,
+                })?;
+            }
+            Ok(())
+        }
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path).map_err(|source| PackageWriteError::Io {
+                operation: "inspect the resumable control directory",
+                source,
+            })?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                Ok(())
+            } else {
+                invalid_input("resumable stage control path is not a real directory")
+            }
+        }
+        Err(source) => Err(PackageWriteError::Io {
+            operation: "create the resumable control directory",
+            source,
+        }),
+    }
+}
+
+fn open_or_validate_stage_header(
+    path: &Path,
+    binding: Sha256Digest,
+) -> Result<(), PackageWriteError> {
+    let mut body = Vec::with_capacity(RESUMABLE_STAGE_SCHEMA.len() + 64);
+    body.extend_from_slice(RESUMABLE_STAGE_SCHEMA);
+    body.extend_from_slice(binding.as_bytes());
+    let digest = Sha256Hasher::digest(&body);
+    body.extend_from_slice(digest.as_bytes());
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            file.write_all(&body)
+                .map_err(|source| PackageWriteError::Io {
+                    operation: "write the resumable stage header",
+                    source,
+                })?;
+            file.sync_data().map_err(|source| PackageWriteError::Io {
+                operation: "synchronize the resumable stage header",
+                source,
+            })?;
+            Ok(())
+        }
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            let actual = fs::read(path).map_err(|source| PackageWriteError::Io {
+                operation: "read the resumable stage header",
+                source,
+            })?;
+            if actual == body {
+                Ok(())
+            } else {
+                invalid_input("resumable stage belongs to different import inputs")
+            }
+        }
+        Err(source) => Err(PackageWriteError::Io {
+            operation: "create the resumable stage header",
+            source,
+        }),
+    }
+}
+
+fn open_stage_journal(path: &Path) -> Result<(File, Vec<StageJournalRecord>), PackageWriteError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|source| PackageWriteError::Io {
+            operation: "open the resumable stage journal",
+            source,
+        })?;
+    let mut records = Vec::new();
+    let mut durable_end = 0_u64;
+    loop {
+        let mut prefix = [0_u8; 13];
+        match file.read_exact(&mut prefix) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => {
+                file.set_len(durable_end)
+                    .map_err(|source| PackageWriteError::Io {
+                        operation: "discard an incomplete resumable journal suffix",
+                        source,
+                    })?;
+                break;
+            }
+            Err(source) => {
+                return Err(PackageWriteError::Io {
+                    operation: "read the resumable stage journal",
+                    source,
+                });
+            }
+        }
+        let ordinal = u64::from_le_bytes(prefix[0..8].try_into().expect("fixed prefix"));
+        let present = prefix[8];
+        let length = u32::from_le_bytes(prefix[9..13].try_into().expect("fixed prefix"));
+        let length = usize::try_from(length).map_err(|_| PackageWriteError::InvalidInput {
+            reason: "resumable descriptor length is not addressable",
+        })?;
+        if ordinal
+            != u64::try_from(records.len()).map_err(|_| PackageWriteError::InvalidInput {
+                reason: "resumable journal record count exceeds u64",
+            })?
+            || present > 1
+            || (present == 0 && length != 0)
+            || length > 512
+        {
+            return invalid_input("resumable stage journal contains a malformed record");
+        }
+        let mut suffix = vec![0_u8; length + 32];
+        if let Err(source) = file.read_exact(&mut suffix) {
+            if source.kind() == io::ErrorKind::UnexpectedEof {
+                file.set_len(durable_end)
+                    .map_err(|source| PackageWriteError::Io {
+                        operation: "discard an incomplete resumable journal suffix",
+                        source,
+                    })?;
+                break;
+            }
+            return Err(PackageWriteError::Io {
+                operation: "read the resumable stage journal record",
+                source,
+            });
+        }
+        let mut record_bytes = Vec::with_capacity(13 + length);
+        record_bytes.extend_from_slice(&prefix);
+        record_bytes.extend_from_slice(&suffix[..length]);
+        let expected = Sha256Hasher::digest(&record_bytes);
+        if expected.as_bytes() != &suffix[length..] {
+            return invalid_input("resumable stage journal checksum failed");
+        }
+        let descriptor = if present == 1 {
+            Some(PackageObjectDescriptor::parse_canonical(&suffix[..length])?)
+        } else {
+            None
+        };
+        records.push(StageJournalRecord {
+            ordinal,
+            descriptor,
+        });
+        durable_end = file
+            .stream_position()
+            .map_err(|source| PackageWriteError::Io {
+                operation: "locate the resumable stage journal",
+                source,
+            })?;
+    }
+    file.seek(SeekFrom::End(0))
+        .map_err(|source| PackageWriteError::Io {
+            operation: "position the resumable stage journal",
+            source,
+        })?;
+    Ok((file, records))
+}
+
+fn append_stage_record(
+    journal: &mut File,
+    record: &StageJournalRecord,
+) -> Result<(), PackageWriteError> {
+    let descriptor = record
+        .descriptor
+        .as_ref()
+        .map(PackageObjectDescriptor::canonical_bytes)
+        .transpose()?;
+    let length = descriptor.as_ref().map_or(0, Vec::len);
+    let mut bytes = Vec::with_capacity(RESUMABLE_JOURNAL_RECORD_MAX);
+    bytes.extend_from_slice(&record.ordinal.to_le_bytes());
+    bytes.push(u8::from(descriptor.is_some()));
+    bytes.extend_from_slice(
+        &u32::try_from(length)
+            .map_err(|_| PackageWriteError::InvalidInput {
+                reason: "resumable descriptor length exceeds u32",
+            })?
+            .to_le_bytes(),
+    );
+    if let Some(descriptor) = descriptor {
+        bytes.extend_from_slice(&descriptor);
+    }
+    let digest = Sha256Hasher::digest(&bytes);
+    bytes.extend_from_slice(digest.as_bytes());
+    journal
+        .write_all(&bytes)
+        .map_err(|source| PackageWriteError::Io {
+            operation: "append the resumable stage journal",
+            source,
+        })
+}
+
+fn remove_uncommitted_stage_entries(
+    stage: &Path,
+    committed: &BTreeSet<PackagePath>,
+) -> Result<(), PackageWriteError> {
+    fn visit(
+        root: &Path,
+        current: &Path,
+        committed: &BTreeSet<PackagePath>,
+    ) -> Result<bool, PackageWriteError> {
+        let mut empty = true;
+        for entry in fs::read_dir(current).map_err(|source| PackageWriteError::Io {
+            operation: "enumerate the resumable package stage",
+            source,
+        })? {
+            let entry = entry.map_err(|source| PackageWriteError::Io {
+                operation: "read a resumable package stage entry",
+                source,
+            })?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|source| PackageWriteError::Io {
+                operation: "inspect a resumable package stage entry",
+                source,
+            })?;
+            if current == root && entry.file_name() == RESUMABLE_CONTROL_DIRECTORY {
+                empty = false;
+                continue;
+            }
+            if metadata.file_type().is_symlink() {
+                return invalid_input("resumable package stage contains a symbolic link");
+            }
+            if metadata.is_dir() {
+                if visit(root, &path, committed)? {
+                    fs::remove_dir(&path).map_err(|source| PackageWriteError::Io {
+                        operation: "remove an empty uncommitted staging directory",
+                        source,
+                    })?;
+                } else {
+                    empty = false;
+                }
+            } else if metadata.is_file() {
+                let relative =
+                    path.strip_prefix(root)
+                        .map_err(|_| PackageWriteError::InvalidInput {
+                            reason: "staging object escaped its root",
+                        })?;
+                let package_path = PackagePath::parse(relative.to_str().ok_or(
+                    PackageWriteError::InvalidInput {
+                        reason: "staging object path is not UTF-8",
+                    },
+                )?)?;
+                if committed.contains(&package_path) {
+                    empty = false;
+                } else {
+                    fs::remove_file(&path).map_err(|source| PackageWriteError::Io {
+                        operation: "remove an uncommitted staging object",
+                        source,
+                    })?;
+                }
+            } else {
+                return invalid_input("resumable package stage contains a non-regular object");
+            }
+        }
+        Ok(empty)
+    }
+    let _ = visit(stage, stage, committed)?;
+    Ok(())
+}
+
+fn validate_committed_descriptors(
+    stage: &Path,
+    descriptors: &[PackageObjectDescriptor],
+) -> Result<(), PackageWriteError> {
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    for descriptor in descriptors {
+        let path = stage.join(descriptor.path().as_str());
+        let metadata = fs::symlink_metadata(&path).map_err(|source| PackageWriteError::Io {
+            operation: "inspect a committed staging object",
+            source,
+        })?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() != descriptor.raw().byte_length()
+        {
+            return invalid_input("a committed staging object changed after its journal record");
+        }
+        let mut file = File::open(&path).map_err(|source| PackageWriteError::Io {
+            operation: "open a committed staging object",
+            source,
+        })?;
+        let mut hasher = ExactBytesHasher::new();
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|source| PackageWriteError::Io {
+                    operation: "verify a committed staging object",
+                    source,
+                })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read])?;
+        }
+        if hasher.finalize()?.digest() != descriptor.raw().digest() {
+            return invalid_input("a committed staging object checksum changed");
+        }
+    }
+    Ok(())
+}
+
+fn validate_staged_shard_descriptors(
+    descriptors: &[PackageObjectDescriptor],
+    arrays: &BTreeMap<PackagePath, PreparedArray>,
+) -> Result<(), PackageWriteError> {
+    for descriptor in descriptors {
+        if !matches!(
+            descriptor.kind(),
+            PackageObjectKind::PixelShard
+                | PackageObjectKind::ValidityShard
+                | PackageObjectKind::PackedIndexShard
+        ) {
+            return invalid_input("resumable stage journal contains a non-shard descriptor");
+        }
+        let matched = arrays.iter().find(|(path, _)| {
+            descriptor
+                .path()
+                .as_str()
+                .strip_prefix(path.as_str())
+                .is_some_and(|suffix| suffix.starts_with("/c/"))
+        });
+        let Some((_path, array)) = matched else {
+            return invalid_input("resumable stage shard names an array outside the profile");
+        };
+        if descriptor.kind() != array.shard_kind {
+            return invalid_input("resumable stage shard kind differs from its array");
+        }
+    }
+    Ok(())
+}
+
+struct ControlExcursion {
+    stage_control: PathBuf,
+    sidecar: PathBuf,
+    active: bool,
+}
+
+impl ControlExcursion {
+    fn begin(stage: &Path, stage_control: &Path) -> Result<Self, PackageWriteError> {
+        let sidecar = control_sidecar(stage)?;
+        if sidecar.exists() {
+            return invalid_input("resumable stage control sidecar already exists");
+        }
+        fs::rename(stage_control, &sidecar).map_err(|source| PackageWriteError::Io {
+            operation: "move private import control outside the validation inventory",
+            source,
+        })?;
+        Ok(Self {
+            stage_control: stage_control.to_path_buf(),
+            sidecar,
+            active: true,
+        })
+    }
+
+    fn discard_after_publication(&mut self) {
+        // Publication is already visible and durable. Control cleanup is
+        // intentionally best-effort so an orphaned private sidecar cannot turn
+        // a successful create-only commit into a false import failure.
+        let _ = fs::remove_dir_all(&self.sidecar);
+        self.active = false;
+    }
+}
+
+impl Drop for ControlExcursion {
+    fn drop(&mut self) {
+        if self.active && !self.stage_control.exists() && self.sidecar.exists() {
+            let _ = fs::rename(&self.sidecar, &self.stage_control);
+        }
+    }
+}
+
+fn recover_control_excursion(stage: &Path) -> Result<(), PackageWriteError> {
+    let control = stage.join(RESUMABLE_CONTROL_DIRECTORY);
+    let sidecar = control_sidecar(stage)?;
+    match (control.exists(), sidecar.exists()) {
+        (true, false) | (false, false) => Ok(()),
+        (false, true) => fs::rename(&sidecar, &control).map_err(|source| PackageWriteError::Io {
+            operation: "restore private import control after interrupted validation",
+            source,
+        }),
+        (true, true) => invalid_input("resumable stage has two private control authorities"),
+    }
+}
+
+fn control_sidecar(stage: &Path) -> Result<PathBuf, PackageWriteError> {
+    let name = stage.file_name().and_then(|name| name.to_str()).ok_or(
+        PackageWriteError::InvalidInput {
+            reason: "resumable stage name is not UTF-8",
+        },
+    )?;
+    Ok(stage.with_file_name(format!(".{name}.finalizing-control")))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_shard(
     publication: &mut LocalPublication,
@@ -1350,7 +2252,7 @@ mod tests {
         assert_eq!(tree_bytes(&first), tree_bytes(&second));
         let capability = LocalPackageCatalog::open(&first)
             .unwrap()
-            .validate_exact_package(ProfileKind::Ds0, || false)
+            .validate_exact_package(ProfileKind::Current, || false)
             .unwrap();
         assert_eq!(capability.package_id(), first_receipt.package_id());
         assert_eq!(capability.admission(), first_receipt.admission());
@@ -1378,8 +2280,8 @@ mod tests {
             .expect("object writer helpers must exist");
         let helper_tail = &source[helper_start..];
         let helper_end = helper_tail
-            .find("\nfn check_cancelled(")
-            .expect("cancellation helper must follow object writer helpers");
+            .find("\nfn write_authority_bytes(")
+            .expect("authority writer must follow the ordinary object writer");
         let object_writers = &helper_tail[..helper_end];
 
         assert_eq!(route.matches(".sync_stage(").count(), 1);
@@ -1434,7 +2336,7 @@ mod tests {
                     .unwrap();
             let capability = LocalPackageCatalog::open(&destination)
                 .unwrap()
-                .validate_exact_package(ProfileKind::Ds0, || false)
+                .validate_exact_package(ProfileKind::Current, || false)
                 .unwrap();
             assert_eq!(capability.package_id(), receipt.package_id());
             let brick = capability
@@ -1576,6 +2478,154 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".mirante4d-stage-")
         }));
+    }
+
+    #[test]
+    fn resumable_final_layout_stage_reopens_and_publishes_without_payload_copy() {
+        let root = TestDirectory::new("resumable-final-layout");
+        let scientific = computed_fixture_scientific_id(&root.0, "resumable");
+        let destination = root.0.join("published.m4d");
+        let stage_path = root.0.join("published.checkpoint");
+        let binding = Sha256Hasher::digest(b"resumable fixture plan");
+        let PackageWriteInput {
+            profile_kind,
+            profile,
+            science,
+            display_defaults,
+            portable_records,
+            ome_images,
+            arrays,
+            shards,
+        } = fixture_input_with_scientific_id(BrickMode::PixelPresent, false, scientific);
+        let mut shards = shards.into_iter();
+        let pixel = shards.next().unwrap();
+        let packed = shards.next().unwrap();
+        assert!(shards.next().is_none());
+
+        let mut stage =
+            ResumableLocalPackageStage::open_or_create(&destination, &stage_path, binding).unwrap();
+        stage
+            .append_shard(
+                0,
+                pixel,
+                PackageObjectKind::PixelShard,
+                ShardProfileKind::Pixel2dUint8,
+                || false,
+            )
+            .unwrap();
+        stage.commit_pending(|| false).unwrap();
+        let first_payload_bytes = stage.durable_payload_bytes();
+        assert!(first_payload_bytes > 0);
+        assert_eq!(
+            stage.durable_payload_bytes_in_input_range(0, 1).unwrap(),
+            first_payload_bytes
+        );
+        assert_eq!(stage.durable_payload_bytes_in_input_range(0, 0).unwrap(), 0);
+        drop(stage);
+        assert!(!destination.exists());
+        assert!(stage_path.join(RESUMABLE_CONTROL_DIRECTORY).is_dir());
+
+        let mut stage =
+            ResumableLocalPackageStage::open_or_create(&destination, &stage_path, binding).unwrap();
+        assert_eq!(stage.durable_shard_inputs(), 1);
+        assert_eq!(stage.durable_payload_bytes(), first_payload_bytes);
+        stage
+            .append_shard(
+                1,
+                packed,
+                PackageObjectKind::PackedIndexShard,
+                ShardProfileKind::PackedIndex,
+                || false,
+            )
+            .unwrap();
+        stage.commit_pending(|| false).unwrap();
+        let total_payload_bytes = stage.durable_payload_bytes();
+        assert!(total_payload_bytes > first_payload_bytes);
+        assert_eq!(
+            stage.durable_payload_bytes_in_input_range(1, 2).unwrap(),
+            total_payload_bytes - first_payload_bytes
+        );
+        let transfer = stage
+            .finalize_scientifically_validated(
+                PackageWriteInput::new(
+                    profile_kind,
+                    profile,
+                    science,
+                    display_defaults,
+                    portable_records,
+                    ome_images,
+                    arrays,
+                    Vec::<PackageShardInput>::new(),
+                ),
+                || false,
+                |_| {},
+            )
+            .unwrap();
+
+        assert!(destination.is_dir());
+        assert!(!stage_path.exists());
+        assert!(!destination.join(RESUMABLE_CONTROL_DIRECTORY).exists());
+        let reference_destination = root.0.join("reference.m4d");
+        let reference = LocalPackageWriter::write_new_scientifically_validated(
+            &reference_destination,
+            fixture_input_with_scientific_id(BrickMode::PixelPresent, false, scientific),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(transfer.package_id(), reference.package_id());
+    }
+
+    #[test]
+    fn resumable_stage_discards_uncommitted_suffix_and_rejects_corrupt_committed_bytes() {
+        let root = TestDirectory::new("resumable-recovery");
+        let destination = root.0.join("published.m4d");
+        let stage_path = root.0.join("published.checkpoint");
+        let binding = Sha256Hasher::digest(b"recovery fixture plan");
+        let input = fixture_input(BrickMode::PixelPresent, false);
+        let pixel_path = input.profile.images()[0].levels()[0].pixel_path().clone();
+        let pixel = input.shards.into_iter().next().unwrap();
+        let object_path = stage_path.join(format!("{pixel_path}/c/0/0/0/0/0"));
+
+        let mut stage =
+            ResumableLocalPackageStage::open_or_create(&destination, &stage_path, binding).unwrap();
+        stage
+            .append_shard(
+                0,
+                pixel,
+                PackageObjectKind::PixelShard,
+                ShardProfileKind::Pixel2dUint8,
+                || false,
+            )
+            .unwrap();
+        assert!(object_path.is_file());
+        drop(stage);
+
+        let mut stage =
+            ResumableLocalPackageStage::open_or_create(&destination, &stage_path, binding).unwrap();
+        assert_eq!(stage.durable_shard_inputs(), 0);
+        assert!(!object_path.exists());
+        let pixel = fixture_input(BrickMode::PixelPresent, false)
+            .shards
+            .into_iter()
+            .next()
+            .unwrap();
+        stage
+            .append_shard(
+                0,
+                pixel,
+                PackageObjectKind::PixelShard,
+                ShardProfileKind::Pixel2dUint8,
+                || false,
+            )
+            .unwrap();
+        stage.commit_pending(|| false).unwrap();
+        drop(stage);
+
+        fs::write(&object_path, b"corrupt committed shard").unwrap();
+        assert!(
+            ResumableLocalPackageStage::open_or_create(&destination, &stage_path, binding).is_err()
+        );
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -1728,13 +2778,13 @@ mod tests {
     }
 
     #[test]
-    fn verified_commit_never_issues_after_a_postrename_root_substitution() {
+    fn self_consistent_commit_never_issues_after_a_postrename_root_substitution() {
         let root = TestDirectory::new("scientific-transfer-postrename-substitution");
         let computed = computed_fixture_scientific_id(&root.0, "identity");
         let destination = root.0.join("published.m4d");
         let moved_validated_root = root.0.join("moved-validated-root");
 
-        let error = write_fixture_with_verified_commit_controls(
+        let error = write_fixture_with_self_consistent_commit_controls(
             &destination,
             fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
             || false,
@@ -1761,13 +2811,13 @@ mod tests {
     }
 
     #[test]
-    fn verified_commit_cancellation_boundary_is_the_atomic_rename() {
+    fn self_consistent_commit_cancellation_boundary_is_the_atomic_rename() {
         let root = TestDirectory::new("scientific-transfer-cancellation-boundary");
         let computed = computed_fixture_scientific_id(&root.0, "identity");
 
         let cancelled_before_rename = Cell::new(false);
         let pre_rename_destination = root.0.join("cancelled-before-rename.m4d");
-        let error = write_fixture_with_verified_commit_controls(
+        let error = write_fixture_with_self_consistent_commit_controls(
             &pre_rename_destination,
             fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
             || cancelled_before_rename.get(),
@@ -1784,7 +2834,7 @@ mod tests {
 
         let cancelled_after_rename = Cell::new(false);
         let post_rename_destination = root.0.join("cancelled-after-rename.m4d");
-        let transfer = write_fixture_with_verified_commit_controls(
+        let transfer = write_fixture_with_self_consistent_commit_controls(
             &post_rename_destination,
             fixture_input_with_scientific_id(BrickMode::PixelPresent, false, computed),
             || cancelled_after_rename.get(),
@@ -1966,7 +3016,7 @@ mod tests {
         fixture_input_with_scientific_id(mode, reverse, scientific_id())
     }
 
-    fn write_fixture_with_verified_commit_controls(
+    fn write_fixture_with_self_consistent_commit_controls(
         destination: &Path,
         input: PackageWriteInput<Vec<PackageShardInput>>,
         mut is_cancelled: impl FnMut() -> bool,
@@ -2162,7 +3212,7 @@ mod tests {
         }
 
         PackageWriteInput::new(
-            ProfileKind::Ds0,
+            ProfileKind::Current,
             profile,
             science,
             display,

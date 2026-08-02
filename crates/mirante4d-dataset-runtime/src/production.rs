@@ -460,9 +460,27 @@ impl dyn DatasetRuntime {
             Arc<dyn CpuByteLedger>,
         ) -> Result<Arc<dyn DatasetSource>, RuntimeFault>,
     ) -> Result<(Arc<dyn DatasetRuntime>, Arc<DatasetCatalog>), RuntimeFault> {
-        let work_available = Arc::new(ChangeSignal::default());
-        let ledger = LedgerCore::new(config, Arc::clone(&work_available));
-        let source_ledger: Arc<dyn CpuByteLedger> = Arc::new(LedgerHandle(Arc::clone(&ledger)));
+        let broker =
+            crate::ProcessCpuBroker::new(config.total_cpu_bytes()).map_err(RuntimeFault::new)?;
+        Self::start_with_broker(config, broker, source_factory)
+    }
+
+    pub fn start_with_broker(
+        config: DatasetRuntimeConfig,
+        broker: crate::ProcessCpuBroker,
+        source_factory: impl FnOnce(
+            Arc<dyn CpuByteLedger>,
+        ) -> Result<Arc<dyn DatasetSource>, RuntimeFault>,
+    ) -> Result<(Arc<dyn DatasetRuntime>, Arc<DatasetCatalog>), RuntimeFault> {
+        if broker.total_bytes() != config.total_cpu_bytes() {
+            return Err(RuntimeFault::new(RuntimeFaultCode::InvalidConfiguration));
+        }
+        let work_available = Arc::clone(&broker.work_available);
+        let ledger = Arc::clone(&broker.core);
+        let source_ledger: Arc<dyn CpuByteLedger> = Arc::new(LedgerHandle {
+            core: Arc::clone(&ledger),
+            class: super::ledger::LedgerClass::Foreground,
+        });
         let source = catch_unwind(AssertUnwindSafe(|| source_factory(source_ledger)))
             .map_err(|_| RuntimeFault::new(RuntimeFaultCode::InvariantViolation))??;
         let catalog = catch_unwind(AssertUnwindSafe(|| {
@@ -551,7 +569,6 @@ impl RuntimeShared {
     }
 
     fn begin_shutdown(&self) {
-        self.ledger.stop_accepting();
         let mut state = self.lock_state();
         if state.shutdown != ShutdownState::Running {
             return;
@@ -607,6 +624,8 @@ impl RuntimeShared {
             // the former check/wait window from being lost.
             let observed_change = self.work_available.generation();
             let available = self.ledger.available(CpuLedgerCategory::InFlightDecode);
+            let decoded_available = self.ledger.available(CpuLedgerCategory::DecodedResidency);
+            let prefetch_available = self.ledger.available(CpuLedgerCategory::Prefetch);
             let mut state = self.lock_state();
             if state
                 .minimum_queued_bytes()
@@ -624,7 +643,7 @@ impl RuntimeShared {
             }
             let mut capacity_blocked = Vec::new();
             while let Some(entry) = state.queue.pop() {
-                let Some(job) = state.jobs.get_mut(&entry.job_id) else {
+                let Some(job) = state.jobs.get(&entry.job_id) else {
                     continue;
                 };
                 if job.phase != JobPhase::Queued
@@ -637,6 +656,24 @@ impl RuntimeShared {
                     capacity_blocked.push(entry);
                     continue;
                 }
+                let destination = destination_category(job.priority);
+                let destination_available = match destination {
+                    CpuLedgerCategory::Prefetch => prefetch_available,
+                    CpuLedgerCategory::DecodedResidency => decoded_available,
+                    _ => unreachable!("decoded payloads have one of two destination ledgers"),
+                };
+                if job.descriptor.byte_len() > destination_available
+                    && state
+                        .oldest_cache_key(destination, Some(job.key.resource()))
+                        .is_none()
+                {
+                    capacity_blocked.push(entry);
+                    continue;
+                }
+                let job = state
+                    .jobs
+                    .get_mut(&entry.job_id)
+                    .expect("a validated queued job remains installed");
                 job.phase = JobPhase::Claimed;
                 let claimed_bytes = job.admission_bytes;
                 let claim = JobClaim {
@@ -1007,6 +1044,21 @@ impl RuntimeShared {
         };
 
         if let Err(error) = self.reclassify_with_eviction(job_id, &charge, target) {
+            if matches!(error, CpuLedgerError::CapacityExceeded { .. }) {
+                // Another worker can consume the destination headroom after
+                // this job was claimed. Keep the request pending and return it
+                // to the capacity-aware scheduler instead of manufacturing a
+                // terminal scientific-data failure. Dropping the decoded body
+                // and its in-flight charge first makes the retry observable to
+                // all waiting workers; the selector will sleep until either a
+                // destination lease is released or higher-priority work lands.
+                drop(bytes);
+                drop(charge);
+                if let Err(code) = self.retry_in_flight_capacity(job_id) {
+                    self.finish_failure(job_id, code, true);
+                }
+                return;
+            }
             self.finish_failure(job_id, map_ledger_error_code(error), true);
             return;
         }
@@ -1351,6 +1403,10 @@ impl CpuByteLedger for ProductionDatasetRuntime {
 
     fn capacity_epoch(&self) -> u64 {
         self.shared.ledger.capacity_epoch()
+    }
+
+    fn capacity_bytes(&self) -> u64 {
+        self.shared.config.total_cpu_bytes()
     }
 }
 
@@ -2279,8 +2335,8 @@ mod tests {
     };
 
     use mirante4d_dataset::{
-        DatasetLayer, DatasetResourceIdentity, DatasetSourceId, ResourceRegion, ResourceValidity,
-        ScientificIdentityStatus,
+        ContentAddressStatus, DatasetLayer, DatasetResourceIdentity, DatasetSourceId,
+        ResourceRegion, ResourceValidity,
     };
     use mirante4d_domain::{
         GridToWorld, IntensityDType, LogicalLayerKey, ScaleLevel, Shape3D, Shape4D, TimeIndex,
@@ -2326,7 +2382,7 @@ mod tests {
             let catalog = Arc::new(
                 DatasetCatalog::new(
                     "runtime-test",
-                    ScientificIdentityStatus::Unverified(DatasetSourceId::new(41)),
+                    ContentAddressStatus::SessionLocal(DatasetSourceId::new(41)),
                     vec![layer],
                 )
                 .unwrap(),
@@ -2620,7 +2676,7 @@ mod tests {
                 catalog: Arc::new(
                     DatasetCatalog::new(
                         "direct-span-runtime-test",
-                        ScientificIdentityStatus::Unverified(DatasetSourceId::new(41)),
+                        ContentAddressStatus::SessionLocal(DatasetSourceId::new(41)),
                         vec![layer],
                     )
                     .unwrap(),
@@ -2645,7 +2701,7 @@ mod tests {
                 catalog: Arc::new(
                     DatasetCatalog::new(
                         "transient-capacity-runtime-test",
-                        ScientificIdentityStatus::Unverified(DatasetSourceId::new(41)),
+                        ContentAddressStatus::SessionLocal(DatasetSourceId::new(41)),
                         vec![layer],
                     )
                     .unwrap(),
@@ -2670,7 +2726,7 @@ mod tests {
                 catalog: Arc::new(
                     DatasetCatalog::new(
                         "burst-gate-runtime-test",
-                        ScientificIdentityStatus::Unverified(DatasetSourceId::new(41)),
+                        ContentAddressStatus::SessionLocal(DatasetSourceId::new(41)),
                         vec![layer],
                     )
                     .unwrap(),
@@ -3006,7 +3062,7 @@ mod tests {
 
     fn key(origin_x: u64, samples: u64) -> BrickKey {
         BrickKey::new(
-            DatasetResourceIdentity::Unverified(DatasetSourceId::new(41)),
+            DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(41)),
             LogicalLayerKey::new(0),
             TimeIndex::new(0),
             ScaleLevel::BASE,
@@ -3219,21 +3275,9 @@ mod tests {
             2 * SCOPE_RECORD_BYTES
         );
 
-        let capacity_limited = start_with_config(
-            TestSource::new(ResourceValidity::AllValid, GatePoint::None),
-            DatasetRuntimeConfig::new(2_000, 1, 2, 2).unwrap(),
-        );
-        assert!(matches!(
-            capacity_limited
-                .cancel_before(CancellationGeneration::for_scope(1, 0))
-                .unwrap_err()
-                .code(),
-            RuntimeFaultCode::CapacityExceeded {
-                category: CpuLedgerCategory::QueuesAndResults,
-                requested_bytes: SCOPE_RECORD_BYTES,
-                available_bytes: 100,
-            }
-        ));
+        // Scope records now borrow from the one process total instead of an
+        // artificial category fraction; queue cardinality remains the hard
+        // structural bound exercised above.
     }
 
     #[test]
@@ -3601,11 +3645,10 @@ mod tests {
     }
 
     #[test]
-    fn capacity_blocked_priority_does_not_starve_a_decode_that_fits() {
+    fn shared_total_preserves_priority_when_both_decodes_fit() {
         let source = TestSource::new(ResourceValidity::AllValid, GatePoint::BeforeWrite);
-        // In-flight decode receives one eighth of this budget: 65,536 bytes.
-        // The first worker holds 60,000, leaving room for the 1,000-byte
-        // prefetch but not the higher-priority 6,000-byte request.
+        // Categories no longer create an artificial in-flight wall: both
+        // queued decodes fit the shared total, so urgency remains decisive.
         let runtime = start_with_config(
             Arc::clone(&source),
             DatasetRuntimeConfig::new(512 * 1024, 2, 8, 8).unwrap(),
@@ -3622,10 +3665,11 @@ mod tests {
             .unwrap();
 
         source.wait_entered(2);
-        assert_eq!(*source.decode_order.lock().unwrap(), vec![0, 2]);
+        assert_eq!(*source.decode_order.lock().unwrap(), vec![0, 1]);
         source.release();
-        let _ = wait_completions(&runtime, 3);
-        assert_eq!(*source.decode_order.lock().unwrap(), vec![0, 2, 1]);
+        let completions = wait_completions(&runtime, 3);
+        drop(completions);
+        assert_eq!(*source.decode_order.lock().unwrap(), vec![0, 1, 2]);
     }
 
     #[test]
@@ -3783,7 +3827,7 @@ mod tests {
     }
 
     #[test]
-    fn cohort_virtual_admission_prevents_self_overcommit_retry_livelock() {
+    fn cohort_virtual_admission_completes_within_the_shared_total() {
         const TARGETS: usize = 4;
 
         let layer = DatasetLayer::new(
@@ -3798,7 +3842,7 @@ mod tests {
         let catalog = Arc::new(
             DatasetCatalog::new(
                 "cohort-virtual-admission-test",
-                ScientificIdentityStatus::Unverified(DatasetSourceId::new(41)),
+                ContentAddressStatus::SessionLocal(DatasetSourceId::new(41)),
                 vec![layer],
             )
             .unwrap(),
@@ -3807,12 +3851,6 @@ mod tests {
         let factory_catalog = Arc::clone(&catalog);
         let factory_control = Arc::clone(&control);
         let config = DatasetRuntimeConfig::new(1 << 20, 2, 8, 8).unwrap();
-        let peer_headroom = config
-            .category_cap(CpuLedgerCategory::InFlightDecode)
-            .saturating_sub(1)
-            .saturating_sub(40_000);
-        assert!(40_000 + 30_000 <= peer_headroom);
-        assert!(30_000 + 40_000 + 30_000 > peer_headroom);
         let (runtime, _) = <dyn DatasetRuntime>::start(config, move |ledger| {
             let source: Arc<dyn DatasetSource> = Arc::new(CohortAdmissionSource {
                 catalog: factory_catalog,
@@ -3844,25 +3882,27 @@ mod tests {
         }
 
         let deadline = Instant::now() + Duration::from_secs(3);
-        let mut target_completions = Vec::with_capacity(TARGETS);
-        while target_completions.len() < TARGETS {
-            target_completions.extend(runtime.poll(TARGETS - target_completions.len()).unwrap());
+        let mut target_completions = 0_usize;
+        while target_completions < TARGETS {
+            let completions = runtime.poll(TARGETS - target_completions).unwrap();
+            assert!(
+                completions
+                    .iter()
+                    .all(|completion| matches!(completion.outcome(), RuntimeOutcome::Ready(_)))
+            );
+            target_completions += completions.len();
+            drop(completions);
             if Instant::now() >= deadline {
                 control.release_blocker();
                 panic!("individually admissible targets made no forward progress");
             }
-            if target_completions.len() < TARGETS {
+            if target_completions < TARGETS {
                 thread::sleep(Duration::from_millis(1));
             }
         }
-        assert!(
-            target_completions
-                .iter()
-                .all(|completion| matches!(completion.outcome(), RuntimeOutcome::Ready(_)))
-        );
         {
             let state = control.state.lock().unwrap();
-            assert_eq!(state.target_cohort_sizes, vec![1; TARGETS]);
+            assert_eq!(state.target_cohort_sizes.iter().sum::<usize>(), TARGETS);
             assert_eq!(state.target_capacity_failures, 0);
         }
 
@@ -3874,13 +3914,13 @@ mod tests {
         assert_eq!(diagnostics.failed_requests(), 0);
         assert_eq!(
             diagnostics.performance().decode_cohorts(),
-            (TARGETS + 1) as u64
+            u64::try_from(control.state.lock().unwrap().target_cohort_sizes.len() + 1).unwrap()
         );
         assert_eq!(
             diagnostics.performance().decode_cohort_members(),
             (TARGETS + 1) as u64
         );
-        assert_eq!(diagnostics.performance().peak_decode_cohort_members(), 1);
+        assert!(diagnostics.performance().peak_decode_cohort_members() <= TARGETS as u64);
     }
 
     #[test]
@@ -3988,6 +4028,34 @@ mod tests {
             diagnostics.category_used_bytes(CpuLedgerCategory::Prefetch),
             0
         );
+    }
+
+    #[test]
+    fn production_runtime_prefetch_borrows_the_shared_total() {
+        let source = TestSource::new(ResourceValidity::AllValid, GatePoint::None);
+        let config = DatasetRuntimeConfig::new(4_000, 1, 16, 16).unwrap();
+        let runtime = start_with_config(Arc::clone(&source), config);
+        let first_key = key(0, 1_500);
+        let second_key = key(2_000, 1_500);
+
+        runtime
+            .submit(request(first_key, RequestPriority::Prefetch, 1, 0))
+            .unwrap();
+        let first = wait_completions(&runtime, 1).pop().unwrap();
+        let RuntimeOutcome::Ready(first_lease) = first.outcome() else {
+            panic!("the first prefetch body must become resident");
+        };
+        let held_first = first_lease.clone();
+        drop(first);
+
+        runtime
+            .submit(request(second_key, RequestPriority::Prefetch, 1, 0))
+            .unwrap();
+        let second = wait_completions(&runtime, 1).pop().unwrap();
+        assert!(matches!(second.outcome(), RuntimeOutcome::Ready(_)));
+        assert_eq!(source.decode_count.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(runtime.diagnostics().unwrap().failed_requests(), 0);
+        drop(held_first);
     }
 
     #[test]

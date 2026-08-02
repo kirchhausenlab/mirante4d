@@ -14,7 +14,9 @@ const TILE_DOMAIN: &[u8] = b"M4D-SC-V1-TILE\0";
 const NODE_DOMAIN: &[u8] = b"M4D-SC-V1-NODE\0";
 const LAYER_DOMAIN: &[u8] = b"M4D-SC-V1-LAYER\0";
 const DATASET_DOMAIN: &[u8] = b"M4D-SC-V1-DATASET\0";
+const LAYER_CHECKPOINT_DOMAIN: &[u8] = b"M4D-SC-LAYER-CHECKPOINT-V1\0";
 const MERKLE_ARITY: usize = 1024;
+const MERKLE_CHECKPOINT_LEVELS_MAX: usize = 64;
 
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum ScientificHashError {
@@ -80,6 +82,8 @@ pub enum ScientificHashError {
     IncompleteDataset { expected: u32, actual: u32 },
     #[error("canonical transform unexpectedly contains a non-finite value")]
     NonFiniteTransform,
+    #[error("invalid private scientific hash checkpoint: {reason}")]
+    InvalidCheckpoint { reason: &'static str },
 }
 
 /// Canonical relative-second calibration for one scientific logical layer.
@@ -214,7 +218,7 @@ impl ScientificLayerDescriptor {
     }
 }
 
-/// Borrowed canonical bytes and coordinates for one scientific identity tile.
+/// Borrowed canonical bytes and coordinates for one scientific-content-address tile.
 #[derive(Clone, Copy, Debug)]
 pub struct ScientificTile<'a> {
     origin_tzyx: [u64; 4],
@@ -271,7 +275,7 @@ impl<'a> ScientificTile<'a> {
     }
 }
 
-/// A verified layer root ready for ordered dataset-root assembly.
+/// A computed layer root ready for ordered dataset-root assembly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScientificLayerRoot {
     layer: LogicalLayerKey,
@@ -315,6 +319,184 @@ impl ScientificLayerHasher {
 
     pub const fn accepted_tile_count(&self) -> u64 {
         self.next_tile
+    }
+
+    /// Conservative encoded-size bound for any private checkpoint whose
+    /// accepted tile count is at most `accepted_tiles_max`.
+    ///
+    /// The bound follows the base-1024 Merkle frontier itself; it does not use
+    /// a dataset fixture or reserve the parser's blanket maximum per temporal
+    /// unit.
+    pub fn checkpoint_bytes_upper_bound(
+        accepted_tiles_max: u64,
+    ) -> Result<u64, ScientificHashError> {
+        let fixed = u64::try_from(LAYER_CHECKPOINT_DOMAIN.len())
+            .map_err(|_| ScientificHashError::TileByteLengthOverflow)?
+            .checked_add(32 + 8 + 8 + 4 + 32)
+            .ok_or(ScientificHashError::TileByteLengthOverflow)?;
+        let mut total = fixed;
+        let mut weight = 1_u64;
+        while weight <= accepted_tiles_max {
+            let width = (accepted_tiles_max / weight).min((MERKLE_ARITY - 1) as u64);
+            total = total
+                .checked_add(4)
+                .and_then(|value| value.checked_add(width.checked_mul(32)?))
+                .ok_or(ScientificHashError::TileByteLengthOverflow)?;
+            match weight.checked_mul(MERKLE_ARITY as u64) {
+                Some(next) => weight = next,
+                None => break,
+            }
+        }
+        Ok(total)
+    }
+
+    /// Encodes bounded private resume state for an authenticated importer
+    /// checkpoint. These bytes are not a scientific identity and must never be
+    /// accepted independently of the import plan/source binding that owns
+    /// them.
+    pub fn checkpoint_bytes(&self) -> Result<Vec<u8>, ScientificHashError> {
+        if self.failed {
+            return Err(ScientificHashError::PreviouslyFailed);
+        }
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(LAYER_CHECKPOINT_DOMAIN);
+        bytes.extend_from_slice(descriptor_checkpoint_digest(&self.descriptor)?.as_bytes());
+        bytes.extend_from_slice(&self.next_tile.to_le_bytes());
+        bytes.extend_from_slice(&self.merkle.leaf_count.to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(self.merkle.levels.len())
+                .map_err(|_| ScientificHashError::InvalidCheckpoint {
+                    reason: "Merkle level count exceeds u32",
+                })?
+                .to_le_bytes(),
+        );
+        for level in &self.merkle.levels {
+            bytes.extend_from_slice(
+                &u32::try_from(level.len())
+                    .map_err(|_| ScientificHashError::InvalidCheckpoint {
+                        reason: "Merkle level width exceeds u32",
+                    })?
+                    .to_le_bytes(),
+            );
+            for digest in level {
+                bytes.extend_from_slice(digest.as_bytes());
+            }
+        }
+        let digest = Sha256Hasher::digest(&bytes);
+        bytes.extend_from_slice(digest.as_bytes());
+        Ok(bytes)
+    }
+
+    /// Restores private state produced by `checkpoint_bytes` after validating
+    /// its exact descriptor binding and canonical base-1024 frontier.
+    pub fn resume_from_checkpoint(
+        descriptor: ScientificLayerDescriptor,
+        bytes: &[u8],
+    ) -> Result<Self, ScientificHashError> {
+        let minimum = LAYER_CHECKPOINT_DOMAIN.len() + 32 + 8 + 8 + 4 + 32;
+        if bytes.len() < minimum || !bytes.starts_with(LAYER_CHECKPOINT_DOMAIN) {
+            return Err(ScientificHashError::InvalidCheckpoint {
+                reason: "schema or length is invalid",
+            });
+        }
+        let (body, checksum) = bytes.split_at(bytes.len() - 32);
+        if Sha256Hasher::digest(body).as_bytes() != checksum {
+            return Err(ScientificHashError::InvalidCheckpoint {
+                reason: "checksum failed",
+            });
+        }
+        let mut offset = LAYER_CHECKPOINT_DOMAIN.len();
+        let descriptor_end = offset + 32;
+        if descriptor_checkpoint_digest(&descriptor)?.as_bytes() != &body[offset..descriptor_end] {
+            return Err(ScientificHashError::InvalidCheckpoint {
+                reason: "layer descriptor differs",
+            });
+        }
+        offset = descriptor_end;
+        let next_tile = take_u64(body, &mut offset)?;
+        let leaf_count = take_u64(body, &mut offset)?;
+        let level_count = usize::try_from(take_u32(body, &mut offset)?).map_err(|_| {
+            ScientificHashError::InvalidCheckpoint {
+                reason: "Merkle level count is not addressable",
+            }
+        })?;
+        if level_count > MERKLE_CHECKPOINT_LEVELS_MAX {
+            return Err(ScientificHashError::InvalidCheckpoint {
+                reason: "Merkle level count exceeds the bounded format",
+            });
+        }
+        let mut levels = Vec::with_capacity(level_count);
+        for _ in 0..level_count {
+            let count = usize::try_from(take_u32(body, &mut offset)?).map_err(|_| {
+                ScientificHashError::InvalidCheckpoint {
+                    reason: "Merkle frontier width is not addressable",
+                }
+            })?;
+            if count >= MERKLE_ARITY {
+                return Err(ScientificHashError::InvalidCheckpoint {
+                    reason: "Merkle frontier width is non-canonical",
+                });
+            }
+            let mut level = Vec::with_capacity(count);
+            for _ in 0..count {
+                let end = offset
+                    .checked_add(32)
+                    .ok_or(ScientificHashError::InvalidCheckpoint {
+                        reason: "digest offset overflowed",
+                    })?;
+                let digest =
+                    body.get(offset..end)
+                        .ok_or(ScientificHashError::InvalidCheckpoint {
+                            reason: "digest bytes are truncated",
+                        })?;
+                level.push(Sha256Digest::from_bytes(
+                    digest.try_into().expect("checked 32-byte digest"),
+                ));
+                offset = end;
+            }
+            levels.push(level);
+        }
+        if offset != body.len() || next_tile != leaf_count {
+            return Err(ScientificHashError::InvalidCheckpoint {
+                reason: "frontier length or accepted count is inconsistent",
+            });
+        }
+        let mut represented = 0_u64;
+        let mut weight = 1_u64;
+        for level in &levels {
+            represented = represented
+                .checked_add(
+                    u64::try_from(level.len())
+                        .map_err(|_| ScientificHashError::TileCountOverflow)?
+                        .checked_mul(weight)
+                        .ok_or(ScientificHashError::TileCountOverflow)?,
+                )
+                .ok_or(ScientificHashError::TileCountOverflow)?;
+            weight = weight
+                .checked_mul(MERKLE_ARITY as u64)
+                .ok_or(ScientificHashError::TileCountOverflow)?;
+        }
+        if represented != leaf_count
+            || (leaf_count == 0 && !levels.is_empty())
+            || levels.last().is_some_and(Vec::is_empty)
+        {
+            return Err(ScientificHashError::InvalidCheckpoint {
+                reason: "Merkle frontier is not the canonical base-arity representation",
+            });
+        }
+        let tile_count = identity_tile_count(descriptor.shape)?;
+        if next_tile > tile_count {
+            return Err(ScientificHashError::InvalidCheckpoint {
+                reason: "accepted tile count exceeds the descriptor",
+            });
+        }
+        Ok(Self {
+            descriptor,
+            tile_count,
+            next_tile,
+            merkle: MerkleAccumulator { levels, leaf_count },
+            failed: false,
+        })
     }
 
     /// Validates and hashes one tile at its canonical linear position without
@@ -656,6 +838,57 @@ impl MerkleAccumulator {
             self.push_at_level(level + 1, parent)?;
         }
     }
+}
+
+fn descriptor_checkpoint_digest(
+    descriptor: &ScientificLayerDescriptor,
+) -> Result<Sha256Digest, ScientificHashError> {
+    let mut hasher = Sha256Hasher::new();
+    hasher.update(b"M4D-SC-LAYER-CHECKPOINT-DESCRIPTOR-V1\0");
+    update_u32(&mut hasher, descriptor.layer.ordinal());
+    update_u8(&mut hasher, dtype_tag(descriptor.dtype));
+    for dimension in descriptor.shape.dimensions() {
+        update_u64(&mut hasher, dimension);
+    }
+    descriptor.temporal.update_hasher(&mut hasher)?;
+    for value in descriptor.grid_to_world.row_major() {
+        hasher.update(f64_hex(value).ok_or(ScientificHashError::NonFiniteTransform)?);
+    }
+    Ok(hasher.finalize())
+}
+
+fn take_u32(bytes: &[u8], offset: &mut usize) -> Result<u32, ScientificHashError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or(ScientificHashError::InvalidCheckpoint {
+            reason: "u32 checkpoint offset overflowed",
+        })?;
+    let value = bytes
+        .get(*offset..end)
+        .ok_or(ScientificHashError::InvalidCheckpoint {
+            reason: "u32 checkpoint field is truncated",
+        })?;
+    *offset = end;
+    Ok(u32::from_le_bytes(
+        value.try_into().expect("checked four-byte field"),
+    ))
+}
+
+fn take_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, ScientificHashError> {
+    let end = offset
+        .checked_add(8)
+        .ok_or(ScientificHashError::InvalidCheckpoint {
+            reason: "u64 checkpoint offset overflowed",
+        })?;
+    let value = bytes
+        .get(*offset..end)
+        .ok_or(ScientificHashError::InvalidCheckpoint {
+            reason: "u64 checkpoint field is truncated",
+        })?;
+    *offset = end;
+    Ok(u64::from_le_bytes(
+        value.try_into().expect("checked eight-byte field"),
+    ))
 }
 
 fn hash_node(level: usize, children: &[Sha256Digest]) -> Result<Sha256Digest, ScientificHashError> {
@@ -1064,5 +1297,103 @@ mod tests {
             }
             assert_eq!(merkle.finalize().unwrap().to_string(), expected_root);
         }
+    }
+
+    #[test]
+    fn private_checkpoint_resume_matches_uninterrupted_hashing_across_merkle_carry() {
+        let shape = Shape4D::new(1025, 1, 1, 1).unwrap();
+        let descriptor = descriptor(0, IntensityDType::Uint8, shape);
+
+        let mut uninterrupted = ScientificLayerHasher::new(descriptor.clone()).unwrap();
+        for timepoint in 0..1025_u64 {
+            uninterrupted
+                .push_tile(ScientificTile::new(
+                    [timepoint, 0, 0, 0],
+                    [1; 4],
+                    &[1],
+                    &[(timepoint % 251) as u8],
+                ))
+                .unwrap();
+        }
+        let expected = uninterrupted.finalize().unwrap();
+
+        let mut interrupted = ScientificLayerHasher::new(descriptor.clone()).unwrap();
+        for timepoint in 0..1024_u64 {
+            interrupted
+                .push_tile(ScientificTile::new(
+                    [timepoint, 0, 0, 0],
+                    [1; 4],
+                    &[1],
+                    &[(timepoint % 251) as u8],
+                ))
+                .unwrap();
+        }
+        let checkpoint = interrupted.checkpoint_bytes().unwrap();
+        let mut resumed =
+            ScientificLayerHasher::resume_from_checkpoint(descriptor, &checkpoint).unwrap();
+        assert_eq!(resumed.accepted_tile_count(), 1024);
+        resumed
+            .push_tile(ScientificTile::new(
+                [1024, 0, 0, 0],
+                [1; 4],
+                &[1],
+                &[(1024 % 251) as u8],
+            ))
+            .unwrap();
+        assert_eq!(resumed.finalize().unwrap(), expected);
+    }
+
+    #[test]
+    fn private_checkpoint_rejects_corruption_and_descriptor_substitution() {
+        let shape = Shape4D::new(2, 1, 1, 1).unwrap();
+        let original = descriptor(0, IntensityDType::Uint8, shape);
+        let mut layer = ScientificLayerHasher::new(original.clone()).unwrap();
+        layer
+            .push_tile(ScientificTile::new([0; 4], [1; 4], &[1], &[7]))
+            .unwrap();
+        let checkpoint = layer.checkpoint_bytes().unwrap();
+
+        let mut corrupt = checkpoint.clone();
+        let middle = corrupt.len() / 2;
+        corrupt[middle] ^= 0x40;
+        assert!(matches!(
+            ScientificLayerHasher::resume_from_checkpoint(original, &corrupt),
+            Err(ScientificHashError::InvalidCheckpoint {
+                reason: "checksum failed"
+            })
+        ));
+
+        let substituted = descriptor(1, IntensityDType::Uint8, shape);
+        assert!(matches!(
+            ScientificLayerHasher::resume_from_checkpoint(substituted, &checkpoint),
+            Err(ScientificHashError::InvalidCheckpoint {
+                reason: "layer descriptor differs"
+            })
+        ));
+    }
+
+    #[test]
+    fn private_checkpoint_size_bound_covers_frontier_boundaries() {
+        for count in [0_u64, 1, 1023, 1024, 1025, 4097] {
+            let shape = Shape4D::new(count.max(1), 1, 1, 1).unwrap();
+            let mut layer =
+                ScientificLayerHasher::new(descriptor(0, IntensityDType::Uint8, shape)).unwrap();
+            for timepoint in 0..count {
+                layer
+                    .push_tile(ScientificTile::new(
+                        [timepoint, 0, 0, 0],
+                        [1; 4],
+                        &[1],
+                        &[0],
+                    ))
+                    .unwrap();
+            }
+            let actual = u64::try_from(layer.checkpoint_bytes().unwrap().len()).unwrap();
+            assert!(actual <= ScientificLayerHasher::checkpoint_bytes_upper_bound(count).unwrap());
+        }
+        assert!(
+            ScientificLayerHasher::checkpoint_bytes_upper_bound(u64::MAX).unwrap()
+                < 4 * 1024 * 1024
+        );
     }
 }

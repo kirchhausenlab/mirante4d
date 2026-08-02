@@ -12,11 +12,11 @@ use std::{
 };
 
 use mirante4d_application::{OperationToken, import_workflow::ImportReviewId};
-use mirante4d_dataset::CpuByteLedger;
+use mirante4d_dataset_runtime::ImportProgressReservation;
 use mirante4d_import_pipeline::{
     ImportCancellation, ImportError, ImportEvent, ImportOptions, ImportReceipt, ImportStage,
-    PublishedImport, SourceFingerprint, TiffInspection, TiffSource, spawn_tiff_import_worker,
-    spawn_tiff_inspection_worker,
+    ImportStorageProgress, PublishedImport, SourceFingerprint, TiffInspection,
+    TiffInspectionProgress, TiffSource, spawn_tiff_import_worker, spawn_tiff_inspection_worker,
 };
 use rustix::time::{ClockId, clock_gettime};
 
@@ -37,11 +37,13 @@ pub(crate) enum ImportWorkerStatus {
     Inspecting {
         source: TiffSource,
         destination: PathBuf,
+        progress: Option<TiffInspectionProgress>,
         cancellation_requested: bool,
     },
     Importing {
         destination: PathBuf,
         latest_event: Option<ImportEvent>,
+        storage_progress: Option<Box<ImportStorageProgress>>,
         cancellation_requested: bool,
         elapsed: Duration,
     },
@@ -67,15 +69,13 @@ pub(crate) enum ImportWorkerOutcome<T> {
 }
 
 pub(crate) struct InspectionWorkerCompletion {
-    pub(crate) source: TiffSource,
-    pub(crate) destination: PathBuf,
     pub(crate) cancellation_requested: bool,
     pub(crate) outcome: ImportWorkerOutcome<TiffInspection>,
 }
 
 pub(crate) struct ImportExecutionCompletion {
     pub(crate) review_id: ImportReviewId,
-    pub(crate) token: OperationToken,
+    pub(crate) token: Option<OperationToken>,
     pub(crate) destination: PathBuf,
     pub(crate) source_fingerprint: SourceFingerprint,
     pub(crate) reviewed_source_bytes: u64,
@@ -113,7 +113,7 @@ pub(crate) struct ImportWorkerTimingOrigin {
     pub(crate) started_at_epoch_ms: u128,
     pub(crate) process_cpu_time_ns: u64,
     pub(crate) review_id: ImportReviewId,
-    pub(crate) token: OperationToken,
+    pub(crate) token: Option<OperationToken>,
     pub(crate) destination: PathBuf,
     pub(crate) source_fingerprint: SourceFingerprint,
     pub(crate) reviewed_source_bytes: u64,
@@ -122,7 +122,7 @@ pub(crate) struct ImportWorkerTimingOrigin {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SuccessfulImportEvidence {
     pub(crate) review_id: ImportReviewId,
-    pub(crate) token: OperationToken,
+    pub(crate) token: Option<OperationToken>,
     pub(crate) destination: PathBuf,
     pub(crate) source_fingerprint: SourceFingerprint,
     pub(crate) reviewed_source_bytes: u64,
@@ -205,6 +205,7 @@ impl ImportWorkerDiagnosticsHandle {
                     diagnostics.emitted_stages.push(timing.stage);
                 }
             }
+            ImportEvent::StorageProgress(_) => {}
             ImportEvent::Published => {
                 diagnostics.published_events = diagnostics.published_events.saturating_add(1);
                 diagnostics.last_published_timing = Some(ImportPublishedTiming {
@@ -280,32 +281,63 @@ struct InspectionWorker {
     cancellation: ImportCancellation,
     result: Receiver<Result<TiffInspection, ImportError>>,
     worker: Option<JoinHandle<()>>,
+    latest_progress: LatestInspectionProgress,
+}
+
+#[derive(Clone, Default)]
+struct LatestInspectionProgress(Arc<Mutex<Option<TiffInspectionProgress>>>);
+
+impl LatestInspectionProgress {
+    fn record(&self, progress: TiffInspectionProgress) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(progress);
+    }
+
+    fn get(&self) -> Option<TiffInspectionProgress> {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 struct ImportWorker {
     review_id: ImportReviewId,
-    token: OperationToken,
+    token: Option<OperationToken>,
     destination: PathBuf,
     retry_options: Option<ImportOptions>,
     cancellation: ImportCancellation,
-    latest_event: LatestImportEvent,
+    latest_progress: LatestImportProgress,
     result: Receiver<Result<PublishedImport, ImportError>>,
     worker: Option<JoinHandle<()>>,
     timing_origin: ImportWorkerTimingOrigin,
+    _progress_reservation: Option<ImportProgressReservation>,
 }
 
 #[derive(Clone, Default)]
-struct LatestImportEvent(Arc<Mutex<Option<ImportEvent>>>);
+struct LatestImportProgress(Arc<Mutex<LatestImportProgressState>>);
 
-impl LatestImportEvent {
+#[derive(Clone, Default)]
+struct LatestImportProgressState {
+    latest_event: Option<ImportEvent>,
+    storage: Option<ImportStorageProgress>,
+}
+
+impl LatestImportProgress {
     fn record(&self, event: ImportEvent) {
-        *self
+        let mut state = self
             .0
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(event);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match event {
+            ImportEvent::StorageProgress(storage) => state.storage = Some(storage),
+            event => state.latest_event = Some(event),
+        }
     }
 
-    fn get(&self) -> Option<ImportEvent> {
+    fn get(&self) -> LatestImportProgressState {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -362,14 +394,19 @@ impl ImportWorkerService {
             Some(ActiveWorker::Inspection(active)) => ImportWorkerStatus::Inspecting {
                 source: active.source.clone(),
                 destination: active.destination.clone(),
+                progress: active.latest_progress.get(),
                 cancellation_requested: active.cancellation.is_cancelled(),
             },
-            Some(ActiveWorker::Import(active)) => ImportWorkerStatus::Importing {
-                destination: active.destination.clone(),
-                latest_event: active.latest_event.get(),
-                cancellation_requested: active.cancellation.is_cancelled(),
-                elapsed: active.timing_origin.started_at.elapsed(),
-            },
+            Some(ActiveWorker::Import(active)) => {
+                let progress = active.latest_progress.get();
+                ImportWorkerStatus::Importing {
+                    destination: active.destination.clone(),
+                    latest_event: progress.latest_event,
+                    storage_progress: progress.storage.map(Box::new),
+                    cancellation_requested: active.cancellation.is_cancelled(),
+                    elapsed: active.timing_origin.started_at.elapsed(),
+                }
+            }
         }
     }
 
@@ -384,16 +421,21 @@ impl ImportWorkerService {
         let cancellation = ImportCancellation::new();
         let (sender, result) = mpsc::sync_channel(1);
         let completion_wake = self.completion_wake.clone();
-        let worker =
-            spawn_tiff_inspection_worker(source.clone(), cancellation.clone(), move |outcome| {
-                publish_inspection_completion(sender, outcome, completion_wake)
-            });
+        let latest_progress = LatestInspectionProgress::default();
+        let worker_progress = latest_progress.clone();
+        let worker = spawn_tiff_inspection_worker(
+            source.clone(),
+            cancellation.clone(),
+            move |progress| worker_progress.record(progress),
+            move |outcome| publish_inspection_completion(sender, outcome, completion_wake),
+        );
         self.active = Some(ActiveWorker::Inspection(InspectionWorker {
             source,
             destination,
             cancellation,
             result,
             worker: Some(worker),
+            latest_progress,
         }));
         Ok(())
     }
@@ -403,7 +445,26 @@ impl ImportWorkerService {
         review_id: ImportReviewId,
         token: OperationToken,
         options: ImportOptions,
-        ledger: Arc<dyn CpuByteLedger>,
+        progress_reservation: ImportProgressReservation,
+    ) -> Result<(), ImportWorkerBusy> {
+        self.start_import_inner(review_id, Some(token), options, progress_reservation)
+    }
+
+    pub(crate) fn start_shell_import(
+        &mut self,
+        review_id: ImportReviewId,
+        options: ImportOptions,
+        progress_reservation: ImportProgressReservation,
+    ) -> Result<(), ImportWorkerBusy> {
+        self.start_import_inner(review_id, None, options, progress_reservation)
+    }
+
+    fn start_import_inner(
+        &mut self,
+        review_id: ImportReviewId,
+        token: Option<OperationToken>,
+        options: ImportOptions,
+        progress_reservation: ImportProgressReservation,
     ) -> Result<(), ImportWorkerBusy> {
         if self.active.is_some() {
             return Err(ImportWorkerBusy);
@@ -413,8 +474,8 @@ impl ImportWorkerService {
         let reviewed_source_bytes = options.inspection.source_bytes;
         self.diagnostics.begin_import();
         let cancellation = ImportCancellation::new();
-        let latest_event = LatestImportEvent::default();
-        let worker_events = latest_event.clone();
+        let latest_progress = LatestImportProgress::default();
+        let worker_events = latest_progress.clone();
         let worker_diagnostics = self.diagnostics.clone();
         let (sender, result) = mpsc::sync_channel(1);
         let timing_token = token.clone();
@@ -432,6 +493,7 @@ impl ImportWorkerService {
             reviewed_source_bytes,
         };
         let completion_wake = self.completion_wake.clone();
+        let ledger = progress_reservation.ledger();
         let worker = spawn_tiff_import_worker(
             options.clone(),
             ledger,
@@ -450,10 +512,11 @@ impl ImportWorkerService {
             destination,
             retry_options: Some(options),
             cancellation,
-            latest_event,
+            latest_progress,
             result,
             worker: Some(worker),
             timing_origin,
+            _progress_reservation: Some(progress_reservation),
         })));
         Ok(())
     }
@@ -579,8 +642,6 @@ fn finish_worker(active: ActiveWorker, ready: ReadyCompletion) -> ImportWorkerCo
             let cancellation_requested = active.cancellation.is_cancelled();
             let joined = join_worker(active.worker.take()).is_ok();
             ImportWorkerCompletion::Inspection(Box::new(InspectionWorkerCompletion {
-                source: active.source,
-                destination: active.destination,
                 cancellation_requested,
                 outcome: match (result, joined) {
                     (Some(result), true) => ImportWorkerOutcome::Finished(result),
@@ -640,7 +701,7 @@ mod tests {
 
     #[test]
     fn progress_is_coalesced_to_the_latest_event() {
-        let progress = LatestImportEvent::default();
+        let progress = LatestImportProgress::default();
         progress.record(ImportEvent::StageStarted {
             stage: mirante4d_import_pipeline::ImportStage::BaseProduction,
             completed_work_units: 0,
@@ -652,13 +713,46 @@ mod tests {
             total_work_units: 3,
         });
         let latest = ImportEvent::StageStarted {
-            stage: mirante4d_import_pipeline::ImportStage::SourceScientificIdentity,
+            stage: mirante4d_import_pipeline::ImportStage::SourceIngest,
             completed_work_units: 0,
             total_work_units: None,
         };
         progress.record(latest.clone());
 
-        assert_eq!(progress.get(), Some(latest));
+        assert_eq!(progress.get().latest_event, Some(latest));
+    }
+
+    #[test]
+    fn storage_progress_is_retained_without_hiding_the_active_stage() {
+        let progress = LatestImportProgress::default();
+        let stage = ImportEvent::StageStarted {
+            stage: ImportStage::BaseProduction,
+            completed_work_units: 0,
+            total_work_units: Some(9),
+        };
+        let storage = ImportStorageProgress {
+            completed_temporal_units: 3,
+            total_temporal_units: 12,
+            active_timepoint: Some(1),
+            active_channel: Some(0),
+            preparing_timepoint: Some(2),
+            preparing_channel: Some(0),
+            preparing_completed_planes: 3,
+            preparing_total_planes: 5,
+            prepared_temporal_units: 0,
+            temporal_pipeline_width: 2,
+            stage_payload_bytes: 4_096,
+            remaining_package_output_upper_bound: 8_192,
+            unit_scratch_bytes: 1_024,
+            decode_ahead_scratch_bytes: 2_048,
+            additional_headroom_required_bytes: 4_096,
+        };
+        progress.record(stage.clone());
+        progress.record(ImportEvent::StorageProgress(storage));
+
+        let snapshot = progress.get();
+        assert_eq!(snapshot.latest_event, Some(stage));
+        assert_eq!(snapshot.storage, Some(storage));
     }
 
     #[test]
@@ -747,11 +841,12 @@ mod tests {
         });
         let mut service = ImportWorkerService {
             active: Some(ActiveWorker::Inspection(InspectionWorker {
-                source: TiffSource::auto("cancel.tif"),
+                source: TiffSource::single_3d("cancel.tif"),
                 destination: PathBuf::from("cancel.m4d"),
                 cancellation,
                 result,
                 worker: Some(worker),
+                latest_progress: LatestInspectionProgress::default(),
             })),
             diagnostics: ImportWorkerDiagnosticsHandle::default(),
             completion_wake: None,
@@ -786,11 +881,12 @@ mod tests {
         });
         let mut service = ImportWorkerService {
             active: Some(ActiveWorker::Inspection(InspectionWorker {
-                source: TiffSource::auto("stopped.tif"),
+                source: TiffSource::single_3d("stopped.tif"),
                 destination: PathBuf::from("stopped.m4d"),
                 cancellation: ImportCancellation::new(),
                 result,
                 worker: Some(worker),
+                latest_progress: LatestInspectionProgress::default(),
             })),
             diagnostics: ImportWorkerDiagnosticsHandle::default(),
             completion_wake: None,
@@ -824,11 +920,12 @@ mod tests {
         });
         let mut service = ImportWorkerService {
             active: Some(ActiveWorker::Inspection(InspectionWorker {
-                source: TiffSource::auto("shutdown.tif"),
+                source: TiffSource::single_3d("shutdown.tif"),
                 destination: PathBuf::from("shutdown.m4d"),
                 cancellation,
                 result,
                 worker: Some(worker),
+                latest_progress: LatestInspectionProgress::default(),
             })),
             diagnostics: ImportWorkerDiagnosticsHandle::default(),
             completion_wake: None,
@@ -855,11 +952,12 @@ mod tests {
         });
         let service = ImportWorkerService {
             active: Some(ActiveWorker::Inspection(InspectionWorker {
-                source: TiffSource::auto("drop.tif"),
+                source: TiffSource::single_3d("drop.tif"),
                 destination: PathBuf::from("drop.m4d"),
                 cancellation,
                 result,
                 worker: Some(worker),
+                latest_progress: LatestInspectionProgress::default(),
             })),
             diagnostics: ImportWorkerDiagnosticsHandle::default(),
             completion_wake: None,

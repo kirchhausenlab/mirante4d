@@ -9,9 +9,7 @@ use crate::package_read::{
     read_local_brick_reusing_in_transaction, read_local_brick_reusing_into_sink_in_transaction,
 };
 use crate::package_structure::{PackageStructureError, PackageStructureReport};
-use crate::range_io::{
-    LocalCurrentnessBatch, LocalObjectGeneration, LocalObjectHashError, LocalObjectSnapshot,
-};
+use crate::range_io::{LocalCurrentnessBatch, LocalObjectHashError, LocalObjectSnapshot};
 use crate::{
     DatasetProfileAdmission, DirectoryInventoryError, LocalPackageCatalog, LocalPackageReader,
     ManifestRoot, PackageObjectDescriptor, PackagePath, PackedIndexCoordinates, RangeReadError,
@@ -30,6 +28,24 @@ pub struct ExactPackageCapability {
     catalog: LocalPackageCatalog,
     admission: DatasetProfileAdmission,
     proof: PackageIntegrityProof,
+}
+
+/// Truthful cumulative work emitted after each encoded object has been
+/// completely hashed and matched against the package manifest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExactPackageValidationProgress {
+    objects_hashed: u64,
+    bytes_hashed: u64,
+}
+
+impl ExactPackageValidationProgress {
+    pub const fn objects_hashed(self) -> u64 {
+        self.objects_hashed
+    }
+
+    pub const fn bytes_hashed(self) -> u64 {
+        self.bytes_hashed
+    }
 }
 
 impl ExactPackageCapability {
@@ -166,7 +182,7 @@ impl ExactPackageCapability {
             self.catalog.descriptors(),
             plan,
             transaction,
-            DirectPayloadFactsAuthority::VerifiedPackedRecord,
+            DirectPayloadFactsAuthority::PublishedPackedRecord,
         )?;
         self.validate_cached_brick_snapshots(&read, &mut is_cancelled)?;
         Ok(read)
@@ -205,48 +221,6 @@ impl ExactPackageCapability {
             .reader()
             .revalidate_cached_snapshots(snapshots)?;
         self.validate_cached_snapshots(snapshots, &mut is_cancelled)?;
-        self.proof
-            .revalidate_authority_cached(self.catalog.reader(), &mut is_cancelled)
-            .map_err(map_snapshot_read_error)
-    }
-
-    pub(crate) fn validate_promotion_observations(
-        &self,
-        observations: &[Option<LocalObjectGeneration>],
-        mut is_cancelled: impl FnMut() -> bool,
-    ) -> Result<(), PackageReadError> {
-        if observations.len() != self.catalog.descriptors().len() {
-            return Err(RangeReadError::ObjectChanged {
-                path: "<manifest closure>".to_owned(),
-            }
-            .into());
-        }
-        self.proof
-            .revalidate_authority_cached(self.catalog.reader(), &mut is_cancelled)
-            .map_err(map_snapshot_read_error)?;
-        let mut observations_batch = self.catalog.reader().begin_cached_snapshot_revalidation()?;
-        for (descriptor, observed) in self.catalog.descriptors().iter().zip(observations) {
-            let Some(observed) = observed else {
-                continue;
-            };
-            if is_cancelled() {
-                return Err(PackageReadError::Cancelled);
-            }
-            let Some(expected) = self.proof.object_snapshots.get(descriptor.path()) else {
-                return Err(RangeReadError::ObjectChanged {
-                    path: descriptor.path().to_string(),
-                }
-                .into());
-            };
-            if expected.generation() != *observed {
-                return Err(RangeReadError::ObjectChanged {
-                    path: descriptor.path().to_string(),
-                }
-                .into());
-            }
-            observations_batch.validate_snapshot(expected)?;
-        }
-        observations_batch.finish_snapshot();
         self.proof
             .revalidate_authority_cached(self.catalog.reader(), &mut is_cancelled)
             .map_err(map_snapshot_read_error)
@@ -463,9 +437,18 @@ impl From<SnapshotValidationError> for PackageValidationError {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn validate_package_integrity(
     input: PackageIntegrityInput<'_>,
     mut is_cancelled: impl FnMut() -> bool,
+) -> Result<PackageIntegrityProof, PackageValidationError> {
+    validate_package_integrity_with_progress(input, &mut is_cancelled, &mut |_| {})
+}
+
+pub(crate) fn validate_package_integrity_with_progress(
+    input: PackageIntegrityInput<'_>,
+    mut is_cancelled: impl FnMut() -> bool,
+    mut report_progress: impl FnMut(ExactPackageValidationProgress),
 ) -> Result<PackageIntegrityProof, PackageValidationError> {
     let mut structural = BTreeMap::new();
     for snapshot in input.structure.snapshots() {
@@ -495,6 +478,7 @@ pub(crate) fn validate_package_integrity(
         root_digest,
         &mut proof,
         &mut is_cancelled,
+        &mut report_progress,
     )?;
     proof.authority_snapshots.push(root);
 
@@ -506,6 +490,7 @@ pub(crate) fn validate_package_integrity(
             page.digest(),
             &mut proof,
             &mut is_cancelled,
+            &mut report_progress,
         )?;
         proof.authority_snapshots.push(snapshot);
     }
@@ -518,6 +503,7 @@ pub(crate) fn validate_package_integrity(
             descriptor.raw().digest(),
             &mut proof,
             &mut is_cancelled,
+            &mut report_progress,
         )?;
         if let Some(structural_snapshot) = structural.remove(descriptor.path())
             && structural_snapshot != snapshot
@@ -551,6 +537,7 @@ fn hash_expected_object(
     expected_digest: ExactBytesDigest,
     proof: &mut PackageIntegrityProof,
     is_cancelled: &mut impl FnMut() -> bool,
+    report_progress: &mut impl FnMut(ExactPackageValidationProgress),
 ) -> Result<LocalObjectSnapshot, PackageValidationError> {
     let hashed = reader
         .hash_object_with_snapshot(path, expected_bytes, &mut *is_cancelled)
@@ -573,6 +560,10 @@ fn hash_expected_object(
         .ok_or(PackageValidationError::AccountingOverflow {
             metric: "byte count",
         })?;
+    report_progress(ExactPackageValidationProgress {
+        objects_hashed: proof.objects_hashed,
+        bytes_hashed: proof.bytes_hashed,
+    });
     Ok(hashed.snapshot)
 }
 

@@ -113,7 +113,7 @@ fn imported_open_ready_reuses_every_existing_readiness_fact() {
     assert!(
         ImportedOpenReadyReadiness {
             selected_matches: true,
-            verified: true,
+            content_id_computed_during_import: true,
             import_idle: true,
             problem_absent: true,
         }
@@ -122,25 +122,25 @@ fn imported_open_ready_reuses_every_existing_readiness_fact() {
     for readiness in [
         ImportedOpenReadyReadiness {
             selected_matches: false,
-            verified: true,
+            content_id_computed_during_import: true,
             import_idle: true,
             problem_absent: true,
         },
         ImportedOpenReadyReadiness {
             selected_matches: true,
-            verified: false,
+            content_id_computed_during_import: false,
             import_idle: true,
             problem_absent: true,
         },
         ImportedOpenReadyReadiness {
             selected_matches: true,
-            verified: true,
+            content_id_computed_during_import: true,
             import_idle: false,
             problem_absent: true,
         },
         ImportedOpenReadyReadiness {
             selected_matches: true,
-            verified: true,
+            content_id_computed_during_import: true,
             import_idle: true,
             problem_absent: false,
         },
@@ -158,20 +158,20 @@ fn imported_open_ready_measurement_commit_preserves_all_side_effects() {
         process_cpu_time_ns: 31,
     };
     let mut active_origin = Some("exact-worker-origin");
-    let mut active_verification_origin = Some("exact-verification-origin");
+    let mut active_audit_origin = Some("exact-audit-origin");
     let mut completed_primary = None;
     let mut open_ready_outcome = None;
 
     ImportedOpenReadyCommitState {
         active_origin: &mut active_origin,
-        active_verification_origin: &mut active_verification_origin,
+        active_audit_origin: &mut active_audit_origin,
         completed_primary: &mut completed_primary,
         open_ready_outcome: &mut open_ready_outcome,
     }
     .commit(primary, "complete-open-ready-outcome");
 
     assert!(active_origin.is_none());
-    assert!(active_verification_origin.is_none());
+    assert!(active_audit_origin.is_none());
     assert_eq!(completed_primary, Some(primary));
     assert_eq!(open_ready_outcome, Some("complete-open-ready-outcome"));
 }
@@ -187,11 +187,11 @@ fn test_import_publication_evidence_snapshot() -> ImportPublicationEvidenceSnaps
             observed_total_object_reads: 10,
             observed_codec_decode_calls: 5,
         },
-        source_verification_started_runs: 6,
-        source_verification_progress_updates: 7,
-        source_verification_cancelled_runs: 8,
-        source_verification_failed_runs: 9,
-        source_verification_successes: 10,
+        package_integrity_audit_started_runs: 6,
+        package_integrity_audit_progress_updates: 7,
+        package_integrity_audit_cancelled_runs: 8,
+        package_integrity_audit_failed_runs: 9,
+        package_integrity_audit_completed_runs: 10,
     }
 }
 
@@ -215,7 +215,7 @@ fn passed_imported_open_ready_adds_full_clocks_to_the_same_publication_evidence(
         json!({
             "status": "open_ready_complete",
             "start_boundary": "import_worker_published_event",
-            "end_boundary": "published_destination_verified_and_open_ready_for_normal_product_use",
+            "end_boundary": "published_destination_admitted_and_open_ready_for_normal_product_use",
             "wall_clock": "std_instant_monotonic",
             "cpu_clock": "process_cpu_time",
             "published_at_epoch_ms": 11,
@@ -223,7 +223,7 @@ fn passed_imported_open_ready_adds_full_clocks_to_the_same_publication_evidence(
             "wall_time_ns": 13,
             "process_cpu_time_ns": 14,
             "included_in_primary_clock": true,
-            "transfer_mode": "staged_verified_capability",
+            "transfer_mode": "staged_self_consistent_capability",
             "publication_currentness_execution": {
                 "contract_id": "test-publication-currentness",
                 "expected_snapshot_object_reads": 1,
@@ -233,11 +233,11 @@ fn passed_imported_open_ready_adds_full_clocks_to_the_same_publication_evidence(
                 "observed_total_object_reads": 10,
                 "observed_codec_decode_calls": 5,
             },
-            "source_verification_started_runs": 6,
-            "source_verification_progress_updates": 7,
-            "source_verification_cancelled_runs": 8,
-            "source_verification_failed_runs": 9,
-            "source_verification_successes": 10,
+            "package_integrity_audit_started_runs": 6,
+            "package_integrity_audit_progress_updates": 7,
+            "package_integrity_audit_cancelled_runs": 8,
+            "package_integrity_audit_failed_runs": 9,
+            "package_integrity_audit_completed_runs": 10,
         })
     );
     assert_eq!(full.as_object().map(serde_json::Map::len), Some(17));
@@ -409,6 +409,7 @@ fn input_sequence_bounds_are_validated() {
         json!({ "command": "camera_zoom_sequence", "samples": 1, "duration_ms": MAX_INPUT_SEQUENCE_DURATION_MS + 1, "scroll_y_points_per_sample": 1.0 }),
         json!({ "command": "camera_pan_sequence", "samples": 1, "duration_ms": 1, "x_points_per_sample": 0.0, "y_points_per_sample": -0.0 }),
         json!({ "command": "cross_section_zoom_sequence", "panel": "xy", "samples": 1, "duration_ms": 1, "x_fraction": 0.5, "y_fraction": 0.5, "factor_per_sample": 1.0 }),
+        json!({ "command": "observe_playback_cadence", "duration_ms": 0 }),
         json!({ "command": "set_layer_order", "layer_indices": (0..=mirante4d_render_api::MAX_RENDER_LAYERS).collect::<Vec<_>>() }),
     ] {
         let script: ProductAutomationScript = serde_json::from_value(json!({
@@ -431,6 +432,25 @@ fn input_sequence_schedule_spans_the_requested_monotonic_duration() {
     assert_eq!(sequence_sample_target_ns(0, 1, 100), 100_000_000);
     assert_eq!(sequence_sample_target_ns(0, 300, 5_000), 16_666_666);
     assert_eq!(sequence_sample_target_ns(299, 300, 5_000), 5_000_000_000);
+}
+
+#[test]
+fn temporal_distribution_counts_both_halves_and_boundary_gaps() {
+    let distribution = completed_temporal_distribution(
+        &[100_000_000, 400_000_000, 600_000_000, 900_000_000],
+        1_000_000_000,
+    );
+    assert_eq!(distribution.first_half_transitions, 2);
+    assert_eq!(distribution.second_half_transitions, 2);
+    assert_eq!(distribution.maximum_gap_ns, 300_000_000);
+}
+
+#[test]
+fn mapped_interaction_cadence_floor_is_eighty_percent_rounded_up() {
+    assert_eq!(minimum_interaction_cadence(3), 3);
+    assert_eq!(minimum_interaction_cadence(24), 20);
+    assert_eq!(minimum_interaction_cadence(25), 20);
+    assert_eq!(minimum_interaction_cadence(36), 29);
 }
 
 #[test]
@@ -577,10 +597,6 @@ fn camera_sequence_uses_three_mailbox_samples_and_one_durable_commit() {
     assert_eq!(transient_mailbox.coalesced_samples, 2);
     assert_eq!(transient_mailbox.finished_gestures, 0);
     assert!(transient_mailbox.active_gesture.is_some());
-    let transient_generation = app
-        .render_coordination
-        .display_generation()
-        .input_generation;
     assert_eq!(
         app.render_coordination
             .coordinated_publication_diagnostics()
@@ -589,32 +605,9 @@ fn camera_sequence_uses_three_mailbox_samples_and_one_durable_commit() {
     );
 
     controller.automation_frame_nr += 1;
-    assert!(matches!(
-        controller.execute_command(&mut app, &context, &command),
-        Ok(CommandProgress::PassiveWaiting(_))
-    ));
-    assert_eq!(
-        app.render_coordination
-            .display_generation()
-            .durable_gesture_commits,
-        commits_before,
-        "finish must keep waiting while the final transient generation is not current"
-    );
-    let now_ns = app.display_instrumentation_now_ns();
-    app.render_coordination.record_current_presentation(now_ns);
-    app.render_coordination
-        .record_current_group_presentation(now_ns);
-    assert_eq!(
-        app.render_coordination
-            .coordinated_publication_diagnostics()
-            .current_presentation_generation(),
-        Some(transient_generation)
-    );
-
-    controller.automation_frame_nr += 1;
     let details = match controller.execute_command(&mut app, &context, &command) {
         Ok(CommandProgress::Done(details)) => details,
-        _ => panic!("a separate current-generation update must finish the automation sequence"),
+        _ => panic!("a separate input update must deliver release and finish the sequence"),
     };
 
     assert_eq!(
@@ -787,7 +780,7 @@ fn automation_alone_does_not_enable_validation_capture() {
     let navigation: ProductAutomationScript = serde_json::from_str(
         r#"{
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 8,
+          "schema_version": 10,
           "hard_safety_limits": {},
           "scenario": "performance_navigation",
           "commands": [
@@ -803,6 +796,7 @@ fn automation_alone_does_not_enable_validation_capture() {
 
     for pixel_command in [
         r#"{ "command": "capture_screenshot", "target": "three_d", "name": "mode-proof" }"#,
+        r#"{ "command": "capture_temporal_frame", "target": "three_d", "name": "t0", "min_different_pixels_from_previous": null }"#,
         r#"{ "command": "assert", "condition": {
           "nonblank_panel": { "target": "three_d" }
         } }"#,
@@ -813,7 +807,7 @@ fn automation_alone_does_not_enable_validation_capture() {
         let raw = format!(
             r#"{{
               "schema": "mirante4d-product-automation-script",
-              "schema_version": 8,
+              "schema_version": 10,
               "hard_safety_limits": {{}},
               "scenario": "render_correctness",
               "commands": [{pixel_command}]
@@ -823,6 +817,38 @@ fn automation_alone_does_not_enable_validation_capture() {
         script.validate().unwrap();
         assert!(script.requires_validation_capture());
     }
+}
+
+#[test]
+fn automation_script_parses_nonvacuous_temporal_product_evidence_commands() {
+    let script: ProductAutomationScript = serde_json::from_value(json!({
+        "schema": "mirante4d-product-automation-script",
+        "schema_version": AUTOMATION_SCHEMA_VERSION,
+        "hard_safety_limits": {},
+        "scenario": "temporal_evidence",
+        "commands": [
+            { "command": "wait_for", "condition": "initial_auto_dense_applied", "timeout_ms": 1000 },
+            { "command": "set_playback_fps", "fps": 24 },
+            { "command": "set_playback_active", "active": true },
+            { "command": "wait_for_presented_time_index", "time_index": 1, "timeout_ms": 1000 },
+            { "command": "wait_for_temporal_transitions", "minimum_transitions": 3, "timeout_ms": 1000 },
+            { "command": "observe_playback_cadence", "duration_ms": 2000 },
+            { "command": "capture_temporal_frame", "target": "three_d", "name": "t1", "min_different_pixels_from_previous": 1 },
+            { "command": "assert", "condition": { "playback_advanced_during_previous_input": { "minimum_transitions": 1 } } },
+            { "command": "set_playback_active", "active": false },
+            { "command": "wait_for", "condition": "playback_residency_released", "timeout_ms": 1000 },
+            { "command": "assert", "condition": "playback_stopped_and_released" },
+            { "command": "assert", "condition": "temporal_continuity" },
+            { "command": "quit" }
+        ]
+    }))
+    .unwrap();
+
+    script.validate().unwrap();
+    assert!(script.requires_validation_capture());
+    assert_eq!(script.commands[4].name(), "wait_for_temporal_transitions");
+    assert_eq!(script.commands[5].name(), "observe_playback_cadence");
+    assert_eq!(script.commands[6].name(), "capture_temporal_frame");
 }
 
 #[test]
@@ -860,6 +886,7 @@ fn import_raw_evidence_serializes_the_complete_statistics_surface() {
         "source_revalidation_bytes_read",
         "native_decoded_bytes",
         "base_native_decoded_bytes",
+        "no_data_detection_native_decoded_bytes",
         "scientific_identity_native_decoded_bytes",
         "tiff_open_count",
         "native_chunk_decode_count",
@@ -888,7 +915,7 @@ fn import_raw_evidence_serializes_the_complete_statistics_surface() {
         "sampled_peak_open_file_descriptors",
         "open_file_descriptor_structural_bound",
         "peak_open_file_descriptors",
-        "preflight_temporary_bytes_bound",
+        "preflight_required_headroom_bytes",
         "peak_temporary_bytes",
         "peak_checkpoint_regular_files",
         "peak_working_bytes",
@@ -911,7 +938,7 @@ fn import_raw_evidence_serializes_the_complete_statistics_surface() {
     assert_eq!(primary["wall_time_ns"], 30);
     assert_eq!(
         primary["end_boundary"],
-        "published_destination_verified_and_open_ready_for_normal_product_use"
+        "published_destination_admitted_and_open_ready_for_normal_product_use"
     );
 
     let inspection = import_pre_start_measurement_json(Some(ImportPreStartMeasurement {
@@ -935,7 +962,7 @@ fn automation_script_parses_the_b4_project_store_contract() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 8,
+          "schema_version": 10,
           "hard_safety_limits": {},
           "scenario": "b4_project_store",
           "commands": [
@@ -1011,7 +1038,7 @@ fn automation_script_parses_exposed_provisional_autosave_recovery() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 8,
+          "schema_version": 10,
           "hard_safety_limits": {},
           "scenario": "pre_alpha_recovery",
           "commands": [
@@ -1120,7 +1147,7 @@ fn automation_script_parses_semantic_camera_commands() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 8,
+          "schema_version": 10,
           "hard_safety_limits": {
             "max_cpu_total_bytes": 1024,
             "max_runtime_queued_requests": 128
@@ -1244,25 +1271,25 @@ fn automation_script_parses_exact_fidelity_layer_mode_and_pick_assertions() {
 }
 
 #[test]
-fn automation_script_parses_source_verification_evidence_workflow() {
+fn automation_script_parses_package_integrity_audit_evidence_workflow() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 8,
+          "schema_version": 10,
           "hard_safety_limits": {},
-          "scenario": "b3_source_verification",
+          "scenario": "b3_package_integrity_audit",
           "commands": [
             { "command": "set_render_target_size", "width": 1280, "height": 720 },
-            { "command": "cancel_active_source_verification" },
-            { "command": "wait_for", "condition": "source_verification_inactive", "timeout_ms": 1000 },
-            { "command": "cancel_source_verification" },
-            { "command": "wait_for", "condition": "source_verification_required", "timeout_ms": 1000 },
-            { "command": "request_source_verification" },
-            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 1000 },
-            { "command": "assert", "condition": { "source_verification_evidence": {
-              "min_accepted_progress_updates": 1,
+            { "command": "cancel_active_package_integrity_audit" },
+            { "command": "wait_for", "condition": "package_integrity_audit_inactive", "timeout_ms": 1000 },
+            { "command": "cancel_package_integrity_audit" },
+            { "command": "wait_for", "condition": "package_integrity_audit_not_run", "timeout_ms": 1000 },
+            { "command": "request_package_integrity_audit" },
+            { "command": "wait_for", "condition": "package_integrity_audit_self_consistent", "timeout_ms": 1000 },
+            { "command": "assert", "condition": { "package_integrity_audit_evidence": {
+              "min_progress_updates": 1,
               "min_cancelled_runs": 1,
-              "min_accepted_successes": 1
+              "min_completed_runs": 1
             } } },
             { "command": "assert", "condition": { "render_target_pixels": {
               "width": 1280,
@@ -1278,21 +1305,21 @@ fn automation_script_parses_source_verification_evidence_workflow() {
     assert_eq!(script.commands[0].name(), "set_render_target_size");
     assert_eq!(
         script.commands[1].name(),
-        "cancel_active_source_verification"
+        "cancel_active_package_integrity_audit"
     );
     assert!(matches!(
         script.commands[2],
         ProductAutomationCommand::WaitFor {
-            condition: ProductAutomationWaitCondition::SourceVerificationInactive,
+            condition: ProductAutomationWaitCondition::PackageIntegrityAuditInactive,
             ..
         }
     ));
-    assert_eq!(script.commands[3].name(), "cancel_source_verification");
-    assert_eq!(script.commands[5].name(), "request_source_verification");
+    assert_eq!(script.commands[3].name(), "cancel_package_integrity_audit");
+    assert_eq!(script.commands[5].name(), "request_package_integrity_audit");
     let ProductAutomationCommand::Assert { condition } = &script.commands[7] else {
-        panic!("expected source-verification evidence assertion");
+        panic!("expected package-integrity-audit evidence assertion");
     };
-    assert_eq!(condition.name(), "source_verification_evidence");
+    assert_eq!(condition.name(), "package_integrity_audit_evidence");
     let ProductAutomationCommand::Assert { condition } = &script.commands[8] else {
         panic!("expected render-target assertion");
     };
@@ -1304,13 +1331,13 @@ fn automation_script_parses_normal_import_cancel_resume_workflow() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 8,
+          "schema_version": 10,
           "hard_safety_limits": {},
           "scenario": "import_preprocessing",
           "commands": [
-            { "command": "begin_tiff_import_setup", "source": "/tmp/source", "output_parent": "/tmp/output" },
+            { "command": "begin_tiff_import_setup", "source": "/tmp/source", "output_parent": "/tmp/output", "source_kind": "folder_of_3d_tiffs" },
             { "command": "wait_for", "condition": "import_review_ready", "timeout_ms": 1000 },
-            { "command": "start_reviewed_import", "spacing_zyx_um": [0.4, 0.2, 0.1], "time_step_seconds": null, "no_data_sentinel": 255, "working_memory_bytes": 268435456 },
+            { "command": "start_reviewed_import", "spacing_zyx_um": [0.4, 0.2, 0.1], "time_step_seconds": null, "no_data_value_rule": { "kind": "manual_uint8", "value": 255 }, "hide_constant_z_planes": false },
             { "command": "wait_for_import_progress", "stage": "base-production", "minimum_completed_work_units": 512, "timeout_ms": 1000 },
             { "command": "cancel_import" },
             { "command": "wait_for", "condition": "import_idle", "timeout_ms": 1000 },
@@ -1347,7 +1374,7 @@ fn automation_script_parses_retained_four_panel_assertions() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 8,
+          "schema_version": 10,
           "hard_safety_limits": {},
           "scenario": "unit_four_panel",
           "commands": [
@@ -1674,7 +1701,7 @@ fn panel_image_comparison_rejects_blank_targets_and_compares_unequal_extents() {
     assert!(equal_error.contains("0 normalized-coordinate pixels"));
 
     let mut normalized_different = normalized_equal;
-    normalized_different[(1 * 4 + 3) * 4] = 255;
+    normalized_different[(4 + 3) * 4] = 255;
     assert!(
         assert_gpu_display_images_distinct(
             "unequal",

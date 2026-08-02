@@ -1,6 +1,6 @@
 # Architecture
 
-Last updated: 2026-07-30
+Last updated: 2026-08-01
 
 Mirante4D is a native Rust desktop viewer and analysis workbench. It opens
 strict `.m4d` packages; source microscopy data enters through explicit
@@ -45,9 +45,10 @@ The workspace has eighteen packages (seventeen `mirante4d-*` crates plus
   lookup, opaque frame leases, brick traversal, asynchronous timing and
   picking, first-cause typed terminal-device latching, and presentation built
   only against dataset leases and render contracts.
-- `mirante4d-storage`: active target-profile catalog, checked ceilings,
+- `mirante4d-storage`: one active compositional package-safety contract,
   portable package paths, bounded local validation/reads, exact and scientific
-  capabilities, dataset source, and deterministic create-only local writer.
+  capabilities, dataset source, and deterministic resumable/create-only local
+  writer.
 - `mirante4d-import-pipeline`: active bounded, cancellable, restartable
   TIFF/OME-TIFF producer for validated sharded target packages.
 - `mirante4d-ui-egui`: active egui visual components, UI-facing message
@@ -63,6 +64,14 @@ files; format code does not own viewer state. The product uses
 `mirante4d-render-wgpu`; the CPU reference renderer is test-only.
 
 ## Application Composition
+
+`MiranteApplicationShell` is the native process composition root. It owns the
+selected-adapter facts, settings connection, process CPU broker,
+preprocessing service, asynchronous package-open transaction, and an optional
+`MiranteWorkbenchApp`. The normal window therefore exists in `Welcome` and
+`Opening` states without constructing a catalog, dataset runtime, or fake
+workspace. A successful open constructs the dataset-bound workbench session;
+a failed or cancelled open returns to the empty shell.
 
 `MiranteWorkbenchApp` holds `ApplicationState`, bounded
 `DatasetDemandState`, process diagnostics, egui state owned by
@@ -85,67 +94,131 @@ wakes egui. The app issues one prompt-free close request; the existing
 guardian process, timeout kill path, or second shutdown authority.
 
 The native `ImportWorkflow` owns TIFF worker cancellation, bounded terminal
-results, retry options, and explicit joining. It projects immutable import
-facts through `ApplicationSnapshot`; egui owns only the editable review draft
-and returns ID-checked import commands. Egui owns no path, TIFF inspection,
-worker channel, or thread handle.
+results, typed checkpoint recovery, explicit setup rows and their inspection
+generations, and explicit joining. It projects immutable import facts through
+`ApplicationSnapshot`; egui owns only transient text/control drafts and
+returns ID-checked import commands. Egui owns no selected path, TIFF
+inspection, worker channel, or thread handle. Capacity exhaustion retains the
+checkpoint and exposes non-destructive `Resume`; a corrupt or mismatched
+checkpoint remains a distinct, confirmed `Reset and Restart` operation.
+
+Every setup row declares one source kind: one 3D TIFF, immediate 3D TIFF
+children as timepoints, or immediate single-page TIFF children as Z. The
+source manifest stores canonical channel labels and the complete ordered
+logical mapping. No later stage rediscovers a hierarchy or parses filename
+tokens. Inspection is metadata-only, cancellable, first-mismatch terminating,
+and generation checked; it does not hash or decode the full source.
 
 The import pipeline has one source-native authority. It captures the reviewed
 inventory, traverses each admitted TIFF strip/tile once, and writes canonical
-little-endian `[c,t,z,y,x]` planes to a fixed two-file cache. Source admission
-is deliberately closed to uncompressed, LZW, current/old Deflate, and PackBits
-grayscale `uint8`, `uint16`, or finite `float32` pages. JPEG, WebP,
-Zstd-in-TIFF, fax, and other unaudited decoder workspaces fail as unsupported
-sources rather than selecting another path. Inspection, native decode, and the
-final SHA-256 pass bind reads to the opened descriptor's generation as well as
-guarding the source path before and after use; ingest and final revalidation
-also compare the reviewed generation. Before decoder construction, a bounded
+little-endian planes into the current `(timepoint, channel)` unit cache or the
+single ordinal-bound future decode cache admitted by the temporal coordinator.
+Source admission is deliberately closed to uncompressed, LZW, current/old
+Deflate, and PackBits grayscale `uint8`, `uint16`, or finite `float32` pages.
+JPEG, WebP, Zstd-in-TIFF, fax, and other unaudited decoder workspaces fail as
+unsupported sources rather than selecting another path. Inspection and native
+decode bind reads to the opened descriptor's generation as well as guarding
+the source path before and after use. Final structural revalidation compares
+the reviewed generation without a payload pass. Per-unit decoded digests are
+stored at fixed channel/time offsets and folded in canonical `[c,t]` order
+without retaining all digests in RAM. Before decoder construction, a bounded
 positional-read preflight walks the primary IFD chain, rejects oversized or
 duplicate eager fields and more than 65,536 pages, and charges retained
 multipage decoder state separately from one-plane parallel workers.
 
-The canonical cache is opened relative to the spool-held checkpoint directory
-descriptor with no-follow semantics. It retains the exact data/state
-descriptors, shares descriptor-bound positional readers across workers, and
-removes a checkpoint name only when it still resolves to the retained file
-identity. The four-file spool applies the same fixed-name and descriptor-owned
-authority to canonical encoded logical chunks. Canonical batch triggers are 16
-completed planes, 64 MiB of pending plane bytes, and a 15-second age check;
-spool triggers are 512 work units, 64 MiB of pending encoded payload, and the
-same age check. Stage boundaries and entry into a serialized decoder interval
-may commit earlier. A canonical plane above 64 MiB is rejected before ingest;
-the byte ceiling is not expanded for a large plane. Recovery accepts only
-checksummed, binding-matched durable prefixes, discards at most one bounded
-incomplete batch, and has no predecessor-schema reader.
+The active factor-two pyramid geometry is storage policy, so
+`mirante4d-storage` owns its terminal constants and sole pure shape-sequence
+function. Import planning and generation consume that sequence;
+`mirante4d-import-pipeline` continues to own the actual bounded pixel and
+validity reduction. Package admission composes checked spatial geometry with
+codec/object limits and aggregate addressability. Its 65,536 manifest
+descriptor ceiling follows from the smaller of the wire format capacity and
+an explicit 64 MiB descriptor working-set contract; temporal/channel growth is
+not compared with a reference acquisition.
 
-CPU work is admitted by the shared byte ledger and bounded by cores and
-per-task allocation ceilings. Eligible single-plane source decodes,
+The current checkpoint is the destination-bound hidden final-layout stage.
+Only one canonical current unit cache, one optional future decoded cache, and
+one encoded-inner unit spool may be live. The future cache has no spool or
+commit authority. Their files are opened with the existing no-follow and
+descriptor-owned rules. The current cache and spool are deleted after the
+final-layout shard prefix and unit journal are durable; unused speculative
+cache scratch is reclaimed before a genuine capacity pause or terminal
+failure. The stage keeps chained records for final-relative objects, a canonical unit
+journal, sparse decoded-digest storage, packed-index records, resolved no-data
+facts, and resumable per-channel scientific-hash frontiers. Recovery accepts
+only checksummed, plan/source-bound canonical prefixes and removes at most one
+incomplete unit/object suffix. A canonical plane above 64 MiB is rejected
+before ingest; there is no predecessor checkpoint reader.
+
+CPU work is admitted by one process-level broker with a hard managed total,
+accounting-only purpose categories, an interactive foreground reserve, and
+one run-scoped preprocessing progress reservation. The progress reservation
+protects the maximum phase-local minimum execution path and converts to normal
+leases without a second charge. Borrowed capacity expands a contiguous
+ordered sliding window; temporary refusal stops admission, drains useful
+results, and retries. Eligible single-plane source decodes,
 normalization, downsampling, scientific-tile preparation, and inner encoding
-run concurrently; multipage or over-task-ceiling TIFFs use one streaming
-decoder. The calling owner alone advances checkpoint state and commits
-canonical order. Canonical and spool positional readers are shared, so worker
+run concurrently inside the active bounded unit; multipage or
+over-task-ceiling TIFFs use one streaming decoder. The calling owner alone
+advances scientific identity, final-layout objects, and journal state in
+canonical order. Cache and spool positional readers are shared, so worker
 tasks add no per-task checkpoint descriptors.
 
-The reviewed `U8Sentinel` selector has one hard-cut production route. Base and
-scientific-identity tasks read a clipped Chebyshev-radius-one source halo,
-classify exact sentinel equality, scatter invalid dilation into the logical
-core, and canonicalize final invalid values to zero. A coarse task reads pixel
+After first-volume no-data resolution is durable, the temporal coordinator
+may run exactly one future source ingest while the owner performs canonical
+processing. The future worker receives a child cancellation token and a CPU
+ledger capped to the source decode's conservative transient ceiling; the cap
+cannot borrow the current unit's protected progress bytes. While it is active,
+the current unit's ordered-worker parallelism ceiling is reduced by one slot,
+so nested work never exceeds the system authority. Runtime disk admission
+requires both mandatory current-unit headroom and the missing future-cache
+ceiling. Failure to obtain optional CPU or disk capacity is an ordinary
+width-one schedule, not an import error. Ready caches are consumed only at the
+next canonical ordinal, all exit paths join the worker, and source-generation
+failures retain their typed meaning. The hard Start requirement therefore
+remains independent of this throughput optimization and of total `T/C`.
+
+The no-data resolver has one hard-cut typed production route. Canonical ingest
+first decodes channel zero at timepoint zero exactly once. The resolver then
+reads that local cache, inspects only that volume, detects exactly constant Z
+planes and, when requested, uses rolling X/Y/Z equality runs to find the first uniform
+`5 x 5 x 5` block in linear voxel work and O(Y×X) state. Constant planes are
+excluded from automatic value inference when plane hiding is enabled. When a
+value resolves, a complete cache pass marks every matching cube and performs
+face-six reconstruction through exact-value voxels using row-packed bitsets,
+a fixed in-memory run window, and a checkpoint-owned spill file. The
+immutable row-packed spatial mask, resolved typed value or no-match result, and
+sorted plane indices bind the plan digest, recipe, scientific content, and
+every worker task. Its retained bytes remain charged to the import CPU ledger.
+
+Base-production and scientific-identity tasks read a clipped
+Chebyshev-radius-one source halo only when a value rule resolved. Automatic
+mode classifies fixed first-volume mask membership; manual uint8 mode alone
+classifies dataset-wide exact source values. Tasks scatter the applicable
+rule's dilation into the logical core, overlay strictly plane-local invalidity,
+and canonicalize final invalid values to typed zero. A coarse task reads pixel
 components only for its aligned factor-two core (at most four 2D or eight 3D
 parents), while a separately charged parent-validity window supplies the
-target-plus-one support halo (at most sixteen or sixty-four parents). Uniform
-packed-index facts synthesize validity without codec work; mixed parents decode
-only their validity component. The task forms valid-only half-up means,
-dilates unsupported child samples, crops once, and encodes one final work unit.
-There is no full-level support pass or sentinel fallback to point decimation.
-No-sentinel imports retain the prior point-sampled route.
+target-plus-one value-support halo (at most sixteen or sixty-four parents).
+Uniform packed-index facts synthesize validity without codec work; mixed
+parents decode only their validity component. Integer means use half-up
+rounding; float means use finite f64 accumulation and canonical float32 output.
+Plane-only parent gaps are excluded from values but do not acquire value-rule
+morphology. A coarse plane sample is invalid only when its complete base-Z
+support is hidden. If resolution finds neither a value nor a plane, the exact
+plan emits no validity payload and retains the prior point-sampled route.
 
-Publication streams those validated inner encodings into indexed outer shards
-without decoding and re-encoding pixel or validity chunks. The storage writer
-then performs structure, exact, and locality-aware scientific validation before
-create-only atomic rename. Scientific validation prepares the four `z=16`
-identity leaves intersecting a `z=64` brick while that brick is resident, so
-each present base brick is decoded once per scan. The scientific writer keeps
-the resulting non-cloneable capability, seals it to the private stage's
+Production streams validated inner encodings into indexed outer shards at
+their final package-relative paths without decoding and re-encoding pixel or
+validity chunks. Each bounded suffix crosses one stage-filesystem durability
+barrier before its chained record advances. After all temporal units and
+packed-index shards are present, the storage writer removes private control,
+writes metadata/manifests, and performs structure, exact, and locality-aware
+content validation before create-only atomic rename. Content validation
+prepares the four `z=16`
+content-address leaves intersecting a `z=64` brick while that brick is resident,
+so each present base brick is decoded once per scan. The writer keeps the
+resulting non-cloneable self-consistent publication capability, seals it to the private stage's
 filesystem identity, and rebinds it only when `RENAME_NOREPLACE` publishes that
 same directory. Within the cooperative local destination-parent namespace
 assumed by this contract, an inventory/snapshot/inventory sandwich before
@@ -156,22 +229,23 @@ adversarial namespace isolation: a hostile actor able to rename or unlink
 entries in the destination parent is outside the contract because Unix cannot
 atomically bind a source name to an already-open directory descriptor. Failure
 within the contract is terminal for automatic import opening; it never falls
-back to the external-package verifier.
+back to an ordinary external-package open.
 
 Staged-validation object-read evidence counts every successful strict-reader
 object open, including whole reads, ranges, hashes, and snapshot-only
 revalidations, and reports structure, exact, and scientific components plus
 their checked sum. Directory-only metadata inspection is not an object read.
-Codec operation/time evidence distinguishes checkpoint inner encoding and
-checkpoint-dependent decoding from package-construction encoding and
-staged-validation decoding. Durability operation/time
-evidence covers canonical-cache and spool file/directory synchronization,
-one counted Linux `syncfs` barrier after all staged package objects close,
-every staged directory, and the destination parent synchronization after
-rename. The barrier is filesystem-wide rather than stage-scoped: unrelated
-dirty data can add latency or surface a conservative writeback failure. Package
-creation rejects Linux kernels older than 5.8, where `syncfs` did not reliably
-report those failures.
+Codec operation/time evidence distinguishes unit inner encoding from outer
+shard construction and staged-validation decoding. Durability evidence covers
+unit cache/spool control, incremental final-layout stage commits, compact unit
+and identity state, final staged directories, and destination-parent
+synchronization after rename. Linux incremental commits use one counted
+`syncfs` barrier rather than walking every accumulated directory, while final
+publication performs the complete directory durability pass once. The barrier
+is filesystem-wide rather than stage-scoped: unrelated dirty data can add
+latency or surface a conservative writeback failure. Package creation rejects
+Linux kernels older than 5.8, where `syncfs` did not reliably report those
+failures.
 
 The one-shot published-capability consumer returns a storage-issued execution
 receipt for its closed inventory/snapshot/inventory route. The receipt splits
@@ -183,7 +257,7 @@ inventory deltas, an observed snapshot delta equal to that independent
 expected count, an exact phase sum, and zero codec decodes. A storage source
 architecture test separately forbids exact-package hashing, scientific
 validation, or brick-read calls in this transfer route. The workspace
-architecture check also requires the imported verified-dataset completion to
+architecture check also requires the imported `DatasetOpened` completion to
 have exactly one production constructor, in the current-source-open adapter.
 These are structural call-path and observed-I/O facts; they are not
 self-declared zero pass counts.
@@ -203,17 +277,39 @@ below the gate of 64.
 ```text
 reviewed TIFF inventory
   -> source-native decode-once traversal
-  -> fixed canonical base cache
-  -> bounded ordered base/pyramid workers
-  -> batched encoded spool
-  -> encoded shard publication
-  -> staged structure + exact + scientific validation
+  -> one bounded temporal-unit cache
+  -> bounded ordered base/pyramid/scientific workers
+  -> one bounded encoded-inner unit spool
+  -> durable final-layout shard prefix + compact unit/hash journal
+  -> packed-index assembly
+  -> staged structure + exact + content-address validation
   -> metadata-only stage currentness proof
   -> atomic create-only rename
-  -> destination-bound verified capability transfer
+  -> destination-bound self-consistent publication capability transfer
   -> metadata-only publication currentness proof
-  -> verified product runtime open
+  -> admitted product runtime open
 ```
+
+Planning reports compressed source size, complete decoded S0 size, and logical
+pyramid bytes as information. `StoragePlacementPlan` separately computes a
+summed per-object final-package ceiling for guidance, one-unit scratch, the
+maximum encoded commit for one unit, one compact unit-control increment, and a
+profile-bounded finalization reserve. The whole-package ceiling is never
+passed to `statvfs` and is never described as reserved space. Edge outer
+objects are charged from their occupied inner slots rather than as completely
+populated shards.
+
+Hard Start admission checks only the first bounded unit plus finalization.
+During production, the stage journal's cumulative byte prefixes provide the
+exact durable payload already present in the active input-ordinal range;
+runtime therefore checks only unfinished scratch, the missing unit-output
+suffix, one control increment, and finalization. Complete future timepoints
+are absent from that comparison. After temporal production, the check narrows
+again to the actual request's missing packed-index/metadata/manifest work.
+Every safe prepublication `ENOSPC` route becomes a typed capacity pause and
+keeps the resumable stage. The application projects the active phase,
+timepoint/channel, exact durable stage bytes, actual unit scratch,
+non-reserved remaining package ceiling, and immediate additional headroom.
 
 `DatasetRequestDispatcher` is the sole application poll owner. It keeps only
 bounded request correlation and cancellation generations; decoded allocations
@@ -243,28 +339,31 @@ Aligned full 3D resources instead stream codec output into the runtime-owned
 sink in bounded writable spans and avoid a payload-sized intermediate copy.
 Current-view workers may submit a bounded source cohort, so one guarded
 pre-use/post-use transaction covers its deduplicated object set while every
-member retains an independent cancellation and typed outcome. A verified
-source may use packed min/max/validity facts without rescanning a delivered
-payload only because scientific verification decoded and compared those facts
-at every runtime-addressable pyramid scale before issuing the capability.
-Every cached hit still revalidates its guarded object snapshots; source
-promotion refreshes matching authority in place and invalidates incompatible
-generations. Handle, index, physical-brick, codec, range, cohort/currentness,
-direct-span, post-decode-copy, and contention counters describe actual work
-without adding a second reader path.
+member retains an independent cancellation and typed outcome. For an
+externally opened package, packed min/max/validity records remain hints until
+the corresponding payload has been decoded and checked; a claimed empty brick
+cannot suppress that first payload read. A package published by the active
+importer may transfer checked packed facts with its self-consistent publication
+capability. Every cached hit still revalidates its guarded object snapshots.
+The source retains one stable package-access authority for its lifetime; there
+is no background promotion or reader swap. Handle, index, physical-brick,
+codec, range, cohort/currentness, direct-span, post-decode-copy, and contention
+counters describe actual work without adding a second reader path.
 
 `AnalysisProductRuntime` is the narrow product bridge to the analysis
 runtime. It uses the shared dispatcher below interactive priority and keeps at
 most two analysis blocks in flight. Exact whole-layer time traces and numeric
 box statistics produce one table/plot bundle; the application exposes decoded
 values only after the project store publishes that bundle atomically. Reopen
-authenticates the stored source identity and both artifact payloads before
-installing either result.
+validates the stored source-content-address binding and both artifact payloads
+before installing either result.
 
 Payload validity is explicit, so valid zero, invalid/no-data, and missing are
 distinct. Cancellation generations are ordered only within their scope;
-unrelated view and playback demand cannot cancel each other. Unverified reads
-use an opaque per-open source ID, never a fabricated scientific-content ID.
+unrelated view and playback demand cannot cancel each other. Ordinary admitted
+reads use an opaque per-open runtime source ID. The declared scientific content
+address remains package metadata and is never fabricated as a runtime
+integrity capability.
 
 ## Runtime Flow
 
@@ -289,6 +388,56 @@ for a tiny fixture is an optimization inside that path, not a second product
 architecture. Missing occupied data is loading/incomplete, never empty.
 An explicit zero-resource plan means the view is outside selected data (or no
 layer is visible); it is terminal and distinct from missing occupied data.
+
+Temporal playback has one application-owned `PlaybackSession`. Warmup chooses
+the finest full-volume layer-scale map that fits the exact CPU/GPU overlap for
+the requested 1–24 FPS cadence, active layout, visible predecessor, startup
+runway, and bounded rotating slot ring. The resulting contract freezes its
+source generation, FPS, target set, scale map, slot count, and resource
+ceilings until Pause or Stop. Total timepoint count therefore does not change
+steady-state playback memory.
+
+Each successor is one immutable temporal frame contract and one prepared
+visible-target resource body. Standalone 3D owns only a 3D body; four-panel
+owns fixed-scale 3D/XY/XZ/YZ bodies. Lateness retains the same-scale
+predecessor rather than substituting a coarser playback LOD, skipping time, or
+exposing `Loading...`. The temporal body contains no camera geometry. During
+four-panel playback, the linked-panel wrappers bind geometry-independent
+full-volume bodies admitted by the same session contract, so plane motion does
+not rebuild temporal residency.
+
+One private application `ComposedPresentationScheduler` is the semantic
+presentation authority above the renderer. It owns a bounded latest
+transaction with independent temporal, 3D-spatial, linked-spatial, and
+retained-quality coordinates. A ready due `PlaybackFrameContract` is composed
+with the latest spatial mailbox snapshots; newest whole-layout spatial
+settlement is not a temporal clock gate, and spatial samples cannot rebuild or
+discard the playback session's prepared body.
+
+The scheduler assembles a fixed logical target set before deriving physical
+work: standalone 3D contains exactly 3D, while four-panel contains exactly 3D,
+XY, XZ, and YZ. Each member is either newly prepared or reused after proving
+its exact source, timepoint, scale map, spatial revision, extent, immutable
+body, and renderer lineage. Validation sees the complete logical set. A
+separate projection then yields an empty, partial, or complete physical delta;
+an empty delta completes without GPU work, and a partial delta receives an
+exact atomic publication group for only its changed targets.
+
+Pause or Stop creates a retained-quality transaction after application
+reconciliation has established the final render-intent revisions. The current
+playback front remains visible while future playback-only demand is released
+and the ordinary stationary plan is prepared. That transaction cannot
+assemble, reuse, or render until the entire active-layout stationary plan is
+current, complete, and renderable, so a stale playback plan cannot masquerade
+as the finer result. Recoverable failures are latched by transaction
+fingerprint and leave the retained front intact until a relevant state change.
+
+The renderer `FrameCoordinator` remains the sole owner of GPU targets,
+recording order, queue submission, completion, and atomic swaps. The
+application scheduler supplies semantic transactions only; it owns no GPU
+texture, fence, residency map, or second submission path. The
+[composed presentation scheduler cutover](plans/active/VIEWER_COMPOSED_PRESENTATION_SCHEDULER_CUTOVER.md)
+records the completed hard cut and evidence.
 
 Native resource defaults are derived from the exact adapter already selected
 for the eframe window. On Linux Vulkan, the application queries that adapter's
@@ -427,43 +576,55 @@ presentation. A matching direct pass or the completed private candidate makes
 the only preview-to-exact transition. Identical settled work is then
 suppressed.
 
-The visible navigation decision is static for one gesture. The controller
-counts physical pixels, maximum selected-scale ray steps, visible layers, one
-or eight taps for voxel-exact or smooth-linear sampling, and ISO gradient taps
-against a fixed 1920×1080 product work class. It considers every complete
-resident full-volume rung no finer than the current target plus the exact
-camera-local body, selects the finest body inside that class, and freezes its
-per-layer scale map for the gesture. If a camera-local body loses geometric
-coverage, one monotonic cut chooses the finest safe resident full-volume rung;
-that gesture cannot upgrade again. GPU timings cannot change visible LOD or
-output resolution. They may certify the exact same camera/profile for a
-future direct pass and supply a conservative initial hidden-batch size.
+The visible navigation decision is static for one gesture. One analytical
+schedule model projects each selected layer's renderer-quantized affine bounds
+into the physical output, derives a transform-aware grid traversal bound, and
+separates full-output ray setup, shared traversal, per-layer sampling/optics,
+and ISO-gradient work. Compatibility credit follows the actual kernel:
+co-registered voxel-exact DVR shares ray and traversal mechanics, while MIP,
+ISO, general affine DVR, and authored Mixed retain their actual per-layer or
+common-world schedules. The controller considers every complete resident
+full-volume rung no finer than the current per-layer target plus the exact
+camera-local body, selects the finest map inside the fixed 1920×1080 work
+class, and freezes that map for the gesture. If a camera-local body loses
+geometric coverage, one monotonic cut chooses the finest safe resident
+full-volume rung; that gesture cannot upgrade again. GPU timings cannot change
+visible LOD or output resolution. They may certify the exact same
+camera/profile for a future direct pass and supply a conservative initial
+hidden-batch size.
 
 Hidden-work classification uses one bounded family cache. Families separate
-projection, ordered layer mode, sampling, ISO shading, and one of 32 ISO
-display-threshold bands. MIP's former 1x and DVR/ISO's former 2x values survive
-only as conservative first-observation priors. The renderer worker owns
-within-job batch adaptation from completed submissions, so a one-row initial
-estimate can expand immediately and is never limited to one row per display
-refresh. Fast or slow hidden observations do not probe or change visible
-preview policy. Job/results, profile observations, family calibrations, and
-timing associations all have fixed bounds.
+projection, kernel class, ordered layer mode, sampling, ISO shading, and one
+of 32 ISO display-threshold bands. The analytical schedule supplies the
+content-independent initial envelope; the renderer worker owns within-job
+batch adaptation from completed submissions, so a one-row initial estimate
+can expand immediately and is never limited to one row per display refresh.
+Fast or slow hidden observations do not probe or change visible preview
+policy. Job/results, profile observations, family calibrations, and timing
+associations all have fixed bounds.
 
 The navigation floor is the terminal geometry generated by the import
-contract, not a named ordinal. Its complete active-layer/timepoint body remains
-in the ordinary globally accounted requirement union. When one canonical
-resource covers a complete terminal layer, control field 62 names the
-renderer-owned page record directly. Volume kernels then bypass per-segment
-directory hashing, resolve origin/shape/payload/dtype/validity once, and reuse
-that address through the ray. Smooth-linear sampling resolves one resource for
-the complete eight-tap footprint rather than repeating sparse lookup for every
-tap. Multi-page exact bodies retain the ordinary global sparse-directory path.
+contract, not a named ordinal. The complete terminal body for every visible
+layer/timepoint remains in the ordinary globally accounted requirement union.
+When one canonical resource covers a complete terminal layer, control field 62
+names the renderer-owned page record directly. Volume kernels then bypass
+per-segment directory hashing, resolve origin/shape/payload/dtype/validity
+once, and reuse that address through the ray. Smooth-linear sampling resolves
+one resource for the complete eight-tap footprint rather than repeating sparse
+lookup for every tap. Multi-page exact bodies retain the ordinary global
+sparse-directory path.
 
-For 3D, the terminal body is the mandatory first rung of one bounded coherent
-navigation ladder. The planner advances every visible layer by at most one
-catalog level per rung and admits a finer full-volume body atomically only
-while the optional one-quarter tail, 512 MiB/16,384-resource caps, and exact
-global union all fit. Every candidate owns an exact one-scale selection body.
+For static 3D, the terminal map is the mandatory first rung of one bounded
+coherent navigation ladder. Each successor advances exactly one visible layer
+by one catalog step. Deterministic max-min normalized progress chooses that
+layer and authored visible order breaks ties, preventing analysis focus or an
+unequal catalog depth from monopolizing the retained quality. A finer
+full-volume map is admitted atomically only while the optional one-quarter
+tail, 512 MiB/16,384-resource caps, and exact global union all fit. Playback
+retains its separate established lockstep ladder policy. Every candidate owns
+an exact one-scale-per-layer selection body. Installed ladder reuse is
+mode-local: entering or leaving playback rebuilds the requested ladder policy
+instead of interpreting the other mode's terminal rung as a complete ladder.
 Its renderer wrapper places that exact body first and carries the common
 aggregate ladder as a dormant suffix. Only the exact prefix participates in
 coverage or volume control; the suffix is ordinary global residency prefetch
@@ -549,6 +710,11 @@ viewport changes advance only linked 2D; shared layer/time/transfer/source
 changes advance both once. Finishing a raw gesture commits durable state
 without allocating a second frame. Consequently linked-only interaction
 cannot cancel, restart, rerender, or relabel an unchanged hidden 3D candidate.
+An active gesture therefore exposes both its spatial sample identity and the
+newest composed family identity: settlement uses the former, while visible
+demand and presentation use the latter. The composed scheduler consumes the
+latest family identity at each cutoff without making its settlement a
+precondition for a ready due temporal successor.
 
 Frame identity names semantic input, not asynchronous preparation completion.
 A provisional and successor immutable requirement body may therefore be
@@ -587,17 +753,29 @@ gradient lighting before reporting complete. Crosshair, numeric ROI, and
 distance tools consume current exact world hits and draw through one small UI
 overlay model, not a scene graph.
 
+`ViewState::active_layer` is durable analysis/editor focus only. It may name a
+hidden layer and never supplies render membership, LOD, residency,
+presentation currentness, or backend classification. The authored-order
+projection of visible view layers is the sole derived render membership and
+may be empty. Ideal, capacity-selected, frozen-navigation, and displayed
+quality remain exact per-layer maps; a scalar exists only as an explicitly
+uniform nonempty summary. Empty visibility commits empty demand and publishes
+the intentional empty surface instead of retaining an old front or entering a
+planning retry.
+
 The UI evaluates bounded demand signatures. The affine cell footprint in the
 physical pixels of the actual 3D or cross-section view produces an independent
 ideal LOD for each visible layer. Ideal is a quality target, not mandatory
 admission. The planner traverses only that layer's actual catalog levels,
-starts from its coarsest valid candidate, and deterministically refines toward
-ideal while resource, payload, candidate, scratch, and transition-overlap
-bounds fit. Exact installed or staged reuse is intended to require the same
-selected projected map. Incremental linked-2D interaction keeps resident
-geometric coverage provisional when its installed scale/body differs from the
-selected settled target. The exact-demand signature retains installed scale
-and immutable requirement-body identity, and only the complete coordinated
+starts from its coarsest valid candidate, and for static viewing refines by
+max-min normalized per-layer progress toward ideal while resource, payload,
+candidate, scratch, and transition-overlap bounds fit. Authored visible order
+breaks exact ties; durable analysis selection is not a render priority and may
+be hidden. Exact installed or staged reuse requires the same selected
+per-layer map. Incremental linked-2D interaction keeps resident geometric
+coverage provisional when its installed scale/body differs from the selected
+settled target. The exact-demand signature retains installed maps and
+immutable requirement-body identity, and only the complete coordinated
 replacement can satisfy exact currentness.
 
 The 3D path keeps the bounded ladder above, and every nonempty linked Plane
@@ -679,13 +857,13 @@ already-advanced guard position. A rejected result therefore neither cancels
 useful overlap nor exposes a mixed generation.
 
 Volume rendering first records the newest camera through either a certified
-native direct pass or a complete uniform navigation preview at the physical
-panel extent. A complete selected body is not automatically
+native direct pass or a complete per-layer-map navigation preview at the
+physical panel extent. A complete selected body is not automatically
 interaction-safe merely because it is resident. During active input the
 controller uses the finest complete resident target-eligible ladder rung
 inside the fixed work envelope; only absence of a finer safe rung reaches the
-terminal body. After a current preview exists, the selected uniform body renders
-through the renderer-owned asynchronous row-batch scheduler and swaps
+terminal body. After a current preview exists, the selected per-layer-map body
+renders through the renderer-owned asynchronous row-batch scheduler and swaps
 atomically only after every row for the same camera and controls completes and
 the application authorizes promotion. Visible coordinated cutoffs observe
 progress but do not drive it. An incomplete selected resource body remains
@@ -710,11 +888,11 @@ recovery set exists. Required-prefix and full camera-guard readiness have
 separate monotone cursors. Current-only, refinement-only, dual-scope, and
 installed-empty progressive states check every installed body without
 requiring an absent companion scope. Generation/dirty tracking suppresses a
-volume submission for an unchanged settled view. Background verification has
-lower priority than interaction and a fixed post-input/render grace. Its
-worker blocks on an explicit condition-variable wakeup while interaction is
-active, rather than polling, and resumes after that grace rather than starving
-on a warm resident camera path.
+volume submission for an unchanged settled view. There is no automatic
+background package verifier or post-interaction verification grace. The
+optional package-integrity audit starts only from an explicit user command,
+runs on its own cancellable worker with byte-accounted scratch, and never owns
+renderer demand or presentation state.
 
 Dataset scheduler and ledger wakeups carry predicate generations. A queue or
 capacity change that lands between a worker's check and wait is therefore
@@ -765,15 +943,22 @@ application-wide GPU latch.
 
 ## Persistence And Settings
 
-Target packages open provisionally through `LocalPackageCatalog` and
-`LocalDatasetSource`. Background exact-package and scientific-content
-verification promotes the same source generation. Project attach, open, and
-save remain identity-gated, and observed source drift invalidates the verified
-state. This is the external-open route. A package produced by the active
-importer instead arrives with the linear publication capability described
-above and is installed through one atomic `VerifiedDatasetOpened` reducer
-completion. Dirty-project deferral retains that exact capability until Save,
-Discard, or Cancel; it is never reduced to a path-only request.
+Target packages receive bounded structural admission through
+`LocalPackageCatalog` and `LocalDatasetSource`. Ordinary use performs no
+automatic whole-package scan: each consumed object is checksum/currentness
+checked, and externally supplied packed facts become authoritative only after
+the corresponding payload is decoded and checked. Project attach, open, save,
+recovery, analysis, and export do not wait for unrelated package bytes.
+
+A package produced by the active importer instead arrives with the linear
+self-consistent publication capability described above and is installed
+through the same atomic `DatasetOpened` reducer completion. Dirty-project
+deferral retains that exact capability until Save, Discard, or Cancel; it is
+never reduced to a path-only request. A user may start or cancel an explicit
+full package-integrity audit. That read-only operation reports exact encoded
+objects, recomputed S0 content address, and packed-fact agreement with real
+work counters and exact failures. Its result never authenticates the producer,
+gates ordinary work, changes source authority, or clears visible pixels.
 
 `mirante4d-project-store` is the sole project-storage authority, reached by
 the product only through `ProjectStoreApplicationService`. Its directory-backed

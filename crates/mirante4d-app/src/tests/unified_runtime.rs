@@ -1,3 +1,5 @@
+use mirante4d_application::PackageIntegrityAuditSnapshot;
+
 #[test]
 fn unified_source_open_starts_with_no_owned_interactive_payloads() {
     let temp = tempfile::tempdir().unwrap();
@@ -7,8 +9,77 @@ fn unified_source_open_starts_with_no_owned_interactive_payloads() {
     assert_eq!(opened.dataset.retained_leases().required_len(), 0);
     assert_eq!(opened.dataset.retained_leases().retained_len(), 0);
     assert!(!opened.dataset.dispatcher().has_pending_work());
-    assert_eq!(opened.dataset.current_scale(), ScaleLevel::BASE);
+    assert_eq!(opened.dataset.current_uniform_scale(), None);
     opened.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn integrity_audit_is_explicit_reports_real_work_and_never_rebinds_the_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let source_generation = app.application.snapshot().source_generation();
+    let selected_path = app.dataset.selected_path().to_path_buf();
+
+    for _ in 0..32 {
+        app.poll_package_integrity_audit_service();
+    }
+    assert_eq!(
+        app.package_integrity_audit_service
+            .as_ref()
+            .unwrap()
+            .diagnostics()
+            .started_runs,
+        0,
+        "ordinary idle polling must not start an audit"
+    );
+
+    app.apply_application_command(
+        ApplicationCommand::RequestPackageIntegrityAudit,
+        &egui::Context::default(),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        app.poll_package_integrity_audit_service();
+        if !matches!(
+            app.application.snapshot().source().integrity_audit(),
+            PackageIntegrityAuditSnapshot::Running { .. }
+        ) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+
+    let snapshot = app.application.snapshot();
+    let PackageIntegrityAuditSnapshot::SelfConsistent(report) =
+        snapshot.source().integrity_audit()
+    else {
+        panic!("explicit fixture audit did not complete as self-consistent");
+    };
+    assert!(report.objects_hashed() > 0);
+    assert!(report.bytes_hashed() > 0);
+    assert!(report.decoded_bricks() > 0);
+    assert!(report.decoded_bytes() > 0);
+    assert_eq!(snapshot.source_generation(), source_generation);
+    assert_eq!(app.dataset.selected_path(), selected_path);
+    let diagnostics = app
+        .package_integrity_audit_service
+        .as_ref()
+        .unwrap()
+        .diagnostics();
+    assert_eq!(diagnostics.started_runs, 1);
+    assert_eq!(diagnostics.completed_runs, 1);
+    assert!(diagnostics.progress_updates > 0);
+
+    app.package_integrity_audit_service
+        .take()
+        .unwrap()
+        .shutdown()
+        .unwrap();
+    app.dataset.request_shutdown().unwrap();
 }
 
 #[test]
@@ -486,7 +557,7 @@ fn latest_transient_cross_section_stays_provisional_and_finishes_without_replann
             &mut app.render_coordination,
             cross_section_scheduler::CrossSectionScheduleInput {
                 view: application_view(&app.application.snapshot()),
-                active_layer_target: empty_target,
+                uniform_target: empty_target,
                 requirements: empty_requirements.as_ref(),
                 first_useful_requirements: 0,
                 first_useful_available: false,
@@ -806,16 +877,22 @@ fn resident_cross_section_guard_avoids_planning_until_settlement_or_envelope_exi
         app.dataset.visible_demand_diagnostics().submitted,
         planner_before.submitted + 1
     );
-    assert!(app.pending_visible_demand_plan.is_some());
-    for (scope, installed) in cross_scopes.into_iter().zip(&installed_bodies) {
-        assert!(Arc::ptr_eq(
-            installed,
-            &app.dataset.scope_requirement_handle(scope)
-        ));
+    if app.pending_visible_demand_plan.is_some() {
+        for (scope, installed) in cross_scopes.into_iter().zip(&installed_bodies) {
+            assert!(Arc::ptr_eq(
+                installed,
+                &app.dataset.scope_requirement_handle(scope)
+            ));
+        }
+        let installed = await_visible_demand_plan(&mut app);
+        assert!(installed.cross_section_plan_installed);
+    } else {
+        assert_eq!(
+            app.dataset.visible_demand_diagnostics().completed,
+            planner_before.completed + 1,
+            "a worker allowed to finish in the initiating UI turn must publish exactly one result"
+        );
     }
-
-    let installed = await_visible_demand_plan(&mut app);
-    assert!(installed.cross_section_plan_installed);
     assert!(panels.into_iter().all(|panel| {
         !app
             .visible_demand_plan_currentness()
@@ -2075,7 +2152,8 @@ fn unsafe_3d_profile_keeps_native_preview_visible_until_atomic_exact_strips_fini
     );
     await_visible_demand_plan(&mut app);
     assert_eq!(
-        app.render_coordination.frame_fidelity.target_scale_level, 0,
+        app.render_coordination.frame_fidelity.target_scale_level,
+        Some(0),
         "the fixture and mapped viewport must require exact scale zero"
     );
     let expected_preview_frame = app.render_intent_mailbox.snapshot().three_d_revision;
@@ -2851,6 +2929,100 @@ fn complete_navigation_floor_makes_latest_camera_immediately_renderable() {
 }
 
 #[test]
+fn predecessor_timepoint_navigation_floor_cannot_make_a_new_camera_intent_renderable() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let context = egui::Context::default();
+    await_visible_demand_plan(&mut app);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !app
+        .navigation_render_plans
+        .first()
+        .is_some_and(|plan| {
+            workbench_brick_runtime::first_useful_resources_complete_with_renderer(
+                &app.dataset,
+                &app.native_presentation,
+                plan,
+            )
+        })
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the predecessor navigation floor did not become resident"
+        );
+        app.drain_brick_results(&context);
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        app.navigation_render_plans[0].requirements.timepoint(),
+        TimeIndex::new(0)
+    );
+    let generation = app
+        .render_coordination
+        .surface(PresentationSlot::ThreeD)
+        .generation();
+    assert!(app.render_coordination.record_presented_frame(
+        PresentationSlot::ThreeD,
+        generation,
+        synthetic_presented_frame(
+            PresentationSlot::ThreeD,
+            app.render_coordination.render_viewport,
+        ),
+    ));
+
+    app.apply_application_command(
+        ApplicationCommand::SetTimepoint(TimeIndex::new(1)),
+        &context,
+    )
+    .unwrap();
+    assert_eq!(application_view(&app.application.snapshot()).timepoint(), TimeIndex::new(1));
+    assert_eq!(
+        app.navigation_render_plans[0].requirements.timepoint(),
+        TimeIndex::new(0),
+        "the retained predecessor remains paintable while the successor is planned"
+    );
+
+    let durable_camera = *application_view(&app.application.snapshot()).camera();
+    assert!(
+        !app.prepare_resident_camera_intent(durable_camera),
+        "resident resources from t0 must not suppress demand for t1 during camera input"
+    );
+
+    assert!(await_visible_demand_plan(&mut app).current_plan_installed);
+    assert!(
+        app.dataset.holding_previous_presentation(),
+        "the t0 presentation remains protected while t1 becomes renderable"
+    );
+    assert_eq!(
+        app.navigation_render_plans[0].requirements.timepoint(),
+        TimeIndex::new(1),
+        "successor navigation metadata must not remain bound to the retained predecessor"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !workbench_brick_runtime::first_useful_resources_complete_with_renderer(
+        &app.dataset,
+        &app.native_presentation,
+        &app.navigation_render_plans[0],
+    ) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the successor navigation floor did not become resident"
+        );
+        app.drain_brick_results(&context);
+        std::thread::yield_now();
+    }
+    assert!(
+        app.prepare_resident_camera_intent(durable_camera),
+        "the ready t1 navigation floor must decouple camera rendering from further demand planning"
+    );
+
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
 fn finishing_camera_gesture_commits_without_allocating_a_second_3d_frame() {
     let temp = tempfile::tempdir().unwrap();
     let package = write_target_fixture(temp.path()).unwrap();
@@ -3308,14 +3480,86 @@ fn render_mode_switch_skips_membership_planning_and_admits_one_display_generatio
 }
 
 #[test]
-fn verification_promotes_the_live_source_without_redecode_or_runtime_rekey() {
+fn hiding_active_analysis_layer_keeps_remaining_visible_layers_authoritative() {
     let temp = tempfile::tempdir().unwrap();
     let package = write_target_fixture(temp.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
-    let runtime_identity = app.dataset.resource_identity();
     await_visible_demand_plan(&mut app);
+    let context = egui::Context::default();
+    let snapshot = app.application.snapshot();
+    let view = application_view(&snapshot);
+    let active = view.active_layer();
+    let active_layer = view.layer(active).unwrap();
+    let remaining = view
+        .layers()
+        .iter()
+        .filter(|layer| layer.visible() && layer.layer_key() != active)
+        .map(|layer| layer.layer_key())
+        .collect::<Vec<_>>();
+    assert!(
+        !remaining.is_empty(),
+        "the multichannel fixture must retain a visible layer after hiding analysis focus"
+    );
+    let hidden_active = mirante4d_project_model::LayerViewState::new(
+        active,
+        false,
+        active_layer.transfer().clone(),
+        *active_layer.render_state(),
+    );
 
+    app.apply_application_command(ApplicationCommand::SetLayerView(hidden_active), &context)
+        .unwrap();
+    assert!(await_visible_demand_plan(&mut app).current_plan_installed);
+
+    let snapshot = app.application.snapshot();
+    let view = application_view(&snapshot);
+    assert_eq!(view.active_layer(), active);
+    assert!(!view.layer(active).unwrap().visible());
+    assert_eq!(
+        app.dataset
+            .current_ideal_layer_scales()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        remaining
+    );
+    let target_scope = if app.dataset.staging_current_refinement() {
+        dataset_requests::SCOPE_CURRENT_3D_REFINEMENT
+    } else {
+        dataset_requests::SCOPE_CURRENT_3D
+    };
+    assert_eq!(
+        app.dataset
+            .scope_layer_scales(target_scope)
+            .unwrap()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        remaining
+    );
+    assert_eq!(
+        app.prepared_scope_render_plans[&target_scope]
+            .layer_scales
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        remaining
+    );
+    assert!(app.navigation_render_plans.iter().all(|plan| {
+        plan.layer_scales.keys().copied().collect::<Vec<_>>() == remaining
+    }));
+    assert_eq!(app.dataset.last_plan_error(), None);
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn changing_analysis_focus_preserves_static_render_and_residency_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    await_visible_demand_plan(&mut app);
     let context = egui::Context::default();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !app
@@ -3326,51 +3570,152 @@ fn verification_promotes_the_live_source_without_redecode_or_runtime_rekey() {
         app.drain_brick_results(&context);
         std::thread::yield_now();
     }
-    await_visible_demand_plan(&mut app);
-    let retained_before = app.dataset.retained_leases().retained_len();
-    let runtime_before = app.dataset.dispatcher().diagnostics().unwrap();
-    let storage_before = app.dataset.local_source_diagnostics().unwrap();
-
-    verify_test_source(&mut app);
 
     let snapshot = app.application.snapshot();
-    assert!(snapshot.catalog().scientific_identity().is_verified());
-    assert_eq!(snapshot.catalog().resource_identity(), runtime_identity);
-    assert_eq!(app.dataset.resource_identity(), runtime_identity);
-    assert_eq!(
+    let view = application_view(&snapshot);
+    let next_active = view
+        .layers()
+        .iter()
+        .find(|layer| layer.layer_key() != view.active_layer())
+        .expect("the multichannel fixture has another analysis focus")
+        .layer_key();
+    let plans_before = app.visible_demand_plan_calls;
+    let generation_before = app.render_coordination.display_generation();
+    let mailbox_before = app.render_intent_mailbox.snapshot();
+    let fidelity_before = app.render_coordination.frame_fidelity.clone();
+    let current_body = app
+        .dataset
+        .scope_requirement_handle(dataset_requests::SCOPE_CURRENT_3D);
+    let refinement_body = app
+        .dataset
+        .scope_requirement_handle(dataset_requests::SCOPE_CURRENT_3D_REFINEMENT);
+    let retained_before = (
+        app.dataset.retained_leases().required_len(),
         app.dataset.retained_leases().retained_len(),
+    );
+    let submitted_before = app
+        .dataset
+        .dispatcher()
+        .diagnostics()
+        .unwrap()
+        .submitted_requests();
+
+    app.apply_application_command(ApplicationCommand::SetActiveLayer(next_active), &context)
+        .unwrap();
+
+    assert_eq!(
+        application_view(&app.application.snapshot()).active_layer(),
+        next_active
+    );
+    assert_eq!(app.visible_demand_plan_calls, plans_before);
+    assert_eq!(app.render_coordination.display_generation(), generation_before);
+    assert_eq!(app.render_intent_mailbox.snapshot(), mailbox_before);
+    assert_eq!(app.render_coordination.frame_fidelity, fidelity_before);
+    assert!(Arc::ptr_eq(
+        &current_body,
+        &app.dataset
+            .scope_requirement_handle(dataset_requests::SCOPE_CURRENT_3D)
+    ));
+    assert!(Arc::ptr_eq(
+        &refinement_body,
+        &app
+            .dataset
+            .scope_requirement_handle(dataset_requests::SCOPE_CURRENT_3D_REFINEMENT)
+    ));
+    assert_eq!(
+        (
+            app.dataset.retained_leases().required_len(),
+            app.dataset.retained_leases().retained_len(),
+        ),
         retained_before
     );
+    assert_eq!(
+        app.dataset
+            .dispatcher()
+            .diagnostics()
+            .unwrap()
+            .submitted_requests(),
+        submitted_before
+    );
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn hiding_all_visible_layers_publishes_explicit_empty_3d_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    await_visible_demand_plan(&mut app);
+    let context = egui::Context::default();
+    let hidden_layers = application_view(&app.application.snapshot())
+        .layers()
+        .iter()
+        .filter(|layer| layer.visible())
+        .map(|layer| {
+            mirante4d_project_model::LayerViewState::new(
+                layer.layer_key(),
+                false,
+                layer.transfer().clone(),
+                *layer.render_state(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(!hidden_layers.is_empty());
+    for hidden in hidden_layers {
+        app.apply_application_command(ApplicationCommand::SetLayerView(hidden), &context)
+            .unwrap();
+    }
+    assert!(
+        application_view(&app.application.snapshot())
+            .layers()
+            .iter()
+            .all(|layer| !layer.visible()),
+        "the fixture command must establish an all-hidden canonical view"
+    );
+    assert!(await_visible_demand_plan(&mut app).current_plan_installed);
     assert!(
         app.dataset
-            .local_source()
-            .is_some_and(|source| source.package_id().is_some())
+            .scope_is_empty(dataset_requests::SCOPE_CURRENT_3D),
+        "empty visibility did not replace the installed 3D scope: error={:?}, requirements={}, scales={:?}",
+        app.dataset.last_plan_error(),
+        app.dataset
+            .scope_requirements(dataset_requests::SCOPE_CURRENT_3D)
+            .len(),
+        app.dataset
+            .scope_layer_scales(dataset_requests::SCOPE_CURRENT_3D)
     );
-    let runtime_after = app.dataset.dispatcher().diagnostics().unwrap();
-    let storage_after = app.dataset.local_source_diagnostics().unwrap();
-    assert_eq!(
-        runtime_after.started_decodes(),
-        runtime_before.started_decodes()
-    );
-    assert_eq!(
-        runtime_after.completed_decodes(),
-        runtime_before.completed_decodes()
-    );
-    assert_eq!(
-        storage_after.physical_brick_unique_decodes,
-        storage_before.physical_brick_unique_decodes
-    );
-    assert_eq!(
-        storage_after.reader.codec_decode_operations,
-        storage_before.reader.codec_decode_operations
-    );
+    assert!(app.dataset.current_ideal_layer_scales().is_empty());
+    assert!(!app
+        .prepared_scope_render_plans
+        .contains_key(&dataset_requests::SCOPE_CURRENT_3D));
+    assert!(!app
+        .prepared_scope_render_plans
+        .contains_key(&dataset_requests::SCOPE_CURRENT_3D_REFINEMENT));
+    assert!(app.navigation_render_plans.is_empty());
+    assert_eq!(app.dataset.last_plan_error(), None);
 
+    app.rerender_coordinated_display_state().unwrap();
+
+    assert_eq!(
+        app.render_coordination.frame_fidelity.backend,
+        mirante4d_application::RenderBackend::Empty
+    );
+    assert_eq!(
+        app.render_coordination.frame_fidelity.reason,
+        mirante4d_application::LodDecisionReason::NoVisibleData
+    );
+    assert_eq!(
+        app.render_coordination.frame_fidelity.displayed_scale_level,
+        None
+    );
+    assert!(
+        app.render_coordination
+            .surface(PresentationSlot::ThreeD)
+            .layer_presentations()
+            .is_empty()
+    );
     app.dataset.request_shutdown().unwrap();
-    app.source_verification_service
-        .take()
-        .unwrap()
-        .shutdown()
-        .unwrap();
 }
 
 #[test]
@@ -3554,20 +3899,41 @@ fn inspection_review_and_typed_start_form_one_import_workflow() {
     let mut app = test_workbench_app_without_background_runtime(opened);
     let context = egui::Context::default();
 
-    app.enter_tiff_import_setup_waiting_state(TiffSource::auto(&source), destination)
+    app.import.begin_setup();
+    app.import.set_channel_kind(
+        0,
+        mirante4d_application::import_workflow::ImportChannelSourceKind::FolderOf3dTiffs,
+    );
+    app.import.install_channel_selection(0, source.clone());
+    let manifest = TiffSource::new(vec![
+        TiffChannelSource::folder_of_3d("channel 1", &source).unwrap(),
+    ])
+    .unwrap();
+    app.import
+        .workers
+        .start_inspection(manifest.clone(), PathBuf::new())
         .unwrap();
+    app.import.mark_channel_inspection_active(0);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         app.drain_tiff_import_setup_results(&context);
-        if matches!(
-            app.application_snapshot_for_ui().import_workflow(),
-            ImportWorkflowSnapshot::Review(_)
-        ) {
+        if app
+            .import
+            .setup
+            .as_ref()
+            .and_then(|setup| setup.channels[0].inspection.as_ref())
+            .is_some()
+        {
             break;
         }
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();
     }
+    let inspection = app.import.validated_setup_inspection().unwrap();
+    app.import.setup = None;
+    app.import
+        .install_review(manifest, inspection, destination)
+        .unwrap();
 
     let ImportWorkflowSnapshot::Review(review) = app.import.snapshot() else {
         panic!("inspection must produce an import review");
@@ -3633,9 +3999,13 @@ fn import_cancellation_waits_for_the_worker_terminal_result() {
     let temp = tempfile::tempdir().unwrap();
     let package = write_target_fixture(temp.path()).unwrap();
     let source = write_source_time_series_fixture(temp.path()).unwrap();
-    let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
+    let manifest = TiffSource::new(vec![
+        TiffChannelSource::folder_of_3d("channel 1", &source).unwrap(),
+    ])
+    .unwrap();
+    let inspection = mirante4d_import_pipeline::inspect_tiff(manifest.clone()).unwrap();
     let (review_id, options) = reviewed_import_options(
-        TiffSource::auto(&source),
+        manifest,
         inspection,
         temp.path().join("cancelled-import.m4d"),
     );
@@ -3678,8 +4048,7 @@ fn imported_dataset_uses_the_existing_dirty_project_open_handoff() {
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
     let context = egui::Context::default();
-    verify_test_source(&mut app);
-    app.apply_application_command(ApplicationCommand::AttachVerifiedDataset, &context)
+    app.apply_application_command(ApplicationCommand::AttachDataset, &context)
         .unwrap();
     assert!(app.project_dirty());
     let imported = temp.path().join("imported.m4d");
@@ -3704,7 +4073,7 @@ fn imported_dataset_uses_the_existing_dirty_project_open_handoff() {
             .all(|operation| operation.kind() != OperationKind::DatasetOpen)
     );
     app.dataset.request_shutdown().unwrap();
-    app.source_verification_service
+    app.package_integrity_audit_service
         .take()
         .unwrap()
         .shutdown()
@@ -3717,7 +4086,9 @@ fn invalid_external_open_does_not_close_the_current_project_store() {
     let package = write_target_fixture(temp.path()).unwrap();
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
-    app.source_open_service = Some(current_source_open_service::CurrentSourceOpenService::new());
+    app.source_open_service = Some(current_source_open_service::CurrentSourceOpenService::new(
+        app.cpu_broker.clone(),
+    ));
     install_test_project_store(&mut app);
     assert!(!app.project_dirty());
     let original_path = app.dataset.selected_path().canonicalize().unwrap();
@@ -3765,14 +4136,14 @@ fn invalid_external_open_does_not_close_the_current_project_store() {
 
 #[test]
 #[ignore = "developer-local: deep imported-publication/project-close integration"]
-fn imported_publication_waits_for_project_close_then_installs_without_normal_verifier() {
+fn imported_publication_waits_for_project_close_then_installs_without_an_integrity_audit() {
     let temp = tempfile::tempdir().unwrap();
     let current_package = write_target_fixture(temp.path()).unwrap();
     let source = write_source_single_ome_fixture(temp.path()).unwrap();
-    let destination = temp.path().join("direct-verified-import.m4d");
-    let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
+    let destination = temp.path().join("direct-import-publication.m4d");
+    let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::single_3d(&source)).unwrap();
     let (_, options) =
-        reviewed_import_options(TiffSource::auto(&source), inspection, destination.clone());
+        reviewed_import_options(TiffSource::single_3d(&source), inspection, destination.clone());
     let published = mirante4d_import_pipeline::import_tiff(
         options,
         &TestImportLedger,
@@ -3784,17 +4155,18 @@ fn imported_publication_waits_for_project_close_then_installs_without_normal_ver
 
     let opened = open_dataset_and_render_first_frame(&current_package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
-    app.source_open_service = Some(current_source_open_service::CurrentSourceOpenService::new());
+    app.source_open_service = Some(current_source_open_service::CurrentSourceOpenService::new(
+        app.cpu_broker.clone(),
+    ));
     install_test_project_store(&mut app);
-    verify_test_source(&mut app);
     app.apply_application_command(
-        ApplicationCommand::AttachVerifiedDataset,
+        ApplicationCommand::AttachDataset,
         &egui::Context::default(),
     )
     .unwrap();
     assert!(app.project_dirty());
     let diagnostics_before = app
-        .source_verification_service
+        .package_integrity_audit_service
         .as_ref()
         .unwrap()
         .diagnostics();
@@ -3802,7 +4174,7 @@ fn imported_publication_waits_for_project_close_then_installs_without_normal_ver
     assert!(!app.open_or_queue_imported_dataset(published, None).unwrap());
     assert!(matches!(
         app.pending_dataset_open.as_ref(),
-        Some(current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_))
+        Some(current_source_open_service::CurrentSourceOpenRequest::ImportedPublication(_))
     ));
     assert_eq!(
         app.dataset_open_project_close,
@@ -3817,7 +4189,7 @@ fn imported_publication_waits_for_project_close_then_installs_without_normal_ver
     );
     assert!(matches!(
         app.pending_dataset_open.as_ref(),
-        Some(current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_))
+        Some(current_source_open_service::CurrentSourceOpenRequest::ImportedPublication(_))
     ));
     assert!(
         app.source_open_service
@@ -3835,8 +4207,8 @@ fn imported_publication_waits_for_project_close_then_installs_without_normal_ver
     wait_for_test_app(&mut app, |app| {
         app.dataset.selected_path().canonicalize().unwrap() == destination.canonicalize().unwrap()
             && matches!(
-                app.application.snapshot().source(),
-                SourceVerificationSnapshot::Verified(_)
+                app.application.snapshot().source().content_address_origin(),
+                mirante4d_application::ContentAddressOrigin::ComputedDuringImport
             )
             && app.pending_dataset_open.is_none()
             && app
@@ -3848,22 +4220,21 @@ fn imported_publication_waits_for_project_close_then_installs_without_normal_ver
     assert_eq!(
         snapshot
             .catalog()
-            .scientific_identity()
-            .verified_id()
+            .content_address_status()
+            .content_address()
             .copied(),
         Some(receipt.scientific_content_id)
     );
 
-    let verification = app.source_verification_service.as_ref().unwrap();
-    assert_eq!(verification.diagnostics(), diagnostics_before);
-    assert!(verification.active_token().is_none());
-    assert!(app.pending_automatic_source_verification.is_none());
+    let audit = app.package_integrity_audit_service.as_ref().unwrap();
+    assert_eq!(audit.diagnostics(), diagnostics_before);
+    assert!(audit.active_token().is_none());
 
     if app.project_store.is_some() {
         close_test_project_store(&mut app);
     }
     app.source_open_service.take().unwrap().shutdown().unwrap();
-    app.source_verification_service
+    app.package_integrity_audit_service
         .take()
         .unwrap()
         .shutdown()
@@ -3873,14 +4244,14 @@ fn imported_publication_waits_for_project_close_then_installs_without_normal_ver
 
 #[test]
 #[ignore = "developer-local: deep imported-publication/project-close integration"]
-fn failed_project_close_retains_imported_authority_without_verifier_fallback() {
+fn failed_project_close_retains_imported_authority_without_an_audit_fallback() {
     let temp = tempfile::tempdir().unwrap();
     let current_package = write_target_fixture(temp.path()).unwrap();
     let source = write_source_single_ome_fixture(temp.path()).unwrap();
     let destination = temp.path().join("retained-after-close-failure.m4d");
-    let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
+    let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::single_3d(&source)).unwrap();
     let (_, options) =
-        reviewed_import_options(TiffSource::auto(&source), inspection, destination.clone());
+        reviewed_import_options(TiffSource::single_3d(&source), inspection, destination.clone());
     let published = mirante4d_import_pipeline::import_tiff(
         options,
         &TestImportLedger,
@@ -3891,18 +4262,19 @@ fn failed_project_close_retains_imported_authority_without_verifier_fallback() {
 
     let opened = open_dataset_and_render_first_frame(&current_package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
-    app.source_open_service = Some(current_source_open_service::CurrentSourceOpenService::new());
+    app.source_open_service = Some(current_source_open_service::CurrentSourceOpenService::new(
+        app.cpu_broker.clone(),
+    ));
     install_test_project_store(&mut app);
-    verify_test_source(&mut app);
     app.apply_application_command(
-        ApplicationCommand::AttachVerifiedDataset,
+        ApplicationCommand::AttachDataset,
         &egui::Context::default(),
     )
     .unwrap();
     assert!(app.project_dirty());
     let original_path = app.dataset.selected_path().canonicalize().unwrap();
-    let verification_before = app
-        .source_verification_service
+    let audit_before = app
+        .package_integrity_audit_service
         .as_ref()
         .unwrap()
         .diagnostics();
@@ -3938,11 +4310,11 @@ fn failed_project_close_retains_imported_authority_without_verifier_fallback() {
     assert!(
         app.project_status_message
             .as_deref()
-            .is_some_and(|message| message.contains("verified import handoff remains retained"))
+            .is_some_and(|message| message.contains("publication handoff remains retained"))
     );
     assert!(matches!(
         app.pending_dataset_open.as_ref(),
-        Some(current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(
+        Some(current_source_open_service::CurrentSourceOpenRequest::ImportedPublication(
             transfer
         )) if transfer.destination() == destination
     ));
@@ -3964,16 +4336,16 @@ fn failed_project_close_retains_imported_authority_without_verifier_fallback() {
             .active_token()
             .is_none()
     );
-    let verification = app.source_verification_service.as_ref().unwrap();
-    assert_eq!(verification.diagnostics(), verification_before);
-    assert!(verification.active_token().is_none());
+    let audit = app.package_integrity_audit_service.as_ref().unwrap();
+    assert_eq!(audit.diagnostics(), audit_before);
+    assert!(audit.active_token().is_none());
     assert!(
         app.open_or_queue_dataset_path(temp.path().join("must-not-replace-retained.m4d"), None)
             .is_err()
     );
     assert!(matches!(
         app.pending_dataset_open.as_ref(),
-        Some(current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_))
+        Some(current_source_open_service::CurrentSourceOpenRequest::ImportedPublication(_))
     ));
 
     app.egui_ui.close_prompt_open = false;
@@ -3990,7 +4362,7 @@ fn failed_project_close_retains_imported_authority_without_verifier_fallback() {
     );
 
     app.source_open_service.take().unwrap().shutdown().unwrap();
-    app.source_verification_service
+    app.package_integrity_audit_service
         .take()
         .unwrap()
         .shutdown()
@@ -4005,9 +4377,9 @@ fn imported_transfer_drift_fails_closed_without_external_open_fallback() {
     let current_package = write_target_fixture(temp.path()).unwrap();
     let source = write_source_single_ome_fixture(temp.path()).unwrap();
     let destination = temp.path().join("drifted-import.m4d");
-    let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
+    let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::single_3d(&source)).unwrap();
     let (_, options) =
-        reviewed_import_options(TiffSource::auto(&source), inspection, destination.clone());
+        reviewed_import_options(TiffSource::single_3d(&source), inspection, destination.clone());
     let published = mirante4d_import_pipeline::import_tiff(
         options,
         &TestImportLedger,
@@ -4023,10 +4395,10 @@ fn imported_transfer_drift_fails_closed_without_external_open_fallback() {
 
     let opened = open_dataset_and_render_first_frame(&current_package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
-    app.source_open_service = Some(current_source_open_service::CurrentSourceOpenService::new());
+    app.source_open_service = Some(current_source_open_service::CurrentSourceOpenService::new(
+        app.cpu_broker.clone(),
+    ));
     install_test_project_store(&mut app);
-    app.source_verification_service =
-        Some(current_source_verification_service::CurrentSourceVerificationService::new());
     let original_path = app.dataset.selected_path().canonicalize().unwrap();
 
     assert!(app.open_or_queue_imported_dataset(published, None).unwrap());
@@ -4056,7 +4428,7 @@ fn imported_transfer_drift_fails_closed_without_external_open_fallback() {
     assert_eq!(
         app.project_status_message.as_deref(),
         Some(
-            "The package was created and remains on disk, but Mirante4D could not complete its verified imported open; the current dataset and its project storage remain available."
+            "The package was created and remains on disk, but Mirante4D could not complete its published import handoff; the current dataset and its project storage remain available."
         )
     );
     assert_eq!(
@@ -4067,13 +4439,13 @@ fn imported_transfer_drift_fails_closed_without_external_open_fallback() {
         app.project_store.as_ref().unwrap().status().lifecycle(),
         ProjectStoreLifecycle::Unbound
     );
-    let verification = app.source_verification_service.as_ref().unwrap();
-    assert_eq!(verification.diagnostics(), Default::default());
-    assert!(verification.active_token().is_none());
+    let audit = app.package_integrity_audit_service.as_ref().unwrap();
+    assert_eq!(audit.diagnostics(), Default::default());
+    assert!(audit.active_token().is_none());
 
     close_test_project_store(&mut app);
     app.source_open_service.take().unwrap().shutdown().unwrap();
-    app.source_verification_service
+    app.package_integrity_audit_service
         .take()
         .unwrap()
         .shutdown()
@@ -4113,7 +4485,7 @@ impl mirante4d_dataset::CpuByteLedger for TestImportLedger {
 }
 
 #[test]
-fn import_verify_analyze_save_and_reopen_atomically() {
+fn import_analyze_save_and_reopen_without_a_global_integrity_audit() {
     let temp = tempfile::tempdir().unwrap();
     let source = write_source_time_series_fixture(temp.path()).unwrap();
     let source_bytes = fs::read_dir(&source)
@@ -4127,9 +4499,12 @@ fn import_verify_analyze_save_and_reopen_atomically() {
     let project_path = temp.path().join("analysis-result.m4dproj");
     let context = egui::Context::default();
 
-    let inspection = mirante4d_import_pipeline::inspect_tiff(TiffSource::auto(&source)).unwrap();
-    let (_, options) =
-        reviewed_import_options(TiffSource::auto(&source), inspection, package.clone());
+    let manifest = TiffSource::new(vec![
+        TiffChannelSource::folder_of_3d("channel 1", &source).unwrap(),
+    ])
+    .unwrap();
+    let inspection = mirante4d_import_pipeline::inspect_tiff(manifest.clone()).unwrap();
+    let (_, options) = reviewed_import_options(manifest, inspection, package.clone());
     let published = mirante4d_import_pipeline::import_tiff(
         options,
         &TestImportLedger,
@@ -4138,7 +4513,7 @@ fn import_verify_analyze_save_and_reopen_atomically() {
     )
     .unwrap();
     // This test intentionally exercises a later independent external open;
-    // the direct verified-import handoff is covered separately above.
+    // the direct publication handoff is covered separately above.
     drop(published);
     assert!(package.is_dir());
     assert_eq!(
@@ -4155,8 +4530,7 @@ fn import_verify_analyze_save_and_reopen_atomically() {
     let opened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut app = test_workbench_app_without_background_runtime(opened);
     install_test_project_store(&mut app);
-    verify_test_source(&mut app);
-    app.apply_application_command(ApplicationCommand::AttachVerifiedDataset, &context)
+    app.apply_application_command(ApplicationCommand::AttachDataset, &context)
         .unwrap();
     assert!(app.project_dirty());
     app.project_store_noninteractive_paths.initial_save = Some(project_path.clone());
@@ -4168,7 +4542,7 @@ fn import_verify_analyze_save_and_reopen_atomically() {
         assert!(app.analysis_start_unavailable_reason().is_some());
         close_test_project_store(&mut app);
         app.dataset.request_shutdown().unwrap();
-        app.source_verification_service
+        app.package_integrity_audit_service
             .take()
             .unwrap()
             .shutdown()
@@ -4255,7 +4629,7 @@ fn import_verify_analyze_save_and_reopen_atomically() {
 
     close_test_project_store(&mut app);
     app.dataset.request_shutdown().unwrap();
-    app.source_verification_service
+    app.package_integrity_audit_service
         .take()
         .unwrap()
         .shutdown()
@@ -4265,7 +4639,6 @@ fn import_verify_analyze_save_and_reopen_atomically() {
     let reopened = open_dataset_and_render_first_frame(&package).unwrap();
     let mut reopened_app = test_workbench_app_without_background_runtime(reopened);
     install_test_project_store(&mut reopened_app);
-    verify_test_source(&mut reopened_app);
     reopened_app.project_store_noninteractive_paths.open = Some(project_path);
     let reopened_camera = *application_view(&reopened_app.application.snapshot()).camera();
     reopened_app
@@ -4322,76 +4695,14 @@ fn import_verify_analyze_save_and_reopen_atomically() {
     close_test_project_store(&mut reopened_app);
     reopened_app.dataset.request_shutdown().unwrap();
     reopened_app
-        .source_verification_service
+        .package_integrity_audit_service
         .take()
         .unwrap()
         .shutdown()
         .unwrap();
 }
 
-#[test]
-fn analysis_only_source_failure_invalidates_the_verified_source() {
-    let temp = tempfile::tempdir().unwrap();
-    let package = write_target_fixture(temp.path()).unwrap();
-    let project_path = temp.path().join("analysis-source-failure.m4dproj");
-    let context = egui::Context::default();
-    let opened = open_dataset_and_render_first_frame(&package).unwrap();
-    let mut app = test_workbench_app_without_background_runtime(opened);
-    install_test_project_store(&mut app);
-    verify_test_source(&mut app);
-    app.apply_application_command(ApplicationCommand::AttachVerifiedDataset, &context)
-        .unwrap();
-    app.project_store_noninteractive_paths.initial_save = Some(project_path);
-    app.apply_application_command(ApplicationCommand::RequestProjectSave, &context)
-        .unwrap();
-    if wait_for_initial_project_save(&mut app) == InitialProjectSave::UnsupportedFilesystem {
-        assert!(app.project_dirty());
-        assert!(app.analysis_start_unavailable_reason().is_some());
-        close_test_project_store(&mut app);
-        app.dataset.request_shutdown().unwrap();
-        app.source_verification_service
-            .take()
-            .unwrap()
-            .shutdown()
-            .unwrap();
-        return;
-    }
-
-    fs::remove_dir_all(&package).unwrap();
-    app.start_product_analysis(analysis_product::ProductAnalysisScope::FullTimeTrace)
-        .unwrap();
-    wait_for_test_app(&mut app, |app| {
-        app.analysis_runtime.active_token().is_none()
-            && matches!(
-                app.application.snapshot().source(),
-                SourceVerificationSnapshot::Required
-            )
-    });
-    assert!(
-        app.application
-            .snapshot()
-            .transient()
-            .analysis_tables()
-            .is_empty()
-    );
-    assert!(
-        app.application
-            .snapshot()
-            .transient()
-            .analysis_plots()
-            .is_empty()
-    );
-
-    close_test_project_store(&mut app);
-    app.dataset.request_shutdown().unwrap();
-    app.source_verification_service
-        .take()
-        .unwrap()
-        .shutdown()
-        .unwrap();
-}
-
-fn install_test_project_store(app: &mut MiranteWorkbenchApp) {
+ fn install_test_project_store(app: &mut MiranteWorkbenchApp) {
     let snapshot = app.application.snapshot();
     let WorkspaceSnapshot::Unbound { workspace } = snapshot.workspace() else {
         panic!("test project store must start before the workspace is bound");
@@ -4400,21 +4711,6 @@ fn install_test_project_store(app: &mut MiranteWorkbenchApp) {
         start_project_store_service(None, workspace.provisional_project_id()).unwrap();
     assert_eq!(warning, None);
     app.project_store = Some(service);
-}
-
-fn verify_test_source(app: &mut MiranteWorkbenchApp) {
-    app.source_verification_service =
-        Some(current_source_verification_service::CurrentSourceVerificationService::new());
-    app.request_current_source_verification();
-    wait_for_test_app(app, |app| {
-        matches!(
-            app.application.snapshot().source(),
-            SourceVerificationSnapshot::Verified(_)
-        ) && app
-            .source_verification_service
-            .as_ref()
-            .is_some_and(|service| service.active_token().is_none())
-    });
 }
 
 fn wait_for_test_app(
@@ -4437,7 +4733,6 @@ fn wait_for_test_app(
             );
         }
         app.drain_brick_results(&context);
-        app.update_source_verification_interactive_busy();
         app.pump_application_services();
         std::thread::yield_now();
     }
@@ -4542,432 +4837,7 @@ fn terminal_decode_failure_is_stable_until_the_scope_changes() {
     app.dataset.request_shutdown().unwrap();
 }
 
-#[test]
-fn observed_source_fault_invalidates_then_retry_restores_runtime_identity_coherence() {
-    let temp = tempfile::tempdir().unwrap();
-    let package = write_target_fixture(temp.path()).unwrap();
-    let opened = open_dataset_and_render_first_frame(&package).unwrap();
-    let mut app = test_workbench_app_without_background_runtime(opened);
-    app.source_verification_service =
-        Some(current_source_verification_service::CurrentSourceVerificationService::new());
-    app.request_current_source_verification();
-    app.pump_application_services();
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        app.pump_application_services();
-        let verified = matches!(
-            app.application.snapshot().source(),
-            SourceVerificationSnapshot::Verified(_)
-        );
-        let idle = app
-            .source_verification_service
-            .as_ref()
-            .unwrap()
-            .active_token()
-            .is_none();
-        if verified && idle {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::yield_now();
-    }
-    let verified_catalog_identity = app.application.snapshot().catalog().resource_identity();
-    assert_eq!(app.dataset.resource_identity(), verified_catalog_identity);
-    await_visible_demand_plan(&mut app);
-    assert!(app.dataset.retained_leases().required_len() > 0);
-    let completion_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let diagnostics = app.dataset.dispatcher().diagnostics().unwrap();
-        if diagnostics.pending_completions() > 0 {
-            assert!(diagnostics.ready_requests() > 0);
-            break;
-        }
-        assert!(std::time::Instant::now() < completion_deadline);
-        std::thread::yield_now();
-    }
-
-    app.record_dataset_fault(&mirante4d_dataset_runtime::RuntimeFault::new(
-        mirante4d_dataset_runtime::RuntimeFaultCode::SourceRejected,
-    ));
-    app.pump_application_services();
-    assert!(matches!(
-        app.application.snapshot().source(),
-        SourceVerificationSnapshot::Required
-    ));
-    assert_eq!(app.dataset.retained_leases().required_len(), 0);
-    assert_eq!(app.dataset.retained_leases().retained_len(), 0);
-    assert!(app.dataset.renderer_requirements().is_empty());
-    for scope in [
-        dataset_requests::SCOPE_CURRENT_3D,
-        dataset_requests::SCOPE_CURRENT_3D_REFINEMENT,
-        dataset_requests::SCOPE_CROSS_SECTION_XY,
-        dataset_requests::SCOPE_CROSS_SECTION_XZ,
-        dataset_requests::SCOPE_CROSS_SECTION_YZ,
-        dataset_requests::SCOPE_PLAYBACK,
-    ] {
-        assert!(app.dataset.scope_requirements(scope).is_empty());
-    }
-    assert_eq!(
-        app.dataset.resource_identity(),
-        app.application.snapshot().catalog().resource_identity()
-    );
-    assert!(app.dataset.source_quarantined());
-    let submitted_before = app
-        .dataset
-        .dispatcher()
-        .diagnostics()
-        .unwrap()
-        .submitted_requests();
-    assert_eq!(
-        app.request_visible_bricks(),
-        workbench_brick_runtime::VisibleBrickRequestOutcome::default()
-    );
-    assert_eq!(
-        app.dataset
-            .dispatcher()
-            .diagnostics()
-            .unwrap()
-            .submitted_requests(),
-        submitted_before
-    );
-    let context = egui::Context::default();
-    let drain_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while app
-        .dataset
-        .dispatcher()
-        .diagnostics()
-        .unwrap()
-        .pending_completions()
-        > 0
-    {
-        assert!(std::time::Instant::now() < drain_deadline);
-        app.drain_brick_results(&context);
-        std::thread::yield_now();
-    }
-    assert_eq!(
-        app.dataset
-            .dispatcher()
-            .diagnostics()
-            .unwrap()
-            .pending_completions(),
-        0
-    );
-    assert_eq!(app.dataset.retained_leases().required_len(), 0);
-    assert_eq!(app.dataset.retained_leases().retained_len(), 0);
-
-    app.apply_application_command(ApplicationCommand::RequestSourceVerification, &context)
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        app.pump_application_services();
-        let verified = matches!(
-            app.application.snapshot().source(),
-            SourceVerificationSnapshot::Verified(_)
-        );
-        let idle = app
-            .source_verification_service
-            .as_ref()
-            .unwrap()
-            .active_token()
-            .is_none();
-        if verified && idle {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::yield_now();
-    }
-    assert_eq!(
-        app.dataset.resource_identity(),
-        app.application.snapshot().catalog().resource_identity()
-    );
-    assert!(!app.dataset.source_quarantined());
-    let restored = await_visible_demand_plan(&mut app);
-    assert!(restored.current_plan_installed);
-    assert!(app.dataset.retained_leases().required_len() > 0);
-
-    app.dataset.request_shutdown().unwrap();
-    app.source_verification_service
-        .take()
-        .unwrap()
-        .shutdown()
-        .unwrap();
-}
-
-#[test]
-fn terminal_idle_source_fault_quarantines_immediately_and_wakes_the_service_pump() {
-    let temp = tempfile::tempdir().unwrap();
-    let package = write_target_fixture(temp.path()).unwrap();
-    let opened = open_dataset_and_render_first_frame(&package).unwrap();
-    let mut app = test_workbench_app_without_background_runtime(opened);
-    verify_test_source(&mut app);
-    app.pump_application_services();
-
-    assert!(!app.dataset.dispatcher().has_pending_work());
-    assert_eq!(app.application.snapshot().pending_event_count(), 0);
-
-    app.record_dataset_fault(&mirante4d_dataset_runtime::RuntimeFault::new(
-        mirante4d_dataset_runtime::RuntimeFaultCode::SourceRejected,
-    ));
-
-    assert!(app.dataset.source_quarantined());
-    assert_eq!(app.dataset.retained_leases().required_len(), 0);
-    assert_eq!(
-        app.render_coordination.frame_fidelity.completeness,
-        FrameCompleteness::Loading
-    );
-    let snapshot = app.application.snapshot();
-    assert!(matches!(
-        snapshot.source(),
-        SourceVerificationSnapshot::Required
-    ));
-    assert!(snapshot.pending_event_count() > 0);
-    assert!(!app.dataset.dispatcher().has_pending_work());
-    let progressive_render_work =
-        workbench_playback_runtime::progressive_render_submission_work(&app.native_presentation);
-    assert!(workbench_playback_runtime::background_work_active(
-        &snapshot,
-        &app.import.workers,
-        &app.dataset,
-        &app.render_coordination,
-        &app.native_presentation,
-        progressive_render_work.any_required,
-    ));
-
-    app.pump_application_services();
-    assert_eq!(app.application.snapshot().pending_event_count(), 0);
-    assert!(app.dataset.source_quarantined());
-
-    app.dataset.request_shutdown().unwrap();
-    app.source_verification_service
-        .take()
-        .unwrap()
-        .shutdown()
-        .unwrap();
-}
-
-#[test]
-fn automation_quiescence_dispatches_and_retires_the_pending_normal_verifier() {
-    let temp = tempfile::tempdir().unwrap();
-    let package = write_target_fixture(temp.path()).unwrap();
-    let opened = open_dataset_and_render_first_frame(&package).unwrap();
-    let mut app = test_workbench_app_without_background_runtime(opened);
-    app.source_verification_service =
-        Some(current_source_verification_service::CurrentSourceVerificationService::new());
-    app.pending_automatic_source_verification =
-        Some(app.application.snapshot().source_generation());
-
-    assert!(!product_automation::source_verification_inactive(&app));
-    let details = product_automation::cancel_active_source_verification(&mut app).unwrap();
-    assert_eq!(details["automatic_request_dispatched"], true);
-    assert!(app.pending_automatic_source_verification.is_none());
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !product_automation::source_verification_inactive(&app) {
-        assert!(std::time::Instant::now() < deadline);
-        app.pump_application_services();
-        std::thread::yield_now();
-    }
-    assert!(!app.dataset.source_quarantined());
-
-    app.dataset.request_shutdown().unwrap();
-    app.source_verification_service
-        .take()
-        .unwrap()
-        .shutdown()
-        .unwrap();
-}
-
-#[test]
-fn automatic_source_verification_waits_for_the_previous_worker_to_retire() {
-    let temp = tempfile::tempdir().unwrap();
-    let package = write_target_fixture(temp.path()).unwrap();
-    let opened = open_dataset_and_render_first_frame(&package).unwrap();
-    let replacement = crate::unified_source_open::open(
-        &package,
-        ResourcePolicy::default(),
-        DatasetSourceId::new(2),
-    )
-    .unwrap();
-    let mut app = test_workbench_app_without_background_runtime(opened);
-    app.source_verification_service =
-        Some(current_source_verification_service::CurrentSourceVerificationService::new());
-
-    struct BlockingLedger {
-        delegate: Arc<dyn mirante4d_dataset::CpuByteLedger>,
-        entered: std::sync::atomic::AtomicBool,
-        released: std::sync::Mutex<bool>,
-        release: std::sync::Condvar,
-    }
-
-    impl mirante4d_dataset::CpuByteLedger for BlockingLedger {
-        fn try_acquire(
-            &self,
-            category: mirante4d_dataset::CpuLedgerCategory,
-            bytes: u64,
-        ) -> Result<Box<dyn mirante4d_dataset::CpuByteLease>, mirante4d_dataset::CpuLedgerError>
-        {
-            self.entered
-                .store(true, std::sync::atomic::Ordering::Release);
-            let mut released = self.released.lock().unwrap();
-            while !*released {
-                released = self.release.wait(released).unwrap();
-            }
-            self.delegate.try_acquire(category, bytes)
-        }
-    }
-
-    let blocking_ledger = Arc::new(BlockingLedger {
-        delegate: app.dataset.cpu_ledger_arc(),
-        entered: std::sync::atomic::AtomicBool::new(false),
-        released: std::sync::Mutex::new(false),
-        release: std::sync::Condvar::new(),
-    });
-
-    app.request_current_source_verification();
-    let events = app.application.drain_events(256);
-    let token = events
-        .iter()
-        .find_map(|event| match event {
-            ApplicationEvent::SourceVerificationRequested { token } => Some(token.clone()),
-            _ => None,
-        })
-        .expect("the production request must emit its worker token");
-    app.source_verification_service
-        .as_mut()
-        .unwrap()
-        .request_verification(
-            token.clone(),
-            package.clone(),
-            Arc::clone(&blocking_ledger) as Arc<dyn mirante4d_dataset::CpuByteLedger>,
-            Arc::clone(app.dataset.local_source().unwrap()),
-        )
-        .unwrap();
-    let worker_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !blocking_ledger
-        .entered
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        assert!(std::time::Instant::now() < worker_deadline);
-        std::thread::yield_now();
-    }
-
-    app.application
-        .dispatch(ApplicationCommand::CancelOperation(token.operation_id()))
-        .unwrap();
-    for event in app.application.drain_events(256) {
-        app.observe_source_application_event(&event);
-    }
-    assert!(matches!(
-        app.application.snapshot().source(),
-        SourceVerificationSnapshot::Required
-    ));
-
-    app.application
-        .dispatch(ApplicationCommand::RequestDatasetOpen)
-        .unwrap();
-    let open_token = app
-        .application
-        .drain_events(256)
-        .into_iter()
-        .find_map(|event| match event {
-            ApplicationEvent::DatasetOpenRequested { token } => Some(token),
-            _ => None,
-        })
-        .expect("the replacement source must issue a dataset-open token");
-    let replacement_generation = SourceSessionGeneration::new(2);
-    let unified_source_open::UnifiedOpenedSource {
-        dataset,
-        catalog,
-        workspace,
-        render_coordination,
-        analysis_runtime,
-        startup_diagnostics: _,
-    } = replacement;
-    app.application
-        .dispatch(ApplicationCommand::CompleteOperation {
-            token: open_token,
-            completion: OperationCompletion::DatasetOpened {
-                catalog,
-                workspace: Box::new(workspace),
-                source_generation: replacement_generation,
-            },
-        })
-        .unwrap();
-    app.install_current_source_runtime(current_source_open_service::CurrentSourceRuntimeTransfer {
-        dataset,
-        render_coordination,
-        analysis_runtime,
-    });
-
-    assert_eq!(
-        app.pending_automatic_source_verification,
-        Some(replacement_generation)
-    );
-    assert!(matches!(
-        app.application.snapshot().source(),
-        SourceVerificationSnapshot::Required
-    ));
-    assert_eq!(
-        app.source_verification_service
-            .as_ref()
-            .unwrap()
-            .active_token(),
-        Some(&token)
-    );
-
-    *blocking_ledger.released.lock().unwrap() = true;
-    blocking_ledger.release.notify_all();
-    let verification_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let context = egui::Context::default();
-    loop {
-        app.pump_application_services();
-        // Mirror the production update order: interactive source demand owns
-        // priority, then the verifier resumes as soon as that bounded demand
-        // has drained.
-        app.drain_brick_results(&context);
-        app.update_source_verification_interactive_busy();
-        let snapshot = app.application.snapshot();
-        let verified = snapshot.source_generation() == replacement_generation
-            && matches!(snapshot.source(), SourceVerificationSnapshot::Verified(_));
-        let idle = app
-            .source_verification_service
-            .as_ref()
-            .unwrap()
-            .active_token()
-            .is_none();
-        if verified && idle {
-            break;
-        }
-        assert!(std::time::Instant::now() < verification_deadline);
-        std::thread::yield_now();
-    }
-    assert_eq!(app.pending_automatic_source_verification, None);
-    assert_eq!(
-        app.application.snapshot().source_generation(),
-        replacement_generation
-    );
-    assert_eq!(
-        app.dataset.resource_identity(),
-        app.application.snapshot().catalog().resource_identity()
-    );
-    let diagnostics = app
-        .source_verification_service
-        .as_ref()
-        .unwrap()
-        .diagnostics();
-    assert!(diagnostics.cancelled_runs >= 1);
-    assert!(diagnostics.accepted_successes >= 1);
-
-    app.source_verification_service
-        .take()
-        .unwrap()
-        .shutdown()
-        .unwrap();
-    app.dataset.request_shutdown().unwrap();
-}
-
-#[test]
+    #[test]
 fn playback_prefetch_readiness_is_backed_by_retained_accounted_leases() {
     let temp = tempfile::tempdir().unwrap();
     let package = write_target_fixture(temp.path()).unwrap();
@@ -4993,6 +4863,381 @@ fn playback_prefetch_readiness_is_backed_by_retained_accounted_leases() {
             .iter()
             .all(|key| app.dataset.retained_leases().payload(*key).is_some())
     );
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn starting_playback_rebuilds_the_static_fair_ladder_as_playback_lockstep() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let context = egui::Context::default();
+    app.render_coordination.record_viewports(
+        PresentationSlot::ThreeD,
+        PresentationViewport::new(256.0, 256.0).unwrap(),
+        mirante4d_render_api::RenderExtent::new(256, 256).unwrap(),
+    );
+
+    assert!(await_visible_demand_plan(&mut app).current_plan_installed);
+    assert!(
+        app.navigation_render_plans.iter().any(|candidate| {
+            dataset_demand_plan::uniform_layer_scale(&candidate.layer_scales).is_none()
+        }),
+        "the multichannel static fixture must install its one-layer-at-a-time intermediate rung"
+    );
+
+    app.apply_application_command(ApplicationCommand::SetPlaybackActive(true), &context)
+        .unwrap();
+    assert!(await_visible_demand_plan(&mut app).current_plan_installed);
+
+    let playback_scales = Arc::clone(
+        app.playback_session
+            .contract()
+            .expect("starting playback installs its fixed quality contract")
+            .layer_scales(),
+    );
+    assert!(
+        playback_scales
+            .values()
+            .all(|scale| *scale == mirante4d_domain::ScaleLevel::BASE),
+        "starting playback from a static ladder must not strand its quality contract at the terminal rung: {playback_scales:?}"
+    );
+    assert!(
+        app.navigation_render_plans.iter().all(|candidate| {
+            dataset_demand_plan::uniform_layer_scale(&candidate.layer_scales).is_some()
+        }),
+        "playback must rebuild the established lockstep ladder instead of retaining static mixed rungs"
+    );
+    assert_eq!(
+        app.navigation_render_plans
+            .last()
+            .map(|candidate| candidate.layer_scales.as_ref()),
+        Some(playback_scales.as_ref()),
+        "the finest retained playback rung must agree with the admitted playback contract"
+    );
+
+    let snapshot = app.application.snapshot();
+    let view = application_view(&snapshot);
+    let next_active = view
+        .layers()
+        .iter()
+        .find(|layer| layer.layer_key() != view.active_layer())
+        .expect("the playback fixture has a second analysis focus")
+        .layer_key();
+    let plans_before = app.visible_demand_plan_calls;
+    app.apply_application_command(ApplicationCommand::SetActiveLayer(next_active), &context)
+        .unwrap();
+    assert!(
+        app.visible_demand_plan_calls > plans_before,
+        "playback retains its pre-cutover active-first priority dependency and must rewarm on a focus change"
+    );
+    assert!(await_visible_demand_plan(&mut app).current_plan_installed);
+    assert_eq!(
+        app.playback_session
+            .contract()
+            .expect("playback focus rewarm reinstalls a fixed contract")
+            .layer_scales()
+            .as_ref(),
+        playback_scales.as_ref()
+    );
+    app.dataset.request_shutdown().unwrap();
+}
+
+fn await_exact_three_d_timepoint_capture(
+    app: &mut MiranteWorkbenchApp,
+    context: &egui::Context,
+    expected: TimeIndex,
+) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the complete GPU presentation for t{} did not settle: current={:?}, \
+             staged={}, plan_error={:?}, render_error={:?}",
+            expected.get(),
+            app.render_coordination
+                .surface(PresentationSlot::ThreeD)
+                .presented_frame()
+                .map(|frame| (frame.timepoint(), frame.frame(), frame.progress().completeness())),
+            app.dataset.staging_current_refinement(),
+            app.dataset.last_plan_error(),
+            app.render_coordination.frame_fidelity.last_capacity_error,
+        );
+
+        app.request_visible_bricks();
+        app.drain_brick_results(context);
+        if app
+            .native_presentation
+            .product_gpu
+            .as_ref()
+            .is_some_and(|product| !product.pending_validation_captures.is_empty())
+        {
+            app.poll_product_validation_captures()
+                .expect("the temporal GPU validation capture completes");
+        } else {
+            let target_scope = if app.dataset.staging_current_refinement()
+                && app
+                    .dataset
+                    .scope_requirements(dataset_requests::SCOPE_CURRENT_3D_REFINEMENT)
+                    .iter()
+                    .all(|key| key.timepoint() == expected)
+            {
+                dataset_requests::SCOPE_CURRENT_3D_REFINEMENT
+            } else {
+                dataset_requests::SCOPE_CURRENT_3D
+            };
+            if app.dataset.scope_resources_complete(target_scope) {
+                app.rerender_coordinated_display_state()
+                    .expect("the temporal successor renders through the product coordinator");
+            }
+        }
+
+        let presented = app
+            .render_coordination
+            .surface(PresentationSlot::ThreeD)
+            .presented_frame();
+        if presented.is_some_and(|frame| {
+            frame.timepoint() == expected
+                && frame.progress().completeness()
+                    == mirante4d_render_api::FrameCompleteness::Exact
+        }) && let Some(capture) =
+            product_automation::product_target_capture(app, PanelId::ThreeD)
+        {
+            return capture.rgba8().to_vec();
+        }
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+#[ignore = "requires a trusted Vulkan GPU"]
+fn direct_timepoint_selection_replaces_retained_gpu_pixels_with_the_successor_body() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let context = egui::Context::default();
+    let mut renderer = test_wgpu_renderer(
+        mirante4d_render_wgpu::WgpuRenderRuntimeConfig::new(1024 * 1024 * 1024)
+            .unwrap()
+            .with_validation_capture(true),
+    );
+    renderer
+        .activate_dataset_generation(app.application.snapshot().catalog())
+        .expect("the temporal fixture activates on the product renderer");
+    app.native_presentation =
+        native_presentation::NativePresentationBridge::with_headless_product_renderer(renderer);
+    app.render_coordination.record_viewports(
+        PresentationSlot::ThreeD,
+        PresentationViewport::new(64.0, 64.0).unwrap(),
+        mirante4d_render_api::RenderExtent::new(64, 64).unwrap(),
+    );
+    assert!(await_visible_demand_plan(&mut app).current_plan_installed);
+
+    let timepoint_zero = await_exact_three_d_timepoint_capture(
+        &mut app,
+        &context,
+        TimeIndex::new(0),
+    );
+    assert!(timepoint_zero.iter().any(|value| *value != 0));
+
+    app.apply_application_command(
+        ApplicationCommand::SetTimepoint(TimeIndex::new(1)),
+        &context,
+    )
+    .unwrap();
+    let retained = app
+        .render_coordination
+        .surface(PresentationSlot::ThreeD)
+        .presented_frame()
+        .expect("a temporal seek must retain the predecessor instead of exposing an empty frame");
+    assert_eq!(retained.timepoint(), TimeIndex::new(0));
+
+    let timepoint_one = await_exact_three_d_timepoint_capture(
+        &mut app,
+        &context,
+        TimeIndex::new(1),
+    );
+    assert_ne!(
+        timepoint_one, timepoint_zero,
+        "different public-fixture timepoints must produce different GPU pixels"
+    );
+    assert_eq!(app.application.snapshot().view().timepoint(), TimeIndex::new(1));
+    assert!(
+        app.dataset
+            .scope_requirements(dataset_requests::SCOPE_CURRENT_3D)
+            .iter()
+            .all(|key| key.timepoint() == TimeIndex::new(1)),
+        "the promoted current body must be bound only to the visible successor timepoint"
+    );
+    assert!(!app.dataset.staging_current_refinement());
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn stopping_playback_removes_the_transient_window_from_cpu_and_renderer_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let context = egui::Context::default();
+    app.apply_application_command(ApplicationCommand::SetPlaybackActive(true), &context)
+        .unwrap();
+    await_visible_demand_plan(&mut app);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !app.dataset.scope_complete(dataset_requests::SCOPE_PLAYBACK) {
+        assert!(std::time::Instant::now() < deadline);
+        app.drain_brick_results(&context);
+        std::thread::yield_now();
+    }
+    let playback_only = app
+        .dataset
+        .scope_requirements(dataset_requests::SCOPE_PLAYBACK)
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    assert!(!playback_only.is_empty());
+
+    app.apply_application_command(ApplicationCommand::SetPlaybackActive(false), &context)
+        .unwrap();
+    await_visible_demand_plan(&mut app);
+    assert!(
+        app.dataset
+            .scope_requirements(dataset_requests::SCOPE_PLAYBACK)
+            .is_empty()
+    );
+    assert!(
+        app.dataset
+            .renderer_requirements()
+            .iter()
+            .all(|key| !playback_only.contains(key))
+    );
+    assert!(
+        playback_only
+            .iter()
+            .all(|key| app.dataset.retained_leases().payload(*key).is_none())
+    );
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn stopping_playback_commits_the_last_coherently_presented_cursor() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let context = egui::Context::default();
+
+    app.apply_application_command(ApplicationCommand::SetPlaybackActive(true), &context)
+        .unwrap();
+    await_visible_demand_plan(&mut app);
+    app.apply_application_command(ApplicationCommand::MarkPlaybackPrepared, &context)
+        .unwrap();
+    app.apply_application_command(ApplicationCommand::AdvancePlaybackTick(100), &context)
+        .unwrap();
+    app.apply_application_command(ApplicationCommand::AdvancePlaybackTick(101), &context)
+        .unwrap();
+
+    assert_eq!(
+        application_view(&app.application.snapshot()).timepoint(),
+        TimeIndex::new(1),
+        "the reducer cursor must be allowed to lead successor preparation"
+    );
+    assert_eq!(
+        app.playback_session.presented_timepoint(),
+        Some(TimeIndex::new(0)),
+        "without a coordinated publication, the visible session front remains t0"
+    );
+
+    app.apply_application_command(ApplicationCommand::SetPlaybackActive(false), &context)
+        .unwrap();
+
+    let stopped = app.application.snapshot();
+    assert!(!stopped.transient().playback_active());
+    assert_eq!(
+        application_view(&stopped).timepoint(),
+        TimeIndex::new(0),
+        "stop must commit what the user actually saw, not an unpublished requested successor"
+    );
+    assert!(app.playback_session.contract().is_none());
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn four_panel_stop_handoff_captures_the_post_reconciliation_cutoff() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let context = egui::Context::default();
+    let initial = app.application.snapshot();
+    app.apply_application_command(
+        ApplicationCommand::SetLayout {
+            layout: CanonicalViewerLayout::FourPanel,
+            cross_section: *application_view(&initial).cross_section(),
+        },
+        &context,
+    )
+    .unwrap();
+    let presentation = PresentationViewport::new(64.0, 64.0).unwrap();
+    let extent = mirante4d_render_api::RenderExtent::new(64, 64).unwrap();
+    for slot in PresentationSlot::ALL {
+        app.render_coordination
+            .record_viewports(slot, presentation, extent);
+    }
+
+    app.apply_application_command(ApplicationCommand::SetPlaybackActive(true), &context)
+        .unwrap();
+    await_visible_demand_plan(&mut app);
+    app.apply_application_command(ApplicationCommand::MarkPlaybackPrepared, &context)
+        .unwrap();
+    app.apply_application_command(ApplicationCommand::AdvancePlaybackTick(100), &context)
+        .unwrap();
+    app.apply_application_command(ApplicationCommand::AdvancePlaybackTick(101), &context)
+        .unwrap();
+    assert_eq!(
+        app.playback_session.presented_timepoint(),
+        Some(TimeIndex::new(0))
+    );
+    for slot in PresentationSlot::ALL {
+        let generation = app.render_coordination.surface(slot).generation();
+        assert!(app.render_coordination.record_presented_frame(
+            slot,
+            generation,
+            synthetic_presented_frame(slot, extent),
+        ));
+    }
+
+    app.apply_application_command(ApplicationCommand::SetPlaybackActive(false), &context)
+        .unwrap();
+
+    let stopped = app.application.snapshot();
+    let mailbox = app.render_intent_mailbox.snapshot();
+    let transaction = app
+        .presentation_scheduler
+        .transaction(
+            &stopped,
+            &app.playback_session,
+            &app.render_intent_mailbox,
+        )
+        .expect("Stop must retain one quality-only transaction after cursor reconciliation");
+    assert!(transaction.is_retained_quality());
+    assert_eq!(
+        transaction.expected_revision(PresentationSlot::ThreeD),
+        mailbox.three_d_revision
+    );
+    for slot in [
+        PresentationSlot::Xy,
+        PresentationSlot::Xz,
+        PresentationSlot::Yz,
+    ] {
+        assert_eq!(
+            transaction.expected_revision(slot),
+            mailbox.linked_2d_revision
+        );
+    }
     app.dataset.request_shutdown().unwrap();
 }
 
@@ -5064,6 +5309,279 @@ fn four_panel_playback_demand_shares_one_aggregate_resource_and_byte_budget() {
         decoded_bytes.unwrap()
             <= diagnostics
                 .category_cap_bytes(mirante4d_dataset::CpuLedgerCategory::DecodedResidency,)
+    );
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn four_panel_linked_navigation_and_playback_advance_under_one_composed_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let context = egui::Context::default();
+    let initial = app.application.snapshot();
+    app.apply_application_command(
+        ApplicationCommand::SetLayout {
+            layout: CanonicalViewerLayout::FourPanel,
+            cross_section: *application_view(&initial).cross_section(),
+        },
+        &context,
+    )
+    .unwrap();
+    let presentation = PresentationViewport::new(64.0, 64.0).unwrap();
+    let render = mirante4d_render_api::RenderExtent::new(64, 64).unwrap();
+    for slot in PresentationSlot::ALL {
+        app.render_coordination
+            .record_viewports(slot, presentation, render);
+    }
+
+    app.apply_application_command(ApplicationCommand::SetPlaybackActive(true), &context)
+        .unwrap();
+    await_visible_demand_plan(&mut app);
+    let session_generation = app
+        .playback_session
+        .contract()
+        .expect("warmup planning admits one playback contract")
+        .generation();
+    let playback_scales = app
+        .playback_session
+        .contract()
+        .unwrap()
+        .layer_scales()
+        .clone();
+    for scope in [
+        dataset_requests::SCOPE_CROSS_SECTION_XY,
+        dataset_requests::SCOPE_CROSS_SECTION_XZ,
+        dataset_requests::SCOPE_CROSS_SECTION_YZ,
+    ] {
+        let plan = app
+            .prepared_scope_render_plans
+            .get(&scope)
+            .expect("four-panel warmup installs every linked target");
+        assert!(plan.covers_full_selected_volumes);
+        assert_eq!(plan.layer_scales, playback_scales);
+    }
+    app.apply_application_command(ApplicationCommand::MarkPlaybackPrepared, &context)
+        .unwrap();
+    app.apply_application_command(ApplicationCommand::AdvancePlaybackTick(100), &context)
+        .unwrap();
+
+    let mut linked = mirante4d_application::viewport_interaction::CrossSectionViewState::from_canonical(
+        *application_view(&app.application.snapshot()).cross_section(),
+    );
+    let linked_panel = mirante4d_application::viewport_interaction::CrossSectionPanel::Xy;
+    let timepoint_count = app.application.snapshot().timepoint_count();
+    for step in 0_u64..3 {
+        match step {
+            0 => linked.pan_by_panel_points(linked_panel, 2.0, -1.0),
+            1 => linked.zoom_around_panel_point(linked_panel, presentation, 32.0, 32.0, 0.9),
+            2 => linked.rotate_oblique_by_panel_drag(linked_panel, 2.0, 1.0, 0.005),
+            _ => unreachable!(),
+        }
+        let expected_cross_section = linked.into_canonical().unwrap();
+        app.apply_render_intent_interaction(
+            RenderIntentInteraction::Sample(
+                mirante4d_application::RenderIntentSample::cross_section(
+                    mirante4d_application::CrossSectionPanelId::Xy,
+                    mirante4d_application::RenderGestureKind::Drag,
+                    expected_cross_section,
+                ),
+            ),
+            &context,
+        )
+        .unwrap();
+        let before_tick = app.application.snapshot();
+        let base_before = RenderIntentBase::from_snapshot(&before_tick);
+        let gesture_revision = app
+            .render_intent_mailbox
+            .active_revision(base_before)
+            .expect("the linked sample owns one spatial revision");
+
+        app.apply_application_command(
+            ApplicationCommand::AdvancePlaybackTick(101 + step),
+            &context,
+        )
+        .unwrap();
+
+        let after_tick = app.application.snapshot();
+        let base_after = RenderIntentBase::from_snapshot(&after_tick);
+        let composed_revision = app
+            .render_intent_mailbox
+            .active_composed_revision(base_after)
+            .expect("the active linked payload composes with the temporal frame");
+        let (_, active_target, demand_revision) =
+            app.effective_visible_demand_inputs(&after_tick);
+        assert_eq!(
+            after_tick.transient().playback_phase(),
+            mirante4d_application::PlaybackPhase::Playing
+        );
+        assert!(after_tick.transient().playback_active());
+        assert_eq!(
+            application_view(&after_tick).timepoint(),
+            mirante4d_domain::TimeIndex::new((step + 1) % timepoint_count)
+        );
+        assert_eq!(
+            app.playback_session.contract().unwrap().generation(),
+            session_generation,
+            "linked navigation must not restart or rebase the temporal session"
+        );
+        assert_eq!(
+            active_target,
+            Some(mirante4d_application::RenderIntentTarget::CrossSection(
+                mirante4d_application::CrossSectionPanelId::Xy,
+            ))
+        );
+        assert_eq!(
+            app.render_intent_mailbox.effective_cross_section(
+                base_after,
+                *application_view(&after_tick).cross_section(),
+            ),
+            expected_cross_section
+        );
+        assert!(composed_revision > gesture_revision);
+        assert_eq!(demand_revision, composed_revision);
+        assert_eq!(
+            demand_revision,
+            app.render_intent_mailbox.snapshot().linked_2d_revision,
+            "demand and linked presentation must observe the same composed frame"
+        );
+
+        await_visible_demand_plan(&mut app);
+        assert_eq!(app.dataset.last_plan_error(), None);
+    }
+
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn linked_input_rebases_an_in_flight_temporal_bundle_without_restarting_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let context = egui::Context::default();
+    let initial = app.application.snapshot();
+    app.apply_application_command(
+        ApplicationCommand::SetLayout {
+            layout: CanonicalViewerLayout::FourPanel,
+            cross_section: *application_view(&initial).cross_section(),
+        },
+        &context,
+    )
+    .unwrap();
+    let presentation = PresentationViewport::new(64.0, 64.0).unwrap();
+    let render = mirante4d_render_api::RenderExtent::new(64, 64).unwrap();
+    for slot in PresentationSlot::ALL {
+        app.render_coordination
+            .record_viewports(slot, presentation, render);
+    }
+    app.apply_application_command(ApplicationCommand::SetPlaybackActive(true), &context)
+        .unwrap();
+    await_visible_demand_plan(&mut app);
+    let session_generation = app.playback_session.contract().unwrap().generation();
+    app.apply_application_command(ApplicationCommand::MarkPlaybackPrepared, &context)
+        .unwrap();
+    app.apply_application_command(ApplicationCommand::AdvancePlaybackTick(100), &context)
+        .unwrap();
+    for slot in PresentationSlot::ALL {
+        let generation = app.render_coordination.surface(slot).generation();
+        assert!(app.render_coordination.record_presented_frame(
+            slot,
+            generation,
+            synthetic_presented_frame(slot, render),
+        ));
+    }
+
+    let (result_blocked, release_result) =
+        app.dataset.block_next_visible_demand_result_publication();
+    app.apply_application_command(ApplicationCommand::AdvancePlaybackTick(101), &context)
+        .unwrap();
+    result_blocked
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the temporal successor reaches the worker publication boundary");
+    let before_linked = app.dataset.visible_demand_diagnostics();
+
+    let mut linked = mirante4d_application::viewport_interaction::CrossSectionViewState::from_canonical(
+        app.render_intent_mailbox.effective_cross_section(
+            RenderIntentBase::from_snapshot(&app.application.snapshot()),
+            *application_view(&app.application.snapshot()).cross_section(),
+        ),
+    );
+    let panel = mirante4d_application::viewport_interaction::CrossSectionPanel::Xy;
+    let mut linked_samples = Vec::new();
+    for step in 0_u8..3 {
+        match step {
+            0 => linked.pan_by_panel_points(panel, 2.0, -1.0),
+            1 => linked.zoom_around_panel_point(panel, presentation, 32.0, 32.0, 0.9),
+            2 => linked.rotate_oblique_by_panel_drag(panel, 2.0, 1.0, 0.005),
+            _ => unreachable!(),
+        }
+        let latest = linked.into_canonical().unwrap();
+        linked_samples.push(latest);
+        app.apply_render_intent_interaction(
+            RenderIntentInteraction::Sample(
+                mirante4d_application::RenderIntentSample::cross_section(
+                    mirante4d_application::CrossSectionPanelId::Xy,
+                    mirante4d_application::RenderGestureKind::Drag,
+                    latest,
+                ),
+            ),
+            &context,
+        )
+        .unwrap();
+        let snapshot = app.application.snapshot();
+        assert_eq!(
+            snapshot.transient().playback_phase(),
+            mirante4d_application::PlaybackPhase::Playing
+        );
+        assert_eq!(application_view(&snapshot).timepoint(), TimeIndex::new(1));
+        assert_eq!(
+            app.playback_session.contract().unwrap().generation(),
+            session_generation
+        );
+    }
+    let after_linked = app.dataset.visible_demand_diagnostics();
+    assert_eq!(after_linked.submitted, before_linked.submitted);
+    assert_eq!(
+        after_linked.pending_replacements,
+        before_linked.pending_replacements
+    );
+    assert_eq!(
+        after_linked.cancelled_running,
+        before_linked.cancelled_running,
+        "linked spatial input must not cancel temporal residency planning"
+    );
+
+    release_result.send(()).unwrap();
+    await_visible_demand_plan(&mut app);
+    let latest = *linked_samples.last().unwrap();
+    assert_eq!(app.dataset.last_plan_error(), None);
+    assert!(app.visible_demand_plan_currentness().cross_sections);
+    let snapshot = app.application.snapshot();
+    assert_eq!(
+        app.render_intent_mailbox.effective_cross_section(
+            RenderIntentBase::from_snapshot(&snapshot),
+            *application_view(&snapshot).cross_section(),
+        ),
+        latest
+    );
+    app.apply_render_intent_interaction(
+        RenderIntentInteraction::Finish(
+            mirante4d_application::RenderIntentTarget::CrossSection(
+                mirante4d_application::CrossSectionPanelId::Xy,
+            ),
+        ),
+        &context,
+    )
+    .unwrap();
+    assert_eq!(
+        app.application.snapshot().transient().playback_phase(),
+        mirante4d_application::PlaybackPhase::Playing
+    );
+    assert_eq!(
+        app.playback_session.contract().unwrap().generation(),
+        session_generation
     );
     app.dataset.request_shutdown().unwrap();
 }

@@ -9,7 +9,7 @@ use mirante4d_identity::Sha256Hasher;
 use mirante4d_storage::{
     LocalPackageCatalog, LocalPackageReader, LocalPackageWriter, OmeImageGroupMetadata,
     PackageArrayInput, PackageObjectKind, PackagePath, PackageShardInput, PackageWriteInput,
-    PackedIndexCoordinates, ProfileKind, ShardProfileKind, VerifiedScientificPackageCapability,
+    PackedIndexCoordinates, ProfileKind, SelfConsistentPackageCapability, ShardProfileKind,
     decode_inner_payload, decode_shard_index_tail,
 };
 use serde::Deserialize;
@@ -129,7 +129,7 @@ fn reproduce_archive(repository: &Path, archive: &ArchiveAuthority, output_root:
     let ome_images = ome_images(&catalog);
     let shards = decode_all_shards(&source, &catalog, &arrays);
     let input = PackageWriteInput::new(
-        ProfileKind::Ds0,
+        ProfileKind::Current,
         catalog.profile().clone(),
         catalog.science().clone(),
         catalog.display_defaults().clone(),
@@ -197,10 +197,10 @@ fn reproduce_archive(repository: &Path, archive: &ArchiveAuthority, output_root:
     compare_all_bricks(&source_capability, &written_capability, &archive.case_id);
 }
 
-fn validate_scientific_package(root: &Path) -> VerifiedScientificPackageCapability {
+fn validate_scientific_package(root: &Path) -> SelfConsistentPackageCapability {
     LocalPackageCatalog::open(root)
         .expect("open target-profile package")
-        .validate_exact_package(ProfileKind::Ds0, || false)
+        .validate_exact_package(ProfileKind::Current, || false)
         .expect("target-profile package passes exact validation")
         .validate_scientific_content(|| false)
         .expect("target-profile package passes scientific validation")
@@ -389,8 +389,8 @@ fn assert_metadata_and_tree_boundary(
 }
 
 fn compare_all_bricks(
-    source: &VerifiedScientificPackageCapability,
-    written: &VerifiedScientificPackageCapability,
+    source: &SelfConsistentPackageCapability,
+    written: &SelfConsistentPackageCapability,
     case_id: &str,
 ) {
     assert_eq!(source.catalog().profile(), written.catalog().profile());

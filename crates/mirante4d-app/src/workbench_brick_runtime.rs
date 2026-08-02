@@ -8,13 +8,14 @@ use std::{
 
 use eframe::egui;
 use mirante4d_application::{
-    ApplicationCommand, PresentationSlot, RenderIntentBase, RenderIntentRevision,
-    RenderIntentTarget,
+    PresentationSlot, RenderIntentBase, RenderIntentRevision, RenderIntentTarget,
 };
 use mirante4d_dataset::{BrickKey, CpuLedgerCategory, CpuLedgerError};
 use mirante4d_dataset_runtime::{RuntimeFault, RuntimeFaultCode};
 use mirante4d_domain::{CameraView, LogicalLayerKey, ScaleLevel, TimeIndex, ViewerLayout};
-use mirante4d_render_api::{MAX_RENDER_REQUIREMENTS, PreparedRenderRequirements};
+use mirante4d_render_api::{
+    MAX_RENDER_REQUIREMENTS, PreparedRenderRequirements, PresentationTarget,
+};
 
 use crate::{
     BACKGROUND_WORK_REPAINT_INTERVAL, DeterministicFailureLatch, DisplayedFrameFreshness,
@@ -28,15 +29,17 @@ use crate::{
     dataset_demand_plan::{
         DatasetDemandPlanCapacityError, DatasetDemandPlanLimits, NavigationCandidateBaseline,
         NavigationLadderBaseline, cross_section_projected_layer_scales,
-        current_3d_projected_layer_scales, sampling_footprint_class,
+        current_3d_projected_layer_scales, sampling_footprint_class, uniform_layer_scale,
     },
     dataset_requests::{
         DatasetDemandState, RendererEvictionDisposition, SCOPE_ANALYSIS, SCOPE_CROSS_SECTION_XY,
         SCOPE_CROSS_SECTION_XZ, SCOPE_CROSS_SECTION_YZ, SCOPE_CURRENT_3D,
         SCOPE_CURRENT_3D_REFINEMENT, SCOPE_PLAYBACK, ScopeReconciliationTargets,
     },
-    display_refresh::render_backend_for_mode,
+    display_refresh::render_backend_for_view,
     native_presentation::NativePresentationBridge,
+    playback_session::PlaybackFrameContract,
+    presentation_scheduler::{TargetAvailability, assemble_logical_targets},
     product_render_intent::PRODUCT_RENDER_RESOURCE_LIMIT,
     retained_leases::RetainedRequirementHandle,
     viewer_layout::PanelId,
@@ -113,7 +116,7 @@ fn pump_interactive_admission_with_renderer(
     })
 }
 
-fn scope_complete_with_renderer(
+pub(crate) fn scope_complete_with_renderer(
     dataset: &DatasetDemandState,
     native: &NativePresentationBridge,
     scope: u64,
@@ -123,6 +126,18 @@ fn scope_complete_with_renderer(
     };
     dataset
         .scope_complete_with_gpu_residency(scope, |key| product.renderer.resource_is_resident(key))
+}
+
+pub(crate) fn playback_successor_complete_with_renderer(
+    dataset: &DatasetDemandState,
+    native: &NativePresentationBridge,
+) -> bool {
+    let Some(product) = native.product_gpu.as_ref() else {
+        return dataset.playback_successor_complete_with_gpu_residency(|_| false);
+    };
+    dataset.playback_successor_complete_with_gpu_residency(|key| {
+        product.renderer.resource_is_resident(key)
+    })
 }
 
 pub(crate) fn scope_resources_complete_with_renderer(
@@ -487,7 +502,10 @@ struct DemandPlanningLayerSignature {
 #[derive(Debug, Clone, PartialEq)]
 struct Current3dDemandPlanningSignature {
     resource_identity: mirante4d_dataset::DatasetResourceIdentity,
-    active_layer: mirante4d_domain::LogicalLayerKey,
+    /// Playback's retained pre-cutover target ordering uses analysis focus as
+    /// its priority input. Static demand deliberately stores `None` so an
+    /// analysis-only focus change cannot invalidate rendered membership.
+    playback_priority_layer: Option<mirante4d_domain::LogicalLayerKey>,
     timepoint: TimeIndex,
     camera: mirante4d_domain::CameraView,
     layout: ViewerLayout,
@@ -495,19 +513,21 @@ struct Current3dDemandPlanningSignature {
     presentation_viewport: mirante4d_render_api::PresentationViewport,
     render_viewport: mirante4d_render_api::RenderExtent,
     playback_active: bool,
+    playback_fps: mirante4d_application::PlaybackFps,
     gpu_payload_capacity: u64,
 }
 
 impl Current3dDemandPlanningSignature {
     fn same_non_camera_demand(&self, other: &Self) -> bool {
         self.resource_identity == other.resource_identity
-            && self.active_layer == other.active_layer
+            && self.playback_priority_layer == other.playback_priority_layer
             && self.timepoint == other.timepoint
             && self.layout == other.layout
             && self.layers == other.layers
             && self.presentation_viewport == other.presentation_viewport
             && self.render_viewport == other.render_viewport
             && self.playback_active == other.playback_active
+            && self.playback_fps == other.playback_fps
             && self.gpu_payload_capacity == other.gpu_payload_capacity
     }
 }
@@ -537,23 +557,25 @@ struct CrossSectionPanelDemandPlanningSignature {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CrossSectionDemandPlanningSignature {
     resource_identity: mirante4d_dataset::DatasetResourceIdentity,
-    active_layer: mirante4d_domain::LogicalLayerKey,
+    playback_priority_layer: Option<mirante4d_domain::LogicalLayerKey>,
     timepoint: TimeIndex,
     layout: ViewerLayout,
     layers: Box<[DemandPlanningLayerSignature]>,
     panels: [CrossSectionPanelDemandPlanningSignature; 3],
     playback_active: bool,
+    playback_fps: mirante4d_application::PlaybackFps,
     gpu_payload_capacity: u64,
 }
 
 impl CrossSectionDemandPlanningSignature {
     fn same_common_demand(&self, other: &Self) -> bool {
         self.resource_identity == other.resource_identity
-            && self.active_layer == other.active_layer
+            && self.playback_priority_layer == other.playback_priority_layer
             && self.timepoint == other.timepoint
             && self.layout == other.layout
             && self.layers == other.layers
             && self.playback_active == other.playback_active
+            && self.playback_fps == other.playback_fps
             && self.gpu_payload_capacity == other.gpu_payload_capacity
     }
 
@@ -563,6 +585,18 @@ impl CrossSectionDemandPlanningSignature {
 
     fn panel_mut(&mut self, panel: PanelId) -> &mut CrossSectionPanelDemandPlanningSignature {
         &mut self.panels[cross_section_panel_index(panel)]
+    }
+
+    fn same_non_geometry_demand(&self, other: &Self) -> bool {
+        self.same_common_demand(other)
+            && self
+                .panels
+                .iter()
+                .zip(other.panels.iter())
+                .all(|(planned, current)| {
+                    planned.presentation_viewport == current.presentation_viewport
+                        && planned.render_extent == current.render_extent
+                })
     }
 }
 
@@ -604,6 +638,7 @@ pub(crate) struct PendingVisibleDemandPlan {
     renderer_requirement_base: RetainedRequirementHandle,
     cpu_capacity_epoch: u64,
     dataset_runtime_epoch: u64,
+    temporal_frame_contract: Option<PlaybackFrameContract>,
 }
 
 impl PendingVisibleDemandPlan {
@@ -614,6 +649,46 @@ impl PendingVisibleDemandPlan {
             (true, true) | (false, false) => "visible aggregate",
         }
     }
+}
+
+fn pending_temporal_plan_accepts_spatial_supersession(
+    pending: &PendingVisibleDemandPlan,
+    current: &VisibleDemandPlanningSignature,
+    active_target: Option<RenderIntentTarget>,
+) -> bool {
+    if pending.temporal_frame_contract.is_none() {
+        return false;
+    }
+    let camera_only = pending.current_3d.as_ref().is_some_and(|planned| {
+        temporal_3d_body_matches_camera_only_change(planned, &current.current_3d, active_target)
+    }) && pending.planning.cross_sections == current.cross_sections
+        && pending
+            .cross_sections
+            .as_ref()
+            .is_none_or(|cross| cross.target == current.cross_sections);
+    let linked_only = matches!(active_target, Some(RenderIntentTarget::CrossSection(_)))
+        && pending.current_3d.as_ref() == Some(&current.current_3d)
+        && pending
+            .planning
+            .cross_sections
+            .same_non_geometry_demand(&current.cross_sections)
+        && pending.cross_sections.as_ref().is_some_and(|cross| {
+            cross.panels == CrossSectionPlanMask::ALL
+                && cross
+                    .target
+                    .same_non_geometry_demand(&current.cross_sections)
+        });
+    camera_only || linked_only
+}
+
+fn temporal_3d_body_matches_camera_only_change(
+    planned: &Current3dDemandPlanningSignature,
+    current: &Current3dDemandPlanningSignature,
+    active_target: Option<RenderIntentTarget>,
+) -> bool {
+    active_target == Some(RenderIntentTarget::ThreeD)
+        && planned.playback_active
+        && planned.same_non_camera_demand(current)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -843,6 +918,9 @@ pub(crate) struct PreparedScopeRenderPlan {
     pub(crate) render_payload_bytes: u64,
     pub(crate) planned_payload_bytes: u64,
     pub(crate) primary_resource_count: usize,
+    /// The selected scales contain every brick of every visible layer. Plane
+    /// geometry can therefore change without changing this immutable body.
+    pub(crate) covers_full_selected_volumes: bool,
     pub(crate) plane_reuse_envelope: Option<crate::semantic_demand::SemanticPlaneReuseEnvelope>,
 }
 
@@ -863,7 +941,7 @@ pub(crate) struct VisibleDemandPlanningSignature {
 pub(crate) struct ResidentCrossSectionCoverage {
     revision: RenderIntentRevision,
     cross_sections: CrossSectionDemandPlanningSignature,
-    exact_guard_reuse: bool,
+    exact_body_reuse: bool,
     rolling_replan: bool,
     /// True only while the resident body is a continuity fallback or its
     /// rolling window is near exhaustion. A worker-installed latest body has
@@ -930,6 +1008,37 @@ fn required_cross_section_plan(
 }
 
 impl MiranteWorkbenchApp {
+    fn installed_temporal_3d_body_matches(&self, frame: &PlaybackFrameContract) -> bool {
+        [SCOPE_CURRENT_3D, SCOPE_CURRENT_3D_REFINEMENT]
+            .into_iter()
+            .any(|scope| {
+                let Some(plan) = self.prepared_scope_render_plans.get(&scope) else {
+                    return false;
+                };
+                let requirements = self.dataset.scope_requirement_handle(scope);
+                self.dataset.scope_is_installed(scope)
+                    && Arc::ptr_eq(&requirements, &plan.scope_requirements)
+                    && plan.covers_full_selected_volumes
+                    && plan.requirements.timepoint() == frame.timepoint()
+                    && plan.layer_scales.as_ref() == frame.layer_scales().as_ref()
+            })
+    }
+
+    fn installed_temporal_cross_section_body_matches(
+        &self,
+        panel: PanelId,
+        frame: &PlaybackFrameContract,
+    ) -> bool {
+        let scope = cross_section_scope_id(panel);
+        self.installed_cross_section_full_volume_body_matches_scales(
+            panel,
+            frame.layer_scales().as_ref(),
+        ) && self
+            .prepared_scope_render_plans
+            .get(&scope)
+            .is_some_and(|plan| plan.requirements.timepoint() == frame.timepoint())
+    }
+
     fn installed_cross_section_body_matches_prepared(&self, panel: PanelId) -> bool {
         let scope = cross_section_scope_id(panel);
         if !self.dataset.scope_is_installed(scope)
@@ -973,6 +1082,27 @@ impl MiranteWorkbenchApp {
         })
     }
 
+    fn installed_cross_section_full_volume_body_matches_scales(
+        &self,
+        panel: PanelId,
+        layer_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
+    ) -> bool {
+        if !self.installed_cross_section_body_matches_prepared(panel) {
+            return false;
+        }
+        let scope = cross_section_scope_id(panel);
+        self.prepared_scope_render_plans
+            .get(&scope)
+            .is_some_and(|plan| {
+                plan.covers_full_selected_volumes
+                    && plan.layer_scales.as_ref() == layer_scales
+                    && plan.requirements.required_prefix_len()
+                        == plan.requirements.body().ranked().len()
+                    && self.dataset.scope_required_prefix_len(scope)
+                        == self.dataset.scope_requirements(scope).len()
+            })
+    }
+
     fn installed_cross_section_exact_body_is_current(&self, panel: PanelId) -> bool {
         let scope = cross_section_scope_id(panel);
         let Some(exact) =
@@ -1014,7 +1144,7 @@ impl MiranteWorkbenchApp {
             return false;
         };
         let base = RenderIntentBase::from_snapshot(snapshot);
-        self.render_intent_mailbox.active_revision(base) == Some(coverage.revision)
+        self.render_intent_mailbox.active_composed_revision(base) == Some(coverage.revision)
             && matches!(
                 self.render_intent_mailbox.active_target(base),
                 Some(RenderIntentTarget::CrossSection(_))
@@ -1060,7 +1190,7 @@ impl MiranteWorkbenchApp {
     pub(crate) fn resident_cross_section_requires_planning(&self) -> bool {
         self.resident_cross_section_coverage
             .as_ref()
-            .is_some_and(|coverage| coverage.planning_required)
+            .is_none_or(|coverage| coverage.planning_required)
     }
 
     /// Geometry/body eligibility for issuing a frame. Unlike exact
@@ -1135,7 +1265,12 @@ impl MiranteWorkbenchApp {
         {
             return false;
         }
-        let projected_lod_is_unchanged = current_3d_projected_layer_scales(
+        let projected_lod_is_unchanged = self.playback_session.contract().is_some_and(|contract| {
+            self.dataset
+                .scope_layer_scales(SCOPE_CURRENT_3D_REFINEMENT)
+                .or_else(|| self.dataset.scope_layer_scales(SCOPE_CURRENT_3D))
+                == Some(contract.layer_scales().as_ref())
+        }) || current_3d_projected_layer_scales(
             snapshot.catalog(),
             &candidate_view,
             candidate.current_3d.presentation_viewport,
@@ -1174,7 +1309,8 @@ impl MiranteWorkbenchApp {
     /// scheduling remains the responsibility of the volume-presentation
     /// controller.
     pub(crate) fn prepare_resident_camera_intent(&mut self, camera: CameraView) -> bool {
-        if self.resident_camera_target_body_is_complete(camera)
+        let target_body_complete = self.resident_camera_target_body_is_complete(camera);
+        if target_body_complete
             && (self.dataset.current_covers_full_volume()
                 || promote_installed_camera_guards(
                     &mut self.dataset,
@@ -1183,12 +1319,20 @@ impl MiranteWorkbenchApp {
         {
             return true;
         }
+        if self.playback_session.contract().is_some() {
+            // Playback owns one fixed, full-volume target body. A spatial
+            // sample must wait for that body rather than escape through an
+            // unrelated coarser navigation rung and visibly change LOD.
+            return false;
+        }
+        let effective_timepoint = application_view(&self.application.snapshot()).timepoint();
         self.navigation_render_plans.first().is_some_and(|plan| {
-            first_useful_resources_complete_with_renderer(
-                &self.dataset,
-                &self.native_presentation,
-                plan,
-            )
+            plan.requirements.timepoint() == effective_timepoint
+                && first_useful_resources_complete_with_renderer(
+                    &self.dataset,
+                    &self.native_presentation,
+                    plan,
+                )
         })
     }
 
@@ -1246,7 +1390,12 @@ impl MiranteWorkbenchApp {
             return false;
         }
         let mut reusable_candidates = 0_usize;
-        let mut exact_guard_reuse = true;
+        let playback_scales = self
+            .playback_session
+            .contract()
+            .map(|contract| contract.layer_scales().as_ref());
+        let mut exact_body_reuse = true;
+        let mut all_panels_renderable = true;
         let mut rolling_replan = false;
         for linked_panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
             let current_panel = current.cross_sections.panel(linked_panel);
@@ -1260,36 +1409,43 @@ impl MiranteWorkbenchApp {
             let Some(plan) = self.prepared_scope_render_plans.get(&scope) else {
                 return false;
             };
-            if !first_useful_resources_complete_with_renderer(
+            let panel_renderable = first_useful_resources_complete_with_renderer(
                 &self.dataset,
                 &self.native_presentation,
                 plan,
-            ) {
+            );
+            let full_volume_body = playback_scales.is_some_and(|scales| {
+                self.installed_cross_section_full_volume_body_matches_scales(linked_panel, scales)
+            });
+            if !full_volume_body && !panel_renderable {
                 return false;
             }
+            all_panels_renderable &= panel_renderable;
             let semantic_panel = match linked_panel {
                 PanelId::Xy => crate::semantic_demand::CrossSectionPlane::Xy,
                 PanelId::Xz => crate::semantic_demand::CrossSectionPlane::Xz,
                 PanelId::Yz => crate::semantic_demand::CrossSectionPlane::Yz,
                 PanelId::ThreeD => unreachable!(),
             };
-            let exact_panel = plan.plane_reuse_envelope.as_ref().is_some_and(|envelope| {
-                envelope
-                    .contains(cross_section, semantic_panel, presentation, extent)
-                    .unwrap_or(false)
-                    && scope_all_resources_complete_with_renderer(
-                        &self.dataset,
-                        &self.native_presentation,
-                        scope,
-                    )
-                    && installed_plane_guard_is_promotable(
-                        &self.dataset,
-                        &self.prepared_scope_render_plans,
-                        scope,
-                    )
-            });
-            exact_guard_reuse &= exact_panel;
-            if exact_panel {
+            let guarded_panel = !full_volume_body
+                && plan.plane_reuse_envelope.as_ref().is_some_and(|envelope| {
+                    envelope
+                        .contains(cross_section, semantic_panel, presentation, extent)
+                        .unwrap_or(false)
+                        && scope_all_resources_complete_with_renderer(
+                            &self.dataset,
+                            &self.native_presentation,
+                            scope,
+                        )
+                        && installed_plane_guard_is_promotable(
+                            &self.dataset,
+                            &self.prepared_scope_render_plans,
+                            scope,
+                        )
+                });
+            let exact_panel = full_volume_body || guarded_panel;
+            exact_body_reuse &= exact_panel;
+            if guarded_panel {
                 let envelope = plan
                     .plane_reuse_envelope
                     .as_ref()
@@ -1299,9 +1455,12 @@ impl MiranteWorkbenchApp {
                     .unwrap_or(true);
                 reusable_candidates =
                     reusable_candidates.saturating_add(envelope.reusable_candidates());
+            } else if full_volume_body {
+                reusable_candidates =
+                    reusable_candidates.saturating_add(plan.primary_resource_count);
             }
         }
-        if exact_guard_reuse {
+        if exact_body_reuse {
             if !self
                 .dataset
                 .can_install_visible_intent(revision, active_scope)
@@ -1309,11 +1468,18 @@ impl MiranteWorkbenchApp {
                 return false;
             }
             for linked_panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
-                commit_preflighted_installed_plane_guard(
-                    &mut self.dataset,
-                    &mut self.prepared_scope_render_plans,
-                    cross_section_scope_id(linked_panel),
-                );
+                let scope = cross_section_scope_id(linked_panel);
+                if self
+                    .prepared_scope_render_plans
+                    .get(&scope)
+                    .is_some_and(|plan| plan.plane_reuse_envelope.is_some())
+                {
+                    commit_preflighted_installed_plane_guard(
+                        &mut self.dataset,
+                        &mut self.prepared_scope_render_plans,
+                        scope,
+                    );
+                }
             }
             self.dataset
                 .commit_preflighted_installed_visible_intent(revision, active_scope);
@@ -1324,14 +1490,17 @@ impl MiranteWorkbenchApp {
             self.resident_plane_guard_reuses = self.resident_plane_guard_reuses.saturating_add(3);
         }
         self.resident_cross_section_coverage = Some(ResidentCrossSectionCoverage {
-            revision,
+            revision: self
+                .render_intent_mailbox
+                .active_composed_revision(base)
+                .unwrap_or(revision),
             cross_sections: current.cross_sections,
-            exact_guard_reuse,
+            exact_body_reuse,
             rolling_replan,
-            planning_required: !exact_guard_reuse || rolling_replan,
+            planning_required: !exact_body_reuse || rolling_replan,
         });
         self.render_coordination.invalidate_cross_sections();
-        true
+        all_panels_renderable
     }
 
     /// Rebinds all three linked panels after the one settled durable
@@ -1369,14 +1538,22 @@ impl MiranteWorkbenchApp {
                 return false;
             };
             let scope = cross_section_scope_id(panel);
-            if !cross_section_projected_layer_scales(
-                snapshot.catalog(),
-                &effective_view,
-                panel,
-                presentation,
-                extent,
-            )
-            .is_ok_and(|selected| self.dataset.scope_layer_scales(scope) == Some(&selected))
+            let expected_scales = self.playback_session.contract().map_or_else(
+                || {
+                    cross_section_projected_layer_scales(
+                        snapshot.catalog(),
+                        &effective_view,
+                        panel,
+                        presentation,
+                        extent,
+                    )
+                    .ok()
+                },
+                |contract| Some(contract.layer_scales().as_ref().clone()),
+            );
+            if expected_scales
+                .as_ref()
+                .is_none_or(|selected| self.dataset.scope_layer_scales(scope) != Some(selected))
             {
                 return false;
             }
@@ -1392,37 +1569,49 @@ impl MiranteWorkbenchApp {
             ) {
                 return false;
             }
-            if !installed_plane_guard_is_promotable(
-                &self.dataset,
-                &self.prepared_scope_render_plans,
-                scope,
-            ) {
-                return false;
-            }
+            let full_volume_body = expected_scales.as_ref().is_some_and(|scales| {
+                self.installed_cross_section_full_volume_body_matches_scales(panel, scales)
+            });
             let semantic_panel = match panel {
                 PanelId::Xy => crate::semantic_demand::CrossSectionPlane::Xy,
                 PanelId::Xz => crate::semantic_demand::CrossSectionPlane::Xz,
                 PanelId::Yz => crate::semantic_demand::CrossSectionPlane::Yz,
                 PanelId::ThreeD => unreachable!(),
             };
-            let envelope = self
-                .prepared_scope_render_plans
-                .get(&scope)
-                .and_then(|plan| plan.plane_reuse_envelope.as_ref())
-                .expect("the checked plane scope retains its envelope");
-            if !envelope
-                .contains(
-                    *effective_view.cross_section(),
-                    semantic_panel,
-                    presentation,
-                    extent,
-                )
-                .unwrap_or(false)
-            {
-                return false;
+            if full_volume_body {
+                reusable_candidates = reusable_candidates.saturating_add(
+                    self.prepared_scope_render_plans
+                        .get(&scope)
+                        .expect("the full-volume scope owns a render plan")
+                        .primary_resource_count,
+                );
+            } else {
+                if !installed_plane_guard_is_promotable(
+                    &self.dataset,
+                    &self.prepared_scope_render_plans,
+                    scope,
+                ) {
+                    return false;
+                }
+                let envelope = self
+                    .prepared_scope_render_plans
+                    .get(&scope)
+                    .and_then(|plan| plan.plane_reuse_envelope.as_ref())
+                    .expect("the checked guarded plane scope retains its envelope");
+                if !envelope
+                    .contains(
+                        *effective_view.cross_section(),
+                        semantic_panel,
+                        presentation,
+                        extent,
+                    )
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
+                reusable_candidates =
+                    reusable_candidates.saturating_add(envelope.reusable_candidates());
             }
-            reusable_candidates =
-                reusable_candidates.saturating_add(envelope.reusable_candidates());
         }
 
         let revision = self.render_intent_mailbox.snapshot().linked_2d_revision;
@@ -1435,11 +1624,18 @@ impl MiranteWorkbenchApp {
             return false;
         }
         for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
-            commit_preflighted_installed_plane_guard(
-                &mut self.dataset,
-                &mut self.prepared_scope_render_plans,
-                cross_section_scope_id(panel),
-            );
+            let scope = cross_section_scope_id(panel);
+            if self
+                .prepared_scope_render_plans
+                .get(&scope)
+                .is_some_and(|plan| plan.plane_reuse_envelope.is_some())
+            {
+                commit_preflighted_installed_plane_guard(
+                    &mut self.dataset,
+                    &mut self.prepared_scope_render_plans,
+                    scope,
+                );
+            }
         }
         self.dataset
             .commit_preflighted_visible_intent(revision, None);
@@ -1566,7 +1762,7 @@ impl MiranteWorkbenchApp {
         error
     }
 
-    fn effective_visible_demand_inputs(
+    pub(crate) fn effective_visible_demand_inputs(
         &self,
         snapshot: &mirante4d_application::ApplicationSnapshot,
     ) -> (
@@ -1579,7 +1775,7 @@ impl MiranteWorkbenchApp {
         let active_target = self.render_intent_mailbox.active_target(base);
         let revision = self
             .render_intent_mailbox
-            .active_revision(base)
+            .active_composed_revision(base)
             .unwrap_or_else(|| self.render_intent_mailbox.snapshot().latest_revision);
         let camera = self
             .render_intent_mailbox
@@ -1634,27 +1830,31 @@ impl MiranteWorkbenchApp {
             }
         });
         let gpu_payload_capacity = self.physical_gpu_payload_capacity();
+        let playback_active = snapshot.transient().playback_active();
+        let playback_priority_layer = playback_active.then_some(effective_view.active_layer());
         VisibleDemandPlanningSignature {
             current_3d: Current3dDemandPlanningSignature {
                 resource_identity: snapshot.catalog().resource_identity(),
-                active_layer: effective_view.active_layer(),
+                playback_priority_layer,
                 timepoint: effective_view.timepoint(),
                 camera: *effective_view.camera(),
                 layout: effective_view.layout(),
                 layers: layers.clone(),
                 presentation_viewport: self.render_coordination.presentation_viewport,
                 render_viewport: self.render_coordination.render_viewport,
-                playback_active: snapshot.transient().playback_active(),
+                playback_active,
+                playback_fps: snapshot.transient().playback_fps(),
                 gpu_payload_capacity,
             },
             cross_sections: CrossSectionDemandPlanningSignature {
                 resource_identity: snapshot.catalog().resource_identity(),
-                active_layer: effective_view.active_layer(),
+                playback_priority_layer,
                 timepoint: effective_view.timepoint(),
                 layout: effective_view.layout(),
                 layers,
                 panels: panel_signatures,
-                playback_active: snapshot.transient().playback_active(),
+                playback_active,
+                playback_fps: snapshot.transient().playback_fps(),
                 gpu_payload_capacity,
             },
         }
@@ -1721,12 +1921,6 @@ impl MiranteWorkbenchApp {
         let (effective_view, active_target, intent_revision) =
             self.effective_visible_demand_inputs(&snapshot);
         let active_scope = active_target.map(render_intent_scope);
-        if !self
-            .dataset
-            .observe_visible_intent(intent_revision, active_scope)
-        {
-            return VisibleBrickRequestOutcome::default();
-        }
         if self.dataset.source_quarantined()
             || self.dataset.resource_identity() != snapshot.catalog().resource_identity()
         {
@@ -1744,6 +1938,45 @@ impl MiranteWorkbenchApp {
 
         let planning_signature =
             self.visible_demand_planning_signature(&snapshot, &effective_view, active_target);
+        let temporal_frame_contract = self
+            .playback_session
+            .pending_frame_contract(effective_view.timepoint());
+        let retained_quality_handoff = self
+            .presentation_scheduler
+            .retained_quality_active(&snapshot, self.render_intent_mailbox.snapshot());
+        // Playback installs geometry-independent full-volume bodies. Once a
+        // timepoint replacement is in flight, camera or linked-plane samples
+        // cannot change its resource selection and must not continually
+        // cancel the worker. The completed immutable body is rebound to the
+        // newest spatial revision below before it can become renderable. The CPU capacity
+        // epoch is deliberately absent from this validity proof: it is an
+        // advisory retry signal for a previously refused reservation, and
+        // ordinary lease release while this successful request is in flight
+        // cannot invalidate the request's owned ledger authority.
+        let pending_temporal_spatial_rebase = self
+            .pending_visible_demand_plan
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.revision < intent_revision
+                    && pending_temporal_plan_accepts_spatial_supersession(
+                        pending,
+                        &planning_signature,
+                        active_target,
+                    )
+                    && pending.dataset_runtime_epoch == self.dataset_runtime_epoch
+                    && unchanged_scope_handles_are_current(&self.dataset, pending)
+                    && renderer_requirement_base_is_current(
+                        &self.dataset,
+                        &pending.renderer_requirement_base,
+                    )
+            });
+        if !pending_temporal_spatial_rebase
+            && !self
+                .dataset
+                .observe_visible_intent(intent_revision, active_scope)
+        {
+            return VisibleBrickRequestOutcome::default();
+        }
         if self
             .visible_demand_placeability_limit
             .as_ref()
@@ -1758,15 +1991,20 @@ impl MiranteWorkbenchApp {
             let result_is_current = pending
                 .as_ref()
                 .is_some_and(|pending| pending.revision == result.revision)
-                && result.revision == intent_revision
+                && (result.revision == intent_revision || pending_temporal_spatial_rebase)
                 && pending
                     .as_ref()
                     .and_then(|pending| pending.current_3d.as_ref())
-                    .is_none_or(|current| current == &planning_signature.current_3d)
+                    .is_none_or(|current| {
+                        current == &planning_signature.current_3d || pending_temporal_spatial_rebase
+                    })
                 && pending
                     .as_ref()
                     .and_then(|pending| pending.cross_sections.as_ref())
-                    .is_none_or(|cross| cross.target == planning_signature.cross_sections)
+                    .is_none_or(|cross| {
+                        cross.target == planning_signature.cross_sections
+                            || pending_temporal_spatial_rebase
+                    })
                 && pending.as_ref().is_some_and(|pending| {
                     unchanged_scope_handles_are_current(&self.dataset, pending)
                         && renderer_requirement_base_is_current(
@@ -1780,6 +2018,69 @@ impl MiranteWorkbenchApp {
                         let pending = pending.expect("a current result has pending identity");
                         match self.install_prepared_visible_demand(prepared, &pending) {
                             Ok(outcome) => {
+                                if pending_temporal_spatial_rebase {
+                                    // The worker selected geometry-independent
+                                    // full-volume bodies under the temporal
+                                    // revision that launched it. Publication
+                                    // is owned by the latest spatial revision.
+                                    self.visible_demand_planning_signature =
+                                        Some(planning_signature.clone());
+                                    if !self
+                                        .dataset
+                                        .observe_visible_intent(intent_revision, active_scope)
+                                    {
+                                        self.dataset.record_plan_error(
+                                            "playback spatial rebase rejected the latest render intent",
+                                        );
+                                        return VisibleBrickRequestOutcome::default();
+                                    }
+                                    if let Some(scope) = active_scope
+                                        && self.dataset.scope_is_installed(scope)
+                                    {
+                                        debug_assert!(
+                                            self.dataset.activate_installed_visible_intent(
+                                                intent_revision,
+                                                scope,
+                                            )
+                                        );
+                                    }
+                                    if matches!(
+                                        active_target,
+                                        Some(RenderIntentTarget::CrossSection(_))
+                                    ) {
+                                        let scales = self
+                                            .playback_session
+                                            .contract()
+                                            .expect("a temporal linked rebase retains its session")
+                                            .layer_scales()
+                                            .as_ref();
+                                        assert!(
+                                            [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+                                                .into_iter()
+                                                .all(|panel| self
+                                                    .installed_cross_section_full_volume_body_matches_scales(
+                                                        panel, scales,
+                                                    )),
+                                            "a rebased temporal linked bundle must be geometry-independent"
+                                        );
+                                        self.installed_cross_section_exact_bodies =
+                                            [PanelId::Xy, PanelId::Xz, PanelId::Yz].map(|panel| {
+                                                self.installed_cross_section_exact_body_candidate(
+                                                    panel,
+                                                )
+                                            });
+                                        self.resident_cross_section_coverage =
+                                            Some(ResidentCrossSectionCoverage {
+                                                revision: intent_revision,
+                                                cross_sections: planning_signature
+                                                    .cross_sections
+                                                    .clone(),
+                                                exact_body_reuse: true,
+                                                rolling_replan: false,
+                                                planning_required: false,
+                                            });
+                                    }
+                                }
                                 self.visible_demand_failure_latch = None;
                                 accepted = outcome;
                             }
@@ -1867,8 +2168,12 @@ impl MiranteWorkbenchApp {
                 planning_signature.current_3d.playback_active,
             )
             .is_ok_and(|ideal| self.dataset.current_ideal_layer_scales() == &ideal);
-        let current_plan_is_reusable = projected_lod_is_unchanged
-            && (self.dataset.current_covers_full_volume() || camera_is_inside_reuse_envelope);
+        let playback_full_volume_reuse = camera_only_change
+            && planning_signature.current_3d.playback_active
+            && self.dataset.current_covers_full_volume();
+        let current_plan_is_reusable = playback_full_volume_reuse
+            || (projected_lod_is_unchanged
+                && (self.dataset.current_covers_full_volume() || camera_is_inside_reuse_envelope));
         let camera_guard_is_reusable = !current_plan_is_reusable
             || (installed_camera_guard_bodies_are_complete(
                 &self.dataset,
@@ -1966,34 +2271,38 @@ impl MiranteWorkbenchApp {
         }
         self.visible_demand_failure_latch = None;
 
-        let pending_matches = self
-            .pending_visible_demand_plan
-            .as_ref()
-            .is_some_and(|pending| {
-                pending.revision == intent_revision
-                    && pending.current_3d.as_ref()
-                        == current_plan_required.then_some(&planning_signature.current_3d)
-                    && pending_cross_sections_match(
-                        pending.cross_sections.as_ref(),
-                        &planning_signature.cross_sections,
-                        cross_plan_required,
-                    )
-                    && unchanged_scope_handles_are_current(&self.dataset, pending)
-                    && renderer_requirement_base_is_current(
-                        &self.dataset,
-                        &pending.renderer_requirement_base,
-                    )
-            });
+        let pending_matches = pending_temporal_spatial_rebase
+            || self
+                .pending_visible_demand_plan
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.revision == intent_revision
+                        && pending.current_3d.as_ref()
+                            == current_plan_required.then_some(&planning_signature.current_3d)
+                        && pending_cross_sections_match(
+                            pending.cross_sections.as_ref(),
+                            &planning_signature.cross_sections,
+                            cross_plan_required,
+                        )
+                        && unchanged_scope_handles_are_current(&self.dataset, pending)
+                        && renderer_requirement_base_is_current(
+                            &self.dataset,
+                            &pending.renderer_requirement_base,
+                        )
+                });
         if !pending_matches {
             let view = &effective_view;
             let four_panel = view.layout() == ViewerLayout::FourPanel;
             let playback_active = snapshot.transient().playback_active();
+            let playback_window =
+                playback_demand_window(&snapshot, self.playback_session.contract());
             let gpu_payload_capacity = self.selected_gpu_payload_capacity(&planning_signature);
             let global_demand_limits = DatasetDemandPlanLimits::new(
                 SEMANTIC_PLAN_CANDIDATES_PER_LAYER,
                 PRODUCT_RENDER_RESOURCE_LIMIT,
                 gpu_payload_capacity,
-            );
+            )
+            .with_playback_decoded_capacity(snapshot.resource_policy().cpu_dataset_budget_bytes());
             let mut unchanged_scopes = Vec::new();
             if !current_plan_required {
                 unchanged_scopes.extend([
@@ -2019,18 +2328,32 @@ impl MiranteWorkbenchApp {
                 .map(|scope| self.dataset.scope_prepared_body_handle(scope))
                 .collect::<Vec<_>>();
 
-            let mut preserve_complete_presentation = false;
+            let mut preserve_complete_presentation = retained_quality_handoff;
             let current_3d = if current_plan_required {
                 #[cfg(test)]
                 {
                     self.visible_demand_plan_calls =
                         self.visible_demand_plan_calls.saturating_add(1);
                 }
-                let navigation_ladder_baseline = installed_navigation_ladder_baseline(
+                let installed_navigation_ladder = installed_navigation_ladder_baseline(
                     &self.dataset,
                     &self.navigation_render_plans,
                 );
-                preserve_complete_presentation = self
+                // Static viewing and playback deliberately own different
+                // navigation-ladder policies. In particular, the static
+                // max-min ladder advances one visible layer per rung while
+                // playback retains its pre-cutover lockstep ladder. Never
+                // infer compatibility from an installed suffix: a
+                // terminal-only ladder has no suffix from which to infer its
+                // policy. A mode transition therefore rebuilds the requested
+                // ladder, while an unchanged mode may still adopt the
+                // validated installed baseline.
+                let navigation_ladder_baseline = self
+                    .visible_demand_planning_signature
+                    .as_ref()
+                    .filter(|installed| installed.current_3d.playback_active == playback_active)
+                    .and(installed_navigation_ladder.clone());
+                preserve_complete_presentation |= self
                     .render_coordination
                     .surface(PresentationSlot::ThreeD)
                     .presented_frame()
@@ -2038,7 +2361,7 @@ impl MiranteWorkbenchApp {
                         frame.progress().completeness()
                             != mirante4d_render_api::FrameCompleteness::Progressive
                     })
-                    && navigation_ladder_baseline.is_some()
+                    && installed_navigation_ladder.is_some()
                     && self.navigation_render_plans.first().is_some_and(|plan| {
                         first_useful_resources_complete_with_renderer(
                             &self.dataset,
@@ -2057,7 +2380,14 @@ impl MiranteWorkbenchApp {
                             scope_baseline(&self.dataset, SCOPE_PLAYBACK),
                         ),
                     )
-                    .with_playback(playback_active, next_playback_timepoint(&snapshot))
+                    .with_playback(
+                        playback_active,
+                        playback_window.timepoints,
+                        playback_window.required_timepoint_count,
+                        self.playback_session
+                            .contract()
+                            .map(|contract| Arc::clone(contract.layer_scales())),
+                    )
                     .with_complete_presentation_preserved(preserve_complete_presentation)
                     .with_navigation_ladder_baseline(navigation_ladder_baseline),
                 )
@@ -2127,8 +2457,17 @@ impl MiranteWorkbenchApp {
                 promotion_bodies,
             )
             .with_previous_renderer_requirement_union_preserved(
-                preserve_previous_renderer_requirement_union,
-            );
+                preserve_previous_renderer_requirement_union
+                    || preserve_complete_presentation
+                    || temporal_frame_contract.is_some()
+                    || retained_quality_handoff,
+            )
+            .with_fixed_playback_layer_scales(
+                self.playback_session
+                    .contract()
+                    .map(|contract| Arc::clone(contract.layer_scales())),
+            )
+            .with_temporal_frame_contract(temporal_frame_contract.clone());
             if !self.dataset.submit_visible_demand_plan(request) {
                 self.dataset.record_plan_error(
                     "visible-demand planning received a stale render-intent revision",
@@ -2157,6 +2496,7 @@ impl MiranteWorkbenchApp {
                 renderer_requirement_base,
                 cpu_capacity_epoch,
                 dataset_runtime_epoch: self.dataset_runtime_epoch,
+                temporal_frame_contract,
             });
         }
 
@@ -2185,14 +2525,32 @@ impl MiranteWorkbenchApp {
         pending: &PendingVisibleDemandPlan,
     ) -> anyhow::Result<VisibleBrickRequestOutcome> {
         let PreparedVisibleDemand {
-            current_3d,
-            cross_sections,
+            targets,
             renderer_requirement_update,
             renderer_requirement_payload_bytes,
             post_refinement_promotion_update,
             candidates_visited,
         } = prepared;
+        let (current_3d, cross_sections, temporal_frame_contract) = targets.into_parts();
         let previous_plan_error = self.dataset.last_plan_error().map(str::to_owned);
+        if temporal_frame_contract != pending.temporal_frame_contract {
+            anyhow::bail!(
+                "prepared temporal-frame identity does not match its pending transaction"
+            );
+        }
+        if let Some(frame) = temporal_frame_contract.as_ref() {
+            let snapshot = self.application.snapshot();
+            let session = self.playback_session.contract().ok_or_else(|| {
+                anyhow::anyhow!("prepared temporal frame outlived its playback session")
+            })?;
+            if !session.admits_frame(frame)
+                || frame.source_generation() != snapshot.source_generation()
+                || frame.timepoint() != application_view(&snapshot).timepoint()
+                || frame.target_set() != application_view(&snapshot).layout().into()
+            {
+                anyhow::bail!("prepared temporal frame is stale for the live playback contract");
+            }
+        }
         if current_3d.is_some() != pending.current_3d.is_some() {
             anyhow::bail!("prepared 3D scope set does not match its pending transaction");
         }
@@ -2212,10 +2570,13 @@ impl MiranteWorkbenchApp {
                     current,
                     refinement,
                     playback,
+                    playback_resources_per_timepoint,
                     navigation_ladder,
                 } = current;
-                let ideal_scale = plan.ideal_scale;
-                let target_scale = plan.target.scale;
+                let ideal_scale = uniform_layer_scale(&plan.ideal_layer_scales);
+                let playback_timepoint_count = plan.playback_timepoint_count;
+                let target_scale = uniform_layer_scale(&plan.target.layer_scales);
+                let target_is_empty = plan.target.layer_scales.is_empty();
                 let adaptive_capacity_limited = plan.target.layer_scales != plan.ideal_layer_scales;
                 let target_playback_downshifted = plan.target.playback_downshifted;
                 let target_visible_count = plan.target.primary_resource_count;
@@ -2232,6 +2593,8 @@ impl MiranteWorkbenchApp {
                 };
                 let current_accounting =
                     current_plan.map(|plan| (plan.payload_bytes, plan.primary_resource_count));
+                let current_covers_full_selected_volumes =
+                    current_plan.is_some_and(|plan| plan.covers_full_volume);
                 let current_layer_scales =
                     current_plan.map(|plan| Arc::new(plan.layer_scales.clone()));
                 let refinement_accounting = refinement.render_requirements.is_some().then_some((
@@ -2240,6 +2603,23 @@ impl MiranteWorkbenchApp {
                 ));
                 let current_scope_requirements = Arc::clone(current.requirements.canonical());
                 let refinement_scope_requirements = Arc::clone(refinement.requirements.canonical());
+                let navigation_scope_requirements = if pending.preserve_complete_presentation {
+                    Arc::clone(&refinement_scope_requirements)
+                } else {
+                    Arc::clone(&current_scope_requirements)
+                };
+                if target_is_empty
+                    && (!plan.ideal_layer_scales.is_empty()
+                        || !plan.target.requirements.canonical().is_empty()
+                        || !current.requirements.canonical().is_empty()
+                        || current.render_requirements.is_some()
+                        || !refinement.requirements.canonical().is_empty()
+                        || refinement.render_requirements.is_some()
+                        || !playback.requirements.canonical().is_empty()
+                        || playback.render_requirements.is_some())
+                {
+                    anyhow::bail!("an empty visible-layer target owns prepared 3D artifacts");
+                }
                 let current_render =
                     current
                         .render_requirements
@@ -2259,6 +2639,7 @@ impl MiranteWorkbenchApp {
                             primary_resource_count: current_accounting
                                 .expect("a current render owns plan accounting")
                                 .1,
+                            covers_full_selected_volumes: current_covers_full_selected_volumes,
                             plane_reuse_envelope: None,
                         });
                 let refinement_render =
@@ -2268,7 +2649,7 @@ impl MiranteWorkbenchApp {
                             selection_required_prefix_len: requirements.first_useful_prefix_len(),
                             selection_body: requirements.body().clone(),
                             requirements,
-                            scope_requirements: refinement_scope_requirements,
+                            scope_requirements: Arc::clone(&refinement_scope_requirements),
                             layer_scales: Arc::new(plan.target.layer_scales.clone()),
                             render_payload_bytes: refinement
                                 .render_payload_bytes
@@ -2279,6 +2660,7 @@ impl MiranteWorkbenchApp {
                             primary_resource_count: refinement_accounting
                                 .expect("a refinement render owns target accounting")
                                 .1,
+                            covers_full_selected_volumes: plan.target.covers_full_volume,
                             plane_reuse_envelope: None,
                         });
                 if playback.render_requirements.is_some() {
@@ -2291,20 +2673,26 @@ impl MiranteWorkbenchApp {
                         selection_required_prefix_len: candidate.selection_body.ranked().len(),
                         selection_body: candidate.selection_body,
                         requirements: candidate.render_requirements,
-                        scope_requirements: Arc::clone(&current_scope_requirements),
+                        scope_requirements: Arc::clone(&navigation_scope_requirements),
                         layer_scales: Arc::new(candidate.layer_scales),
                         render_payload_bytes: candidate.planned_payload_bytes,
                         planned_payload_bytes: candidate.planned_payload_bytes,
                         primary_resource_count: candidate.resource_count,
+                        covers_full_selected_volumes: true,
                         plane_reuse_envelope: None,
                     })
                     .collect::<Vec<_>>();
-                if navigation_render_plans.is_empty() {
+                if !target_is_empty && navigation_render_plans.is_empty() {
                     anyhow::bail!("prepared 3D navigation ladder is empty");
+                }
+                if target_is_empty && !navigation_render_plans.is_empty() {
+                    anyhow::bail!("an empty visible-layer target owns a navigation ladder");
                 }
                 Ok::<_, anyhow::Error>((
                     plan,
                     playback.requirements,
+                    playback_resources_per_timepoint,
+                    playback_timepoint_count,
                     playback_layer_scales,
                     current_render,
                     refinement_render,
@@ -2343,6 +2731,7 @@ impl MiranteWorkbenchApp {
                             .expect("a cross-section render owns exact payload accounting"),
                         planned_payload_bytes: cross.plan.payload_bytes,
                         primary_resource_count: cross.plan.primary_resource_count,
+                        covers_full_selected_volumes: cross.plan.covers_full_volume,
                         plane_reuse_envelope: cross.reuse_envelope,
                     }),
                     None if cross.plan.requirements.canonical().is_empty() => None,
@@ -2361,6 +2750,45 @@ impl MiranteWorkbenchApp {
                 ));
             }
         }
+
+        // A worker result is an incremental physical delta. Assemble and
+        // validate the fixed logical temporal target set against compatible
+        // installed bodies before the first scope or renderer union changes.
+        // Reused is therefore a proved member, never an omitted list entry.
+        let _logical_temporal_targets = temporal_frame_contract
+            .as_ref()
+            .map(|frame| {
+                let mut availability = TargetAvailability::new();
+                if current_install.is_some() {
+                    availability.mark_prepared(PresentationTarget::ThreeD);
+                }
+                for panel in installed_panels.iter().copied() {
+                    availability.mark_prepared(panel.presentation_slot());
+                }
+                if let Some(installed) = self.visible_demand_planning_signature.as_ref() {
+                    if installed.current_3d == pending.planning.current_3d
+                        && self.installed_temporal_3d_body_matches(frame)
+                    {
+                        availability.mark_reusable(PresentationTarget::ThreeD);
+                    }
+                    if installed
+                        .cross_sections
+                        .same_common_demand(&pending.planning.cross_sections)
+                    {
+                        for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
+                            if installed.cross_sections.panel(panel)
+                                == pending.planning.cross_sections.panel(panel)
+                                && self.installed_temporal_cross_section_body_matches(panel, frame)
+                            {
+                                availability.mark_reusable(panel.presentation_slot());
+                            }
+                        }
+                    }
+                }
+                assemble_logical_targets(frame.target_set(), availability)
+                    .map_err(anyhow::Error::new)
+            })
+            .transpose()?;
 
         let next_signature = match self.visible_demand_planning_signature.as_ref() {
             Some(installed) => {
@@ -2387,7 +2815,8 @@ impl MiranteWorkbenchApp {
         };
 
         let mut scope_targets = ScopeReconciliationTargets::default();
-        if let Some((plan, playback, _, _, _, _, _, _, _, _, _, _)) = current_install.as_ref() {
+        if let Some((plan, playback, _, _, _, _, _, _, _, _, _, _, _, _)) = current_install.as_ref()
+        {
             self.dataset.prepare_progressive_current_scope_targets(
                 plan,
                 four_panel,
@@ -2442,6 +2871,50 @@ impl MiranteWorkbenchApp {
         }
         let prepared_scope_reconciliation =
             self.dataset.prepare_scope_reconciliation(scope_targets)?;
+        let mut prepared_playback_session = if let Some((
+            _,
+            _,
+            _,
+            playback_timepoint_count,
+            playback_layer_scales,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        )) = current_install.as_ref()
+            && self.application.snapshot().transient().playback_active()
+            && self.playback_session.contract().is_none()
+        {
+            let snapshot = self.application.snapshot();
+            let window = playback_demand_window(&snapshot, None);
+            Some(
+                self.playback_session
+                    .prepare_contract(
+                        snapshot.source_generation(),
+                        snapshot.transient().playback_fps(),
+                        application_view(&snapshot).layout(),
+                        playback_layer_scales.clone(),
+                        *playback_timepoint_count,
+                        window.required_timepoint_count,
+                        snapshot.resource_policy().cpu_dataset_budget_bytes(),
+                        self.physical_gpu_payload_capacity(),
+                        application_view(&snapshot).timepoint(),
+                        &window.timepoints,
+                    )
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "prepared playback plan cannot form its immutable session contract"
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
 
         // Atomic runtime cancellation is the last fallible boundary. It
         // prevalidates every ticket under one lock and changes nothing on
@@ -2455,6 +2928,8 @@ impl MiranteWorkbenchApp {
         if let Some((
             plan,
             playback,
+            playback_resources_per_timepoint,
+            _playback_timepoint_count,
             playback_layer_scales,
             current_render,
             refinement_render,
@@ -2467,17 +2942,30 @@ impl MiranteWorkbenchApp {
             reuse_envelope,
         )) = current_install
         {
+            let target_is_empty = plan.target.layer_scales.is_empty();
+            // Empty visibility is an immediate display state, never a quality
+            // handoff. A predecessor retained for progressive replacement
+            // must not keep either its scope render plan or its fidelity label
+            // alive after the last visible layer is hidden.
+            let preserve_complete_presentation =
+                pending.preserve_complete_presentation && !target_is_empty;
             current_changed = self.dataset.commit_preflighted_progressive_current_plan(
                 plan,
                 four_panel,
-                pending.preserve_complete_presentation,
+                preserve_complete_presentation,
             );
-            self.dataset.commit_preflighted_scope_replacement(
-                SCOPE_PLAYBACK,
+            self.dataset.commit_preflighted_playback_scope_replacement(
                 playback,
-                playback_layer_scales,
+                playback_layer_scales.clone(),
+                playback_resources_per_timepoint,
             );
-            if !pending.preserve_complete_presentation {
+            if let Some(prepared_session) = prepared_playback_session.take() {
+                assert!(
+                    self.playback_session.commit_prepared(prepared_session),
+                    "a preflighted playback session must commit in the same UI transaction"
+                );
+            }
+            if !preserve_complete_presentation {
                 install_scope_render_plan(
                     &mut self.prepared_scope_render_plans,
                     SCOPE_CURRENT_3D,
@@ -2489,16 +2977,16 @@ impl MiranteWorkbenchApp {
                 SCOPE_CURRENT_3D_REFINEMENT,
                 refinement_render,
             );
-            if pending.preserve_complete_presentation {
-                debug_assert!(
-                    !self.navigation_render_plans.is_empty(),
-                    "preserving a complete presentation requires its installed navigation ladder"
-                );
-            } else {
-                self.navigation_render_plans = navigation_render_plans;
-            }
-            self.render_coordination.frame_fidelity.ideal_scale_level = ideal_scale.get();
-            self.render_coordination.frame_fidelity.target_scale_level = target_scale.get();
+            // A retained predecessor remains protected by its installed scope
+            // and renderer front. Navigation metadata is semantic data for
+            // future renders, so it must advance to the successor immediately;
+            // retaining the predecessor's timepoint-bound ladder would make
+            // camera samples repeatedly replan or render stale resources.
+            self.navigation_render_plans = navigation_render_plans;
+            self.render_coordination.frame_fidelity.ideal_scale_level =
+                ideal_scale.map(ScaleLevel::get);
+            self.render_coordination.frame_fidelity.target_scale_level =
+                target_scale.map(ScaleLevel::get);
             self.render_coordination
                 .frame_fidelity
                 .adaptive_capacity_limited = adaptive_capacity_limited;
@@ -2506,11 +2994,13 @@ impl MiranteWorkbenchApp {
                 self.dataset.staging_current_refinement();
             self.render_coordination.frame_fidelity.visible_bricks = target_visible_count;
             self.current_camera_reuse_envelope = reuse_envelope;
-            self.render_coordination.frame_fidelity.reason = if adaptive_capacity_limited {
+            self.render_coordination.frame_fidelity.reason = if target_is_empty {
+                LodDecisionReason::NoVisibleData
+            } else if adaptive_capacity_limited {
                 LodDecisionReason::AdaptiveCapacity
             } else if target_playback_downshifted {
                 LodDecisionReason::PlaybackDownshift
-            } else if target_scale == mirante4d_domain::ScaleLevel::BASE {
+            } else if target_scale == Some(mirante4d_domain::ScaleLevel::BASE) {
                 LodDecisionReason::ExactS0
             } else {
                 LodDecisionReason::ScreenEquivalentCoarserScale
@@ -2580,7 +3070,7 @@ impl MiranteWorkbenchApp {
                 (!cross.exact).then(|| ResidentCrossSectionCoverage {
                     revision: pending.revision,
                     cross_sections: cross.target.clone(),
-                    exact_guard_reuse: false,
+                    exact_body_reuse: false,
                     rolling_replan: false,
                     planning_required: false,
                 });
@@ -2899,8 +3389,10 @@ impl MiranteWorkbenchApp {
         // CPU ledger diagnostics are collected lazily by diagnostics and
         // automation surfaces, never by the interactive demand pump.
         let empty = self.dataset.scope_is_empty(SCOPE_CURRENT_3D);
-        self.render_coordination.frame_fidelity.ideal_scale_level =
-            self.dataset.current_ideal_scale().get();
+        self.render_coordination.frame_fidelity.ideal_scale_level = self
+            .dataset
+            .current_ideal_uniform_scale()
+            .map(ScaleLevel::get);
         self.render_coordination
             .frame_fidelity
             .adaptive_capacity_limited = self.dataset.current_capacity_constrained();
@@ -2914,12 +3406,7 @@ impl MiranteWorkbenchApp {
         let ready_backend = ready.then(|| {
             let snapshot = self.application.snapshot();
             let view = application_view(&snapshot);
-            let mode = view
-                .layer(view.active_layer())
-                .expect("the current view contains its active layer")
-                .render_state()
-                .mode();
-            render_backend_for_mode(mode)
+            render_backend_for_view(view)
         });
         self.render_coordination.frame_fidelity.completeness = dataset_fidelity_completeness(
             empty,
@@ -2944,7 +3431,7 @@ impl MiranteWorkbenchApp {
     }
 
     pub(crate) fn record_dataset_fault(&mut self, fault: &RuntimeFault) {
-        self.record_dataset_fault_with_presentation_effect(fault, true);
+        self.record_dataset_fault_with_presentation_effect(fault, false);
     }
 
     fn record_dataset_admission_fault(
@@ -2963,41 +3450,11 @@ impl MiranteWorkbenchApp {
         fault: &RuntimeFault,
         invalidate_presentation: bool,
     ) {
-        let source_binding_invalidated = if runtime_fault_invalidates_verified_source(fault.code())
-        {
-            let snapshot = self.application.snapshot();
-            if snapshot.catalog().scientific_identity().is_verified() {
-                match self
-                    .application
-                    .dispatch(ApplicationCommand::InvalidateSourceVerification {
-                        source_generation: snapshot.source_generation(),
-                    }) {
-                    Ok(_) => true,
-                    Err(application_fault) => {
-                        tracing::warn!(
-                            ?application_fault,
-                            "observed source fault could not invalidate the verified binding"
-                        );
-                        false
-                    }
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
         let message = fault.to_string();
         self.dataset.record_plan_error(message.clone());
         self.render_coordination.frame_fidelity.last_capacity_error = Some(message);
         if invalidate_presentation {
             self.render_coordination.frame_fidelity.completeness = FrameCompleteness::Incomplete;
-        }
-        if source_binding_invalidated {
-            // The reducer event is consumed at the start of the next UI turn.
-            // Quarantine after recording the terminal fault so the runtime's
-            // fail-closed loading state remains the final visible state.
-            self.retire_invalidated_source_runtime();
         }
     }
 
@@ -3037,16 +3494,6 @@ impl MiranteWorkbenchApp {
 
 const fn admission_fault_invalidates_presentation(preserve_presentation: bool) -> bool {
     !preserve_presentation
-}
-
-pub(crate) const fn runtime_fault_invalidates_verified_source(code: RuntimeFaultCode) -> bool {
-    matches!(
-        code,
-        RuntimeFaultCode::SourceRejected
-            | RuntimeFaultCode::CorruptResource
-            | RuntimeFaultCode::UnsupportedResource
-            | RuntimeFaultCode::DecodeFailed
-    )
 }
 
 fn scope_baseline(dataset: &DatasetDemandState, scope: u64) -> ScopeDemandBaseline {
@@ -3233,20 +3680,62 @@ fn install_scope_render_plan(
     }
 }
 
-fn next_playback_timepoint(
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PlaybackDemandWindow {
+    timepoints: Vec<TimeIndex>,
+    required_timepoint_count: usize,
+}
+
+fn playback_demand_window(
     snapshot: &mirante4d_application::ApplicationSnapshot,
-) -> Option<TimeIndex> {
-    if !snapshot.transient().playback_active() {
-        return None;
+    contract: Option<&crate::playback_session::PlaybackSessionContract>,
+) -> PlaybackDemandWindow {
+    let mut window = playback_demand_window_for(
+        application_view(snapshot).timepoint(),
+        snapshot
+            .catalog()
+            .layers()
+            .map(|layer| layer.shape().t())
+            .min()
+            .unwrap_or(1),
+        snapshot.transient().playback_fps(),
+        snapshot.transient().playback_active(),
+    );
+    if let Some(contract) = contract {
+        window.timepoints.truncate(contract.slot_count());
+        window.required_timepoint_count = contract.startup_runway().min(window.timepoints.len());
     }
-    let timepoints = snapshot
-        .catalog()
-        .layers()
-        .map(|layer| layer.shape().t())
-        .min()
-        .unwrap_or(1);
-    (timepoints > 1)
-        .then(|| TimeIndex::new((application_view(snapshot).timepoint().get() + 1) % timepoints))
+    window
+}
+
+fn playback_demand_window_for(
+    current: TimeIndex,
+    timepoint_count: u64,
+    fps: mirante4d_application::PlaybackFps,
+    active: bool,
+) -> PlaybackDemandWindow {
+    if !active {
+        return PlaybackDemandWindow::default();
+    }
+    if timepoint_count <= 1 {
+        return PlaybackDemandWindow::default();
+    }
+    let desired_count =
+        usize::from(fps.get()).min(usize::try_from(timepoint_count - 1).unwrap_or(usize::MAX));
+    let required_timepoint_count = usize::from(fps.get().saturating_add(3) / 4)
+        .max(1)
+        .min(desired_count);
+    let current = current.get();
+    let timepoints = (1..=desired_count)
+        .map(|offset| {
+            let offset = u64::try_from(offset).expect("playback FPS fits u64");
+            TimeIndex::new((current + offset) % timepoint_count)
+        })
+        .collect();
+    PlaybackDemandWindow {
+        timepoints,
+        required_timepoint_count,
+    }
 }
 
 const fn completion_drain_needs_display_refresh(presentation_changed: bool) -> bool {
@@ -3261,7 +3750,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use mirante4d_application::RenderIntentRevision;
+    use mirante4d_application::{RenderIntentRevision, RenderIntentTarget};
     use mirante4d_dataset::{
         CpuLedgerCategory, CpuLedgerError, DatasetResourceIdentity, DatasetSourceId,
     };
@@ -3280,22 +3769,86 @@ mod tests {
     use super::{
         CrossSectionDemandPlanningSignature, CrossSectionPanelDemandPlanningSignature,
         CrossSectionPlanMask, Current3dDemandPlanningSignature,
-        PROGRESSIVE_DISPLAY_REFRESH_INTERVAL, PayloadPlacementFacts,
+        PROGRESSIVE_DISPLAY_REFRESH_INTERVAL, PayloadPlacementFacts, PlaybackDemandWindow,
         ProgressiveDisplayRefreshPacer, RESULT_DRAIN_BATCH, RESULT_DRAIN_COUNT_ENVELOPE,
         RESULT_DRAIN_TIME_BUDGET, VisibleDemandFailureSignature, VisibleDemandPlaceabilityLimit,
         VisibleDemandPlaceabilityRetry, VisibleDemandPlanningSignature,
         admission_fault_invalidates_presentation, completion_drain_needs_display_refresh,
         dataset_fidelity_completeness, installed_target_layer_scales,
         installed_visible_demand_plan_currentness, next_completion_drain_batch,
-        runtime_fault_invalidates_verified_source, visible_demand_failure_is_deterministic,
-        visible_demand_failure_is_recovery_backpressure,
+        playback_demand_window_for, temporal_3d_body_matches_camera_only_change,
+        visible_demand_failure_is_deterministic, visible_demand_failure_is_recovery_backpressure,
     };
     use crate::{DeterministicFailureLatch, DisplayedFrameFreshness, FrameCompleteness};
 
+    #[test]
+    fn playback_window_is_fps_bounded_wraps_and_does_not_scale_with_total_time() {
+        let fps_24 = mirante4d_application::PlaybackFps::new(24).unwrap();
+        let long = playback_demand_window_for(TimeIndex::new(10), 365, fps_24, true);
+        let arbitrarily_long =
+            playback_demand_window_for(TimeIndex::new(10), 1_000_000, fps_24, true);
+        assert_eq!(long.timepoints.len(), 24);
+        assert_eq!(arbitrarily_long.timepoints, long.timepoints);
+        assert_eq!(long.required_timepoint_count, 6);
+
+        let short = playback_demand_window_for(TimeIndex::new(2), 3, fps_24, true);
+        assert_eq!(short.timepoints, vec![TimeIndex::new(0), TimeIndex::new(1)]);
+        assert_eq!(short.required_timepoint_count, 2);
+
+        let fps_12 = mirante4d_application::PlaybackFps::new(12).unwrap();
+        let lower_rate = playback_demand_window_for(TimeIndex::new(0), 365, fps_12, true);
+        assert_eq!(lower_rate.timepoints.len(), 12);
+        assert_eq!(lower_rate.required_timepoint_count, 3);
+        assert_eq!(
+            playback_demand_window_for(TimeIndex::new(0), 365, fps_12, false),
+            PlaybackDemandWindow::default()
+        );
+    }
+
+    #[test]
+    fn playback_full_volume_planning_survives_only_active_camera_changes() {
+        let mut planned = planning_signature(1).current_3d;
+        planned.playback_active = true;
+        let mut camera_changed = planned.clone();
+        camera_changed.camera = CameraView::new(
+            Projection::Orthographic,
+            WorldPoint3::origin(),
+            UnitQuaternion::identity(),
+            2.0,
+            1.0,
+            1.0,
+        )
+        .unwrap();
+
+        assert!(temporal_3d_body_matches_camera_only_change(
+            &planned,
+            &camera_changed,
+            Some(RenderIntentTarget::ThreeD),
+        ));
+        assert!(!temporal_3d_body_matches_camera_only_change(
+            &planned,
+            &camera_changed,
+            None,
+        ));
+
+        let mut time_changed = camera_changed.clone();
+        time_changed.timepoint = TimeIndex::new(1);
+        assert!(!temporal_3d_body_matches_camera_only_change(
+            &planned,
+            &time_changed,
+            Some(RenderIntentTarget::ThreeD),
+        ));
+        planned.playback_active = false;
+        assert!(!temporal_3d_body_matches_camera_only_change(
+            &planned,
+            &camera_changed,
+            Some(RenderIntentTarget::ThreeD),
+        ));
+    }
+
     fn planning_signature(source_id: u64) -> VisibleDemandPlanningSignature {
         let resource_identity =
-            DatasetResourceIdentity::Unverified(DatasetSourceId::new(source_id));
-        let active_layer = LogicalLayerKey::new(0);
+            DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(source_id));
         let camera = CameraView::new(
             Projection::Orthographic,
             WorldPoint3::origin(),
@@ -3313,7 +3866,7 @@ mod tests {
         VisibleDemandPlanningSignature {
             current_3d: Current3dDemandPlanningSignature {
                 resource_identity,
-                active_layer,
+                playback_priority_layer: None,
                 timepoint: TimeIndex::new(0),
                 camera,
                 layout: ViewerLayout::Single3d,
@@ -3321,11 +3874,12 @@ mod tests {
                 presentation_viewport,
                 render_viewport: render_extent,
                 playback_active: false,
+                playback_fps: mirante4d_application::PlaybackFps::DEFAULT,
                 gpu_payload_capacity: 1,
             },
             cross_sections: CrossSectionDemandPlanningSignature {
                 resource_identity,
-                active_layer,
+                playback_priority_layer: None,
                 timepoint: TimeIndex::new(0),
                 layout: ViewerLayout::Single3d,
                 layers: Box::new([]),
@@ -3335,6 +3889,7 @@ mod tests {
                     render_extent: None,
                 }),
                 playback_active: false,
+                playback_fps: mirante4d_application::PlaybackFps::DEFAULT,
                 gpu_payload_capacity: 1,
             },
         }
@@ -3369,7 +3924,7 @@ mod tests {
             app.request_visible_bricks();
             std::thread::yield_now();
         }
-        assert_eq!(app.dataset.current_scale(), ScaleLevel::BASE);
+        assert_eq!(app.dataset.current_uniform_scale(), Some(ScaleLevel::BASE));
 
         let snapshot = app.application.snapshot();
         let intent = crate::product_render_intent::volume_intent(
@@ -3917,24 +4472,8 @@ mod tests {
     }
 
     #[test]
-    fn only_observed_source_integrity_faults_invalidate_a_verified_binding() {
+    fn scoped_runtime_faults_preserve_an_existing_presentation() {
         assert!(!admission_fault_invalidates_presentation(true));
         assert!(admission_fault_invalidates_presentation(false));
-        for code in [
-            RuntimeFaultCode::SourceRejected,
-            RuntimeFaultCode::CorruptResource,
-            RuntimeFaultCode::UnsupportedResource,
-            RuntimeFaultCode::DecodeFailed,
-        ] {
-            assert!(runtime_fault_invalidates_verified_source(code));
-        }
-        for code in [
-            RuntimeFaultCode::QueueFull,
-            RuntimeFaultCode::Cancelled,
-            RuntimeFaultCode::ShuttingDown,
-            RuntimeFaultCode::InvariantViolation,
-        ] {
-            assert!(!runtime_fault_invalidates_verified_source(code));
-        }
     }
 }

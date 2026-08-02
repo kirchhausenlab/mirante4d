@@ -32,7 +32,7 @@ use crate::dataset_demand_plan::{
     NavigationLadderBaseline, PreparedAllocationReservations, PreparedDatasetDemandPlan,
     PreparedDemandRequirements, PreparedProgressiveDatasetDemandPlan, key_array_bytes,
     plan_adaptive_cross_section_panel_with_obligations_cancellable,
-    plan_cross_section_navigation_floor_cancellable,
+    plan_cross_section_navigation_floor_cancellable, plan_cross_section_playback_body_cancellable,
     plan_guarded_progressive_current_3d_with_obligations_cancellable,
     plane_guard_attempt_should_retry_exact,
 };
@@ -40,6 +40,7 @@ use crate::dataset_demand_plan::{
 use crate::dataset_demand_plan::{
     plan_cross_section_panel_attempt, plan_progressive_current_3d_cancellable,
 };
+use crate::playback_session::{PlaybackFrameContract, PlaybackTargetSet};
 use crate::retained_leases::RetainedRequirementHandle;
 use crate::semantic_demand::SemanticPlaneReuseEnvelope;
 use crate::viewer_layout::PanelId;
@@ -62,6 +63,8 @@ pub(crate) struct CameraDemandRequest {
     preserve_previous_renderer_requirement_union: bool,
     unchanged_renderer_requirement_bodies: Box<[PreparedResourceBody]>,
     post_refinement_promotion_unchanged_bodies: Option<Box<[PreparedResourceBody]>>,
+    fixed_playback_layer_scales: Option<Arc<BTreeMap<LogicalLayerKey, ScaleLevel>>>,
+    temporal_frame_contract: Option<PlaybackFrameContract>,
 }
 
 pub(crate) struct Current3dDemandRequest {
@@ -69,7 +72,9 @@ pub(crate) struct Current3dDemandRequest {
     viewport: RenderExtent,
     limits: DatasetDemandPlanLimits,
     playback_active: bool,
-    next_playback_timepoint: Option<TimeIndex>,
+    playback_timepoints: Box<[TimeIndex]>,
+    playback_required_timepoint_count: usize,
+    fixed_playback_layer_scales: Option<Arc<BTreeMap<LogicalLayerKey, ScaleLevel>>>,
     preserve_complete_presentation: bool,
     navigation_ladder_baseline: Option<NavigationLadderBaseline>,
     baselines: Current3dDemandBaselines,
@@ -143,16 +148,26 @@ impl Current3dDemandRequest {
             viewport,
             limits,
             playback_active: false,
-            next_playback_timepoint: None,
+            playback_timepoints: Box::new([]),
+            playback_required_timepoint_count: 0,
+            fixed_playback_layer_scales: None,
             preserve_complete_presentation: false,
             navigation_ladder_baseline: None,
             baselines,
         }
     }
 
-    pub(crate) fn with_playback(mut self, active: bool, next_timepoint: Option<TimeIndex>) -> Self {
+    pub(crate) fn with_playback(
+        mut self,
+        active: bool,
+        timepoints: Vec<TimeIndex>,
+        required_timepoint_count: usize,
+        fixed_layer_scales: Option<Arc<BTreeMap<LogicalLayerKey, ScaleLevel>>>,
+    ) -> Self {
         self.playback_active = active;
-        self.next_playback_timepoint = next_timepoint;
+        self.playback_required_timepoint_count = required_timepoint_count.min(timepoints.len());
+        self.playback_timepoints = timepoints.into_boxed_slice();
+        self.fixed_playback_layer_scales = fixed_layer_scales;
         self
     }
 
@@ -227,6 +242,8 @@ impl CameraDemandRequest {
                 .into_boxed_slice(),
             post_refinement_promotion_unchanged_bodies: post_refinement_promotion_unchanged_bodies
                 .map(Vec::into_boxed_slice),
+            fixed_playback_layer_scales: None,
+            temporal_frame_contract: None,
         }
     }
 
@@ -239,6 +256,22 @@ impl CameraDemandRequest {
         preserve: bool,
     ) -> Self {
         self.preserve_previous_renderer_requirement_union = preserve;
+        self
+    }
+
+    pub(crate) fn with_temporal_frame_contract(
+        mut self,
+        contract: Option<PlaybackFrameContract>,
+    ) -> Self {
+        self.temporal_frame_contract = contract;
+        self
+    }
+
+    pub(crate) fn with_fixed_playback_layer_scales(
+        mut self,
+        layer_scales: Option<Arc<BTreeMap<LogicalLayerKey, ScaleLevel>>>,
+    ) -> Self {
+        self.fixed_playback_layer_scales = layer_scales;
         self
     }
 }
@@ -325,6 +358,10 @@ pub(crate) struct PreparedCurrent3dDemand {
     pub(crate) current: PreparedScopeDemand,
     pub(crate) refinement: PreparedScopeDemand,
     pub(crate) playback: PreparedScopeDemand,
+    /// Number of ranked resources forming one complete future timepoint in
+    /// `playback`. Warmup may require several such bodies, while the running
+    /// clock gates only on the immediate successor body.
+    pub(crate) playback_resources_per_timepoint: usize,
     pub(crate) navigation_ladder: PreparedNavigationLadderDemand,
 }
 
@@ -337,9 +374,62 @@ pub(crate) struct PreparedCrossSectionDemand {
     pub(crate) reuse_envelope: Option<SemanticPlaneReuseEnvelope>,
 }
 
-pub(crate) struct PreparedVisibleDemand {
+#[derive(Debug)]
+/// Physical worker output for an explicitly requested temporal transaction.
+///
+/// This is deliberately a delta, not the logical frame. Omitted targets must
+/// be assembled from compatible installed bodies at the composition root
+/// before anything is committed or submitted to the renderer.
+pub(crate) struct PreparedTemporalDelta {
+    pub(crate) contract: PlaybackFrameContract,
     pub(crate) current_3d: Option<PreparedCurrent3dDemand>,
     pub(crate) cross_sections: Box<[PreparedCrossSectionDemand]>,
+}
+
+#[derive(Debug)]
+pub(crate) enum PreparedVisibleTargets {
+    Ordinary {
+        current_3d: Option<PreparedCurrent3dDemand>,
+        cross_sections: Box<[PreparedCrossSectionDemand]>,
+    },
+    Temporal(PreparedTemporalDelta),
+}
+
+impl PreparedVisibleTargets {
+    pub(crate) fn current_3d(&self) -> Option<&PreparedCurrent3dDemand> {
+        match self {
+            Self::Ordinary { current_3d, .. } => current_3d.as_ref(),
+            Self::Temporal(delta) => delta.current_3d.as_ref(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cross_sections(&self) -> &[PreparedCrossSectionDemand] {
+        match self {
+            Self::Ordinary { cross_sections, .. } => cross_sections,
+            Self::Temporal(delta) => &delta.cross_sections,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Option<PreparedCurrent3dDemand>,
+        Box<[PreparedCrossSectionDemand]>,
+        Option<PlaybackFrameContract>,
+    ) {
+        match self {
+            Self::Ordinary {
+                current_3d,
+                cross_sections,
+            } => (current_3d, cross_sections, None),
+            Self::Temporal(delta) => (delta.current_3d, delta.cross_sections, Some(delta.contract)),
+        }
+    }
+}
+
+pub(crate) struct PreparedVisibleDemand {
+    pub(crate) targets: PreparedVisibleTargets,
     pub(crate) renderer_requirement_update: PreparedRendererRequirementUpdate,
     /// Exact GPU payload bytes represented by
     /// `renderer_requirement_update.next`. This is prepared on the worker
@@ -354,8 +444,7 @@ impl fmt::Debug for PreparedVisibleDemand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PreparedVisibleDemand")
-            .field("current_3d", &self.current_3d)
-            .field("cross_sections", &self.cross_sections)
+            .field("targets", &self.targets)
             .field(
                 "renderer_requirement_union_len",
                 &self.renderer_requirement_update.next.requirements.len(),
@@ -377,6 +466,17 @@ impl fmt::Debug for PreparedVisibleDemand {
                 &self.renderer_requirement_update,
             )
             .finish()
+    }
+}
+
+impl PreparedVisibleDemand {
+    pub(crate) fn current_3d(&self) -> Option<&PreparedCurrent3dDemand> {
+        self.targets.current_3d()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cross_sections(&self) -> &[PreparedCrossSectionDemand] {
+        self.targets.cross_sections()
     }
 }
 
@@ -824,7 +924,7 @@ fn run_worker(shared: Arc<Shared>) {
             .as_ref()
             .map_or(0, |planning| planning.candidates_visited as u64);
         let completed_3d = outcome.as_ref().ok().and_then(|prepared| {
-            prepared.current_3d.as_ref().map(|current| {
+            prepared.current_3d().map(|current| {
                 let plans = std::iter::once(&current.plan.target).chain(current.plan.coarse.iter());
                 let (primary, total) = plans.fold((0_usize, 0_usize), |(primary, total), plan| {
                     (
@@ -924,6 +1024,8 @@ fn plan_visible_demand(
         preserve_previous_renderer_requirement_union,
         unchanged_renderer_requirement_bodies,
         post_refinement_promotion_unchanged_bodies,
+        fixed_playback_layer_scales,
+        temporal_frame_contract,
     } = request;
     let mut candidates_visited = 0_usize;
     let linked_navigation_floor = if cross_sections.is_empty() {
@@ -1016,7 +1118,9 @@ fn plan_visible_demand(
             input.viewport,
             input.limits,
             input.playback_active,
-            input.next_playback_timepoint,
+            &input.playback_timepoints,
+            input.playback_required_timepoint_count,
+            input.fixed_playback_layer_scales.as_deref(),
             transition_obligations.as_ref(),
             input.navigation_ladder_baseline.as_ref(),
             Some(cpu_ledger.as_ref()),
@@ -1065,29 +1169,37 @@ fn plan_visible_demand(
             plan.target.requirements = current.clone();
             (current, empty.clone())
         };
-        let playback_requirements = if input.playback_active
-            && let Some(timepoint) = input.next_playback_timepoint
-        {
-            let playback_resource_count = plan
+        let playback_timepoint_count = plan
+            .playback_timepoint_count
+            .min(input.playback_timepoints.len());
+        let playback_timepoints = &input.playback_timepoints[..playback_timepoint_count];
+        let playback_requirements = if input.playback_active && !playback_timepoints.is_empty() {
+            let per_timepoint_resource_count = plan
                 .target
                 .playback_resource_count
                 .min(plan.target.requirements.ranked().len());
-            let required_prefix_len = plan
-                .target
-                .requirements
-                .required_prefix_len()
-                .min(playback_resource_count);
+            let playback_resource_count = per_timepoint_resource_count
+                .checked_mul(playback_timepoints.len())
+                .ok_or_else(|| anyhow::anyhow!("playback-window resource count overflow"))?;
+            let required_prefix_len = per_timepoint_resource_count
+                .checked_mul(
+                    input
+                        .playback_required_timepoint_count
+                        .min(playback_timepoints.len()),
+                )
+                .ok_or_else(|| anyhow::anyhow!("playback-runway prefix overflow"))?;
             let temporary_charge =
                 reservations.reserve_temporary(key_array_bytes(playback_resource_count)?)?;
-            let ranked = plan
-                .target
-                .requirements
-                .ranked()
-                .iter()
-                .take(playback_resource_count)
-                .copied()
-                .map(|key| rebind_timepoint(key, timepoint))
-                .collect::<Vec<_>>();
+            let source = &plan.target.requirements.ranked()[..per_timepoint_resource_count];
+            let mut ranked = Vec::with_capacity(playback_resource_count);
+            for &timepoint in playback_timepoints.iter() {
+                ranked.extend(
+                    source
+                        .iter()
+                        .copied()
+                        .map(|key| rebind_timepoint(key, timepoint)),
+                );
+            }
             let prepared = PreparedDemandRequirements::from_ranked_accounted(
                 ranked,
                 required_prefix_len,
@@ -1111,25 +1223,46 @@ fn plan_visible_demand(
             .unwrap_or_else(|| plan.target.requirements.clone());
         let navigation_candidates = std::mem::take(&mut plan.navigation_candidates);
         let mut prepared_navigation_candidates = Vec::with_capacity(navigation_candidates.len());
-        for candidate in navigation_candidates {
-            let render_requirements = prepare_navigation_render_requirements(
-                catalog.as_ref(),
-                &view,
-                &candidate.layer_scales,
-                &candidate.requirements,
-                &navigation_residency_requirements,
-                &mut reservations,
-            )?
-            .ok_or_else(|| anyhow::anyhow!("a full-volume navigation candidate is empty"))?;
-            prepared_navigation_candidates.push(PreparedNavigationCandidateDemand {
-                render_requirements,
-                selection_body: candidate.requirements.body().clone(),
-                layer_scales: candidate.layer_scales,
-                planned_payload_bytes: candidate.payload_bytes,
-                resource_count: candidate.primary_resource_count,
-            });
+        let target_is_empty = plan.target.layer_scales.is_empty();
+        if target_is_empty {
+            if !plan.ideal_layer_scales.is_empty()
+                || !plan.target.requirements.canonical().is_empty()
+                || plan.target.primary_resource_count != 0
+                || plan.target.playback_resource_count != 0
+                || plan.coarse.as_ref().is_some_and(|coarse| {
+                    !coarse.layer_scales.is_empty()
+                        || !coarse.requirements.canonical().is_empty()
+                        || coarse.primary_resource_count != 0
+                })
+                || navigation_candidates.iter().any(|candidate| {
+                    !candidate.layer_scales.is_empty()
+                        || !candidate.requirements.canonical().is_empty()
+                        || candidate.primary_resource_count != 0
+                })
+            {
+                anyhow::bail!("an empty visible-layer target owns non-empty 3D demand");
+            }
+        } else {
+            for candidate in navigation_candidates {
+                let render_requirements = prepare_navigation_render_requirements(
+                    catalog.as_ref(),
+                    &view,
+                    &candidate.layer_scales,
+                    &candidate.requirements,
+                    &navigation_residency_requirements,
+                    &mut reservations,
+                )?
+                .ok_or_else(|| anyhow::anyhow!("a full-volume navigation candidate is empty"))?;
+                prepared_navigation_candidates.push(PreparedNavigationCandidateDemand {
+                    render_requirements,
+                    selection_body: candidate.requirements.body().clone(),
+                    layer_scales: candidate.layer_scales,
+                    planned_payload_bytes: candidate.payload_bytes,
+                    resource_count: candidate.primary_resource_count,
+                });
+            }
         }
-        if prepared_navigation_candidates.is_empty() {
+        if !target_is_empty && prepared_navigation_candidates.is_empty() {
             anyhow::bail!("the full-volume navigation ladder is empty");
         }
         let navigation_ladder = PreparedNavigationLadderDemand {
@@ -1192,6 +1325,15 @@ fn plan_visible_demand(
                 render_requirements: None,
                 render_payload_bytes: None,
             },
+            playback_resources_per_timepoint: if input.playback_active
+                && !playback_timepoints.is_empty()
+            {
+                plan.target
+                    .playback_resource_count
+                    .min(plan.target.requirements.ranked().len())
+            } else {
+                0
+            },
             navigation_ladder,
             plan,
         };
@@ -1248,6 +1390,12 @@ fn plan_visible_demand(
     };
     let mut _selection_obligation_charge = selection_obligation_reservations.finish();
 
+    let playback_cross_section_scales = fixed_playback_layer_scales.as_deref().or_else(|| {
+        current_3d.as_ref().and_then(|current| {
+            (!current.playback.requirements.canonical().is_empty())
+                .then_some(&current.plan.target.layer_scales)
+        })
+    });
     let mut prepared_cross_sections = Vec::with_capacity(cross_sections.len());
     for input in cross_sections {
         if cancelled() {
@@ -1257,11 +1405,14 @@ fn plan_visible_demand(
             catalog.as_ref(),
             &view,
             &input,
-            &linked_navigation_floor
-                .as_ref()
-                .expect("a requested cross-section owns one navigation floor")
-                .plan,
-            &selection_obligations,
+            CrossSectionPlanningObligations {
+                navigation_floor: &linked_navigation_floor
+                    .as_ref()
+                    .expect("a requested cross-section owns one navigation floor")
+                    .plan,
+                obligated_resources: &selection_obligations,
+                playback_layer_scales: playback_cross_section_scales,
+            },
             cpu_ledger.as_ref(),
             &mut cancelled,
         )?;
@@ -1295,6 +1446,9 @@ fn plan_visible_demand(
     }
 
     let unchanged_renderer_requirement_bodies = unchanged_renderer_requirement_bodies.into_vec();
+    let current_target_is_empty = current_3d
+        .as_ref()
+        .is_some_and(|current| current.plan.target.layer_scales.is_empty());
     let cross_bodies = prepared_cross_sections
         .iter()
         .map(|cross| Arc::clone(cross.plan.requirements.canonical()))
@@ -1334,20 +1488,33 @@ fn plan_visible_demand(
         .iter()
         .map(|body| Arc::clone(body.canonical()))
         .collect::<Vec<_>>();
-    union_bodies.extend(
-        preserved_previous_renderer_requirement_union
-            .iter()
-            .cloned(),
-    );
+    if !current_target_is_empty {
+        union_bodies.extend(
+            preserved_previous_renderer_requirement_union
+                .iter()
+                .cloned(),
+        );
+    }
     if let Some(current) = current_3d.as_ref() {
         union_bodies.push(Arc::clone(current.current.requirements.canonical()));
         union_bodies.push(Arc::clone(current.refinement.requirements.canonical()));
         union_bodies.push(Arc::clone(current.playback.requirements.canonical()));
     }
-    if let Some(current_front) = transition_current_front_body {
+    if !current_target_is_empty && let Some(current_front) = transition_current_front_body {
         union_bodies.push(current_front);
     }
-    union_bodies.extend(transition_cross_front_bodies);
+    debug_assert_eq!(
+        transition_cross_front_bodies.len(),
+        prepared_cross_sections.len()
+    );
+    union_bodies.extend(
+        transition_cross_front_bodies
+            .into_iter()
+            .zip(prepared_cross_sections.iter())
+            .filter_map(|(front, cross)| {
+                (!cross.plan.requirements.canonical().is_empty()).then_some(front)
+            }),
+    );
     union_bodies.extend(cross_bodies);
     let mut union_reservations = PreparedAllocationReservations::new(cpu_ledger.as_ref());
     let Some(renderer_requirement_union) =
@@ -1409,9 +1576,42 @@ fn plan_visible_demand(
     if cancelled() {
         return Ok(None);
     }
+    let cross_sections = prepared_cross_sections.into_boxed_slice();
+    let targets = if let Some(contract) = temporal_frame_contract {
+        if contract.timepoint() != view.timepoint() {
+            anyhow::bail!("a prepared temporal frame changed timepoint while planning");
+        }
+        if current_3d.as_ref().is_some_and(|current| {
+            current.plan.target.layer_scales != *contract.layer_scales().as_ref()
+        }) {
+            anyhow::bail!("a prepared temporal 3D delta escaped its fixed scale map");
+        }
+        match contract.target_set() {
+            PlaybackTargetSet::ThreeD if !cross_sections.is_empty() => {
+                anyhow::bail!("a standalone temporal delta contains linked targets");
+            }
+            PlaybackTargetSet::FullLayout
+                if cross_sections
+                    .iter()
+                    .any(|cross| cross.plan.layer_scales != *contract.layer_scales().as_ref()) =>
+            {
+                anyhow::bail!("a prepared temporal linked delta escaped its fixed scale map");
+            }
+            PlaybackTargetSet::ThreeD | PlaybackTargetSet::FullLayout => {}
+        }
+        PreparedVisibleTargets::Temporal(PreparedTemporalDelta {
+            contract,
+            current_3d,
+            cross_sections,
+        })
+    } else {
+        PreparedVisibleTargets::Ordinary {
+            current_3d,
+            cross_sections,
+        }
+    };
     Ok(Some(PreparedVisibleDemand {
-        current_3d,
-        cross_sections: prepared_cross_sections.into_boxed_slice(),
+        targets,
         renderer_requirement_update: PreparedRendererRequirementUpdate {
             previous: previous_renderer_requirement_union,
             next: PreparedRequirementUnion {
@@ -1440,15 +1640,44 @@ fn requirement_payload_bytes(
     })
 }
 
+struct CrossSectionPlanningObligations<'a> {
+    navigation_floor: &'a DatasetDemandPlan,
+    obligated_resources: &'a [BrickKey],
+    playback_layer_scales: Option<&'a BTreeMap<LogicalLayerKey, ScaleLevel>>,
+}
+
 fn prepare_adaptive_cross_section_panel(
     catalog: &DatasetCatalog,
     view: &ViewState,
     input: &CrossSectionDemandRequest,
-    navigation_floor: &DatasetDemandPlan,
-    obligated_resources: &[BrickKey],
+    obligations: CrossSectionPlanningObligations<'_>,
     cpu_ledger: &dyn CpuByteLedger,
     cancelled: &mut impl FnMut() -> bool,
 ) -> anyhow::Result<Option<(PreparedCrossSectionDemand, usize)>> {
+    if let Some(playback_layer_scales) = obligations.playback_layer_scales {
+        let planning = plan_cross_section_playback_body_cancellable(
+            catalog,
+            view,
+            input.panel,
+            playback_layer_scales,
+            input.limits,
+            obligations.obligated_resources,
+            Some(cpu_ledger),
+            cancelled,
+        )?;
+        let Some(planning) = planning else {
+            return Ok(None);
+        };
+        return prepare_cross_section_planning(
+            catalog,
+            view,
+            input,
+            obligations.navigation_floor,
+            planning,
+            cpu_ledger,
+            cancelled,
+        );
+    }
     let planning = plan_adaptive_cross_section_panel_with_obligations_cancellable(
         catalog,
         view,
@@ -1457,8 +1686,8 @@ fn prepare_adaptive_cross_section_panel(
         input.viewport,
         input.limits,
         Some(cpu_ledger),
-        None,
-        obligated_resources,
+        obligations.playback_layer_scales,
+        obligations.obligated_resources,
         true,
         cancelled,
     )?;
@@ -1470,7 +1699,7 @@ fn prepare_adaptive_cross_section_panel(
         catalog,
         view,
         input,
-        navigation_floor,
+        obligations.navigation_floor,
         planning,
         cpu_ledger,
         cancelled,
@@ -1485,8 +1714,8 @@ fn prepare_adaptive_cross_section_panel(
                 input.viewport,
                 input.limits,
                 Some(cpu_ledger),
-                None,
-                obligated_resources,
+                obligations.playback_layer_scales,
+                obligations.obligated_resources,
                 false,
                 cancelled,
             )?;
@@ -1497,7 +1726,7 @@ fn prepare_adaptive_cross_section_panel(
                 catalog,
                 view,
                 input,
-                navigation_floor,
+                obligations.navigation_floor,
                 planning,
                 cpu_ledger,
                 cancelled,
@@ -1519,7 +1748,6 @@ fn prepare_cross_section_planning(
     let mut reservations = PreparedAllocationReservations::new(cpu_ledger);
     let (plan, work, reuse_envelope) = planning.prepare_accounted(&mut reservations)?;
     let PreparedDatasetDemandPlan {
-        scale,
         layer_scales,
         requirements,
         payload_bytes,
@@ -1533,7 +1761,6 @@ fn prepare_cross_section_planning(
         &reservations,
     )?;
     let mut plan = PreparedDatasetDemandPlan {
-        scale,
         layer_scales,
         requirements,
         payload_bytes,
@@ -2066,10 +2293,12 @@ mod tests {
     };
 
     use glam::{DMat4, DQuat, DVec3};
-    use mirante4d_application::{RenderIntentFamily, RenderIntentMailbox};
+    use mirante4d_application::{
+        PlaybackFps, RenderIntentFamily, RenderIntentMailbox, SourceSessionGeneration,
+    };
     use mirante4d_dataset::{
-        CpuByteLease, CpuLedgerCategory, CpuLedgerError, DatasetLayer, DatasetResourceIdentity,
-        DatasetSourceId, ResourceRegion, ResourceValidity, ScientificIdentityStatus,
+        ContentAddressStatus, CpuByteLease, CpuLedgerCategory, CpuLedgerError, DatasetLayer,
+        DatasetResourceIdentity, DatasetSourceId, ResourceRegion, ResourceValidity,
     };
     use mirante4d_domain::{
         CameraView, CrossSectionView, DisplayWindow, GridToWorld, IntensityDType, IsoLightState,
@@ -2107,6 +2336,195 @@ mod tests {
                 return Err(CpuLedgerError::ZeroByteReservation);
             }
             Ok(Box::new(TestCpuLease { category, bytes }))
+        }
+    }
+
+    #[test]
+    fn temporal_planning_returns_one_fixed_scale_target_bundle() {
+        let (catalog, view) = temporal_fixture(
+            Shape3D::new(64, 64, 64).unwrap(),
+            3,
+            TimeIndex::new(1),
+            ViewerLayout::Single3d,
+        );
+        let scales = BTreeMap::from([(LogicalLayerKey::new(0), ScaleLevel::BASE)]);
+        let mut session = crate::playback_session::PlaybackSession::new();
+        let source = SourceSessionGeneration::new(7);
+        let fps = PlaybackFps::new(24).unwrap();
+        session.begin_warmup(source, fps, ViewerLayout::Single3d);
+        assert!(session.admit_contract(
+            source,
+            fps,
+            ViewerLayout::Single3d,
+            scales.clone(),
+            2,
+            1,
+            1 << 20,
+            1 << 20,
+            TimeIndex::new(0),
+            &[TimeIndex::new(1), TimeIndex::new(2)],
+        ));
+        let frame = session
+            .contract()
+            .unwrap()
+            .frame_contract(TimeIndex::new(1));
+        let limits = DatasetDemandPlanLimits::new(4_096, 65_536, u64::MAX);
+        let request = CameraDemandRequest::new(
+            RenderIntentRevision::initial(),
+            Arc::clone(&catalog),
+            test_cpu_ledger(),
+            view,
+            limits,
+            Some(
+                Current3dDemandRequest::new(
+                    PresentationViewport::new(64.0, 64.0).unwrap(),
+                    RenderExtent::new(64, 64).unwrap(),
+                    limits,
+                    Current3dDemandBaselines::empty(),
+                )
+                .with_playback(
+                    true,
+                    vec![TimeIndex::new(2)],
+                    1,
+                    Some(Arc::new(scales.clone())),
+                ),
+            ),
+            Vec::new(),
+            unaccounted_requirement_handle(Arc::from([])),
+            Vec::new(),
+            None,
+        )
+        .with_temporal_frame_contract(Some(frame.clone()));
+
+        let prepared = plan_visible_demand(request, || false).unwrap().unwrap();
+        let PreparedVisibleTargets::Temporal(bundle) = prepared.targets else {
+            panic!("temporal planning returned an ordinary split target set");
+        };
+        assert_eq!(bundle.contract, frame);
+        assert_eq!(bundle.current_3d.unwrap().plan.target.layer_scales, scales);
+        assert!(bundle.cross_sections.is_empty());
+    }
+
+    #[test]
+    fn temporal_planning_accepts_a_partial_four_panel_physical_delta() {
+        let (catalog, view) = temporal_fixture(
+            Shape3D::new(64, 64, 64).unwrap(),
+            3,
+            TimeIndex::new(1),
+            ViewerLayout::FourPanel,
+        );
+        let scales = BTreeMap::from([(LogicalLayerKey::new(0), ScaleLevel::BASE)]);
+        let source = SourceSessionGeneration::new(7);
+        let fps = PlaybackFps::new(24).unwrap();
+        let mut session = crate::playback_session::PlaybackSession::new();
+        session.begin_warmup(source, fps, ViewerLayout::FourPanel);
+        assert!(session.admit_contract(
+            source,
+            fps,
+            ViewerLayout::FourPanel,
+            scales.clone(),
+            2,
+            1,
+            1 << 20,
+            1 << 20,
+            TimeIndex::new(0),
+            &[TimeIndex::new(1), TimeIndex::new(2)],
+        ));
+        let limits = DatasetDemandPlanLimits::new(4_096, 65_536, u64::MAX);
+        let request = CameraDemandRequest::new(
+            RenderIntentRevision::initial(),
+            catalog,
+            test_cpu_ledger(),
+            view,
+            limits,
+            Some(
+                Current3dDemandRequest::new(
+                    PresentationViewport::new(64.0, 64.0).unwrap(),
+                    RenderExtent::new(64, 64).unwrap(),
+                    limits,
+                    Current3dDemandBaselines::empty(),
+                )
+                .with_playback(
+                    true,
+                    vec![TimeIndex::new(2)],
+                    1,
+                    Some(Arc::new(scales)),
+                ),
+            ),
+            Vec::new(),
+            unaccounted_requirement_handle(Arc::from([])),
+            Vec::new(),
+            None,
+        )
+        .with_temporal_frame_contract(Some(
+            session
+                .contract()
+                .unwrap()
+                .frame_contract(TimeIndex::new(1)),
+        ));
+
+        let prepared = plan_visible_demand(request, || false).unwrap().unwrap();
+        let PreparedVisibleTargets::Temporal(delta) = prepared.targets else {
+            panic!("temporal planning returned an ordinary target delta");
+        };
+        assert!(delta.current_3d.is_some());
+        assert!(delta.cross_sections.is_empty());
+    }
+
+    #[test]
+    fn active_playback_linked_only_planning_keeps_geometry_independent_full_volume_bodies() {
+        let (catalog, view) = temporal_fixture(
+            Shape3D::new(64, 64, 64).unwrap(),
+            3,
+            TimeIndex::new(1),
+            ViewerLayout::FourPanel,
+        );
+        let scales = BTreeMap::from([(LogicalLayerKey::new(0), ScaleLevel::BASE)]);
+        let limits = DatasetDemandPlanLimits::new(4_096, 65_536, u64::MAX);
+        let presentation = PresentationViewport::new(64.0, 64.0).unwrap();
+        let extent = RenderExtent::new(64, 64).unwrap();
+        let cross_sections = [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+            .into_iter()
+            .map(|panel| {
+                CrossSectionDemandRequest::new(
+                    panel,
+                    presentation,
+                    extent,
+                    limits,
+                    ScopeDemandBaseline::empty(),
+                )
+            })
+            .collect();
+        let request = CameraDemandRequest::new(
+            RenderIntentRevision::initial(),
+            catalog,
+            test_cpu_ledger(),
+            view,
+            limits,
+            None,
+            cross_sections,
+            unaccounted_requirement_handle(Arc::from([])),
+            Vec::new(),
+            None,
+        )
+        .with_fixed_playback_layer_scales(Some(Arc::new(scales.clone())));
+
+        let prepared = plan_visible_demand(request, || false).unwrap().unwrap();
+        let panels = prepared.cross_sections();
+        assert_eq!(panels.len(), 3);
+        let canonical = Arc::clone(panels[0].plan.requirements.canonical());
+        assert!(!canonical.is_empty());
+        for panel in panels {
+            assert!(panel.plan.covers_full_volume);
+            assert_eq!(panel.plan.layer_scales, scales);
+            assert_eq!(
+                panel.plan.requirements.canonical().as_ref(),
+                canonical.as_ref()
+            );
+            assert_eq!(
+                panel.plan.requirements.required_prefix_len(),
+                panel.plan.requirements.ranked().len()
+            );
         }
     }
 
@@ -2296,8 +2714,7 @@ mod tests {
         let planning = result.outcome.unwrap();
         assert!(
             !planning
-                .current_3d
-                .as_ref()
+                .current_3d()
                 .expect("a volume request returns volume demand")
                 .plan
                 .target
@@ -2398,9 +2815,9 @@ mod tests {
 
         let result = wait_for_result(&mut planner, Duration::from_secs(5));
         let planning = result.outcome.unwrap();
-        assert!(planning.current_3d.is_none());
-        assert_eq!(planning.cross_sections.len(), 1);
-        let cross = &planning.cross_sections[0];
+        assert!(planning.current_3d().is_none());
+        assert_eq!(planning.cross_sections().len(), 1);
+        let cross = &planning.cross_sections()[0];
         assert_eq!(cross.panel, PanelId::Xy);
         assert!(!cross.plan.requirements.canonical().is_empty());
         assert!(
@@ -2498,8 +2915,11 @@ mod tests {
             catalog.as_ref(),
             &view,
             &input,
-            &floor.plan,
-            &[],
+            CrossSectionPlanningObligations {
+                navigation_floor: &floor.plan,
+                obligated_resources: &[],
+                playback_layer_scales: None,
+            },
             &ledger,
             &mut || false,
         )
@@ -2509,7 +2929,7 @@ mod tests {
         assert_eq!(rejected_result_reservations.load(Ordering::Acquire), 0);
         assert_eq!(prepared.plan.requirements.ranked().len(), floor_count);
         assert_eq!(prepared.plan.primary_resource_count, floor_count);
-        assert_eq!(prepared.plan.scale, guarded.plan.scale);
+        assert_eq!(prepared.plan.layer_scales, guarded.plan.layer_scales);
         assert!(
             prepared.reuse_envelope.is_some(),
             "a same-scale guard contained by the mandatory floor remains a valid zero-cost reuse proof"
@@ -2524,7 +2944,7 @@ mod tests {
 
     #[test]
     fn full_envelope_union_delta_is_prepared_on_worker_with_two_removals() {
-        let identity = DatasetResourceIdentity::Unverified(DatasetSourceId::new(77));
+        let identity = DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(77));
         let key = |x| {
             BrickKey::new(
                 identity,
@@ -2584,8 +3004,7 @@ mod tests {
             .outcome
             .unwrap();
         let installed_volume_body = first
-            .current_3d
-            .as_ref()
+            .current_3d()
             .unwrap()
             .current
             .requirements
@@ -2757,15 +3176,18 @@ mod tests {
         );
         let prepared = plan_visible_demand(request, || false).unwrap().unwrap();
         let current_charge = prepared
-            .current_3d
-            .as_ref()
+            .current_3d()
             .unwrap()
             .current
             .requirements
             .body()
             .charged_bytes()
             .unwrap();
-        let cross_body = prepared.cross_sections[0].plan.requirements.body().clone();
+        let cross_body = prepared.cross_sections()[0]
+            .plan
+            .requirements
+            .body()
+            .clone();
         let cross_charge = cross_body.charged_bytes().unwrap();
         assert!(current_charge != 0);
         assert!(cross_charge != 0);
@@ -2837,8 +3259,7 @@ mod tests {
 
         let prepared = plan_visible_demand(request, || false).unwrap().unwrap();
         let current_count = prepared
-            .current_3d
-            .as_ref()
+            .current_3d()
             .expect("the four-target request includes 3D")
             .plan
             .target
@@ -2850,7 +3271,7 @@ mod tests {
             current_count > old_equal_share,
             "the active 3D target must need more than the deleted one-quarter quota"
         );
-        assert_eq!(prepared.cross_sections.len(), 3);
+        assert_eq!(prepared.cross_sections().len(), 3);
         assert!(
             prepared.renderer_requirement_update.next.requirements.len() <= limits.max_resources,
             "the exact deduplicated four-target union must fit the one global renderer limit"
@@ -2895,12 +3316,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let first_3d = first.current_3d.as_ref().unwrap();
+        let first_3d = first.current_3d().unwrap();
         let first_current = first_3d.current.requirements.body().clone();
         let first_refinement = first_3d.refinement.requirements.body().clone();
         let first_playback = first_3d.playback.requirements.body().clone();
         let first_3d_charge = first_current.charged_bytes().unwrap();
-        let first_cross = first.cross_sections[0].plan.requirements.body().clone();
+        let first_cross = first.cross_sections()[0].plan.requirements.body().clone();
         let first_cross_charge = first_cross.charged_bytes().unwrap();
         let first_union = Arc::clone(&first.renderer_requirement_update.next.requirements);
         let first_union_charge = Arc::clone(&first.renderer_requirement_update.next.charge);
@@ -2940,7 +3361,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let second_3d = second.current_3d.as_ref().unwrap();
+        let second_3d = second.current_3d().unwrap();
         let second_current = second_3d.current.requirements.body().clone();
         let second_refinement = second_3d.refinement.requirements.body().clone();
         let second_playback = second_3d.playback.requirements.body().clone();
@@ -2990,7 +3411,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let third_cross = third.cross_sections[0].plan.requirements.body().clone();
+        let third_cross = third.cross_sections()[0].plan.requirements.body().clone();
         let third_cross_charge = third_cross.charged_bytes().unwrap();
         let third_union_charge = Arc::clone(&third.renderer_requirement_update.next.charge);
         let third_union_bytes = third_union_charge.reserved_bytes();
@@ -3072,8 +3493,7 @@ mod tests {
             assert_eq!(result.revision, revision);
             assert_eq!(
                 planning
-                    .current_3d
-                    .as_ref()
+                    .current_3d()
                     .expect("a volume request returns volume demand")
                     .plan
                     .target
@@ -3112,8 +3532,7 @@ mod tests {
             p95(&worker_samples),
             planning.candidates_visited,
             planning
-                .current_3d
-                .as_ref()
+                .current_3d()
                 .expect("a volume request returns volume demand")
                 .plan
                 .target
@@ -3201,6 +3620,71 @@ mod tests {
         fixture_with_transform(shape, GridToWorld::identity(), shape_center(shape))
     }
 
+    fn temporal_fixture(
+        shape: Shape3D,
+        timepoint_count: u64,
+        timepoint: TimeIndex,
+        layout: ViewerLayout,
+    ) -> (Arc<DatasetCatalog>, ViewState) {
+        let active = LogicalLayerKey::new(0);
+        let catalog = Arc::new(
+            DatasetCatalog::new(
+                "temporal-camera-demand-fixture",
+                ContentAddressStatus::SessionLocal(DatasetSourceId::new(1)),
+                vec![
+                    DatasetLayer::new(
+                        active,
+                        "layer",
+                        Shape4D::new(timepoint_count, shape.z(), shape.y(), shape.x()).unwrap(),
+                        IntensityDType::Uint16,
+                        GridToWorld::identity(),
+                        ResourceValidity::AllValid,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        );
+        let target = shape_center(shape);
+        let camera = CameraView::new(
+            Projection::Orthographic,
+            WorldPoint3::new(target.x, target.y, target.z).unwrap(),
+            UnitQuaternion::identity(),
+            64.0,
+            320.0,
+            shape.z() as f64 * 2.0,
+        )
+        .unwrap();
+        let view = ViewState::new(
+            vec![LayerViewState::new(
+                active,
+                true,
+                LayerTransfer::new(
+                    DisplayWindow::new(0.0, 65_535.0).unwrap(),
+                    RgbColor::new([1.0, 1.0, 1.0]).unwrap(),
+                    Opacity::new(1.0).unwrap(),
+                    TransferCurve::linear(),
+                    false,
+                ),
+                RenderState::mip(SamplingPolicy::VoxelExact),
+            )],
+            active,
+            timepoint,
+            camera,
+            layout,
+            CrossSectionView::new(
+                WorldPoint3::new(target.x, target.y, target.z).unwrap(),
+                UnitQuaternion::identity(),
+                1.0,
+                1.0,
+            )
+            .unwrap(),
+            IsoLightState::attached_camera(),
+        )
+        .unwrap();
+        (catalog, view)
+    }
+
     fn large_oblique_fixture() -> (Arc<DatasetCatalog>, ViewState) {
         let shape = Shape3D::new(48 * 64, 48 * 64, 48 * 64).unwrap();
         let diagonal = DVec3::ONE.normalize();
@@ -3227,7 +3711,7 @@ mod tests {
         let catalog = Arc::new(
             DatasetCatalog::new(
                 "camera-demand-fixture",
-                ScientificIdentityStatus::Unverified(DatasetSourceId::new(1)),
+                ContentAddressStatus::SessionLocal(DatasetSourceId::new(1)),
                 vec![
                     DatasetLayer::new(
                         active,

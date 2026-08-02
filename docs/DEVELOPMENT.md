@@ -37,6 +37,12 @@ Run the generated development dataset:
 cargo xtask run-dev
 ```
 
+Run the ordinary application without requiring a dataset at startup:
+
+```bash
+cargo run --release -p mirante4d-app
+```
+
 Run the current PR profile or one focused leaf:
 
 ```bash
@@ -95,6 +101,9 @@ MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
 MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
   cargo xtask product-validate \
     /absolute/path/to/dataset.m4d representative_native_navigation
+MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
+  cargo xtask product-validate \
+    /absolute/path/to/time-series.m4d representative_temporal_playback
 cargo xtask viewer-oblique-continuity \
   --workflow linked-lod-diagnostic \
   --dataset /absolute/path/to/dataset.m4d \
@@ -117,6 +126,17 @@ command uses the normal release application for independent pixel and mode
 facts. The former representative three-session and command-driven
 resident-navigation cadence scenarios were deleted because they did not
 establish visible continuity.
+
+`representative_temporal_playback` requires a multi-timepoint package. It
+uses 70 normal-product commands to exercise direct selection, fixed-scale
+standalone and coordinated four-panel playback, seven paired stationary versus
+two-second held-input phases across 3D and linked controls, two FPS settings,
+and retained-front Pause/Stop teardown. It requires received material input,
+temporal commits in both halves of every gesture, bounded maximum gaps,
+coherent target groups, and exact Stop scale traces. It also redirects the
+application runtime log into the bounded scenario output and fails on
+renderer/runtime errors; a green automation report beside a dirty runtime log
+is not accepted.
 
 `linked-lod-diagnostic` drives real bounded Shift-drag at exact S3, S1, and S0
 and records causal boundaries, but it does not observe monitor visibility or
@@ -148,11 +168,13 @@ cargo test -p mirante4d-app imported_ -- --ignored
 
 Run them only after changing those boundaries.
 
-The bounded target-package open and verification scenario is retained as a
-small regression check for storage-source changes:
+The bounded target-package admission and explicit-audit scenario is retained
+as a small regression check for storage-source changes. It proves ordinary
+idle starts no audit, then exercises user-requested cancellation and
+self-consistency completion:
 
 ```bash
-cargo xtask product-validate target_source_verification
+cargo xtask product-validate target_package_integrity_audit
 ```
 
 Import/preprocessing changes also run the native generated-source scenario:
@@ -165,6 +187,9 @@ For deliberate local import diagnostics or a current claim, use the release
 `import-performance-t2` or private `import-performance-t5` command documented
 in [Testing](TESTING.md). These are changed-boundary or qualification tools,
 not ordinary edit-loop checks.
+The predecessor private T5 configuration pin is intentionally absent after the
+compositional storage/checkpoint cutover. Do not treat a diagnostic run as a
+current qualification or repin it without explicit owner review.
 Generated sources, packages, and evidence stay below ignored
 `target/mirante4d/` paths unless an explicit qualified scratch root is selected.
 

@@ -63,7 +63,7 @@ pub struct AppSmokeReport {
     pub nonzero_pixels: u64,
     pub max_value: u16,
     pub displayed_scale_level: Option<u32>,
-    pub target_scale_level: u32,
+    pub target_scale_level: Option<u32>,
     pub render_mode: mirante4d_domain::RenderMode,
     pub gpu_adapter_summary: Option<String>,
     pub playback: Vec<PlaybackSmokeFrame>,
@@ -92,6 +92,8 @@ pub fn run_headless_smoke(
     let mut application = ApplicationState::new_unbound(
         SourceSessionGeneration::new(1),
         opened.catalog.as_ref().clone(),
+        opened.source_reference.clone(),
+        opened.content_address_origin,
         opened.workspace.clone(),
         resource_policy,
     )
@@ -136,13 +138,16 @@ pub fn run_headless_smoke(
                 next.get()
             );
         }
+        let uniform_scale = opened.dataset.current_uniform_scale().ok_or_else(|| {
+            anyhow::anyhow!("playback smoke requires one uniform visible-layer scale")
+        })?;
         playback.push(PlaybackSmokeFrame {
             timepoint: next.get(),
             elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
             nonzero_pixels,
             max_value,
-            displayed_scale_level: opened.dataset.current_scale().get(),
-            target_scale_level: opened.dataset.current_scale().get(),
+            displayed_scale_level: uniform_scale.get(),
+            target_scale_level: uniform_scale.get(),
         });
     }
 
@@ -160,8 +165,14 @@ pub fn run_headless_smoke(
         frame_height: u64::from(opened.render_coordination.render_viewport.height_pixels()),
         nonzero_pixels,
         max_value,
-        displayed_scale_level: Some(opened.dataset.current_scale().get()),
-        target_scale_level: opened.dataset.current_scale().get(),
+        displayed_scale_level: opened
+            .dataset
+            .current_uniform_scale()
+            .map(mirante4d_domain::ScaleLevel::get),
+        target_scale_level: opened
+            .dataset
+            .current_uniform_scale()
+            .map(mirante4d_domain::ScaleLevel::get),
         render_mode,
         gpu_adapter_summary,
         playback,
@@ -273,13 +284,16 @@ fn load_current_requirements(
         std::thread::yield_now();
     };
     let PreparedVisibleDemand {
-        current_3d,
-        cross_sections,
+        targets,
         renderer_requirement_update,
         renderer_requirement_payload_bytes: _,
         post_refinement_promotion_update,
         candidates_visited: _,
     } = prepared;
+    let (current_3d, cross_sections, temporal_frame_contract) = targets.into_parts();
+    if temporal_frame_contract.is_some() {
+        anyhow::bail!("headless non-playback planning unexpectedly produced a temporal frame");
+    }
     if !cross_sections.is_empty() {
         anyhow::bail!("headless single-view planning unexpectedly produced linked-panel demand");
     }

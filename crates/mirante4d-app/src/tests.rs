@@ -28,20 +28,6 @@ const TEST_INITIAL_RENDER_VIEWPORT_SIDE: u64 = 32;
 
 use super::*;
 
-#[test]
-fn fixed_viewer_activity_grace_yields_verification_after_settle() {
-    let now = Instant::now();
-    assert!(viewer_verification_grace_active(
-        Some(now + VIEWER_VERIFICATION_GRACE),
-        now,
-    ));
-    assert!(!viewer_verification_grace_active(
-        Some(now),
-        now + Duration::from_millis(1),
-    ));
-    assert!(!viewer_verification_grace_active(None, now));
-}
-
 pub(crate) fn write_target_fixture(output_root: &Path) -> anyhow::Result<PathBuf> {
     if TARGET_FIXTURE_ARCHIVE.is_empty()
         || TARGET_FIXTURE_ARCHIVE.len() > TARGET_FIXTURE_ARCHIVE_BYTES_MAX
@@ -61,6 +47,80 @@ pub(crate) fn write_target_fixture(output_root: &Path) -> anyhow::Result<PathBuf
         return Err(error);
     }
     Ok(package)
+}
+
+pub(crate) fn synthetic_presented_frame(
+    target: mirante4d_render_api::PresentationTarget,
+    extent: mirante4d_render_api::RenderExtent,
+) -> mirante4d_render_api::PresentedFrame {
+    let identity = mirante4d_dataset::DatasetResourceIdentity::SessionLocal(
+        mirante4d_dataset::DatasetSourceId::new(99),
+    );
+    let layer_key = mirante4d_domain::LogicalLayerKey::new(0);
+    let timepoint = mirante4d_domain::TimeIndex::new(0);
+    let layer = mirante4d_render_api::LayerRenderIntent::new(
+        layer_key,
+        mirante4d_domain::LayerTransfer::new(
+            mirante4d_domain::DisplayWindow::new(0.0, 1.0).unwrap(),
+            mirante4d_domain::RgbColor::new([1.0; 3]).unwrap(),
+            mirante4d_domain::Opacity::new(1.0).unwrap(),
+            mirante4d_domain::TransferCurve::linear(),
+            false,
+        ),
+        mirante4d_domain::RenderState::mip(mirante4d_domain::SamplingPolicy::VoxelExact),
+    );
+    let intent = mirante4d_render_api::RenderIntent::new(
+        mirante4d_render_api::FrameIdentity::new(99),
+        identity,
+        timepoint,
+        mirante4d_render_api::RenderViewIntent::volume(
+            mirante4d_domain::CameraView::new(
+                mirante4d_domain::Projection::Orthographic,
+                mirante4d_domain::WorldPoint3::origin(),
+                mirante4d_domain::UnitQuaternion::identity(),
+                1.0,
+                1.0,
+                1.0,
+            )
+            .unwrap(),
+            mirante4d_domain::IsoLightState::attached_camera(),
+        ),
+        mirante4d_render_api::PresentationViewport::new(64.0, 64.0).unwrap(),
+        extent,
+        vec![layer],
+    )
+    .unwrap();
+    let key = mirante4d_dataset::BrickKey::new(
+        identity,
+        layer_key,
+        timepoint,
+        mirante4d_domain::ScaleLevel::BASE,
+        mirante4d_dataset::ResourceRegion::new(
+            [0; 3],
+            mirante4d_domain::Shape3D::new(1, 1, 1).unwrap(),
+        )
+        .unwrap(),
+    );
+    let requirements = mirante4d_render_api::RenderRequirements::new(
+        &intent,
+        vec![mirante4d_render_api::RenderRequirement::new(
+            key,
+            mirante4d_render_api::RenderRequirementRole::FirstUsefulFrame,
+        )],
+    )
+    .unwrap();
+    let coverage =
+        mirante4d_render_api::FrameCoverage::from_available(&requirements, &[key]).unwrap();
+    mirante4d_render_api::PresentedFrame::new(
+        target,
+        extent,
+        mirante4d_render_api::FrameProgress::new(
+            coverage,
+            mirante4d_render_api::FrameCompleteness::Exact,
+            None,
+        )
+        .unwrap(),
+    )
 }
 
 pub(crate) fn write_source_time_series_fixture(output_root: &Path) -> anyhow::Result<PathBuf> {
@@ -412,6 +472,8 @@ fn test_application_for_opened_source(
     ApplicationState::new_unbound(
         SourceSessionGeneration::new(1),
         opened.catalog.as_ref().clone(),
+        opened.source_reference.clone(),
+        opened.content_address_origin,
         opened.workspace.clone(),
         ResourcePolicy::default(),
     )
@@ -422,6 +484,7 @@ pub(crate) fn test_workbench_app_without_background_runtime(
     opened: unified_source_open::UnifiedOpenedSource,
 ) -> MiranteWorkbenchApp {
     let application = test_application_for_opened_source(&opened);
+    let initial_auto_dense = InitialAutoDenseState::for_snapshot(&application.snapshot());
     let unified_source_open::UnifiedOpenedSource {
         startup_diagnostics,
         catalog: _,
@@ -429,6 +492,8 @@ pub(crate) fn test_workbench_app_without_background_runtime(
         dataset,
         render_coordination,
         analysis_runtime,
+        source_reference: _,
+        content_address_origin: _,
     } = opened;
     let resource_policy = ResourcePolicy::default();
     let egui_ui = ui_kit::EguiUiState::new(
@@ -440,6 +505,10 @@ pub(crate) fn test_workbench_app_without_background_runtime(
     settings_connection
         .shutdown()
         .expect("the test settings connection must stop before the harness starts");
+    let cpu_broker = mirante4d_dataset_runtime::ProcessCpuBroker::new(
+        resource_policy.cpu_dataset_budget_bytes(),
+    )
+    .expect("the test resource policy has a valid CPU budget");
 
     MiranteWorkbenchApp {
         application,
@@ -471,12 +540,15 @@ pub(crate) fn test_workbench_app_without_background_runtime(
         resident_plane_async_plan_submissions: 0,
         resident_plane_guard_body_installs: 0,
         resident_plane_exact_body_installs: 0,
-        viewer_verification_busy_until: None,
+        playback_session: playback_session::PlaybackSession::new(),
+        presentation_scheduler: presentation_scheduler::ComposedPresentationScheduler::new(),
         active_histogram_cache: histogram::ActiveLayerHistogramCache::default(),
+        initial_auto_dense,
         render_intent_mailbox: RenderIntentMailbox::new(),
         egui_ui,
         import: ImportWorkflow::new(),
         analysis_runtime,
+        cpu_broker,
         process_termination: None,
         process_termination_close_started: false,
         product_automation: None,
@@ -506,8 +578,9 @@ pub(crate) fn test_workbench_app_without_background_runtime(
         settings_connection,
         selected_adapter_memory: gpu_memory::SelectedAdapterMemoryFacts::unavailable_for_tests(),
         source_open_service: None,
-        source_verification_service: None,
-        pending_automatic_source_verification: None,
+        package_integrity_audit_service: Some(
+            package_integrity_audit_service::PackageIntegrityAuditService::new(),
+        ),
     }
 }
 

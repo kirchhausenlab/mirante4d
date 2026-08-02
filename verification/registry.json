@@ -19,10 +19,10 @@
   "lint_exceptions": [],
   "test_timeout_overrides": [
     {
-      "selector": "package(mirante4d-app) & (test(=tests::import_verify_analyze_save_and_reopen_atomically) | test(=tests::imported_publication_waits_for_project_close_then_installs_without_normal_verifier) | test(=tests::failed_project_close_retains_imported_authority_without_verifier_fallback) | test(=tests::imported_transfer_drift_fails_closed_without_external_open_fallback))",
+      "selector": "package(mirante4d-app) & (test(=tests::import_analyze_save_and_reopen_without_a_global_integrity_audit) | test(=tests::imported_publication_waits_for_project_close_then_installs_without_an_integrity_audit) | test(=tests::failed_project_close_retains_imported_authority_without_an_audit_fallback) | test(=tests::imported_transfer_drift_fails_closed_without_external_open_fallback))",
       "warn_ms": 5000,
       "terminate_ms": 30000,
-      "reason": "These product integrations import and publish a real sharded target package before exercising verified open, project-close retention, drift rejection, or the wider analyze/save/reopen lifecycle. The broad lifecycle case remains routine; the three narrower cases retain this timeout for explicit developer-local execution."
+      "reason": "These product integrations import and publish a real sharded target package before exercising admitted open, project-close retention, drift rejection, or the wider analyze/save/reopen lifecycle. The broad lifecycle case remains routine; the three narrower cases retain this timeout for explicit developer-local execution."
     },
     {
       "selector": "package(mirante4d-project-store) & test(=actor::tests::hosted_durability_tests::exhaustive_hosted_and_process_transition_matrix)",
@@ -193,6 +193,21 @@
   ],
   "selector_adapters": [
     {
+      "id": "IMPORT-TEMPORAL-PIPELINE-RELEASE-BENCHMARK",
+      "lane": "developer-local",
+      "owner": "mirante4d-import-pipeline",
+      "requirements": ["D-022-local-feedback"],
+      "fixture_tier": "none",
+      "capability": "local-cpu",
+      "matches": [
+        {
+          "package": "mirante4d-import-pipeline",
+          "test_prefix": "streaming::tests::temporal_decode_ahead_release_benchmark"
+        }
+      ],
+      "expected_ignored_cases": 1
+    },
+    {
       "id": "R2-ADAPTER-DEEP-BOUNDARY-MATRICES",
       "lane": "developer-local",
       "owner": "project-store-and-application-boundaries",
@@ -214,11 +229,11 @@
         },
         {
           "package": "mirante4d-app",
-          "test_prefix": "tests::imported_publication_waits_for_project_close_then_installs_without_normal_verifier"
+          "test_prefix": "tests::imported_publication_waits_for_project_close_then_installs_without_an_integrity_audit"
         },
         {
           "package": "mirante4d-app",
-          "test_prefix": "tests::failed_project_close_retains_imported_authority_without_verifier_fallback"
+          "test_prefix": "tests::failed_project_close_retains_imported_authority_without_an_audit_fallback"
         },
         {
           "package": "mirante4d-app",
@@ -237,11 +252,11 @@
       "matches": [
         {
           "package": "mirante4d-storage",
-          "test_prefix": "dataset_source::tests::aligned_verified_1024_brick_eight_consumer_storage_scale_diagnostic"
+          "test_prefix": "dataset_source::tests::aligned_self_consistent_1024_brick_eight_consumer_storage_scale_diagnostic"
         },
         {
           "package": "mirante4d-storage",
-          "test_prefix": "dataset_source::tests::aligned_verified_1024_brick_storage_scale_diagnostic"
+          "test_prefix": "dataset_source::tests::aligned_self_consistent_1024_brick_storage_scale_diagnostic"
         },
         {
           "package": "mirante4d-storage",
@@ -288,9 +303,13 @@
         {
           "package": "mirante4d-app",
           "test_prefix": "tests::incremental_linked_zoom_pixels_match_direct_fine_cpu_oracle_after_one_settlement_plan"
+        },
+        {
+          "package": "mirante4d-app",
+          "test_prefix": "tests::direct_timepoint_selection_replaces_retained_gpu_pixels_with_the_successor_body"
         }
       ],
-      "expected_ignored_cases": 4
+      "expected_ignored_cases": 5
     },
     {
       "id": "RENDERER-COORDINATOR-TRUSTED-GPU",
@@ -355,9 +374,13 @@
         {
           "package": "mirante4d-render-wgpu",
           "test_prefix": "gpu_tests::native_1080p_terminal_navigation_gpu_timing"
+        },
+        {
+          "package": "mirante4d-render-wgpu",
+          "test_prefix": "gpu_tests::fixed_lod_multichannel_gpu_timing_matrix"
         }
       ],
-      "expected_ignored_cases": 17
+      "expected_ignored_cases": 18
     },
     {
       "id": "WP10A-ADAPTER-FORMAT-LIFECYCLE-SCALABILITY",

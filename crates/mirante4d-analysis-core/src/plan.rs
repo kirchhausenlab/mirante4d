@@ -94,9 +94,9 @@ impl AnalysisDefinition {
         block_shape: Shape3D,
     ) -> Result<Self, AnalysisError> {
         let source_content_id = *catalog
-            .scientific_identity()
-            .verified_id()
-            .ok_or(AnalysisError::UnverifiedSource)?;
+            .content_address_status()
+            .content_address()
+            .ok_or(AnalysisError::MissingContentAddress)?;
         let layer_facts = catalog.layer(layer).ok_or(AnalysisError::UnknownLayer)?;
         if time_start >= time_end_exclusive || time_end_exclusive > layer_facts.shape().t() {
             return Err(AnalysisError::InvalidTimeRange);
@@ -130,9 +130,9 @@ impl AnalysisDefinition {
 
     /// Identity used to address this source in the live dataset runtime.
     ///
-    /// This is deliberately independent from `source_content_id`: exact
-    /// verification can promote a source's scientific identity while its
-    /// already-issued runtime keys remain stable and resident.
+    /// This is deliberately independent from `source_content_id`: an
+    /// ordinary admitted package can carry its declared content address while
+    /// already-issued runtime keys remain session-local and resident.
     pub const fn resource_identity(&self) -> DatasetResourceIdentity {
         self.resource_identity
     }

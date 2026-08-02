@@ -1,13 +1,12 @@
 //! Bounded factor-two multiscale production.
 
-use mirante4d_domain::{IntensityDType, Shape4D};
+use mirante4d_domain::IntensityDType;
+#[cfg(test)]
+use mirante4d_domain::Shape4D;
 #[cfg(test)]
 use mirante4d_storage::StorageShape;
 
 use crate::ImportError;
-
-const STOP_MAX_DIMENSION: u64 = 64;
-const STOP_VOXELS_PER_TIMEPOINT: u64 = 262_144;
 
 /// Result of reducing one caller-owned dense source region.
 ///
@@ -16,33 +15,6 @@ const STOP_VOXELS_PER_TIMEPOINT: u64 = 262_144;
 pub(crate) struct DownsampledRegion {
     pub shape_zyx: [u64; 3],
     pub pixels_le: Vec<u8>,
-}
-
-/// Builds the deterministic spatial pyramid used by the import producer.
-///
-/// Time is never reduced. Each spatial dimension is ceil-divided by two until
-/// the terminal shape independently bounds both maximum ray traversal and
-/// decoded volume size. Scale count is therefore a deterministic consequence
-/// of source geometry, never a fixed profile tier or runtime hardware probe.
-pub(crate) fn pyramid_shapes(base: Shape4D) -> Result<Vec<Shape4D>, ImportError> {
-    let mut shapes = vec![base];
-    if is_terminal(base) {
-        return Ok(shapes);
-    }
-
-    loop {
-        let previous = *shapes.last().expect("the base shape was inserted");
-        let next = factor_two_shape(previous)?;
-        if next == previous {
-            return Err(ImportError::InvalidRequest(
-                "spatial pyramid did not make progress toward its terminal geometry",
-            ));
-        }
-        shapes.push(next);
-        if is_terminal(next) {
-            return Ok(shapes);
-        }
-    }
 }
 
 /// Returns the fixed target pixel-chunk shape selected by source dimensionality.
@@ -120,38 +92,6 @@ pub(crate) fn downsample_region(
     })
 }
 
-fn factor_two_shape(shape: Shape4D) -> Result<Shape4D, ImportError> {
-    Shape4D::new(
-        shape.t(),
-        shape.z().div_ceil(2),
-        shape.y().div_ceil(2),
-        shape.x().div_ceil(2),
-    )
-    .map_err(|_| ImportError::Overflow)
-}
-
-const fn maximum_spatial_dimension(shape: Shape4D) -> u64 {
-    let maximum_zy = if shape.z() > shape.y() {
-        shape.z()
-    } else {
-        shape.y()
-    };
-    if maximum_zy > shape.x() {
-        maximum_zy
-    } else {
-        shape.x()
-    }
-}
-
-fn is_terminal(shape: Shape4D) -> bool {
-    maximum_spatial_dimension(shape) <= STOP_MAX_DIMENSION
-        && shape
-            .z()
-            .checked_mul(shape.y())
-            .and_then(|zy| zy.checked_mul(shape.x()))
-            .is_some_and(|voxels| voxels <= STOP_VOXELS_PER_TIMEPOINT)
-}
-
 fn checked_voxels(shape_zyx: [u64; 3]) -> Result<usize, ImportError> {
     if shape_zyx.contains(&0) {
         return Err(ImportError::InvalidRequest(
@@ -205,83 +145,6 @@ mod tests {
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect()
-    }
-
-    #[test]
-    fn pyramid_geometry_matches_the_bounded_import_policy() {
-        let tiny = Shape4D::new(3, 8, 31, 256).unwrap();
-        assert_eq!(
-            pyramid_shapes(tiny).unwrap(),
-            vec![
-                tiny,
-                Shape4D::new(3, 4, 16, 128).unwrap(),
-                Shape4D::new(3, 2, 8, 64).unwrap(),
-            ]
-        );
-
-        let large = Shape4D::new(3, 65, 300, 300).unwrap();
-        assert_eq!(
-            pyramid_shapes(large).unwrap(),
-            vec![
-                large,
-                Shape4D::new(3, 33, 150, 150).unwrap(),
-                Shape4D::new(3, 17, 75, 75).unwrap(),
-                Shape4D::new(3, 9, 38, 38).unwrap(),
-            ]
-        );
-    }
-
-    #[test]
-    fn terminal_geometry_requires_both_volume_and_longest_dimension_bounds() {
-        let already_terminal = Shape4D::new(2, 64, 64, 64).unwrap();
-        assert_eq!(
-            pyramid_shapes(already_terminal).unwrap(),
-            vec![already_terminal]
-        );
-
-        let long_thin = Shape4D::new(1, 1, 1, 1_000_000).unwrap();
-        let shapes = pyramid_shapes(long_thin).unwrap();
-        let terminal = *shapes.last().unwrap();
-        assert!(maximum_spatial_dimension(terminal) <= STOP_MAX_DIMENSION);
-        assert!(
-            terminal
-                .z()
-                .checked_mul(terminal.y())
-                .and_then(|zy| zy.checked_mul(terminal.x()))
-                .unwrap()
-                <= STOP_VOXELS_PER_TIMEPOINT
-        );
-        assert!(
-            maximum_spatial_dimension(shapes[shapes.len() - 2]) > STOP_MAX_DIMENSION,
-            "a small voxel count cannot terminate a pathologically long volume"
-        );
-    }
-
-    #[test]
-    fn geometry_can_require_more_than_the_legacy_seven_level_ceiling() {
-        let base = Shape4D::new(1, 1, 1, 1_048_576).unwrap();
-        let expected_x = [
-            1_048_576, 524_288, 262_144, 131_072, 65_536, 32_768, 16_384, 8_192, 4_096, 2_048,
-            1_024, 512, 256, 128, 64,
-        ];
-        let expected = expected_x
-            .into_iter()
-            .map(|x| Shape4D::new(1, 1, 1, x).unwrap())
-            .collect::<Vec<_>>();
-
-        assert_eq!(pyramid_shapes(base).unwrap(), expected);
-    }
-
-    #[test]
-    fn every_representable_dimension_reaches_terminal_geometry_within_64_levels() {
-        let base = Shape4D::new(1, 1, 1, u64::MAX).unwrap();
-        let shapes = pyramid_shapes(base).unwrap();
-
-        assert_eq!(shapes.len(), 59);
-        assert_eq!(
-            shapes.last().unwrap().dimensions(),
-            [1, 1, 1, STOP_MAX_DIMENSION]
-        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::product_validate::{is_product_validation_scenario_name, product_valid
 use crate::workflow_audit::workflow_audit;
 
 const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [target-package] \
-     [target_fixture_camera_smoke|target_fixture_render_modes|representative_native_navigation|target_source_verification|import_preprocessing|b4_project_persistence|pre_alpha_reliability]";
+     [target_fixture_camera_smoke|target_fixture_render_modes|representative_native_navigation|representative_temporal_playback|target_package_integrity_audit|import_preprocessing|b4_project_persistence|pre_alpha_reliability]";
 
 mod arch;
 #[cfg(test)]
@@ -152,12 +152,17 @@ bounded promoted target U16 fixture is extracted locally.
 
 The ordinary bounded scenarios are target_fixture_camera_smoke,
 target_fixture_render_modes, representative_native_navigation,
-target_source_verification, and import_preprocessing.
+representative_temporal_playback, target_package_integrity_audit, and
+import_preprocessing.
 representative_native_navigation requires an explicit package and exercises
 native 3D navigation, all volume modes, smooth sampling, four-panel linked
-input, exact settlement, and return to standalone 3D. The import scenario
+input, exact settlement, and return to standalone 3D.
+representative_temporal_playback requires an explicit multi-timepoint package
+and proves direct t0-to-t1 pixel replacement, coordinated four-panel playback,
+camera input during real advancement, 24/12 FPS operation, and Pause teardown.
+The import scenario
 generates a bounded public TIFF fixture, cancels and resumes preprocessing,
-waits for verified publication, then renders the imported package. The
+waits for admitted publication, then renders the imported package. The
 retained b4_project_persistence scenario checks project save, recovery, and
 reopen behavior across three application launches. The pre_alpha_reliability
 scenario uses isolated state homes to prove provisional-autosave exposure and

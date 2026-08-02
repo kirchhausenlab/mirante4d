@@ -591,9 +591,9 @@ mod tests {
     use std::sync::Arc;
 
     use mirante4d_dataset::{
-        BrickKey, DatasetLayer, DatasetSourceId, ResourceLease, ResourcePayloadDescriptor,
-        ResourcePayloadFacts, ResourcePayloadView, ResourceRegion, ResourceValidity,
-        ScientificIdentityStatus,
+        BrickKey, ContentAddressStatus, DatasetLayer, DatasetSourceId, ResourceLease,
+        ResourcePayloadDescriptor, ResourcePayloadFacts, ResourcePayloadView, ResourceRegion,
+        ResourceValidity,
     };
     use mirante4d_domain::{IntensityDType, Shape4D, TimeIndex};
 
@@ -637,7 +637,7 @@ mod tests {
         .unwrap();
         let catalog = DatasetCatalog::new(
             "dataset",
-            ScientificIdentityStatus::Unverified(source_id),
+            ContentAddressStatus::SessionLocal(source_id),
             vec![layer],
         )
         .unwrap();

@@ -23,7 +23,7 @@ use mirante4d_project_store::{
 
 use super::{
     ApplicationSnapshot, CurrentnessGeneration, OperationId, OperationKind, OperationToken,
-    SourceVerificationSnapshot, WorkspaceSnapshot,
+    WorkspaceSnapshot,
 };
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -68,7 +68,6 @@ struct AutosaveObservation {
     revision: Option<ProjectRevisionId>,
     bound: bool,
     dirty: bool,
-    verified: bool,
     writable: bool,
     commit_active: bool,
     writes_suspended: bool,
@@ -95,7 +94,6 @@ impl AutosaveObservation {
             revision,
             bound,
             dirty,
-            verified: matches!(snapshot.source(), SourceVerificationSnapshot::Verified(_)),
             writable,
             commit_active,
             writes_suspended,
@@ -103,12 +101,7 @@ impl AutosaveObservation {
     }
 
     const fn eligible(self) -> bool {
-        self.verified
-            && self.bound
-            && self.dirty
-            && self.writable
-            && !self.commit_active
-            && !self.writes_suspended
+        self.bound && self.dirty && self.writable && !self.commit_active && !self.writes_suspended
     }
 }
 
@@ -1038,9 +1031,7 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
         {
             return Err(ProjectStoreServiceError::InvalidOperationToken);
         }
-        let SourceVerificationSnapshot::Verified(source) = snapshot.source() else {
-            return Err(ProjectStoreServiceError::InvalidApplicationSnapshot);
-        };
+        let source = snapshot.source().dataset();
         let WorkspaceSnapshot::Bound {
             project,
             revision,
@@ -1201,9 +1192,7 @@ impl<C: MonotonicClock> ProjectStoreApplicationService<C> {
         let bound_project_id = self
             .binding
             .established_manual_project_for_artifact_load(generation_id)?;
-        let SourceVerificationSnapshot::Verified(source) = snapshot.source() else {
-            return Err(ProjectStoreServiceError::InvalidApplicationSnapshot);
-        };
+        let source = snapshot.source().dataset();
         let WorkspaceSnapshot::Bound {
             project, revision, ..
         } = snapshot.workspace()
@@ -2213,9 +2202,7 @@ fn active_autosave_source_is_current(
     active: &ActiveAutosave,
     snapshot: &ApplicationSnapshot,
 ) -> bool {
-    let SourceVerificationSnapshot::Verified(source) = snapshot.source() else {
-        return false;
-    };
+    let source = snapshot.source().dataset();
     let WorkspaceSnapshot::Bound { project, .. } = snapshot.workspace() else {
         return false;
     };
@@ -2233,9 +2220,7 @@ fn artifact_load_source_is_current(
     artifacts: &[ArtifactReference],
     snapshot: &ApplicationSnapshot,
 ) -> bool {
-    let SourceVerificationSnapshot::Verified(source) = snapshot.source() else {
-        return false;
-    };
+    let source = snapshot.source().dataset();
     let WorkspaceSnapshot::Bound {
         project,
         revision: current_revision,
@@ -2258,9 +2243,6 @@ fn artifact_load_source_is_current(
 fn projection_from_snapshot(
     snapshot: &ApplicationSnapshot,
 ) -> Result<ProjectGenerationProjection, ProjectStoreServiceError> {
-    if !matches!(snapshot.source(), SourceVerificationSnapshot::Verified(_)) {
-        return Err(ProjectStoreServiceError::InvalidApplicationSnapshot);
-    }
     let WorkspaceSnapshot::Bound {
         project,
         revision,
@@ -2308,9 +2290,7 @@ fn save_as_projection_from_snapshot(
     {
         return Err(ProjectStoreServiceError::InvalidOperationToken);
     }
-    let SourceVerificationSnapshot::Verified(source) = snapshot.source() else {
-        return Err(ProjectStoreServiceError::InvalidApplicationSnapshot);
-    };
+    let source = snapshot.source().dataset();
     if token.source_identity() != Some(*source.scientific_content_id())
         || !project.dataset().has_same_scientific_content(source)
     {

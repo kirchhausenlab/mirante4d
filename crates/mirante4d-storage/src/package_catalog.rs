@@ -9,9 +9,11 @@ use crate::directory_inventory::{ExpectedFile, ExpectedFileRole, inspect_directo
 use crate::package_admission::{
     DatasetProfileAdmissionInput, admit_dataset_profile, admit_supported_dataset_profile,
 };
+#[cfg(test)]
+use crate::package_integrity::validate_package_integrity;
 use crate::package_integrity::{
-    ExactPackageCapability, PackageIntegrityInput, PackageValidationError,
-    validate_package_integrity,
+    ExactPackageCapability, ExactPackageValidationProgress, PackageIntegrityInput,
+    PackageValidationError, validate_package_integrity_with_progress,
 };
 use crate::package_structure::{
     PackageStructureError, PackageStructureInput, PackageStructureReport,
@@ -29,7 +31,7 @@ use crate::{
 const PROFILE_PATH: &str = "m4d/profile.json";
 const MANIFEST_ROOT_PATH: &str = "m4d/manifest/root.json";
 
-/// Authenticated, bounded metadata catalog for one local target-profile package.
+/// Checksum-checked, bounded metadata catalog for one local target-profile package.
 ///
 /// This proves the canonical manifest root/pages and the opening-critical
 /// profile, science, display, Zarr, and OME objects. Portable records,
@@ -242,12 +244,10 @@ impl LocalPackageCatalog {
         )
     }
 
-    /// Selects the first supported DS envelope in fixed DS-0 through DS-4
-    /// order after deriving the package facts once.
-    ///
-    /// The selected profile is a runtime capacity result. It is not persisted
-    /// package metadata and does not participate in package or scientific
-    /// identity.
+    /// Applies the sole compositional package-safety contract after deriving
+    /// the format, per-object, and aggregate traversal facts once. Admission
+    /// is a runtime capacity result; it is not persisted package metadata and
+    /// does not participate in package or scientific identity.
     pub fn admit_supported_dataset_profile(
         &self,
         mut is_cancelled: impl FnMut() -> bool,
@@ -281,7 +281,7 @@ impl LocalPackageCatalog {
         let admission = self
             .admit_dataset_profile(requested, &mut is_cancelled)
             .map_err(map_admission_validation_error)?;
-        self.validate_exact_package_with_admission(admission, &mut is_cancelled)
+        self.validate_exact_package_with_admission(admission, &mut is_cancelled, &mut |_| {})
     }
 
     /// Consumes this catalog, selects a supported DS envelope, and issues the
@@ -290,16 +290,29 @@ impl LocalPackageCatalog {
         self,
         mut is_cancelled: impl FnMut() -> bool,
     ) -> Result<ExactPackageCapability, PackageValidationError> {
+        self.validate_exact_supported_package_with_progress(&mut is_cancelled, |_| {})
+    }
+
+    pub fn validate_exact_supported_package_with_progress(
+        self,
+        mut is_cancelled: impl FnMut() -> bool,
+        mut report_progress: impl FnMut(ExactPackageValidationProgress),
+    ) -> Result<ExactPackageCapability, PackageValidationError> {
         let admission = self
             .admit_supported_dataset_profile(&mut is_cancelled)
             .map_err(map_admission_validation_error)?;
-        self.validate_exact_package_with_admission(admission, &mut is_cancelled)
+        self.validate_exact_package_with_admission(
+            admission,
+            &mut is_cancelled,
+            &mut report_progress,
+        )
     }
 
     fn validate_exact_package_with_admission(
         self,
         admission: crate::DatasetProfileAdmission,
         is_cancelled: &mut impl FnMut() -> bool,
+        report_progress: &mut impl FnMut(ExactPackageValidationProgress),
     ) -> Result<ExactPackageCapability, PackageValidationError> {
         let report = reconcile_package_structure(
             PackageStructureInput {
@@ -318,7 +331,7 @@ impl LocalPackageCatalog {
             .revalidate_snapshots(&self.reader, &mut *is_cancelled)
             .map_err(map_structure_validation_error)?;
 
-        let proof = validate_package_integrity(
+        let proof = validate_package_integrity_with_progress(
             PackageIntegrityInput {
                 reader: &self.reader,
                 manifest_root_path: self.profile.manifest_root_path(),
@@ -329,6 +342,7 @@ impl LocalPackageCatalog {
                 structure: &report,
             },
             &mut *is_cancelled,
+            &mut *report_progress,
         )?;
         self.inspect_directory_closure(&mut *is_cancelled)
             .map_err(map_inventory_validation_error)?;
@@ -349,13 +363,13 @@ impl LocalPackageCatalog {
         )
     }
 
-    /// Reads one brick for an opened-but-not-yet-verified product source.
+    /// Reads one brick for a structurally admitted product source.
     ///
     /// This deliberately stays crate-private: the returned bytes are protected
     /// by the normal range, codec, CRC, and snapshot checks, but they carry no
     /// `PackageId` authority. Only the dataset-source adapter may use this
-    /// provisional path while full package and scientific verification runs.
-    pub(crate) fn read_brick_unverified(
+    /// admitted path; the accessed object is checked during this read.
+    pub(crate) fn read_brick_admitted(
         &self,
         coordinates: crate::PackedIndexCoordinates,
     ) -> Result<crate::LocalBrickRead, crate::PackageReadError> {
@@ -369,19 +383,6 @@ impl LocalPackageCatalog {
 
     pub(crate) const fn reader_mut(&mut self) -> &mut LocalPackageReader {
         &mut self.reader
-    }
-
-    pub(crate) fn same_runtime_storage_contract(&self, other: &Self) -> bool {
-        self.reader.same_root_node(&other.reader)
-            && self.declared_package_id == other.declared_package_id
-            && self.manifest_root == other.manifest_root
-            && self.manifest_root_bytes == other.manifest_root_bytes
-            && self.profile == other.profile
-            && self.science == other.science
-            && self.display_defaults == other.display_defaults
-            && self.descriptors == other.descriptors
-            && self.ome_images == other.ome_images
-            && self.zarr_arrays == other.zarr_arrays
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1777,12 +1778,12 @@ mod tests {
         let root = fixture(FixtureDrift::None);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         let admission = catalog
-            .admit_dataset_profile(crate::ProfileKind::Ds0, || false)
+            .admit_dataset_profile(crate::ProfileKind::Current, || false)
             .unwrap();
-        assert_eq!(admission.profile(), crate::ProfileKind::Ds0);
+        assert_eq!(admission.profile(), crate::ProfileKind::Current);
         assert_eq!(
             catalog
-                .validate_package_structure(crate::ProfileKind::Ds0, || false)
+                .validate_package_structure(crate::ProfileKind::Current, || false)
                 .unwrap(),
             admission
         );
@@ -1802,7 +1803,7 @@ mod tests {
         let root = fixture_with_brick(FixtureDrift::None, BrickFixture::AllFill);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         let counts = catalog
-            .admit_dataset_profile(crate::ProfileKind::Ds0, || false)
+            .admit_dataset_profile(crate::ProfileKind::Current, || false)
             .unwrap()
             .counts();
         assert_eq!(counts.addressed_pixel_shards, 1);
@@ -1812,7 +1813,7 @@ mod tests {
         let root = fixture_with_brick(FixtureDrift::None, BrickFixture::ExplicitValidity);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         let counts = catalog
-            .admit_dataset_profile(crate::ProfileKind::Ds0, || false)
+            .admit_dataset_profile(crate::ProfileKind::Current, || false)
             .unwrap()
             .counts();
         assert_eq!(counts.addressed_validity_shards, 1);
@@ -1821,14 +1822,14 @@ mod tests {
         let root = fixture_with_brick(FixtureDrift::None, BrickFixture::OutOfGridPixelShard);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         assert!(matches!(
-            catalog.admit_dataset_profile(crate::ProfileKind::Ds0, || false),
+            catalog.admit_dataset_profile(crate::ProfileKind::Current, || false),
             Err(crate::PackageAdmissionError::ShardCoordinateOutOfBounds { .. })
         ));
 
         let root = fixture_with_brick(FixtureDrift::None, BrickFixture::MissingPackedShard);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         assert_eq!(
-            catalog.admit_dataset_profile(crate::ProfileKind::Ds0, || false),
+            catalog.admit_dataset_profile(crate::ProfileKind::Current, || false),
             Err(crate::PackageAdmissionError::Profile(
                 crate::StorageProfileError::PackedIndexShardCoverageMismatch {
                     actual: 0,
@@ -1840,7 +1841,7 @@ mod tests {
         let root = fixture(FixtureDrift::None);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         assert_eq!(
-            catalog.admit_dataset_profile(crate::ProfileKind::Ds0, || true),
+            catalog.admit_dataset_profile(crate::ProfileKind::Current, || true),
             Err(crate::PackageAdmissionError::Inventory(
                 crate::DirectoryInventoryError::Cancelled
             ))
@@ -1852,7 +1853,7 @@ mod tests {
         let root = fixture(FixtureDrift::None);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         let admission = catalog.admit_supported_dataset_profile(|| false).unwrap();
-        assert_eq!(admission.profile(), crate::ProfileKind::Ds0);
+        assert_eq!(admission.profile(), crate::ProfileKind::Current);
 
         let root = fixture_with_brick(FixtureDrift::None, BrickFixture::OutOfGridPixelShard);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
@@ -1894,7 +1895,7 @@ mod tests {
             let root = fixture_with_brick(FixtureDrift::None, brick);
             let catalog = LocalPackageCatalog::open(&root.0).unwrap();
             let report = catalog
-                .reconcile_structure_for_test(crate::ProfileKind::Ds0, || false)
+                .reconcile_structure_for_test(crate::ProfileKind::Current, || false)
                 .unwrap();
             assert_eq!(report.records_visited, 1);
             assert_eq!(report.packed_index_shards, 1);
@@ -1933,7 +1934,7 @@ mod tests {
             let root = fixture_with_brick(FixtureDrift::None, brick);
             let catalog = LocalPackageCatalog::open(&root.0).unwrap();
             let error = catalog
-                .reconcile_structure_for_test(crate::ProfileKind::Ds0, || false)
+                .reconcile_structure_for_test(crate::ProfileKind::Current, || false)
                 .expect_err(expected);
             match (expected, error) {
                 (
@@ -1964,14 +1965,14 @@ mod tests {
         let root = fixture(FixtureDrift::None);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         assert!(matches!(
-            catalog.reconcile_structure_for_test(crate::ProfileKind::Ds0, || true),
+            catalog.reconcile_structure_for_test(crate::ProfileKind::Current, || true),
             Err(PackageStructureError::Admission(
                 crate::PackageAdmissionError::Inventory(crate::DirectoryInventoryError::Cancelled)
             ))
         ));
 
         let admission = catalog
-            .admit_dataset_profile(crate::ProfileKind::Ds0, || false)
+            .admit_dataset_profile(crate::ProfileKind::Current, || false)
             .unwrap();
         let completed_polls = Cell::new(0_u64);
         let completed = reconcile_package_structure(
@@ -2018,7 +2019,7 @@ mod tests {
         let root = fixture(FixtureDrift::None);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         let admission = catalog
-            .admit_dataset_profile(crate::ProfileKind::Ds0, || false)
+            .admit_dataset_profile(crate::ProfileKind::Current, || false)
             .unwrap();
         let report = reconcile_package_structure(
             PackageStructureInput {
@@ -2051,7 +2052,7 @@ mod tests {
         bytes[0] ^= 1;
         fs::write(packed, bytes).unwrap();
         assert!(matches!(
-            catalog.reconcile_structure_for_test(crate::ProfileKind::Ds0, || false),
+            catalog.reconcile_structure_for_test(crate::ProfileKind::Current, || false),
             Err(PackageStructureError::PackedIndexDigestMismatch { .. })
         ));
     }
@@ -2064,10 +2065,13 @@ mod tests {
         let declared = catalog.declared_package_id();
         let expected_objects = 1 + catalog.manifest_root.pages().len() + catalog.descriptors.len();
         let capability = catalog
-            .validate_exact_package(crate::ProfileKind::Ds0, || false)
+            .validate_exact_package(crate::ProfileKind::Current, || false)
             .unwrap();
         assert_eq!(capability.package_id(), declared);
-        assert_eq!(capability.admission().profile(), crate::ProfileKind::Ds0);
+        assert_eq!(
+            capability.admission().profile(),
+            crate::ProfileKind::Current
+        );
         assert_eq!(capability.objects_hashed(), expected_objects as u64);
         assert!(capability.bytes_hashed() > 0);
         let brick = capability.read_brick(coordinates, || false).unwrap();
@@ -2075,11 +2079,45 @@ mod tests {
         assert_eq!(brick.validity_payload().unwrap()[0], 0b0000_0111);
 
         let automatic_root = fixture(FixtureDrift::None);
+        let mut exact_progress = Vec::new();
         let automatic = LocalPackageCatalog::open(&automatic_root.0)
             .unwrap()
-            .validate_exact_supported_package(|| false)
+            .validate_exact_supported_package_with_progress(
+                || false,
+                |progress| exact_progress.push(progress),
+            )
             .unwrap();
-        assert_eq!(automatic.admission().profile(), crate::ProfileKind::Ds0);
+        assert_eq!(automatic.admission().profile(), crate::ProfileKind::Current);
+        assert!(!exact_progress.is_empty());
+        assert!(exact_progress.windows(2).all(|pair| {
+            pair[0].objects_hashed() < pair[1].objects_hashed()
+                && pair[0].bytes_hashed() <= pair[1].bytes_hashed()
+        }));
+        let final_exact = *exact_progress.last().unwrap();
+        assert_eq!(final_exact.objects_hashed(), automatic.objects_hashed());
+        assert_eq!(final_exact.bytes_hashed(), automatic.bytes_hashed());
+
+        let mut scientific_progress = Vec::new();
+        let scientific_result = automatic.validate_scientific_content_with_progress(
+            || false,
+            |progress| scientific_progress.push(progress),
+        );
+        assert!(matches!(
+            scientific_result,
+            Err(crate::ScientificPackageValidationError::ScientificContentMismatch { .. })
+        ));
+        assert!(!scientific_progress.is_empty());
+        assert!(scientific_progress.windows(2).all(|pair| {
+            pair[0].decoded_bricks() <= pair[1].decoded_bricks()
+                && pair[0].decoded_bytes() <= pair[1].decoded_bytes()
+        }));
+        let final_scientific = *scientific_progress.last().unwrap();
+        assert_eq!(
+            final_scientific.stage(),
+            crate::ScientificValidationProgressStage::CanonicalBaseContent
+        );
+        assert!(final_scientific.decoded_bricks() > 0);
+        assert!(final_scientific.decoded_bytes() > 0);
 
         for relative in ["images/i00000000/s00/c/0/0/0/0/0", "m4d/display.json"] {
             let root = fixture(FixtureDrift::None);
@@ -2089,7 +2127,7 @@ mod tests {
             bytes[0] ^= 1;
             fs::write(path, bytes).unwrap();
             assert!(matches!(
-                catalog.validate_exact_package(crate::ProfileKind::Ds0, || false),
+                catalog.validate_exact_package(crate::ProfileKind::Current, || false),
                 Err(crate::PackageValidationError::ObjectDigestMismatch { path })
                     if path == relative
             ));
@@ -2098,14 +2136,14 @@ mod tests {
         let root = fixture(FixtureDrift::None);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         assert!(matches!(
-            catalog.validate_exact_package(crate::ProfileKind::Ds0, || true),
+            catalog.validate_exact_package(crate::ProfileKind::Current, || true),
             Err(crate::PackageValidationError::Cancelled)
         ));
 
         let root = fixture(FixtureDrift::None);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         let report = catalog
-            .reconcile_structure_for_test(crate::ProfileKind::Ds0, || false)
+            .reconcile_structure_for_test(crate::ProfileKind::Current, || false)
             .unwrap();
         let pixel = root.0.join("images/i00000000/s00/c/0/0/0/0/0");
         let replacement = root.0.join("replacement-between-phases");
@@ -2132,7 +2170,7 @@ mod tests {
         let root = fixture(FixtureDrift::None);
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         let report = catalog
-            .reconcile_structure_for_test(crate::ProfileKind::Ds0, || false)
+            .reconcile_structure_for_test(crate::ProfileKind::Current, || false)
             .unwrap();
         let proof = validate_package_integrity(
             PackageIntegrityInput {
@@ -2174,7 +2212,7 @@ mod tests {
         let root = fixture(FixtureDrift::None);
         let capability = LocalPackageCatalog::open(&root.0)
             .unwrap()
-            .validate_exact_package(crate::ProfileKind::Ds0, || false)
+            .validate_exact_package(crate::ProfileKind::Current, || false)
             .unwrap();
         let pixel = root.0.join("images/i00000000/s00/c/0/0/0/0/0");
         let replacement = root.0.join("replacement-pixel");
@@ -2190,7 +2228,7 @@ mod tests {
         let root = fixture(FixtureDrift::None);
         let capability = LocalPackageCatalog::open(&root.0)
             .unwrap()
-            .validate_exact_package(crate::ProfileKind::Ds0, || false)
+            .validate_exact_package(crate::ProfileKind::Current, || false)
             .unwrap();
         let display = root.0.join("m4d/display.json");
         let replacement = root.0.join("replacement-display");
@@ -2210,7 +2248,7 @@ mod tests {
         let root = fixture(FixtureDrift::None);
         let capability = LocalPackageCatalog::open(&root.0)
             .unwrap()
-            .validate_exact_package(crate::ProfileKind::Ds0, || false)
+            .validate_exact_package(crate::ProfileKind::Current, || false)
             .unwrap();
         capability.read_brick(coordinates, || false).unwrap();
         let before = capability.catalog().reader().read_diagnostics();
@@ -2254,7 +2292,7 @@ mod tests {
         let root = fixture(FixtureDrift::None);
         let exact = LocalPackageCatalog::open(&root.0)
             .unwrap()
-            .validate_exact_package(crate::ProfileKind::Ds0, || false)
+            .validate_exact_package(crate::ProfileKind::Current, || false)
             .unwrap();
         assert!(matches!(
             exact.validate_scientific_content(|| true),
@@ -2264,7 +2302,7 @@ mod tests {
         let root = fixture(FixtureDrift::None);
         let exact = LocalPackageCatalog::open(&root.0)
             .unwrap()
-            .validate_exact_package(crate::ProfileKind::Ds0, || false)
+            .validate_exact_package(crate::ProfileKind::Current, || false)
             .unwrap();
         assert!(matches!(
             exact.validate_scientific_content(|| false),
@@ -2414,9 +2452,9 @@ mod tests {
         let catalog = LocalPackageCatalog::open(&root.0).unwrap();
         let coordinates = crate::PackedIndexCoordinates::new(0, 0, 0, 0, 0, 0, 0);
         let before = catalog.reader().read_diagnostics();
-        let first = catalog.read_brick_unverified(coordinates).unwrap();
+        let first = catalog.read_brick_admitted(coordinates).unwrap();
         let after_first = catalog.reader().read_diagnostics();
-        let second = catalog.read_brick_unverified(coordinates).unwrap();
+        let second = catalog.read_brick_admitted(coordinates).unwrap();
         let after_second = catalog.reader().read_diagnostics();
 
         assert_eq!(first.pixel_payload(), second.pixel_payload());
@@ -2464,7 +2502,7 @@ mod tests {
         let replacement = root.0.join("replacement-hot-pixel");
         fs::write(&replacement, fs::read(&pixel).unwrap()).unwrap();
         fs::rename(replacement, pixel).unwrap();
-        let changed = catalog.read_brick_unverified(coordinates);
+        let changed = catalog.read_brick_admitted(coordinates);
         assert!(
             matches!(
                 &changed,

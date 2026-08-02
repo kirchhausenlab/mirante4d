@@ -1,6 +1,6 @@
 use mirante4d_dataset::{
-    DatasetCatalog, DatasetLayer, ResourcePayloadView, ResourceRegion, ResourceValidity,
-    ScientificIdentityStatus,
+    ContentAddressStatus, DatasetCatalog, DatasetLayer, ResourcePayloadView, ResourceRegion,
+    ResourceValidity,
 };
 use mirante4d_domain::{GridToWorld, IntensityDType, LogicalLayerKey, Shape3D, Shape4D};
 use mirante4d_identity::ScientificContentId;
@@ -16,7 +16,7 @@ const SCIENTIFIC_ID: &str =
 fn catalog(dtype: IntensityDType, shape: [u64; 4], validity: ResourceValidity) -> DatasetCatalog {
     DatasetCatalog::new(
         "checked analysis",
-        ScientificIdentityStatus::Verified(ScientificContentId::parse(SCIENTIFIC_ID).unwrap()),
+        ContentAddressStatus::ContentAddress(ScientificContentId::parse(SCIENTIFIC_ID).unwrap()),
         vec![
             DatasetLayer::new(
                 LogicalLayerKey::new(3),

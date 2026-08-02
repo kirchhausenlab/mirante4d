@@ -19,9 +19,9 @@ fn x11_automation_helpers_have_short_silence_absolute_and_output_bounds() {
 }
 
 fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_resources: u64) {
-    assert_eq!(SCRIPT_SCHEMA_VERSION, 8);
-    assert_eq!(REPORT_SCHEMA_VERSION, 8);
-    assert_eq!(script["schema_version"], 8);
+    assert_eq!(SCRIPT_SCHEMA_VERSION, 10);
+    assert_eq!(REPORT_SCHEMA_VERSION, 9);
+    assert_eq!(script["schema_version"], SCRIPT_SCHEMA_VERSION);
     assert_eq!(
         script["hard_safety_limits"]["max_cpu_total_bytes"],
         total_bytes
@@ -363,6 +363,132 @@ fn representative_native_navigation_script_exercises_the_real_navigation_cut() {
 }
 
 #[test]
+fn representative_temporal_script_requires_pixels_presentations_input_and_teardown() {
+    let script = representative_temporal_playback_script(Path::new("/tmp/virus.m4d"));
+    validate_product_automation_script(&script).unwrap();
+    ProductAutomationProgressPlan::from_script(&script).unwrap();
+    let commands = script["commands"].as_array().unwrap();
+
+    assert_eq!(
+        script["scenario"],
+        REPRESENTATIVE_TEMPORAL_PLAYBACK_SCENARIO
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command["command"] == "capture_temporal_frame")
+            .count(),
+        2
+    );
+    assert!(commands.iter().any(|command| {
+        command["command"] == "capture_temporal_frame"
+            && command["min_different_pixels_from_previous"] == 1
+    }));
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command["command"] == "wait_for_temporal_transitions")
+            .count(),
+        3
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command["command"] == "observe_playback_cadence")
+            .count(),
+        7,
+        "every held-input workload needs its own same-duration stationary baseline"
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command["command"] == "camera_orbit_sequence")
+            .count(),
+        2
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command["command"] == "camera_zoom_sequence")
+            .count(),
+        2
+    );
+    for linked_sequence in [
+        "cross_section_pan_sequence",
+        "cross_section_zoom_sequence",
+        "cross_section_rotate_sequence",
+    ] {
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command["command"] == linked_sequence)
+                .count(),
+            1,
+            "the temporal gate must exercise linked {linked_sequence} input"
+        );
+    }
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| {
+                command["command"] == "assert"
+                    && command.pointer(
+                        "/condition/playback_advanced_during_previous_input/minimum_transitions",
+                    ) == Some(&serde_json::Value::from(3))
+            })
+            .count(),
+        7,
+        "every 3D and linked input sequence must prove simultaneous temporal progress"
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| {
+                command["command"] == "wait_for"
+                    && command["condition"] == "playback_residency_released"
+            })
+            .count(),
+        3
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| {
+                command["command"] == "wait_for"
+                    && command["condition"] == "coordinated_presentation_settled"
+            })
+            .count(),
+        4,
+        "one initial layout-settlement wait and three post-Stop stationary handoffs are required"
+    );
+    assert!(commands.iter().any(|command| {
+        command["command"] == "wait_for" && command["condition"] == "initial_auto_dense_applied"
+    }));
+}
+
+#[test]
+fn representative_temporal_runtime_log_rejects_transient_renderer_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("runtime.log");
+    fs::write(&log, "").unwrap();
+    assert_eq!(representative_temporal_playback_log_evidence(&log), Ok(()));
+
+    fs::write(
+        &log,
+        "2026-07-31 WARN visible dataset demand planning failed error=the requirement set changed within one frame generation\n",
+    )
+    .unwrap();
+    assert!(representative_temporal_playback_log_evidence(&log).is_err());
+
+    fs::write(
+        &log,
+        "2026-07-31 ERROR mirante4d_app::display_refresh: GPU display refresh failed\n",
+    )
+    .unwrap();
+    assert!(representative_temporal_playback_log_evidence(&log).is_err());
+}
+
+#[test]
 fn target_fixture_render_modes_script_switches_supported_modes() {
     let script = target_fixture_render_modes_script(Path::new("/tmp/demo.m4d"));
     let commands = script["commands"].as_array().unwrap();
@@ -623,42 +749,42 @@ fn target_fixture_render_modes_script_switches_supported_modes() {
 }
 
 #[test]
-fn target_source_verification_script_proves_cancel_progress_success_and_both_sizes() {
-    let script = target_source_verification_script(Path::new("/tmp/demo.m4d"));
+fn target_package_integrity_audit_script_proves_cancel_progress_success_and_both_sizes() {
+    let script = target_package_integrity_audit_script(Path::new("/tmp/demo.m4d"));
     let commands = script["commands"].as_array().unwrap();
 
-    assert_eq!(script["scenario"], B3_SOURCE_VERIFICATION_SCENARIO);
+    assert_eq!(script["scenario"], B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO);
     assert_eq!(commands[0]["command"], "open_dataset");
-    let initial_verified_wait = commands
+    let initial_not_run_wait = commands
         .iter()
         .position(|command| {
             command["command"] == "wait_for"
-                && command["condition"] == "source_verification_verified"
+                && command["condition"] == "package_integrity_audit_not_run"
         })
         .unwrap();
     let cancellation = commands
         .iter()
-        .position(|command| command["command"] == "cancel_source_verification")
+        .position(|command| command["command"] == "cancel_package_integrity_audit")
         .unwrap();
     let retry = commands
         .iter()
-        .position(|command| command["command"] == "request_source_verification")
+        .position(|command| command["command"] == "request_package_integrity_audit")
         .unwrap();
-    assert!(initial_verified_wait < cancellation);
+    assert!(initial_not_run_wait < cancellation);
     assert!(
         commands
             .iter()
-            .any(|command| command["command"] == "cancel_source_verification")
+            .any(|command| command["command"] == "cancel_package_integrity_audit")
     );
     assert!(
         commands
             .iter()
-            .any(|command| command["command"] == "request_source_verification")
+            .any(|command| command["command"] == "request_package_integrity_audit")
     );
     assert!(commands.iter().any(|command| {
-        command["condition"]["source_verification_evidence"]["min_accepted_progress_updates"] == 1
-            && command["condition"]["source_verification_evidence"]["min_cancelled_runs"] == 1
-            && command["condition"]["source_verification_evidence"]["min_accepted_successes"] == 1
+        command["condition"]["package_integrity_audit_evidence"]["min_progress_updates"] == 1
+            && command["condition"]["package_integrity_audit_evidence"]["min_cancelled_runs"] == 1
+            && command["condition"]["package_integrity_audit_evidence"]["min_completed_runs"] == 1
     }));
     assert!(commands.iter().any(|command| {
         command["command"] == "set_viewport_size"
@@ -707,12 +833,21 @@ fn import_preprocessing_script_uses_normal_cancel_resume_open_ready_path() {
     let script = import_preprocessing_script(
         Path::new("/tmp/startup.m4d"),
         Path::new("/tmp/source"),
+        TiffChannelSourceKind::FolderOf2dTiffs,
         Path::new("/tmp/output"),
         Path::new("/tmp/output/source.m4d"),
     );
     let commands = script["commands"].as_array().unwrap();
     assert_eq!(script["scenario"], IMPORT_PREPROCESSING_SCENARIO);
-    assert_dataset_runtime_limits(&script, 512 * MIB, IMPORT_RESIDENT_RESOURCE_LIMIT);
+    assert_dataset_runtime_limits(
+        &script,
+        IMPORT_CPU_TOTAL_LIMIT_BYTES,
+        IMPORT_RESIDENT_RESOURCE_LIMIT,
+    );
+    assert_eq!(
+        script["hard_safety_limits"]["max_cpu_import_working_set_bytes"],
+        IMPORT_PROGRESS_RESERVATION_LIMIT_BYTES
+    );
     validate_product_automation_script(&script).unwrap();
 
     let starts = commands
@@ -723,6 +858,14 @@ fn import_preprocessing_script_uses_normal_cancel_resume_open_ready_path() {
         })
         .collect::<Vec<_>>();
     assert_eq!(starts.len(), 2);
+    let setup_commands = commands
+        .iter()
+        .filter(|command| command["command"] == "begin_tiff_import_setup")
+        .collect::<Vec<_>>();
+    assert_eq!(setup_commands.len(), 2);
+    assert!(setup_commands.iter().all(|command| {
+        command["source"] == "/tmp/source" && command["source_kind"] == "folder_of_2d_tiffs"
+    }));
     let progress = commands
         .iter()
         .position(|command| command["command"] == "wait_for_import_progress")
@@ -741,7 +884,7 @@ fn import_preprocessing_script_uses_normal_cancel_resume_open_ready_path() {
         commands[open_ready + 1..]
             .iter()
             .all(|command| command["command"] != "open_dataset"),
-        "the imported verified source must render directly without an external reopen"
+        "the imported published source must render directly without an external reopen"
     );
     assert_eq!(
         commands[progress]["minimum_completed_work_units"],
@@ -756,6 +899,8 @@ fn import_preprocessing_script_uses_normal_cancel_resume_open_ready_path() {
             && command["condition"]["import_workflow_evidence"]["min_resumed_work_units"]
                 == IMPORT_DURABLE_PREFIX_WORK_UNITS
             && command["condition"]["import_workflow_evidence"]["min_projected_elapsed_ms"] == 1
+            && command["condition"]["import_workflow_evidence"]["max_peak_working_bytes"]
+                == IMPORT_PEAK_WORKING_BYTES_LIMIT
     }));
     assert!(commands.iter().any(|command| {
         command["command"] == "capture_screenshot"
@@ -763,6 +908,35 @@ fn import_preprocessing_script_uses_normal_cancel_resume_open_ready_path() {
             && command["target"] == "three_d"
     }));
     assert_eq!(commands.last().unwrap()["command"], "quit");
+}
+
+#[test]
+fn import_product_fixture_selects_its_immediate_tiff_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture_root = temp.path().join("fixture");
+    let fixture = prepare_import_product_fixture_at(&fixture_root, 2, 3, 4).unwrap();
+
+    assert_eq!(
+        fixture.source_root,
+        fixture_root.join("public-full-strip-source")
+    );
+    assert_eq!(
+        fixture.channel_source,
+        fixture.source_root.join("channel-000")
+    );
+    assert_eq!(fixture.source_kind, TiffChannelSourceKind::FolderOf2dTiffs);
+    let immediate_tiffs = fs::read_dir(&fixture.channel_source)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "tif"))
+        .collect::<Vec<_>>();
+    assert_eq!(immediate_tiffs.len(), 2);
+
+    let manifest = crate::import_performance::t2_source_manifest(&fixture.source_root).unwrap();
+    assert_eq!(
+        fixture.destination,
+        deterministic_tiff_destination(&manifest, &fixture.output_parent)
+    );
 }
 
 #[test]
@@ -775,9 +949,9 @@ fn import_preprocessing_evidence_requires_named_progress_resume_and_open_ready()
                 "planning-and-preflight",
                 "source-revalidation",
                 "checkpoint-open-or-resume",
+                "source-ingest",
                 "base-production",
                 "pyramid-production",
-                "source-scientific-identity",
                 "shard-publication",
                 "staged-structure-validation",
                 "staged-exact-validation",
@@ -790,12 +964,12 @@ fn import_preprocessing_evidence_requires_named_progress_resume_and_open_ready()
             "failed_runs": 0,
             "published_events": 1,
             "maximum_resumed_work_units": IMPORT_DURABLE_PREFIX_WORK_UNITS,
-            "maximum_peak_working_bytes": IMPORT_WORKING_MEMORY_BYTES,
+            "maximum_peak_working_bytes": IMPORT_PEAK_WORKING_BYTES_LIMIT,
             "maximum_elapsed_ms": 2,
             "maximum_projected_elapsed_ms": 1,
             "publication_to_open_ready_clock": {
                 "status": IMPORT_OPEN_READY_COMPLETE_STATUS,
-                "transfer_mode": "staged_verified_capability",
+                "transfer_mode": "staged_self_consistent_capability",
                 "included_in_primary_clock": true,
                 "publication_currentness_execution": {
                     "contract_id": PUBLICATION_CURRENTNESS_CONTRACT_ID,
@@ -806,18 +980,18 @@ fn import_preprocessing_evidence_requires_named_progress_resume_and_open_ready()
                     "observed_total_object_reads": 29,
                     "observed_codec_decode_calls": 0
                 },
-                "source_verification_started_runs": 0,
-                "source_verification_progress_updates": 0,
-                "source_verification_cancelled_runs": 0,
-                "source_verification_failed_runs": 0,
-                "source_verification_successes": 0
+                "package_integrity_audit_started_runs": 0,
+                "package_integrity_audit_progress_updates": 0,
+                "package_integrity_audit_cancelled_runs": 0,
+                "package_integrity_audit_failed_runs": 0,
+                "package_integrity_audit_completed_runs": 0
             }
         },
         "events": [{
             "command": "wait_for_imported_open_ready",
             "status": "passed",
             "details": {
-                "verified": true,
+                "content_id_computed_during_import": true,
                 "normal_product_open_path": true
             }
         }]
@@ -830,10 +1004,10 @@ fn import_preprocessing_evidence_requires_named_progress_resume_and_open_ready()
     });
     assert!(import_preprocessing_evidence(Some(&unavailable_transfer)).is_err());
 
-    let mut unexpected_verifier = report.clone();
-    unexpected_verifier["import_workflow_evidence"]["publication_to_open_ready_clock"]["source_verification_successes"] =
+    let mut unexpected_audit = report.clone();
+    unexpected_audit["import_workflow_evidence"]["publication_to_open_ready_clock"]["package_integrity_audit_completed_runs"] =
         json!(1);
-    assert!(import_preprocessing_evidence(Some(&unexpected_verifier)).is_err());
+    assert!(import_preprocessing_evidence(Some(&unexpected_audit)).is_err());
 
     let mut hidden_object_work = report.clone();
     hidden_object_work["import_workflow_evidence"]["publication_to_open_ready_clock"]["publication_currentness_execution"]
@@ -1258,8 +1432,8 @@ fn product_validation_scenario_resolution_is_strict() {
             ProductValidationScenario::RepresentativeNativeNavigation,
         ),
         (
-            B3_SOURCE_VERIFICATION_SCENARIO,
-            ProductValidationScenario::B3SourceVerification,
+            B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO,
+            ProductValidationScenario::B3PackageIntegrityAudit,
         ),
         (
             IMPORT_PREPROCESSING_SCENARIO,
@@ -1281,15 +1455,16 @@ fn product_validation_scenario_resolution_is_strict() {
         assert!(ProductValidationScenario::is_named_scenario(name));
     }
     assert_eq!(
-        ProductValidationScenario::resolve(None, Some(B3_SOURCE_VERIFICATION_SCENARIO)).unwrap(),
-        ProductValidationScenario::B3SourceVerification
+        ProductValidationScenario::resolve(None, Some(B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO))
+            .unwrap(),
+        ProductValidationScenario::B3PackageIntegrityAudit
     );
     for removed_alias in [
         "target-fixture-camera-smoke",
         "target",
         "target-fixture-render-modes",
         "render-modes",
-        "target-source-verification",
+        "target-package-integrity-audit",
         "b4-project-persistence",
     ] {
         assert!(ProductValidationScenario::resolve(Some(removed_alias), None).is_err());
@@ -1312,8 +1487,8 @@ fn product_validation_output_dirs_are_scenario_scoped() {
         Path::new(OUTPUT_DIR).join(REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO)
     );
     assert_eq!(
-        product_validation_output_dir(&ProductValidationScenario::B3SourceVerification),
-        Path::new(OUTPUT_DIR).join(B3_SOURCE_VERIFICATION_SCENARIO)
+        product_validation_output_dir(&ProductValidationScenario::B3PackageIntegrityAudit),
+        Path::new(OUTPUT_DIR).join(B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO)
     );
     assert_eq!(
         product_validation_output_dir(&ProductValidationScenario::ImportPreprocessing),
@@ -1360,7 +1535,7 @@ fn fixed_product_automation_script_validation_rejects_wrong_schema() {
         validate_product_automation_script(&predecessor_version)
             .unwrap_err()
             .to_string()
-            .contains("schema_version must be 8")
+            .contains("schema_version must be 10")
     );
 }
 
@@ -1931,6 +2106,7 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
     let automation_report_path = tempdir.path().join("product-automation-report.json");
     let stdout_path = tempdir.path().join("stdout.log");
     let stderr_path = tempdir.path().join("stderr.log");
+    let runtime_log_path = tempdir.path().join("runtime.log");
 
     let report = wrapper_report_json(WrapperReport {
         path: &wrapper_path,
@@ -1948,6 +2124,7 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
         automation_report_value: Some(&automation_report),
         stdout: &stdout_path,
         stderr: &stderr_path,
+        runtime_log: &runtime_log_path,
         display: DisplayClassification {
             class: DisplayClass::RealDisplay,
             source: "unit",
@@ -1982,6 +2159,10 @@ fn wrapper_report_includes_dataset_context_and_automation_artifacts() {
     assert_eq!(
         report["logs"]["stderr"],
         stderr_path.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        report["logs"]["runtime"],
+        runtime_log_path.to_string_lossy().as_ref()
     );
     assert_eq!(
         report["metrics"]["dataset_runtime"]["kind"],
@@ -2083,6 +2264,7 @@ fn wrapper_report_marks_preflight_as_non_launch_unsupported_evidence() {
     let automation_report_path = tempdir.path().join("product-automation-report.json");
     let stdout_path = tempdir.path().join("stdout.log");
     let stderr_path = tempdir.path().join("stderr.log");
+    let runtime_log_path = tempdir.path().join("runtime.log");
 
     let report = wrapper_report_json(WrapperReport {
         path: &wrapper_path,
@@ -2100,6 +2282,7 @@ fn wrapper_report_marks_preflight_as_non_launch_unsupported_evidence() {
         automation_report_value: None,
         stdout: &stdout_path,
         stderr: &stderr_path,
+        runtime_log: &runtime_log_path,
         display: DisplayClassification {
             class: DisplayClass::Unsupported,
             source: PREFLIGHT_ONLY_DISPLAY_SOURCE,

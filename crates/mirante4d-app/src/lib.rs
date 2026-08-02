@@ -9,12 +9,12 @@ use std::{
 mod analysis_product;
 mod analysis_session;
 mod analysis_workspace;
+mod application_shell;
 mod camera_demand_cache;
 mod cross_section_readout;
 mod cross_section_scheduler;
 mod current_settings_connection;
 mod current_source_open_service;
-mod current_source_verification_service;
 mod dataset_demand_plan;
 mod dataset_requests;
 mod diagnostics;
@@ -27,7 +27,10 @@ mod import_worker_service;
 mod import_workflow;
 mod layer_state;
 mod native_presentation;
+mod package_integrity_audit_service;
 mod playback;
+mod playback_session;
+mod presentation_scheduler;
 mod process_termination;
 mod product_automation;
 mod product_render_intent;
@@ -56,6 +59,7 @@ use analysis_workspace::{
     AnalysisTableExportInput, AnalysisWorkspaceSnapshotInput, analysis_workspace_snapshot,
     export_selected_analysis_table,
 };
+pub use application_shell::MiranteApplicationShell;
 use cross_section_readout::cross_section_hover_readout_for_panel_point;
 pub use diagnostics::{StartupDiagnostics, collect_startup_diagnostics, default_log_path};
 use eframe::egui;
@@ -63,19 +67,21 @@ use fidelity::composite_fidelity_label;
 #[cfg(test)]
 use import_worker_service::ImportWorkerStatus;
 use import_worker_service::{ImportWorkerCompletion, ImportWorkerOutcome};
-use import_workflow::{ImportWorkflow, reset_checkpoint_directory};
-use mirante4d_application::LayerHistogramSummary;
+use import_workflow::{ImportWorkflow, PendingImportRecovery, reset_checkpoint_directory};
 use mirante4d_application::{
     ApplicationCommand, ApplicationCommandKind, ApplicationEvent, ApplicationFault,
     ApplicationFaultCode, ApplicationSnapshot, ApplicationState, CommandEffect,
-    CompletedRenderIntent, DisplayRefreshPath, DisplayRefreshTiming, OperationCompletion,
-    OperationFailureCode, OperationKind, OperationToken, PresentationSlot, PresentationSnapshot,
+    CompletedRenderIntent, DisplayRefreshPath, DisplayRefreshTiming, HistogramStatus,
+    LayerHistogramSummary, OperationCompletion, OperationFailureCode, OperationKind,
+    OperationToken, PackageIntegrityAuditFailure, PresentationSlot, PresentationSnapshot,
     PresentationSurface, ProjectRecoveryStoreLocator, ProjectStoreApplicationService,
     ProjectStoreLifecycle, ProjectStoreServiceEvent, RenderCoordinationState, RenderIntentBase,
     RenderIntentFamily, RenderIntentMailbox, RenderIntentMailboxError, RenderIntentPayload,
-    RenderIntentTarget, ResidentRenderFailureStatus, SourceSessionGeneration,
-    SourceVerificationSnapshot, SystemMonotonicClock, VolumePickTicket, WorkspaceSnapshot,
-    import_workflow::{ImportCommand, ImportReviewId},
+    RenderIntentTarget, ResidentRenderFailureStatus, SourceSessionGeneration, SystemMonotonicClock,
+    VolumePickTicket, WorkspaceSnapshot, auto_dense_window_from_histogram,
+    import_workflow::{
+        ImportChannelSourceKind, ImportCommand, ImportRecoveryAction, ImportReviewId,
+    },
     viewer_tools::ViewerToolState,
     viewport_interaction::default_camera_for_shape,
 };
@@ -86,19 +92,23 @@ pub use mirante4d_application::{
 };
 #[cfg(test)]
 use mirante4d_application::{
-    HistogramStatus, auto_dense_window_from_histogram, auto_signal_window_from_histogram,
-    histogram_can_auto_window, import_workflow::ImportWorkflowSnapshot, stepped_timepoint,
+    auto_signal_window_from_histogram, histogram_can_auto_window,
+    import_workflow::ImportWorkflowSnapshot, stepped_timepoint,
 };
-use mirante4d_dataset::{DatasetSourceId, ResourceValidity, ScientificIdentityStatus};
-use mirante4d_domain::{CameraView, ScaleLevel, ViewerLayout as CanonicalViewerLayout};
+use mirante4d_dataset::{DatasetSourceId, ResourceValidity};
+use mirante4d_domain::{
+    CameraView, DisplayWindow, LogicalLayerKey, ScaleLevel, TimeIndex,
+    ViewerLayout as CanonicalViewerLayout,
+};
 #[cfg(test)]
-use mirante4d_domain::{IntensityDType, Shape3D, TimeIndex};
+use mirante4d_domain::{IntensityDType, Shape3D};
 #[cfg(test)]
 use mirante4d_import_pipeline::ImportCancellation;
 use mirante4d_import_pipeline::{
-    ImportError, ImportOptions, PublishedImport, TiffSource, deterministic_tiff_destination,
+    ImportError, ImportOptions, PublishedImport, TiffChannelSource, TiffSource,
+    deterministic_tiff_destination, minimum_import_progress_bytes,
 };
-use mirante4d_project_model::{ProjectId, ProjectRevisionId, ViewState};
+use mirante4d_project_model::{LayerViewState, ProjectId, ProjectRevisionId, ViewState};
 use mirante4d_project_store::{
     ProjectGenerationId, ProjectOpenMode, ProjectRecoveryCandidate, ProjectStoreConfig,
     ProjectStoreFault, ProjectStorePath, ProjectStoreRequestId,
@@ -128,6 +138,46 @@ struct DeterministicFailureLatch<S> {
     signature: S,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum InitialAutoDenseState {
+    Pending {
+        source_generation: SourceSessionGeneration,
+        layer: LogicalLayerKey,
+        timepoint: TimeIndex,
+        original_window: DisplayWindow,
+    },
+    Applied {
+        source_generation: SourceSessionGeneration,
+        layer: LogicalLayerKey,
+        window: DisplayWindow,
+    },
+    Cancelled,
+    Unavailable,
+}
+
+impl InitialAutoDenseState {
+    fn for_snapshot(snapshot: &ApplicationSnapshot) -> Self {
+        let view = application_view(snapshot);
+        let active = view
+            .layer(view.active_layer())
+            .expect("the application view closes over its active layer");
+        Self::Pending {
+            source_generation: snapshot.source_generation(),
+            layer: active.layer_key(),
+            timepoint: view.timepoint(),
+            original_window: active.transfer().window(),
+        }
+    }
+
+    #[cfg(test)]
+    fn applied_window(&self) -> Option<DisplayWindow> {
+        match self {
+            Self::Applied { window, .. } => Some(*window),
+            Self::Pending { .. } | Self::Cancelled | Self::Unavailable => None,
+        }
+    }
+}
+
 impl<S> DeterministicFailureLatch<S> {
     const fn new(signature: S) -> Self {
         Self { signature }
@@ -145,10 +195,6 @@ const BACKGROUND_WORK_REPAINT_INTERVAL: Duration = Duration::from_millis(50);
 /// loop for unrelated slow I/O.
 const FOREGROUND_VISIBLE_WORK_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 pub(crate) const CROSS_SECTION_INTERACTION_SETTLE_DURATION: Duration = Duration::from_millis(120);
-/// Verification is intentionally held off for a short, fixed interval after
-/// real viewer input or a render submission. Warm-resident navigation has no
-/// dataset tickets, so pending-I/O alone cannot represent interaction load.
-const VIEWER_VERIFICATION_GRACE: Duration = Duration::from_millis(150);
 const DVR_DENSITY_SCALE_MIN: f64 = 0.1;
 const DVR_DENSITY_SCALE_MAX: f64 = 64.0;
 const CROSS_SECTION_FAST_SLICE_MULTIPLIER: f64 = 10.0;
@@ -157,24 +203,34 @@ const PROJECT_RECOVERY_ROOT_ENTRIES_MAX: usize = 64;
 const EARLIER_LAUNCH_RECOVERY_STATUS: &str =
     "Unsaved work from an earlier launch is available for recovery.";
 
-fn viewer_verification_grace_active(deadline: Option<Instant>, now: Instant) -> bool {
-    deadline.is_some_and(|deadline| now < deadline)
-}
-
 fn application_view(snapshot: &ApplicationSnapshot) -> &ViewState {
     snapshot.view()
+}
+
+fn playback_material_policy_changed(previous: &ViewState, next: &ViewState) -> bool {
+    previous.layout() != next.layout()
+        || previous.active_layer() != next.active_layer()
+        || previous.layers().len() != next.layers().len()
+        || previous
+            .layers()
+            .iter()
+            .zip(next.layers())
+            .any(|(previous, next)| {
+                previous.layer_key() != next.layer_key()
+                    || previous.visible() != next.visible()
+                    || previous.render_state() != next.render_state()
+            })
 }
 
 fn render_intent_family_for_view_change(
     previous: &ViewState,
     current: &ViewState,
-    playback_changed: bool,
+    playback_active: bool,
 ) -> Option<RenderIntentFamily> {
     let shared_changed = previous.layers() != current.layers()
-        || previous.active_layer() != current.active_layer()
+        || (playback_active && previous.active_layer() != current.active_layer())
         || previous.timepoint() != current.timepoint()
-        || previous.layout() != current.layout()
-        || playback_changed;
+        || previous.layout() != current.layout();
     let three_d_changed = shared_changed
         || previous.camera() != current.camera()
         || previous.iso_light() != current.iso_light();
@@ -312,7 +368,7 @@ struct PendingSourceInstall {
     completion: OperationCompletion,
 }
 
-/// Pre-dispatch project-close phase used only by an imported verified request.
+/// Pre-dispatch project-close phase used only by an imported publication request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum DatasetOpenProjectCloseState {
     #[default]
@@ -571,11 +627,14 @@ pub struct MiranteWorkbenchApp {
     resident_plane_async_plan_submissions: u64,
     resident_plane_guard_body_installs: u64,
     resident_plane_exact_body_installs: u64,
-    viewer_verification_busy_until: Option<Instant>,
     active_histogram_cache: histogram::ActiveLayerHistogramCache,
+    initial_auto_dense: InitialAutoDenseState,
     render_intent_mailbox: RenderIntentMailbox,
+    playback_session: playback_session::PlaybackSession,
+    presentation_scheduler: presentation_scheduler::ComposedPresentationScheduler,
     egui_ui: ui_kit::EguiUiState,
     import: ImportWorkflow,
+    cpu_broker: mirante4d_dataset_runtime::ProcessCpuBroker,
     analysis_runtime: analysis_session::AnalysisProductRuntime,
     product_automation: Option<ProductAutomationController>,
     process_termination: Option<Arc<ProcessTerminationLatch>>,
@@ -612,9 +671,8 @@ pub struct MiranteWorkbenchApp {
     settings_connection: current_settings_connection::CurrentSettingsConnection,
     selected_adapter_memory: gpu_memory::SelectedAdapterMemoryFacts,
     source_open_service: Option<current_source_open_service::CurrentSourceOpenService>,
-    source_verification_service:
-        Option<current_source_verification_service::CurrentSourceVerificationService>,
-    pending_automatic_source_verification: Option<SourceSessionGeneration>,
+    package_integrity_audit_service:
+        Option<package_integrity_audit_service::PackageIntegrityAuditService>,
 }
 
 impl MiranteWorkbenchApp {
@@ -652,26 +710,43 @@ impl MiranteWorkbenchApp {
                 .unwrap_or_default();
         let (settings_connection, resource_policy) =
             current_settings_connection::CurrentSettingsConnection::start(recommended);
-        let opened = unified_source_open::open(path, resource_policy, DatasetSourceId::new(1))?;
+        let cpu_broker = mirante4d_dataset_runtime::ProcessCpuBroker::new(
+            resource_policy.cpu_dataset_budget_bytes(),
+        )
+        .map_err(|code| anyhow::anyhow!("process CPU broker configuration failed: {code}"))?;
+        let opened = unified_source_open::open_with_broker(
+            path,
+            resource_policy,
+            DatasetSourceId::new(1),
+            cpu_broker.clone(),
+        )?;
         Self::new_with_settings(
-            cc,
+            cc.egui_ctx.clone(),
+            render_state.clone(),
             opened,
             settings_connection,
             resource_policy,
             selected_adapter_memory,
             process_termination,
+            cpu_broker,
         )
     }
 
-    fn new_with_settings(
-        cc: &eframe::CreationContext<'_>,
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "dataset-session construction receives each process-owned capability explicitly"
+    )]
+    pub(crate) fn new_with_settings(
+        egui_ctx: egui::Context,
+        render_state: eframe::egui_wgpu::RenderState,
         opened: unified_source_open::UnifiedOpenedSource,
         settings_connection: current_settings_connection::CurrentSettingsConnection,
         resource_policy: ResourcePolicy,
         selected_adapter_memory: gpu_memory::SelectedAdapterMemoryFacts,
         process_termination: Option<Arc<ProcessTerminationLatch>>,
+        cpu_broker: mirante4d_dataset_runtime::ProcessCpuBroker,
     ) -> anyhow::Result<Self> {
-        ui_kit::configure_visuals(&cc.egui_ctx);
+        ui_kit::configure_visuals(&egui_ctx);
         let unified_source_open::UnifiedOpenedSource {
             mut startup_diagnostics,
             catalog,
@@ -679,19 +754,19 @@ impl MiranteWorkbenchApp {
             dataset,
             render_coordination,
             analysis_runtime,
+            source_reference,
+            content_address_origin,
         } = opened;
         let provisional_project_id = workspace.provisional_project_id();
         let application = ApplicationState::new_unbound(
             SourceSessionGeneration::new(1),
             catalog.as_ref().clone(),
+            source_reference,
+            content_address_origin,
             workspace,
             resource_policy,
         )
         .map_err(|code| anyhow::anyhow!("initial application state rejected: {code:?}"))?;
-        let render_state = cc
-            .wgpu_render_state
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("the interactive viewer requires the WGPU renderer"))?;
         let product_automation = ProductAutomationController::from_env();
         let validation_capture = product_automation
             .as_ref()
@@ -713,7 +788,7 @@ impl MiranteWorkbenchApp {
                 .with_gpu_timing(gpu_timing),
         )
         .map_err(|error| anyhow::anyhow!("the progressive GPU renderer is required: {error}"))?;
-        let hidden_refinement_context = cc.egui_ctx.clone();
+        let hidden_refinement_context = egui_ctx.clone();
         product_renderer.set_hidden_refinement_wake(Arc::new(move || {
             hidden_refinement_context.request_repaint();
         }));
@@ -759,6 +834,7 @@ impl MiranteWorkbenchApp {
             earlier_launch_recovery_available.then(|| EARLIER_LAUNCH_RECOVERY_STATUS.to_owned())
         });
         let project_store = Some(project_store);
+        let initial_auto_dense = InitialAutoDenseState::for_snapshot(&application.snapshot());
         let mut app = Self {
             application,
             startup_diagnostics,
@@ -790,11 +866,14 @@ impl MiranteWorkbenchApp {
             resident_plane_async_plan_submissions: 0,
             resident_plane_guard_body_installs: 0,
             resident_plane_exact_body_installs: 0,
-            viewer_verification_busy_until: None,
             active_histogram_cache: histogram::ActiveLayerHistogramCache::default(),
+            initial_auto_dense,
             render_intent_mailbox: RenderIntentMailbox::new(),
+            playback_session: playback_session::PlaybackSession::new(),
+            presentation_scheduler: presentation_scheduler::ComposedPresentationScheduler::new(),
             egui_ui,
             import: ImportWorkflow::new(),
+            cpu_broker: cpu_broker.clone(),
             analysis_runtime,
             product_automation,
             process_termination,
@@ -830,16 +909,14 @@ impl MiranteWorkbenchApp {
             pending_source_install: None,
             settings_connection,
             selected_adapter_memory,
-            source_open_service: Some(current_source_open_service::CurrentSourceOpenService::new()),
-            source_verification_service: Some(
-                current_source_verification_service::CurrentSourceVerificationService::new(),
+            source_open_service: Some(current_source_open_service::CurrentSourceOpenService::new(
+                cpu_broker,
+            )),
+            package_integrity_audit_service: Some(
+                package_integrity_audit_service::PackageIntegrityAuditService::new(),
             ),
-            pending_automatic_source_verification: None,
         };
-        // Ordinary startup establishes visible interactive demand before the
-        // verifier can reserve its scan workspace.
-        app.request_opened_state_visible_work(Some(&cc.egui_ctx));
-        app.request_current_source_verification();
+        app.request_opened_state_visible_work(Some(&egui_ctx));
         app.pump_application_services();
         Ok(app)
     }
@@ -899,9 +976,8 @@ impl MiranteWorkbenchApp {
             // Drain first so a full bounded event queue cannot prevent a
             // terminal actor result from retiring its operation.
             self.poll_source_open_service();
-            self.poll_source_verification_service();
+            self.poll_package_integrity_audit_service();
             self.poll_project_store();
-            self.try_start_pending_automatic_source_verification();
             if events.is_empty()
                 && !had_completion_commands
                 && self.application.snapshot().pending_event_count() == 0
@@ -1237,44 +1313,20 @@ impl MiranteWorkbenchApp {
 
     fn observe_source_application_event(&mut self, event: &ApplicationEvent) {
         match event {
-            ApplicationEvent::SourceVerificationRequested { token } => {
+            ApplicationEvent::PackageIntegrityAuditRequested { token } => {
                 let path = self.dataset.selected_path().to_path_buf();
                 let scan_ledger = self.dataset.cpu_ledger_arc();
-                let local_source = self.dataset.local_source().cloned();
-                let interactive_busy = self.source_verification_interactive_busy();
-                let request = local_source
-                    .ok_or(
-                        current_source_verification_service::CurrentSourceVerificationServiceError::LocalSourceUnavailable,
-                    )
-                    .and_then(|local_source| {
-                        self.source_verification_service.as_mut().ok_or(
-                        current_source_verification_service::CurrentSourceVerificationServiceError::NoActiveOperation,
-                        ).and_then(|service| {
-                        service.set_interactive_busy(interactive_busy);
-                        service.request_verification(
-                            token.clone(),
-                            path,
-                            scan_ledger,
-                            local_source,
-                        )
-                        })
-                    });
+                let request = self.package_integrity_audit_service.as_mut().ok_or(
+                    package_integrity_audit_service::PackageIntegrityAuditServiceError::NoActiveOperation,
+                ).and_then(|service| service.request(token.clone(), path, scan_ledger));
                 if let Err(error) = request {
-                    tracing::warn!(%error, "source-verification request failed");
+                    tracing::warn!(%error, "package integrity audit request failed");
                     self.complete_source_operation(
                         token.clone(),
-                        OperationCompletion::Failed(
-                            OperationFailureCode::SourceVerificationReadFailed,
+                        OperationCompletion::PackageIntegrityAuditFailed(
+                            PackageIntegrityAuditFailure::new(None, None, error.to_string()),
                         ),
                     );
-                }
-            }
-            ApplicationEvent::SourceVerificationInvalidated { source_generation } => {
-                let snapshot = self.application.snapshot();
-                if *source_generation == snapshot.source_generation()
-                    && !self.dataset.source_quarantined()
-                {
-                    self.retire_invalidated_source_runtime();
                 }
             }
             ApplicationEvent::OperationCancellationRequested { token }
@@ -1293,16 +1345,16 @@ impl MiranteWorkbenchApp {
                 }
             }
             ApplicationEvent::OperationCancellationRequested { token }
-                if token.kind() == OperationKind::SourceVerification =>
+                if token.kind() == OperationKind::PackageIntegrityAudit =>
             {
-                if let Some(service) = self.source_verification_service.as_ref() {
+                if let Some(service) = self.package_integrity_audit_service.as_ref() {
                     match service.cancel(token) {
                         Ok(())
                         | Err(
-                            current_source_verification_service::CurrentSourceVerificationServiceError::NoActiveOperation,
+                            package_integrity_audit_service::PackageIntegrityAuditServiceError::NoActiveOperation,
                         ) => {}
                         Err(error) => {
-                            tracing::warn!(%error, "source-verification cancellation failed");
+                            tracing::warn!(%error, "package integrity audit cancellation failed");
                         }
                     }
                 }
@@ -1696,19 +1748,10 @@ impl MiranteWorkbenchApp {
                 match result {
                     Ok(artifacts) => {
                         let snapshot = self.application.snapshot();
-                        let expected_source = match snapshot.source() {
-                            SourceVerificationSnapshot::Verified(source) => Some(source.clone()),
-                            SourceVerificationSnapshot::Required
-                            | SourceVerificationSnapshot::Verifying { .. } => None,
-                        };
-                        let staged = expected_source
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("the analysis source is no longer verified")
-                            })
-                            .and_then(|source| {
-                                self.analysis_runtime
-                                    .stage_authenticated_bundles(artifacts, &source)
-                            })
+                        let source = snapshot.source().dataset().clone();
+                        let staged = self
+                            .analysis_runtime
+                            .stage_authenticated_bundles(artifacts, &source)
                             .and_then(|bundles| {
                                 self.application
                                     .dispatch(
@@ -1812,8 +1855,8 @@ impl MiranteWorkbenchApp {
                         self.egui_ui.close_prompt_open = true;
                         self.project_status_message = Some(match self.pending_dataset_open.as_ref() {
                             Some(
-                                current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_),
-                            ) => "The current project storage could not close cleanly, so the imported package was not opened. Its verified import handoff remains retained; cancel the dataset open, or choose Discard to retry if project storage remains available."
+                                current_source_open_service::CurrentSourceOpenRequest::ImportedPublication(_),
+                            ) => "The current project storage could not close cleanly, so the imported package was not opened. Its publication handoff remains retained; cancel the dataset open, or choose Discard to retry if project storage remains available."
                                 .to_owned(),
                             Some(current_source_open_service::CurrentSourceOpenRequest::External(_)) => {
                                 "The current project storage could not close cleanly, so the new dataset was not opened. Cancel the dataset open, or choose Discard to retry if project storage remains available."
@@ -1912,7 +1955,7 @@ impl MiranteWorkbenchApp {
         )
     }
 
-    fn project_recovery_ui(&self, source_verified: bool) -> ProjectRecoveryView {
+    fn project_recovery_ui(&self, project_actions_available: bool) -> ProjectRecoveryView {
         ProjectRecoveryView::new(
             self.project_recovery_review
                 .as_ref()
@@ -1939,8 +1982,7 @@ impl MiranteWorkbenchApp {
             self.project_store
                 .as_ref()
                 .is_some_and(ProjectStoreApplicationService::can_open)
-                && source_verified,
-            source_verified,
+                && project_actions_available,
         )
     }
 
@@ -2100,7 +2142,7 @@ impl MiranteWorkbenchApp {
     ) -> anyhow::Result<bool> {
         let (_receipt, transfer) = published.into_parts();
         self.open_or_queue_dataset_request(
-            current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(Box::new(
+            current_source_open_service::CurrentSourceOpenRequest::ImportedPublication(Box::new(
                 transfer,
             )),
             ctx,
@@ -2122,7 +2164,7 @@ impl MiranteWorkbenchApp {
             Ok(false)
         } else if matches!(
             &request,
-            current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_)
+            current_source_open_service::CurrentSourceOpenRequest::ImportedPublication(_)
         ) {
             self.pending_dataset_open = Some(request);
             self.dataset_open_project_close = DatasetOpenProjectCloseState::NotRequested;
@@ -2139,7 +2181,7 @@ impl MiranteWorkbenchApp {
         ctx: Option<&egui::Context>,
     ) -> anyhow::Result<()> {
         match self.pending_dataset_open.as_ref() {
-            Some(current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_)) => {
+            Some(current_source_open_service::CurrentSourceOpenRequest::ImportedPublication(_)) => {
                 self.close_project_store_before_pending_dataset_open(ctx)
             }
             Some(current_source_open_service::CurrentSourceOpenRequest::External(_)) => {
@@ -2164,9 +2206,9 @@ impl MiranteWorkbenchApp {
     ) -> anyhow::Result<()> {
         if !matches!(
             self.pending_dataset_open.as_ref(),
-            Some(current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_))
+            Some(current_source_open_service::CurrentSourceOpenRequest::ImportedPublication(_))
         ) {
-            anyhow::bail!("no imported verified dataset-open request is retained");
+            anyhow::bail!("no imported publication dataset-open request is retained");
         }
         if self.dataset_open_project_close == DatasetOpenProjectCloseState::Waiting {
             if let Some(ctx) = ctx {
@@ -2245,9 +2287,9 @@ impl MiranteWorkbenchApp {
         }
         if !matches!(
             self.pending_dataset_open.as_ref(),
-            Some(current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_))
+            Some(current_source_open_service::CurrentSourceOpenRequest::ImportedPublication(_))
         ) {
-            anyhow::bail!("the retained request is not an imported verified open");
+            anyhow::bail!("the retained request is not an imported publication open");
         }
         let request = self
             .pending_dataset_open
@@ -2272,7 +2314,7 @@ impl MiranteWorkbenchApp {
     ) -> anyhow::Result<()> {
         if matches!(
             &request,
-            current_source_open_service::CurrentSourceOpenRequest::ImportedVerified(_)
+            current_source_open_service::CurrentSourceOpenRequest::ImportedPublication(_)
         ) && self.project_store.is_some()
         {
             anyhow::bail!(
@@ -2345,10 +2387,7 @@ impl MiranteWorkbenchApp {
     }
 
     fn new_current_project(&mut self) {
-        if let Err(fault) = self
-            .application
-            .dispatch(ApplicationCommand::AttachVerifiedDataset)
-        {
+        if let Err(fault) = self.application.dispatch(ApplicationCommand::AttachDataset) {
             tracing::info!(?fault, "new project is unavailable for the current source");
         }
         self.pump_application_services();
@@ -2400,96 +2439,8 @@ impl MiranteWorkbenchApp {
         self.pump_application_services();
     }
 
-    fn request_current_source_verification(&mut self) {
-        if let Err(fault) = self
-            .application
-            .dispatch(ApplicationCommand::RequestSourceVerification)
-        {
-            tracing::warn!(?fault, "source verification request was rejected");
-        }
-    }
-
-    fn try_start_pending_automatic_source_verification(&mut self) {
-        let Some(pending_generation) = self.pending_automatic_source_verification else {
-            return;
-        };
-        let snapshot = self.application.snapshot();
-        if snapshot.source_generation() != pending_generation
-            || !matches!(snapshot.source(), SourceVerificationSnapshot::Required)
-        {
-            self.pending_automatic_source_verification = None;
-            return;
-        }
-        if self
-            .source_verification_service
-            .as_ref()
-            .is_none_or(|service| service.active_token().is_some())
-        {
-            return;
-        }
-
-        match self
-            .application
-            .dispatch(ApplicationCommand::RequestSourceVerification)
-        {
-            Ok(_) => self.pending_automatic_source_verification = None,
-            Err(fault) if fault.code() == ApplicationFaultCode::OperationConflict => {}
-            Err(fault) => {
-                self.pending_automatic_source_verification = None;
-                tracing::warn!(?fault, "automatic source verification request was rejected");
-            }
-        }
-    }
-
-    fn retire_invalidated_source_runtime(&mut self) {
-        self.cancel_render_intent();
-        let intent_revision = self.render_intent_mailbox.snapshot().latest_revision;
-        self.dataset.invalidate_visible_demand_plan(intent_revision);
-        self.pending_visible_demand_plan = None;
-        self.visible_demand_planning_signature = None;
-        self.visible_demand_placeability_limit = None;
-        self.installed_cross_section_exact_bodies = std::array::from_fn(|_| None);
-        self.resident_cross_section_coverage = None;
-        self.current_camera_reuse_envelope = None;
-        self.visible_demand_failure_latch = None;
-        self.prepared_scope_render_plans.clear();
-        self.navigation_render_plans.clear();
-        self.staged_post_promotion_renderer_update = None;
-        self.last_camera_demand_planning_duration = None;
-        if let Err(error) = self.dataset.cancel_and_clear_interactive_demand() {
-            tracing::warn!(%error, "invalidated dataset demand cancellation failed");
-        }
-        let retired_leases = self.dataset.take_retained_leases();
-        self.clear_product_presentations();
-        self.render_coordination.frame_fidelity.completeness = FrameCompleteness::Loading;
-        self.render_coordination.frame_fidelity.reason = LodDecisionReason::LoadingTargetScale;
-        self.render_coordination.frame_fidelity.backend = RenderBackend::Loading;
-        std::thread::spawn(move || drop(retired_leases));
-    }
-
     fn request_opened_state_visible_work(&mut self, _ctx: Option<&egui::Context>) {
         self.request_visible_bricks();
-        self.update_source_verification_interactive_busy();
-    }
-
-    fn source_verification_interactive_busy(&self) -> bool {
-        self.dataset.visible_demand_plan_outstanding()
-            || self.pending_visible_demand_plan.is_some()
-            || self.dataset.dispatcher().has_pending_work()
-            || self.application.snapshot().transient().playback_active()
-            || self.analysis_runtime.active_token().is_some()
-            || viewer_verification_grace_active(self.viewer_verification_busy_until, Instant::now())
-    }
-
-    fn note_viewer_render_submission(&mut self) {
-        self.viewer_verification_busy_until = Some(Instant::now() + VIEWER_VERIFICATION_GRACE);
-    }
-
-    fn update_source_verification_interactive_busy(&self) {
-        let busy = self.source_verification_interactive_busy();
-        if let Some(service) = self.source_verification_service.as_ref() {
-            service.set_interactive_busy(busy);
-        }
     }
 
     fn poll_source_open_service(&mut self) {
@@ -2510,7 +2461,7 @@ impl MiranteWorkbenchApp {
                             self.restore_project_store_after_failed_imported_open();
                         if restored_project_store {
                             self.project_status_message = Some(
-                                "The verified imported open worker failed; the current dataset and its project storage remain available."
+                                "The published imported open worker failed; the current dataset and its project storage remain available."
                                     .to_owned(),
                             );
                         }
@@ -2572,22 +2523,24 @@ impl MiranteWorkbenchApp {
                 }
             }
             current_source_open_service::CurrentSourceOpenOutcome::Cancelled => {
-                if origin == current_source_open_service::CurrentSourceOpenOrigin::ImportedVerified
+                if origin
+                    == current_source_open_service::CurrentSourceOpenOrigin::ImportedPublication
                 {
                     self.restore_project_store_after_failed_imported_open();
                 }
                 self.complete_source_operation(token, OperationCompletion::Cancelled);
             }
             current_source_open_service::CurrentSourceOpenOutcome::Failed(code) => {
-                if origin == current_source_open_service::CurrentSourceOpenOrigin::ImportedVerified
+                if origin
+                    == current_source_open_service::CurrentSourceOpenOrigin::ImportedPublication
                 {
                     let restored_project_store =
                         self.restore_project_store_after_failed_imported_open();
                     self.project_status_message = Some(if restored_project_store {
-                        "The package was created and remains on disk, but Mirante4D could not complete its verified imported open; the current dataset and its project storage remain available."
+                        "The package was created and remains on disk, but Mirante4D could not complete its published import handoff; the current dataset and its project storage remain available."
                             .to_owned()
                     } else {
-                        "The package was created and remains on disk, but Mirante4D could not complete its verified imported open; it was not installed as the current dataset. Project storage remains unavailable, so reopen the application before saving again."
+                        "The package was created and remains on disk, but Mirante4D could not complete its published import handoff; it was not installed as the current dataset. Project storage remains unavailable, so reopen the application before saving again."
                             .to_owned()
                     });
                 }
@@ -2667,8 +2620,8 @@ impl MiranteWorkbenchApp {
         std::thread::spawn(move || drop(pending.runtime));
     }
 
-    fn poll_source_verification_service(&mut self) {
-        let (active_token, progress, result) = match self.source_verification_service.as_mut() {
+    fn poll_package_integrity_audit_service(&mut self) {
+        let (active_token, progress, result) = match self.package_integrity_audit_service.as_mut() {
             Some(service) => (
                 service.active_token().cloned(),
                 service.take_progress(),
@@ -2677,38 +2630,26 @@ impl MiranteWorkbenchApp {
             None => return,
         };
 
-        match progress {
-            Ok(Some(progress)) => {
-                match self.application.dispatch(
-                    ApplicationCommand::UpdateSourceVerificationProgress {
-                        token: progress.token,
-                        completed_work: progress.completed_work,
-                        total_work: progress.total_work,
-                    },
-                ) {
-                    Ok(_) => {
-                        if let Some(service) = self.source_verification_service.as_mut() {
-                            service.note_accepted_progress();
-                        }
-                    }
-                    Err(fault) if fault.code() == ApplicationFaultCode::OperationNotFound => {}
-                    Err(fault) => tracing::warn!(?fault, "source-verification progress rejected"),
-                }
+        if let Some((token, progress)) = progress {
+            match self.application.dispatch(
+                ApplicationCommand::UpdatePackageIntegrityAuditProgress { token, progress },
+            ) {
+                Ok(_) => {}
+                Err(fault) if fault.code() == ApplicationFaultCode::OperationNotFound => {}
+                Err(fault) => tracing::warn!(?fault, "package integrity audit progress rejected"),
             }
-            Ok(None) => {}
-            Err(error) => tracing::warn!(%error, "source-verification progress failed"),
         }
 
         let result = match result {
             Ok(Some(result)) => result,
             Ok(None) => return,
             Err(error) => {
-                tracing::error!(%error, "source-verification worker failed");
+                tracing::error!(%error, "package integrity audit worker failed");
                 if let Some(token) = active_token {
                     self.complete_source_operation(
                         token,
-                        OperationCompletion::Failed(
-                            OperationFailureCode::SourceVerificationReadFailed,
+                        OperationCompletion::PackageIntegrityAuditFailed(
+                            PackageIntegrityAuditFailure::new(None, None, error.to_string()),
                         ),
                     );
                 }
@@ -2718,62 +2659,20 @@ impl MiranteWorkbenchApp {
 
         let token = result.token;
         match result.outcome {
-            current_source_verification_service::CurrentSourceVerificationOutcome::Prepared(
-                prepared,
-            ) => {
-                let promotion = prepared.into_promotion();
-                let identity = *promotion.dataset_reference.scientific_content_id();
-                let snapshot = self.application.snapshot();
-                if promotion.source_generation != snapshot.source_generation() {
-                    tracing::warn!(
-                        "stale source-verification promotion was suppressed with its retired source"
-                    );
-                    return;
-                }
-                let catalog = match snapshot
-                    .catalog()
-                    .with_scientific_identity(ScientificIdentityStatus::Verified(identity))
-                {
-                    Ok(catalog) => std::sync::Arc::new(catalog),
-                    Err(error) => {
-                        tracing::error!(%error, "verified source catalog promotion failed");
-                        self.complete_source_operation(
-                            token,
-                            OperationCompletion::Failed(
-                                OperationFailureCode::SourceVerificationInvalid,
-                            ),
-                        );
-                        self.retire_invalidated_source_runtime();
-                        return;
-                    }
-                };
-                let completion = OperationCompletion::SourceVerified {
-                    source_generation: promotion.source_generation,
-                    catalog,
-                    dataset: promotion.dataset_reference,
-                };
-                if self.complete_source_operation(token, completion) {
-                    if let Some(service) = self.source_verification_service.as_mut() {
-                        service.note_accepted_success();
-                    }
-                    if self.dataset.restore_verified_source() {
-                        self.request_opened_state_visible_work(None);
-                    }
-                } else {
-                    tracing::error!(
-                        "committed source promotion could not be admitted by the application"
-                    );
-                    self.retire_invalidated_source_runtime();
-                }
+            package_integrity_audit_service::PackageIntegrityAuditOutcome::Completed(report) => {
+                self.complete_source_operation(
+                    token,
+                    OperationCompletion::PackageIntegrityAuditCompleted(report),
+                );
             }
-            current_source_verification_service::CurrentSourceVerificationOutcome::Cancelled => {
-                if let Some(service) = self.source_verification_service.as_mut() {
-                    service.note_cancelled_run();
-                }
+            package_integrity_audit_service::PackageIntegrityAuditOutcome::Cancelled => {
                 self.complete_source_operation(token, OperationCompletion::Cancelled);
             }
-            current_source_verification_service::CurrentSourceVerificationOutcome::Failed(code) => {
-                self.complete_source_operation(token, OperationCompletion::Failed(code));
+            package_integrity_audit_service::PackageIntegrityAuditOutcome::Failed(failure) => {
+                self.complete_source_operation(
+                    token,
+                    OperationCompletion::PackageIntegrityAuditFailed(failure),
+                );
             }
         }
     }
@@ -2782,6 +2681,8 @@ impl MiranteWorkbenchApp {
         &mut self,
         transfer: current_source_open_service::CurrentSourceRuntimeTransfer,
     ) {
+        self.playback_session.stop();
+        self.presentation_scheduler.cancel_retained_quality();
         self.cancel_render_intent();
         let intent_revision = self.render_intent_mailbox.snapshot().latest_revision;
         let current_source_open_service::CurrentSourceRuntimeTransfer {
@@ -2821,20 +2722,13 @@ impl MiranteWorkbenchApp {
             tracing::warn!(%error, "replaced dataset runtime shutdown request failed");
         }
         let snapshot = self.application.snapshot();
+        self.initial_auto_dense = InitialAutoDenseState::for_snapshot(&snapshot);
         if let Some(product) = self.native_presentation.product_gpu.as_mut() {
             product
                 .activate_dataset_generation(snapshot.catalog())
                 .expect("a retired renderer accepts the installed source generation");
         }
-        self.pending_automatic_source_verification =
-            matches!(snapshot.source(), SourceVerificationSnapshot::Required)
-                .then(|| snapshot.source_generation());
-        // Publish visible demand and its verifier throttle before dispatching
-        // automatic verification for the replacement source.
         self.request_opened_state_visible_work(None);
-        if self.pending_automatic_source_verification.is_some() {
-            self.try_start_pending_automatic_source_verification();
-        }
 
         std::thread::spawn(move || {
             drop((old_dataset, old_render_coordination, old_analysis_runtime));
@@ -2855,7 +2749,8 @@ impl MiranteWorkbenchApp {
             self.render_coordination
                 .frame_fidelity
                 .displayed_scale_level
-                .unwrap_or(self.dataset.current_scale().get()),
+                .or_else(|| self.dataset.current_uniform_scale().map(ScaleLevel::get))
+                .unwrap_or(ScaleLevel::BASE.get()),
         );
         let generation = self.dataset.histogram_generation(active_key);
         self.active_histogram_cache.summary(
@@ -2873,6 +2768,105 @@ impl MiranteWorkbenchApp {
         )
     }
 
+    fn initial_auto_dense_command(
+        &mut self,
+        snapshot: &ApplicationSnapshot,
+        histogram: &LayerHistogramSummary,
+    ) -> Option<ApplicationCommand> {
+        let InitialAutoDenseState::Pending {
+            source_generation,
+            layer,
+            timepoint,
+            original_window,
+        } = self.initial_auto_dense.clone()
+        else {
+            return None;
+        };
+        let view = application_view(snapshot);
+        let Some(active) = view.layer(view.active_layer()) else {
+            self.initial_auto_dense = InitialAutoDenseState::Cancelled;
+            return None;
+        };
+        if snapshot.source_generation() != source_generation
+            || active.layer_key() != layer
+            || view.timepoint() != timepoint
+            || active.transfer().window() != original_window
+        {
+            self.initial_auto_dense = InitialAutoDenseState::Cancelled;
+            return None;
+        }
+        if matches!(histogram.status, HistogramStatus::Pending { .. }) {
+            return None;
+        }
+        let window = match auto_dense_window_from_histogram(histogram) {
+            Ok(window) => window,
+            Err(error) => {
+                tracing::warn!(%error, "initial auto dense window is unavailable");
+                self.initial_auto_dense = InitialAutoDenseState::Unavailable;
+                return None;
+            }
+        };
+        self.initial_auto_dense = InitialAutoDenseState::Applied {
+            source_generation,
+            layer,
+            window,
+        };
+        if window == active.transfer().window() {
+            return None;
+        }
+        let current = active.transfer();
+        let transfer = mirante4d_domain::LayerTransfer::new(
+            window,
+            current.color(),
+            current.opacity(),
+            current.curve(),
+            current.invert(),
+        );
+        Some(ApplicationCommand::SetLayerView(LayerViewState::new(
+            active.layer_key(),
+            active.visible(),
+            transfer,
+            *active.render_state(),
+        )))
+    }
+
+    fn cancel_initial_auto_dense_if_view_diverged(&mut self, snapshot: &ApplicationSnapshot) {
+        let InitialAutoDenseState::Pending {
+            source_generation,
+            layer,
+            timepoint,
+            original_window,
+        } = &self.initial_auto_dense
+        else {
+            return;
+        };
+        let view = application_view(snapshot);
+        let diverged = snapshot.source_generation() != *source_generation
+            || view.active_layer() != *layer
+            || view.timepoint() != *timepoint
+            || view
+                .layer(*layer)
+                .is_none_or(|active| active.transfer().window() != *original_window);
+        if diverged {
+            self.initial_auto_dense = InitialAutoDenseState::Cancelled;
+        }
+    }
+
+    fn initial_auto_dense_is_applied(&self, snapshot: &ApplicationSnapshot) -> bool {
+        let InitialAutoDenseState::Applied {
+            source_generation,
+            layer,
+            window,
+        } = &self.initial_auto_dense
+        else {
+            return false;
+        };
+        snapshot.source_generation() == *source_generation
+            && application_view(snapshot)
+                .layer(*layer)
+                .is_some_and(|active| active.transfer().window() == *window)
+    }
+
     pub(crate) fn apply_application_command(
         &mut self,
         command: ApplicationCommand,
@@ -2888,6 +2882,7 @@ impl MiranteWorkbenchApp {
         allocate_render_revision: bool,
     ) -> Result<CommandEffect, ApplicationFault> {
         let command_kind = command.kind();
+        let temporal_playback_tick = command_kind == ApplicationCommandKind::AdvancePlaybackTick;
         if matches!(
             command_kind,
             ApplicationCommandKind::SetCamera | ApplicationCommandKind::SetActiveTool
@@ -2901,8 +2896,35 @@ impl MiranteWorkbenchApp {
         .then(Instant::now);
         let before = self.application.snapshot();
         let previous_view = application_view(&before).clone();
-        let previous_playback_active = before.transient().playback_active();
-        let effect = self.application.dispatch(command)?;
+        let previous_playback_request = (
+            before.transient().playback_active(),
+            before.transient().playback_fps(),
+        );
+        let playback_stopping = previous_playback_request.0
+            && matches!(&command, ApplicationCommand::SetPlaybackActive(false));
+        let presented_stop_cursor = playback_stopping
+            .then(|| self.playback_session.presented_timepoint())
+            .flatten()
+            .filter(|presented| *presented != previous_view.timepoint());
+        let effect = if let Some(presented) = presented_stop_cursor {
+            // The reducer owns a requested playback cursor so the successor
+            // can be planned before it is visible. Stop is instead defined at
+            // the session's coherently published cursor. Commit that cursor
+            // first; SetTimepoint also retires reducer playback state, making
+            // the following public Stop idempotent while preserving one
+            // composition-root reconciliation below.
+            let cursor_effect = self
+                .application
+                .dispatch(ApplicationCommand::SetTimepoint(presented))?;
+            let stop_effect = self.application.dispatch(command)?;
+            if cursor_effect == CommandEffect::Changed || stop_effect == CommandEffect::Changed {
+                CommandEffect::Changed
+            } else {
+                CommandEffect::NoChange
+            }
+        } else {
+            self.application.dispatch(command)?
+        };
         if effect == CommandEffect::Changed {
             if matches!(
                 command_kind,
@@ -2911,24 +2933,71 @@ impl MiranteWorkbenchApp {
                 self.render_coordination.record_durable_gesture_commit();
             }
             let after = self.application.snapshot();
-            if let Some(family) = render_intent_family_for_view_change(
+            let playback_active = after.transient().playback_active();
+            let render_intent_family = render_intent_family_for_view_change(
                 &previous_view,
                 application_view(&after),
-                previous_playback_active != after.transient().playback_active(),
-            ) {
-                // Durable render-affecting changes and raw gesture samples
-                // share one uniqueness sequence while each presentation
-                // family advances only for input that can change its pixels.
-                if allocate_render_revision
-                    && let Err(error) = self.render_intent_mailbox.observe_durable_intent(family)
-                {
-                    tracing::error!(%error, "render-intent revision could not advance");
+                playback_active,
+            );
+            if let Some(family) = render_intent_family {
+                // Establish the final semantic cutoff before either a
+                // playback-stop handoff captures it or a new playback
+                // session begins. In particular, committing the last
+                // coherently presented cursor on Stop advances both spatial
+                // family revisions. Capturing the handoff first would make
+                // that transaction stale within this same command and expose
+                // ordinary progressive refinement in place of its retained
+                // predecessor.
+                if allocate_render_revision {
+                    let revision = if temporal_playback_tick {
+                        self.render_intent_mailbox.observe_temporal_intent(
+                            RenderIntentBase::from_snapshot(&after),
+                            family,
+                        )
+                    } else {
+                        self.render_intent_mailbox.observe_durable_intent(family)
+                    };
+                    if let Err(error) = revision {
+                        tracing::error!(%error, "render-intent revision could not advance");
+                    }
                 }
-                self.egui_ui.cancel_viewport_drag();
+                if !temporal_playback_tick {
+                    self.egui_ui.cancel_viewport_drag();
+                }
             }
+            if playback_stopping {
+                self.presentation_scheduler.begin_playback_stop_handoff(
+                    &after,
+                    &self.playback_session,
+                    &self.render_intent_mailbox,
+                    &self.render_coordination,
+                );
+            }
+            if !playback_active {
+                self.playback_session.stop();
+            } else if !previous_playback_request.0
+                || previous_playback_request.1 != after.transient().playback_fps()
+                || playback_material_policy_changed(&previous_view, application_view(&after))
+            {
+                self.playback_session.begin_warmup(
+                    after.source_generation(),
+                    after.transient().playback_fps(),
+                    application_view(&after).layout(),
+                );
+            } else {
+                self.playback_session.ensure_warmup(
+                    after.source_generation(),
+                    after.transient().playback_fps(),
+                    application_view(&after).layout(),
+                );
+            }
+            if playback_active {
+                self.presentation_scheduler.cancel_retained_quality();
+            }
+            self.cancel_initial_auto_dense_if_view_diverged(&after);
             self.reconcile_application_change(
                 &previous_view,
-                previous_playback_active,
+                previous_playback_request,
                 &after,
                 ctx,
             );
@@ -2948,13 +3017,16 @@ impl MiranteWorkbenchApp {
     fn reconcile_application_change(
         &mut self,
         previous_view: &ViewState,
-        previous_playback_active: bool,
+        previous_playback_request: (bool, mirante4d_application::PlaybackFps),
         snapshot: &ApplicationSnapshot,
         ctx: &egui::Context,
     ) {
         let next_view = application_view(snapshot);
-        let playback_lod_changed =
-            previous_playback_active != snapshot.transient().playback_active();
+        let playback_lod_changed = previous_playback_request
+            != (
+                snapshot.transient().playback_active(),
+                snapshot.transient().playback_fps(),
+            );
         if previous_view == next_view && !playback_lod_changed {
             return;
         }
@@ -2963,11 +3035,8 @@ impl MiranteWorkbenchApp {
             layer_state::cross_section_render_changed(previous_view, next_view)
                 && (previous_view.layout() == CanonicalViewerLayout::FourPanel
                     || next_view.layout() == CanonicalViewerLayout::FourPanel);
-        if volume_render_changed || linked_runtime_changed || playback_lod_changed {
-            let required_group = match (
-                volume_render_changed || playback_lod_changed,
-                linked_runtime_changed,
-            ) {
+        if volume_render_changed || linked_runtime_changed {
+            let required_group = match (volume_render_changed, linked_runtime_changed) {
                 (true, true) => CoordinatedPresentationGroup::FullLayout,
                 (true, false) => CoordinatedPresentationGroup::ThreeD,
                 (false, true) => CoordinatedPresentationGroup::Linked2d,
@@ -2975,17 +3044,13 @@ impl MiranteWorkbenchApp {
             };
             self.begin_display_input_generation(required_group);
         }
-        if volume_render_changed || playback_lod_changed {
-            self.note_viewer_render_submission();
-        }
-
         if previous_view == next_view {
             self.request_visible_bricks();
             ctx.request_repaint();
             return;
         }
 
-        let source_selection_changed = match layer_state::reconcile_view_runtime(
+        let runtime_change = match layer_state::reconcile_view_runtime(
             previous_view,
             snapshot,
             &mut self.dataset,
@@ -2998,7 +3063,7 @@ impl MiranteWorkbenchApp {
                 self.dataset.record_plan_error(error.to_string());
                 self.render_coordination.frame_fidelity.completeness =
                     FrameCompleteness::Incomplete;
-                false
+                layer_state::ViewRuntimeChange::default()
             }
         };
         if previous_view.layout() != next_view.layout() {
@@ -3009,12 +3074,12 @@ impl MiranteWorkbenchApp {
                 self.clear_cross_section_product_presentations();
             }
         }
-        if source_selection_changed {
+        if runtime_change.playback_priority_changed {
             self.clear_3d_product_presentation();
         } else if linked_runtime_changed {
             self.invalidate_cross_section_panel_display_frames();
         }
-        if source_selection_changed {
+        if runtime_change.playback_priority_changed || runtime_change.timepoint_changed {
             self.request_visible_bricks();
         } else {
             if volume_render_changed {
@@ -3174,9 +3239,14 @@ impl MiranteWorkbenchApp {
                                 FrameCompleteness::Exact | FrameCompleteness::Complete
                             ),
                         !terminal_empty
-                            && displayed.is_some_and(|scale| scale > fidelity.target_scale_level),
+                            && matches!(
+                                (displayed, fidelity.target_scale_level),
+                                (Some(displayed), Some(target)) if displayed > target
+                            ),
                         display_current
-                            && (terminal_empty || displayed == Some(fidelity.target_scale_level))
+                            && (terminal_empty
+                                || (fidelity.target_scale_level.is_some()
+                                    && displayed == fidelity.target_scale_level))
                             && matches!(
                                 fidelity.completeness,
                                 FrameCompleteness::Exact | FrameCompleteness::Complete

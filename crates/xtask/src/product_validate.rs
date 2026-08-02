@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     os::unix::{ffi::OsStrExt, fs::MetadataExt, process::ExitStatusExt},
     path::{Path, PathBuf},
@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use mirante4d_import_pipeline::{TiffSource, deterministic_tiff_destination};
+use mirante4d_import_pipeline::{TiffChannelSourceKind, deterministic_tiff_destination};
 use mirante4d_storage::{LocalPackageCatalog, PACKAGE_VALIDATION_WORKING_BYTES};
 use serde_json::{Value, json};
 
@@ -30,8 +30,8 @@ use crate::{
 const PRODUCT_VALIDATION_SCHEMA: &str = "mirante4d-product-validation-report";
 pub(crate) const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 pub(crate) const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-pub(crate) const SCRIPT_SCHEMA_VERSION: u32 = 8;
-pub(crate) const REPORT_SCHEMA_VERSION: u32 = 8;
+pub(crate) const SCRIPT_SCHEMA_VERSION: u32 = 10;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 9;
 pub(crate) const IMPORT_OPEN_READY_COMPLETE_STATUS: &str = "open_ready_complete";
 pub(crate) const PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS: [&str; 12] = [
     "max_cpu_total_bytes",
@@ -61,7 +61,8 @@ const PREFLIGHT_ONLY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_PREFLIGHT_ONLY";
 const GENERATED_FIXTURE_SCENARIO: &str = "target_fixture_camera_smoke";
 const GENERATED_RENDER_MODES_SCENARIO: &str = "target_fixture_render_modes";
 const REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO: &str = "representative_native_navigation";
-const B3_SOURCE_VERIFICATION_SCENARIO: &str = "target_source_verification";
+const REPRESENTATIVE_TEMPORAL_PLAYBACK_SCENARIO: &str = "representative_temporal_playback";
+const B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO: &str = "target_package_integrity_audit";
 const IMPORT_PREPROCESSING_SCENARIO: &str = "import_preprocessing";
 const B4_PROJECT_PERSISTENCE_SCENARIO: &str = "b4_project_persistence";
 const PRE_ALPHA_RELIABILITY_SCENARIO: &str = "pre_alpha_reliability";
@@ -91,10 +92,15 @@ const B3_SECOND_VIEWPORT_HEIGHT: u32 = 1080;
 const B3_PRIMARY_E1_CAPTURE: &str = "b3-after-success-1280x720";
 const B3_SECONDARY_E1_CAPTURE: &str = "b3-after-success-1920x1080";
 const IMPORT_FIXTURE_Z: u32 = 65;
-const IMPORT_FIXTURE_Y: u32 = 1_025;
-const IMPORT_FIXTURE_X: u32 = 1_537;
+const IMPORT_FIXTURE_Y: u32 = 12_737;
+const IMPORT_FIXTURE_X: u32 = 65;
 const IMPORT_DURABLE_PREFIX_WORK_UNITS: u64 = 512;
-const IMPORT_WORKING_MEMORY_BYTES: u64 = 256 * MIB;
+const IMPORT_CPU_TOTAL_LIMIT_BYTES: u64 = 1_024 * MIB;
+// The broker accounts its non-stealable complete-progress reservation as
+// ImportWorkingSet even while most of the reservation is unused. Keep that
+// authority separate from the actual importer peak asserted in the receipt.
+const IMPORT_PROGRESS_RESERVATION_LIMIT_BYTES: u64 = 768 * MIB;
+const IMPORT_PEAK_WORKING_BYTES_LIMIT: u64 = 512 * MIB;
 const IMPORT_RESIDENT_RESOURCE_LIMIT: u64 = 1_024;
 const IMPORT_VIEWPORT_WIDTH: u32 = 1_280;
 const IMPORT_VIEWPORT_HEIGHT: u32 = 720;
@@ -340,6 +346,7 @@ fn product_validate_report_inner(
     let wrapper_report_path = output_dir.join("product-validation-report.json");
     let stdout_path = output_dir.join("mirante4d-app.stdout.log");
     let stderr_path = output_dir.join("mirante4d-app.stderr.log");
+    let runtime_log_path = output_dir.join("mirante4d-app.runtime.log");
     if automation_report_path.exists() {
         fs::remove_file(&automation_report_path).with_context(|| {
             format!(
@@ -373,6 +380,7 @@ fn product_validate_report_inner(
             automation_report_value: None,
             stdout: &stdout_path,
             stderr: &stderr_path,
+            runtime_log: &runtime_log_path,
             display: DisplayClassification {
                 class: DisplayClass::Unsupported,
                 source: PREFLIGHT_ONLY_DISPLAY_SOURCE,
@@ -411,6 +419,7 @@ fn product_validate_report_inner(
             automation_report_value: None,
             stdout: &stdout_path,
             stderr: &stderr_path,
+            runtime_log: &runtime_log_path,
             display,
             preflight_only,
             source_closure_evidence: pending_source_closure_evidence.clone(),
@@ -443,6 +452,7 @@ fn product_validate_report_inner(
             automation_report_value: None,
             stdout: &stdout_path,
             stderr: &stderr_path,
+            runtime_log: &runtime_log_path,
             display,
             preflight_only,
             source_closure_evidence: pending_source_closure_evidence.clone(),
@@ -454,6 +464,8 @@ fn product_validate_report_inner(
     }
 
     binary.validate_for_launch()?;
+    fs::File::create(&runtime_log_path)
+        .with_context(|| format!("failed to create {}", runtime_log_path.display()))?;
     let timeout = Duration::from_secs(timeout_seconds);
     let progress_root = fs::canonicalize(&output_dir)
         .context("product validation output directory is unavailable for progress monitoring")?;
@@ -464,6 +476,7 @@ fn product_validate_report_inner(
         automation_report: &automation_report_path,
         stdout_path: &stdout_path,
         stderr_path: &stderr_path,
+        runtime_log_path: &runtime_log_path,
         timeout,
         scenario: scenario.name(),
         progress_plan: ProductAutomationProgressPlan::from_script(&script)?,
@@ -499,6 +512,7 @@ fn product_validate_report_inner(
             automation_report_value: None,
             stdout: &stdout_path,
             stderr: &stderr_path,
+            runtime_log: &runtime_log_path,
             display,
             preflight_only,
             source_closure_evidence: source_closure_evidence.clone(),
@@ -532,6 +546,7 @@ fn product_validate_report_inner(
             automation_report_value: None,
             stdout: &stdout_path,
             stderr: &stderr_path,
+            runtime_log: &runtime_log_path,
             display,
             preflight_only,
             source_closure_evidence: source_closure_evidence.clone(),
@@ -563,7 +578,7 @@ fn product_validate_report_inner(
         &script_path,
     );
     if validation_status == ProductValidationStatus::Passed
-        && matches!(scenario, ProductValidationScenario::B3SourceVerification)
+        && matches!(scenario, ProductValidationScenario::B3PackageIntegrityAudit)
         && let Err(reason) = b3_exact_e1_capture_evidence(automation_report.as_ref())
     {
         validation_status = ProductValidationStatus::Failed;
@@ -572,6 +587,26 @@ fn product_validate_report_inner(
     if validation_status == ProductValidationStatus::Passed
         && matches!(scenario, ProductValidationScenario::ImportPreprocessing)
         && let Err(reason) = import_preprocessing_evidence(automation_report.as_ref())
+    {
+        validation_status = ProductValidationStatus::Failed;
+        failure_reason = Some(reason);
+    }
+    if validation_status == ProductValidationStatus::Passed
+        && matches!(
+            scenario,
+            ProductValidationScenario::RepresentativeTemporalPlayback
+        )
+        && let Err(reason) = representative_temporal_playback_evidence(automation_report.as_ref())
+    {
+        validation_status = ProductValidationStatus::Failed;
+        failure_reason = Some(reason);
+    }
+    if validation_status == ProductValidationStatus::Passed
+        && matches!(
+            scenario,
+            ProductValidationScenario::RepresentativeTemporalPlayback
+        )
+        && let Err(reason) = representative_temporal_playback_log_evidence(&runtime_log_path)
     {
         validation_status = ProductValidationStatus::Failed;
         failure_reason = Some(reason);
@@ -599,6 +634,7 @@ fn product_validate_report_inner(
         automation_report_value: automation_report.as_ref(),
         stdout: &stdout_path,
         stderr: &stderr_path,
+        runtime_log: &runtime_log_path,
         display,
         preflight_only,
         source_closure_evidence,
@@ -618,7 +654,8 @@ enum ProductValidationScenario {
     GeneratedFixtureCameraSmoke,
     GeneratedFixtureRenderModes,
     RepresentativeNativeNavigation,
-    B3SourceVerification,
+    RepresentativeTemporalPlayback,
+    B3PackageIntegrityAudit,
     ImportPreprocessing,
     B4ProjectPersistence,
     PreAlphaReliability,
@@ -630,7 +667,8 @@ impl ProductValidationScenario {
             Self::GeneratedFixtureCameraSmoke => GENERATED_FIXTURE_SCENARIO,
             Self::GeneratedFixtureRenderModes => GENERATED_RENDER_MODES_SCENARIO,
             Self::RepresentativeNativeNavigation => REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO,
-            Self::B3SourceVerification => B3_SOURCE_VERIFICATION_SCENARIO,
+            Self::RepresentativeTemporalPlayback => REPRESENTATIVE_TEMPORAL_PLAYBACK_SCENARIO,
+            Self::B3PackageIntegrityAudit => B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO,
             Self::ImportPreprocessing => IMPORT_PREPROCESSING_SCENARIO,
             Self::B4ProjectPersistence => B4_PROJECT_PERSISTENCE_SCENARIO,
             Self::PreAlphaReliability => PRE_ALPHA_RELIABILITY_SCENARIO,
@@ -643,7 +681,8 @@ impl ProductValidationScenario {
             GENERATED_FIXTURE_SCENARIO => Ok(Self::GeneratedFixtureCameraSmoke),
             GENERATED_RENDER_MODES_SCENARIO => Ok(Self::GeneratedFixtureRenderModes),
             REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO => Ok(Self::RepresentativeNativeNavigation),
-            B3_SOURCE_VERIFICATION_SCENARIO => Ok(Self::B3SourceVerification),
+            REPRESENTATIVE_TEMPORAL_PLAYBACK_SCENARIO => Ok(Self::RepresentativeTemporalPlayback),
+            B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO => Ok(Self::B3PackageIntegrityAudit),
             IMPORT_PREPROCESSING_SCENARIO => Ok(Self::ImportPreprocessing),
             B4_PROJECT_PERSISTENCE_SCENARIO => Ok(Self::B4ProjectPersistence),
             PRE_ALPHA_RELIABILITY_SCENARIO => Ok(Self::PreAlphaReliability),
@@ -651,7 +690,8 @@ impl ProductValidationScenario {
                 "unknown product validation scenario {other:?}; expected \
                  {GENERATED_FIXTURE_SCENARIO}, {GENERATED_RENDER_MODES_SCENARIO}, \
                  {REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO}, \
-                 {B3_SOURCE_VERIFICATION_SCENARIO}, {IMPORT_PREPROCESSING_SCENARIO}, or \
+                 {REPRESENTATIVE_TEMPORAL_PLAYBACK_SCENARIO}, \
+                 {B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO}, {IMPORT_PREPROCESSING_SCENARIO}, or \
                  {B4_PROJECT_PERSISTENCE_SCENARIO}, or {PRE_ALPHA_RELIABILITY_SCENARIO}"
             ),
         }
@@ -663,7 +703,8 @@ impl ProductValidationScenario {
             GENERATED_FIXTURE_SCENARIO
                 | GENERATED_RENDER_MODES_SCENARIO
                 | REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO
-                | B3_SOURCE_VERIFICATION_SCENARIO
+                | REPRESENTATIVE_TEMPORAL_PLAYBACK_SCENARIO
+                | B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO
                 | IMPORT_PREPROCESSING_SCENARIO
                 | B4_PROJECT_PERSISTENCE_SCENARIO
                 | PRE_ALPHA_RELIABILITY_SCENARIO
@@ -674,7 +715,8 @@ impl ProductValidationScenario {
         match self {
             Self::GeneratedFixtureCameraSmoke | Self::GeneratedFixtureRenderModes => 60,
             Self::RepresentativeNativeNavigation => B3_SCENARIO_TIMEOUT_SECS,
-            Self::B3SourceVerification => B3_SCENARIO_TIMEOUT_SECS,
+            Self::RepresentativeTemporalPlayback => B3_SCENARIO_TIMEOUT_SECS,
+            Self::B3PackageIntegrityAudit => B3_SCENARIO_TIMEOUT_SECS,
             Self::ImportPreprocessing => IMPORT_SCENARIO_TIMEOUT_SECS,
             Self::B4ProjectPersistence => B4_PHASE_TIMEOUT_SECS * 3,
             Self::PreAlphaReliability => B4_PHASE_TIMEOUT_SECS * 3,
@@ -1717,9 +1759,9 @@ fn import_preprocessing_evidence(automation_report: Option<&Value>) -> Result<Va
         "planning-and-preflight",
         "source-revalidation",
         "checkpoint-open-or-resume",
+        "source-ingest",
         "base-production",
         "pyramid-production",
-        "source-scientific-identity",
         "shard-publication",
         "staged-structure-validation",
         "staged-exact-validation",
@@ -1774,7 +1816,7 @@ fn import_preprocessing_evidence(automation_report: Option<&Value>) -> Result<Va
         || failed_runs != 0
         || published_events < successful_runs
         || resumed_work_units < IMPORT_DURABLE_PREFIX_WORK_UNITS
-        || peak_working_bytes > IMPORT_WORKING_MEMORY_BYTES
+        || peak_working_bytes > IMPORT_PEAK_WORKING_BYTES_LIMIT
         || elapsed_ms == 0
         || projected_elapsed_ms == 0
     {
@@ -1789,7 +1831,10 @@ fn import_preprocessing_evidence(automation_report: Option<&Value>) -> Result<Va
             events.iter().any(|event| {
                 event.get("command").and_then(Value::as_str) == Some("wait_for_imported_open_ready")
                     && event.get("status").and_then(Value::as_str) == Some("passed")
-                    && event.pointer("/details/verified").and_then(Value::as_bool) == Some(true)
+                    && event
+                        .pointer("/details/content_id_computed_during_import")
+                        .and_then(Value::as_bool)
+                        == Some(true)
                     && event
                         .pointer("/details/normal_product_open_path")
                         .and_then(Value::as_bool)
@@ -1798,7 +1843,7 @@ fn import_preprocessing_evidence(automation_report: Option<&Value>) -> Result<Va
         });
     if !open_ready {
         return Err(
-            "import scenario did not prove verified publication through the normal open path"
+            "import scenario did not prove admitted publication through the normal open path"
                 .to_owned(),
         );
     }
@@ -1809,21 +1854,24 @@ fn import_preprocessing_evidence(automation_report: Option<&Value>) -> Result<Va
         })?;
     if transfer.get("status").and_then(Value::as_str) != Some(IMPORT_OPEN_READY_COMPLETE_STATUS)
         || transfer.get("transfer_mode").and_then(Value::as_str)
-            != Some("staged_verified_capability")
+            != Some("staged_self_consistent_capability")
         || transfer
             .get("included_in_primary_clock")
             .and_then(Value::as_bool)
             != Some(true)
     {
-        return Err("import scenario did not prove the verified capability transfer".to_owned());
+        return Err(
+            "import scenario did not prove the self-consistent publication capability transfer"
+                .to_owned(),
+        );
     }
     validate_publication_currentness_execution(transfer)?;
     for field in [
-        "source_verification_started_runs",
-        "source_verification_progress_updates",
-        "source_verification_cancelled_runs",
-        "source_verification_failed_runs",
-        "source_verification_successes",
+        "package_integrity_audit_started_runs",
+        "package_integrity_audit_progress_updates",
+        "package_integrity_audit_cancelled_runs",
+        "package_integrity_audit_failed_runs",
+        "package_integrity_audit_completed_runs",
     ] {
         if transfer.get(field).and_then(Value::as_u64) != Some(0) {
             return Err(format!(
@@ -1918,12 +1966,19 @@ fn product_validation_package_and_script(
             let script = representative_native_navigation_script(&package);
             Ok((package, script, None))
         }
-        ProductValidationScenario::B3SourceVerification => {
+        ProductValidationScenario::RepresentativeTemporalPlayback => {
+            let package = package
+                .context("representative_temporal_playback requires an explicit target package")?
+                .to_path_buf();
+            let script = representative_temporal_playback_script(&package);
+            Ok((package, script, None))
+        }
+        ProductValidationScenario::B3PackageIntegrityAudit => {
             let package = match package {
                 Some(package) => package.to_path_buf(),
                 None => default_target_fixture()?,
             };
-            let script = target_source_verification_script(&package);
+            let script = target_package_integrity_audit_script(&package);
             Ok((package.clone(), script, Some(package)))
         }
         ProductValidationScenario::ImportPreprocessing => {
@@ -1934,11 +1989,12 @@ fn product_validation_package_and_script(
             let fixture = prepare_import_product_fixture(scenario)?;
             let script = import_preprocessing_script(
                 &package,
-                &fixture.source,
+                &fixture.channel_source,
+                fixture.source_kind,
                 &fixture.output_parent,
                 &fixture.destination,
             );
-            Ok((package, script, Some(fixture.source)))
+            Ok((package, script, Some(fixture.source_root)))
         }
         ProductValidationScenario::B4ProjectPersistence => {
             let package = match package {
@@ -1963,7 +2019,9 @@ fn product_validation_package_and_script(
 }
 
 struct ImportProductFixture {
-    source: PathBuf,
+    source_root: PathBuf,
+    channel_source: PathBuf,
+    source_kind: TiffChannelSourceKind,
     output_parent: PathBuf,
     destination: PathBuf,
 }
@@ -1972,7 +2030,16 @@ fn prepare_import_product_fixture(
     scenario: &ProductValidationScenario,
 ) -> anyhow::Result<ImportProductFixture> {
     let root = product_validation_output_dir(scenario).join("public-import-fixture");
-    match fs::symlink_metadata(&root) {
+    prepare_import_product_fixture_at(&root, IMPORT_FIXTURE_Z, IMPORT_FIXTURE_Y, IMPORT_FIXTURE_X)
+}
+
+fn prepare_import_product_fixture_at(
+    root: &Path,
+    z: u32,
+    y: u32,
+    x: u32,
+) -> anyhow::Result<ImportProductFixture> {
+    match fs::symlink_metadata(root) {
         Ok(metadata) => {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 bail!(
@@ -1980,7 +2047,7 @@ fn prepare_import_product_fixture(
                     root.display()
                 );
             }
-            fs::remove_dir_all(&root)
+            fs::remove_dir_all(root)
                 .with_context(|| format!("failed to reset owned fixture {}", root.display()))?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1989,20 +2056,24 @@ fn prepare_import_product_fixture(
                 .with_context(|| format!("failed to inspect owned fixture {}", root.display()));
         }
     }
-    fs::create_dir(&root).with_context(|| format!("failed to create {}", root.display()))?;
-    let source = root.join("public-full-strip-source");
-    crate::import_performance::generate_t2_source(
-        &source,
-        IMPORT_FIXTURE_Z,
-        IMPORT_FIXTURE_Y,
-        IMPORT_FIXTURE_X,
-    )?;
+    fs::create_dir(root).with_context(|| format!("failed to create {}", root.display()))?;
+    let source_root = root.join("public-full-strip-source");
+    crate::import_performance::generate_t2_source(&source_root, z, y, x)?;
+    let source_manifest = crate::import_performance::t2_source_manifest(&source_root)?;
+    let channels = source_manifest.channels();
+    if channels.len() != 1 {
+        bail!("generated import product fixture must contain exactly one explicit channel");
+    }
+    let channel_source = channels[0].path().to_path_buf();
+    let source_kind = channels[0].kind();
     let output_parent = root.join("output");
     fs::create_dir(&output_parent)
         .with_context(|| format!("failed to create {}", output_parent.display()))?;
-    let destination = deterministic_tiff_destination(&TiffSource::auto(&source), &output_parent);
+    let destination = deterministic_tiff_destination(&source_manifest, &output_parent);
     Ok(ImportProductFixture {
-        source,
+        source_root,
+        channel_source,
+        source_kind,
         output_parent,
         destination,
     })
@@ -2029,6 +2100,16 @@ fn dataset_runtime_hard_safety_limits(
         "max_runtime_pending_completions": 1_024,
         "max_runtime_resident_resources": max_resident_resources,
     })
+}
+
+fn temporal_playback_hard_safety_limits() -> Value {
+    let mut limits = dataset_runtime_hard_safety_limits(4_096 * MIB, 16_384);
+    // A one-second 24 FPS runway is intentionally charged as prefetch. Its
+    // valid bounded footprint is larger than the generic five-percent
+    // diagnostic threshold, while the aggregate four-GiB ceiling and the
+    // runtime's own policy remain unchanged.
+    limits["max_cpu_prefetch_bytes"] = json!(512 * MIB);
+    limits
 }
 
 fn default_target_fixture() -> anyhow::Result<PathBuf> {
@@ -2163,6 +2244,174 @@ fn representative_native_navigation_script(package: &Path) -> Value {
         .as_array_mut()
         .expect("the representative script has commands")
         .extend(iso_and_tail);
+    script
+}
+
+fn representative_temporal_playback_script(package: &Path) -> Value {
+    let mut script = json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": REPRESENTATIVE_TEMPORAL_PLAYBACK_SCENARIO,
+        "gpu_timing": false,
+        "hard_safety_limits": temporal_playback_hard_safety_limits(),
+        "commands": [
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
+            { "command": "set_mapped_client_pixels", "width": 960, "height": 640 },
+            { "command": "set_render_mode", "mode": "mip" },
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "voxel_exact" },
+            { "command": "camera_fit_data" },
+            { "command": "wait_for", "condition": "initial_auto_dense_applied", "timeout_ms": 60000 },
+            { "command": "wait_for_presented_time_index", "time_index": 0, "timeout_ms": 60000 },
+            { "command": "capture_temporal_frame", "target": "three_d", "name": "temporal-t0", "min_different_pixels_from_previous": null },
+
+            { "command": "set_time_index", "time_index": 1 },
+            { "command": "wait_for_presented_time_index", "time_index": 1, "timeout_ms": 60000 },
+            { "command": "capture_temporal_frame", "target": "three_d", "name": "temporal-t1", "min_different_pixels_from_previous": 1 },
+            { "command": "assert", "condition": "no_render_error" },
+
+            { "command": "set_time_index", "time_index": 0 },
+            { "command": "wait_for_presented_time_index", "time_index": 0, "timeout_ms": 60000 },
+            { "command": "set_viewer_layout", "layout": "four_panel" },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+            { "command": "assert", "condition": { "viewer_layout": { "layout": "four_panel" } } },
+
+            { "command": "set_playback_fps", "fps": 24 },
+            { "command": "set_playback_active", "active": true },
+            { "command": "wait_for_temporal_transitions", "minimum_transitions": 3, "timeout_ms": 60000 },
+            { "command": "camera_orbit_sequence", "samples": 96, "duration_ms": 2000, "yaw_points_per_sample": 0.5, "pitch_points_per_sample": 0.125 },
+            { "command": "assert", "condition": { "playback_advanced_during_previous_input": { "minimum_transitions": 3 } } },
+            { "command": "set_playback_active", "active": false },
+            { "command": "wait_for", "condition": "playback_residency_released", "timeout_ms": 60000 },
+            { "command": "assert", "condition": "playback_stopped_and_released" },
+            { "command": "assert", "condition": "temporal_continuity" },
+
+            { "command": "set_playback_fps", "fps": 12 },
+            { "command": "set_playback_active", "active": true },
+            { "command": "wait_for_temporal_transitions", "minimum_transitions": 3, "timeout_ms": 60000 },
+            { "command": "camera_zoom_sequence", "samples": 96, "duration_ms": 2000, "scroll_y_points_per_sample": -0.25 },
+            { "command": "assert", "condition": { "playback_advanced_during_previous_input": { "minimum_transitions": 3 } } },
+            { "command": "set_playback_active", "active": false },
+            { "command": "wait_for", "condition": "playback_residency_released", "timeout_ms": 60000 },
+            { "command": "assert", "condition": "playback_stopped_and_released" },
+            { "command": "assert", "condition": "temporal_continuity" },
+
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "xy" } } },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "xz" } } },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "yz" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "copy_diagnostics" },
+            { "command": "quit" }
+        ]
+    });
+    {
+        let commands = script["commands"]
+            .as_array_mut()
+            .expect("the temporal playback script has commands");
+        let input_indices = commands
+            .iter()
+            .enumerate()
+            .filter(|(_, command)| {
+                matches!(
+                    command["command"].as_str(),
+                    Some("camera_orbit_sequence" | "camera_zoom_sequence")
+                )
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for index in input_indices.into_iter().rev() {
+            commands.insert(
+                index,
+                json!({ "command": "observe_playback_cadence", "duration_ms": 2000 }),
+            );
+        }
+        let release_indices = commands
+            .iter()
+            .enumerate()
+            .filter(|(_, command)| {
+                command["command"] == "wait_for"
+                    && command["condition"] == "playback_residency_released"
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for index in release_indices.into_iter().rev() {
+            commands.insert(
+                index + 1,
+                json!({ "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 }),
+            );
+        }
+    }
+    let standalone_input = json!([
+        { "command": "set_playback_fps", "fps": 24 },
+        { "command": "set_playback_active", "active": true },
+        { "command": "wait_for_temporal_transitions", "minimum_transitions": 3, "timeout_ms": 60000 },
+        { "command": "observe_playback_cadence", "duration_ms": 2000 },
+        { "command": "camera_orbit_sequence", "samples": 96, "duration_ms": 2000, "yaw_points_per_sample": 0.5, "pitch_points_per_sample": 0.125 },
+        { "command": "assert", "condition": { "playback_advanced_during_previous_input": { "minimum_transitions": 3 } } },
+        { "command": "observe_playback_cadence", "duration_ms": 2000 },
+        { "command": "camera_zoom_sequence", "samples": 96, "duration_ms": 2000, "scroll_y_points_per_sample": -0.25 },
+        { "command": "assert", "condition": { "playback_advanced_during_previous_input": { "minimum_transitions": 3 } } },
+        { "command": "set_playback_active", "active": false },
+        { "command": "wait_for", "condition": "playback_residency_released", "timeout_ms": 60000 },
+        { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 60000 },
+        { "command": "assert", "condition": "playback_stopped_and_released" },
+        { "command": "assert", "condition": "temporal_continuity" },
+    ]);
+    let commands = script["commands"]
+        .as_array_mut()
+        .expect("the temporal playback script has commands");
+    let four_panel_start = commands
+        .iter()
+        .position(|command| {
+            command["command"] == "set_viewer_layout" && command["layout"] == "four_panel"
+        })
+        .expect("the temporal script has a four-panel phase");
+    commands.splice(
+        four_panel_start..four_panel_start,
+        standalone_input
+            .as_array()
+            .expect("standalone temporal input is an array")
+            .iter()
+            .cloned(),
+    );
+    let linked_input = json!([
+        { "command": "observe_playback_cadence", "duration_ms": 2000 },
+        { "command": "cross_section_pan_sequence", "panel": "xy", "samples": 96, "duration_ms": 2000, "x_points_per_sample": 0.25, "y_points_per_sample": -0.125 },
+        { "command": "assert", "condition": { "playback_advanced_during_previous_input": { "minimum_transitions": 3 } } },
+        { "command": "observe_playback_cadence", "duration_ms": 2000 },
+        { "command": "cross_section_zoom_sequence", "panel": "xy", "samples": 96, "duration_ms": 2000, "x_fraction": 0.5, "y_fraction": 0.5, "factor_per_sample": 0.999 },
+        { "command": "assert", "condition": { "playback_advanced_during_previous_input": { "minimum_transitions": 3 } } },
+        { "command": "observe_playback_cadence", "duration_ms": 2000 },
+        { "command": "cross_section_rotate_sequence", "panel": "xy", "samples": 96, "duration_ms": 2000, "x_points_per_sample": 0.25, "y_points_per_sample": 0.125, "radians_per_point": 0.005 },
+        { "command": "assert", "condition": { "playback_advanced_during_previous_input": { "minimum_transitions": 3 } } },
+    ]);
+    let commands = script["commands"]
+        .as_array_mut()
+        .expect("the temporal playback script has commands");
+    let four_panel_start = commands
+        .iter()
+        .position(|command| {
+            command["command"] == "set_viewer_layout" && command["layout"] == "four_panel"
+        })
+        .expect("the temporal script has a four-panel phase");
+    let first_stop = commands
+        .iter()
+        .enumerate()
+        .skip(four_panel_start + 1)
+        .find(|(_, command)| {
+            command["command"] == "set_playback_active" && command["active"] == false
+        })
+        .map(|(index, _)| index)
+        .expect("the four-panel 24 FPS playback phase has a stop boundary");
+    commands.splice(
+        first_stop..first_stop,
+        linked_input
+            .as_array()
+            .expect("linked temporal input is an array")
+            .iter()
+            .cloned(),
+    );
     script
 }
 
@@ -2361,42 +2610,42 @@ fn target_fixture_render_modes_script(package: &Path) -> Value {
     script
 }
 
-fn target_source_verification_script(package: &Path) -> Value {
+fn target_package_integrity_audit_script(package: &Path) -> Value {
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": SCRIPT_SCHEMA_VERSION,
-        "scenario": B3_SOURCE_VERIFICATION_SCENARIO,
+        "scenario": B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO,
         "hard_safety_limits": dataset_runtime_hard_safety_limits(128 * MIB, 128),
         "commands": [
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
             { "command": "set_viewport_size", "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT },
             { "command": "set_render_target_size", "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT },
-            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
+            { "command": "wait_for", "condition": "package_integrity_audit_not_run", "timeout_ms": 30000 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
             { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": { "render_target_pixels": { "width": B3_VIEWPORT_WIDTH, "height": B3_VIEWPORT_HEIGHT } } },
             { "command": "capture_screenshot", "target": "three_d", "name": "b3-before-cancel-1280x720" },
-            { "command": "cancel_source_verification" },
-            { "command": "wait_for", "condition": "source_verification_required", "timeout_ms": 30000 },
+            { "command": "cancel_package_integrity_audit" },
+            { "command": "wait_for", "condition": "package_integrity_audit_inactive", "timeout_ms": 30000 },
             { "command": "assert", "condition": {
-                "source_verification_evidence": {
-                    "min_accepted_progress_updates": 0,
+                "package_integrity_audit_evidence": {
+                    "min_progress_updates": 0,
                     "min_cancelled_runs": 1,
-                    "min_accepted_successes": 0
+                    "min_completed_runs": 0
                 }
             } },
-            // Source invalidation deliberately retires verified presentation
-            // leases. Do not wait for or capture a frame until verification
-            // has re-established the runtime authority below.
-            { "command": "request_source_verification" },
-            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
+            // The optional audit never revokes source or presentation
+            // authority. The same complete frame must remain available across
+            // cancellation and the subsequent explicit audit.
+            { "command": "request_package_integrity_audit" },
+            { "command": "wait_for", "condition": "package_integrity_audit_self_consistent", "timeout_ms": 30000 },
             { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30000 },
             { "command": "assert", "condition": {
-                "source_verification_evidence": {
-                    "min_accepted_progress_updates": 1,
+                "package_integrity_audit_evidence": {
+                    "min_progress_updates": 1,
                     "min_cancelled_runs": 1,
-                    "min_accepted_successes": 1
+                    "min_completed_runs": 1
                 }
             } },
             { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
@@ -2418,15 +2667,24 @@ fn target_source_verification_script(package: &Path) -> Value {
 fn import_preprocessing_script(
     startup_package: &Path,
     source: &Path,
+    source_kind: TiffChannelSourceKind,
     output_parent: &Path,
     destination: &Path,
 ) -> Value {
-    // The promoted fixture has 850 base-production work units. Keep the
+    // The bounded 65x12737x65 fixture has 800 base-production work units. Keep the
     // resident-record ceiling structural and finite while allowing its exact
     // s0 cohort to settle; byte residency remains independently capped below.
-    let mut hard_safety_limits =
-        dataset_runtime_hard_safety_limits(512 * MIB, IMPORT_RESIDENT_RESOURCE_LIMIT);
-    hard_safety_limits["max_cpu_import_working_set_bytes"] = json!(IMPORT_WORKING_MEMORY_BYTES);
+    let mut hard_safety_limits = dataset_runtime_hard_safety_limits(
+        IMPORT_CPU_TOTAL_LIMIT_BYTES,
+        IMPORT_RESIDENT_RESOURCE_LIMIT,
+    );
+    hard_safety_limits["max_cpu_import_working_set_bytes"] =
+        json!(IMPORT_PROGRESS_RESERVATION_LIMIT_BYTES);
+    let source_kind = match source_kind {
+        TiffChannelSourceKind::Single3dTiff => "single_3d_tiff",
+        TiffChannelSourceKind::FolderOf3dTiffs => "folder_of_3d_tiffs",
+        TiffChannelSourceKind::FolderOf2dTiffs => "folder_of_2d_tiffs",
+    };
     json!({
         "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
         "schema_version": SCRIPT_SCHEMA_VERSION,
@@ -2437,36 +2695,35 @@ fn import_preprocessing_script(
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5_000 },
             { "command": "set_mapped_client_pixels", "width": IMPORT_VIEWPORT_WIDTH, "height": IMPORT_VIEWPORT_HEIGHT },
             { "command": "set_render_target_size", "width": IMPORT_VIEWPORT_WIDTH, "height": IMPORT_VIEWPORT_HEIGHT },
-            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30_000 },
             { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 30_000 },
-            { "command": "begin_tiff_import_setup", "source": source, "output_parent": output_parent },
+            { "command": "begin_tiff_import_setup", "source": source, "output_parent": output_parent, "source_kind": source_kind },
             { "command": "wait_for", "condition": "import_review_ready", "timeout_ms": 30_000 },
-            { "command": "start_reviewed_import", "spacing_zyx_um": [0.4, 0.2, 0.1], "time_step_seconds": null, "no_data_sentinel": 255, "working_memory_bytes": IMPORT_WORKING_MEMORY_BYTES },
+            { "command": "start_reviewed_import", "spacing_zyx_um": [0.4, 0.2, 0.1], "time_step_seconds": null, "no_data_value_rule": { "kind": "manual_uint8", "value": 255 }, "hide_constant_z_planes": false },
             { "command": "wait_for_import_progress", "stage": "base-production", "minimum_completed_work_units": IMPORT_DURABLE_PREFIX_WORK_UNITS, "timeout_ms": 120_000 },
             { "command": "cancel_import" },
             { "command": "wait_for", "condition": "import_idle", "timeout_ms": 30_000 },
             { "command": "assert", "condition": { "import_workflow_evidence": {
-                "required_stage_names": ["planning-and-preflight", "source-revalidation", "checkpoint-open-or-resume", "base-production"],
+                "required_stage_names": ["planning-and-preflight", "source-revalidation", "checkpoint-open-or-resume", "source-ingest", "base-production"],
                 "min_projected_named_stages": 1,
                 "min_cancelled_runs": 1,
                 "min_successful_runs": 0,
                 "min_resumed_work_units": 0,
                 "min_elapsed_ms": 1,
                 "min_projected_elapsed_ms": 1,
-                "max_peak_working_bytes": IMPORT_WORKING_MEMORY_BYTES
+                "max_peak_working_bytes": IMPORT_PEAK_WORKING_BYTES_LIMIT
             } } },
-            { "command": "begin_tiff_import_setup", "source": source, "output_parent": output_parent },
+            { "command": "begin_tiff_import_setup", "source": source, "output_parent": output_parent, "source_kind": source_kind },
             { "command": "wait_for", "condition": "import_review_ready", "timeout_ms": 30_000 },
-            { "command": "start_reviewed_import", "spacing_zyx_um": [0.4, 0.2, 0.1], "time_step_seconds": null, "no_data_sentinel": 255, "working_memory_bytes": IMPORT_WORKING_MEMORY_BYTES },
+            { "command": "start_reviewed_import", "spacing_zyx_um": [0.4, 0.2, 0.1], "time_step_seconds": null, "no_data_value_rule": { "kind": "manual_uint8", "value": 255 }, "hide_constant_z_planes": false },
             { "command": "wait_for_imported_open_ready", "path": destination, "timeout_ms": 180_000 },
             { "command": "assert", "condition": { "import_workflow_evidence": {
                 "required_stage_names": [
                     "planning-and-preflight",
                     "source-revalidation",
                     "checkpoint-open-or-resume",
+                    "source-ingest",
                     "base-production",
                     "pyramid-production",
-                    "source-scientific-identity",
                     "shard-publication",
                     "staged-structure-validation",
                     "staged-exact-validation",
@@ -2479,7 +2736,7 @@ fn import_preprocessing_script(
                 "min_resumed_work_units": IMPORT_DURABLE_PREFIX_WORK_UNITS,
                 "min_elapsed_ms": 1,
                 "min_projected_elapsed_ms": 1,
-                "max_peak_working_bytes": IMPORT_WORKING_MEMORY_BYTES
+                "max_peak_working_bytes": IMPORT_PEAK_WORKING_BYTES_LIMIT
             } } },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 60_000 },
             { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 60_000 },
@@ -2505,7 +2762,6 @@ fn pre_alpha_provisional_launch_script(package: &Path, checkpoint: &Path) -> Val
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5_000 },
             { "command": "set_mapped_client_pixels", "width": B4_PRIMARY_CLIENT_WIDTH, "height": B4_PRIMARY_CLIENT_HEIGHT },
-            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30_000 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30_000 },
             { "command": "new_project" },
             { "command": "camera_pan", "x_points": 8.0, "y_points": -4.0 },
@@ -2537,7 +2793,6 @@ fn pre_alpha_recovery_launch_script(package: &Path) -> Value {
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5_000 },
             { "command": "set_mapped_client_pixels", "width": B4_PRIMARY_CLIENT_WIDTH, "height": B4_PRIMARY_CLIENT_HEIGHT },
-            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30_000 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30_000 },
             { "command": "wait_for", "condition": "unsaved_autosave_recovery_exposed", "timeout_ms": 30_000 },
             { "command": "recover_exposed_unsaved_autosave" },
@@ -2572,7 +2827,6 @@ fn pre_alpha_native_close_launch_script(package: &Path, checkpoint: &Path) -> Va
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5_000 },
             { "command": "set_mapped_client_pixels", "width": B4_PRIMARY_CLIENT_WIDTH, "height": B4_PRIMARY_CLIENT_HEIGHT },
-            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30_000 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30_000 },
             { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "assert", "condition": "no_render_error" },
@@ -2592,7 +2846,6 @@ fn b4_launch_one_script(package: &Path, project: &Path, checkpoint: &Path) -> Va
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
             { "command": "set_mapped_client_pixels", "width": B4_PRIMARY_CLIENT_WIDTH, "height": B4_PRIMARY_CLIENT_HEIGHT },
-            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
             { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
             { "command": "new_project" },
@@ -2635,7 +2888,6 @@ fn b4_launch_two_script(package: &Path, original: &Path, save_as: &Path) -> Valu
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
             { "command": "set_mapped_client_pixels", "width": B4_SECONDARY_CLIENT_WIDTH, "height": B4_SECONDARY_CLIENT_HEIGHT },
-            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
             { "command": "open_project", "path": original },
             { "command": "wait_for", "condition": "recovery_review_required", "timeout_ms": 30000 },
@@ -2681,7 +2933,6 @@ fn b4_launch_three_script(package: &Path, save_as: &Path) -> Value {
             { "command": "open_dataset", "path": package },
             { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
             { "command": "set_mapped_client_pixels", "width": B4_SECONDARY_CLIENT_WIDTH, "height": B4_SECONDARY_CLIENT_HEIGHT },
-            { "command": "wait_for", "condition": "source_verification_verified", "timeout_ms": 30000 },
             { "command": "wait_for", "condition": "first_frame", "timeout_ms": 30000 },
             { "command": "open_project", "path": save_as },
             { "command": "wait_for", "condition": "project_store_idle", "timeout_ms": 30000 },
@@ -2760,13 +3011,16 @@ pub(crate) fn validate_product_automation_script(script: &Value) -> anyhow::Resu
             .get("command")
             .and_then(Value::as_str)
             .context("automation command must name its command")?;
-        if command_name == "capture_screenshot" {
+        if matches!(
+            command_name,
+            "capture_screenshot" | "capture_temporal_frame"
+        ) {
             let target = command
                 .get("target")
                 .and_then(Value::as_str)
-                .context("capture_screenshot requires an explicit target")?;
+                .context("capture command requires an explicit target")?;
             if !valid_product_presentation_target(target) {
-                bail!("capture_screenshot target {target:?} is invalid");
+                bail!("capture target {target:?} is invalid");
             }
         }
         if command_name == "assert"
@@ -2790,6 +3044,344 @@ pub(crate) fn validate_product_automation_script(script: &Value) -> anyhow::Resu
 
 fn valid_product_presentation_target(target: &str) -> bool {
     matches!(target, "three_d" | "xy" | "xz" | "yz")
+}
+
+fn representative_temporal_playback_evidence(report: Option<&Value>) -> Result<(), String> {
+    let report =
+        report.ok_or_else(|| "temporal scenario produced no automation report".to_owned())?;
+    let temporal = report
+        .get("temporal_evidence")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "temporal scenario omitted presentation evidence".to_owned())?;
+    let transitions = temporal
+        .get("presented_transition_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "temporal scenario omitted its presented transition count".to_owned())?;
+    if transitions < 8 {
+        return Err(format!(
+            "temporal scenario presented only {transitions} transitions; at least eight are required across 24 and 12 FPS runs"
+        ));
+    }
+    if temporal.get("continuity_violation") != Some(&Value::Null) {
+        return Err(format!(
+            "temporal scenario recorded a continuity violation: {:?}",
+            temporal.get("continuity_violation")
+        ));
+    }
+    let observations = temporal
+        .get("observations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "temporal scenario omitted bounded presentation observations".to_owned())?;
+    if observations.len() < 9 {
+        return Err("temporal scenario did not retain enough presentation observations".to_owned());
+    }
+
+    let events = report
+        .get("events")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "temporal scenario omitted command events".to_owned())?;
+    let temporal_captures = events
+        .iter()
+        .filter(|event| {
+            event.get("command").and_then(Value::as_str) == Some("capture_temporal_frame")
+        })
+        .collect::<Vec<_>>();
+    if temporal_captures.len() != 2
+        || temporal_captures
+            .iter()
+            .any(|event| event.get("status").and_then(Value::as_str) != Some("passed"))
+    {
+        return Err("temporal scenario did not pass exactly two semantic GPU captures".to_owned());
+    }
+    let first_timepoint = temporal_captures[0]
+        .pointer("/details/presented_time_index")
+        .and_then(Value::as_u64);
+    let second_timepoint = temporal_captures[1]
+        .pointer("/details/presented_time_index")
+        .and_then(Value::as_u64);
+    let changed_pixels = temporal_captures[1]
+        .pointer("/details/different_pixels_from_previous")
+        .and_then(Value::as_u64);
+    let meaningful_pixels = temporal_captures.iter().all(|event| {
+        event
+            .pointer("/details/intermediate_rgb_pixels")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0)
+    });
+    if first_timepoint != Some(0)
+        || second_timepoint != Some(1)
+        || changed_pixels.is_none_or(|count| count == 0)
+        || !meaningful_pixels
+    {
+        return Err(
+            "temporal scenario captures did not prove non-clipped, pixel-distinct t0 and t1 GPU presentations"
+                .to_owned(),
+        );
+    }
+
+    let transition_waits = events
+        .iter()
+        .filter(|event| {
+            event.get("command").and_then(Value::as_str) == Some("wait_for_temporal_transitions")
+                && event.get("status").and_then(Value::as_str) == Some("passed")
+                && event
+                    .pointer("/details/observed_transitions")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|count| count >= 3)
+        })
+        .count();
+    let fps_values = events
+        .iter()
+        .filter(|event| event.get("command").and_then(Value::as_str) == Some("set_playback_fps"))
+        .filter_map(|event| event.pointer("/details/fps").and_then(Value::as_u64))
+        .collect::<BTreeSet<_>>();
+    if transition_waits != 3 || fps_values != BTreeSet::from([12, 24]) {
+        return Err(
+            "temporal scenario did not prove real transitions in standalone and four-panel 24 FPS runs plus the four-panel 12 FPS run"
+                .to_owned(),
+        );
+    }
+    let input_commands = BTreeSet::from([
+        "camera_orbit_sequence",
+        "camera_zoom_sequence",
+        "cross_section_pan_sequence",
+        "cross_section_zoom_sequence",
+        "cross_section_rotate_sequence",
+    ]);
+    let input_events = events
+        .iter()
+        .filter(|event| {
+            event
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|command| input_commands.contains(command))
+        })
+        .collect::<Vec<_>>();
+    if input_events.len() != 7 {
+        return Err(
+            "temporal scenario omitted one or more required held-input workloads".to_owned(),
+        );
+    }
+    let cadence_events = events
+        .iter()
+        .filter(|event| {
+            event.get("command").and_then(Value::as_str) == Some("observe_playback_cadence")
+                && event.get("status").and_then(Value::as_str) == Some("passed")
+        })
+        .collect::<Vec<_>>();
+    if cadence_events.len() != input_events.len()
+        || cadence_events.iter().any(|event| {
+            event
+                .pointer("/details/requested_duration_ms")
+                .and_then(Value::as_u64)
+                != Some(2_000)
+                || event
+                    .pointer("/details/presented_temporal_transitions")
+                    .and_then(Value::as_u64)
+                    .is_none_or(|count| count < 3)
+        })
+    {
+        return Err(
+            "temporal scenario did not record one valid same-duration stationary cadence baseline for every held input"
+                .to_owned(),
+        );
+    }
+    for event in input_events {
+        let command = event
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown input");
+        let observed = event
+            .pointer("/details/observed_counter_delta/presented_temporal_transitions")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("{command} omitted its temporal transition count"))?;
+        let timing = event
+            .pointer("/details/temporal_presentation_timing")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("{command} omitted monotonic temporal timing evidence"))?;
+        let elapsed = timing
+            .get("transition_elapsed_ns")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("{command} omitted temporal presentation timestamps"))?;
+        let first_half = timing
+            .get("first_half_transitions")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let second_half = timing
+            .get("second_half_transitions")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let window = timing
+            .get("observation_window_ns")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let timestamps = elapsed
+            .iter()
+            .map(|value| value.as_u64())
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| format!("{command} contains a non-integer temporal timestamp"))?;
+        let cadence_passed = event
+            .pointer("/details/stationary_cadence_comparison/passed")
+            .and_then(Value::as_bool)
+            == Some(true);
+        let baseline_transitions = event
+            .pointer("/details/stationary_cadence_comparison/baseline_transitions")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let minimum_input_transitions = event
+            .pointer("/details/stationary_cadence_comparison/minimum_input_transitions")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX);
+        let maximum_input_gap = event
+            .pointer("/details/stationary_cadence_comparison/input_maximum_gap_ns")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX);
+        let maximum_allowed_gap = event
+            .pointer("/details/stationary_cadence_comparison/maximum_allowed_input_gap_ns")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if observed < 3
+            || timestamps.len() != usize::try_from(observed).unwrap_or(usize::MAX)
+            || first_half == 0
+            || second_half == 0
+            || window == 0
+            || timestamps.windows(2).any(|pair| pair[0] >= pair[1])
+            || timestamps.last().is_some_and(|last| *last > window)
+            || baseline_transitions < 3
+            || observed < minimum_input_transitions
+            || maximum_input_gap > maximum_allowed_gap
+            || !cadence_passed
+        {
+            return Err(format!(
+                "{command} did not prove temporal commits distributed throughout held input"
+            ));
+        }
+    }
+
+    let stop_events = events
+        .iter()
+        .filter(|event| {
+            event.get("command").and_then(Value::as_str) == Some("assert")
+                && event.pointer("/details/condition").and_then(Value::as_str)
+                    == Some("playback_stopped_and_released")
+                && event.get("status").and_then(Value::as_str) == Some("passed")
+        })
+        .collect::<Vec<_>>();
+    if stop_events.len() != 3 {
+        return Err("temporal scenario omitted a retained-front trace for one Stop".to_owned());
+    }
+    for event in stop_events {
+        let trace = event
+            .pointer("/details/playback_stop_handoff_trace")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "playback Stop omitted its retained-front handoff trace".to_owned())?;
+        if trace.get("violation") != Some(&Value::Null) {
+            return Err(format!(
+                "playback Stop recorded a handoff violation: {:?}",
+                trace.get("violation")
+            ));
+        }
+        let expected = trace
+            .get("playback_layer_scales")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "playback Stop omitted its fixed scale map".to_owned())?
+            .iter()
+            .map(|layer| {
+                Some((
+                    layer.get("layer_ordinal")?.as_u64()?,
+                    layer.get("scale_level")?.as_u64()?,
+                ))
+            })
+            .collect::<Option<BTreeMap<_, _>>>()
+            .ok_or_else(|| "playback Stop contains an invalid fixed scale map".to_owned())?;
+        let states = trace
+            .get("states")
+            .and_then(Value::as_array)
+            .filter(|states| !states.is_empty())
+            .ok_or_else(|| "playback Stop trace contains no visible state".to_owned())?;
+        let mut previous = BTreeMap::<(String, u64), u64>::new();
+        for (state_index, state) in states.iter().enumerate() {
+            let panels = state
+                .get("panels")
+                .and_then(Value::as_array)
+                .filter(|panels| !panels.is_empty())
+                .ok_or_else(|| "playback Stop exposed an empty target group".to_owned())?;
+            for panel in panels {
+                let label = panel
+                    .get("panel")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "playback Stop panel omitted its identity".to_owned())?;
+                if panel.get("time_index").and_then(Value::as_u64)
+                    != trace.get("expected_time_index").and_then(Value::as_u64)
+                {
+                    return Err(format!(
+                        "playback Stop exposed {label} at the wrong timepoint"
+                    ));
+                }
+                for layer in panel
+                    .get("layers")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "playback Stop panel omitted layer scales".to_owned())?
+                {
+                    let ordinal = layer
+                        .get("layer_ordinal")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| "playback Stop layer omitted its ordinal".to_owned())?;
+                    let displayed = layer
+                        .get("displayed_scale_level")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| "playback Stop exposed a layer without scale".to_owned())?;
+                    let fixed = *expected.get(&ordinal).ok_or_else(|| {
+                        "playback Stop exposed a layer outside its fixed scale map".to_owned()
+                    })?;
+                    let key = (label.to_owned(), ordinal);
+                    if layer.get("mixed").and_then(Value::as_bool) != Some(false)
+                        || displayed > fixed
+                        || (state_index == 0 && displayed != fixed)
+                        || previous
+                            .get(&key)
+                            .is_some_and(|previous| displayed > *previous)
+                    {
+                        return Err(format!(
+                            "playback Stop trace downgraded or mixed {label} layer {ordinal}: fixed=s{fixed}, displayed=s{displayed}"
+                        ));
+                    }
+                    previous.insert(key, displayed);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn representative_temporal_playback_log_evidence(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("temporal scenario runtime log is unavailable: {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("temporal scenario runtime log is not a regular file".to_owned());
+    }
+    if metadata.len() > PRE_ALPHA_STDERR_BYTES_MAX {
+        return Err(format!(
+            "temporal scenario runtime log exceeded its {}-byte evidence bound",
+            PRE_ALPHA_STDERR_BYTES_MAX
+        ));
+    }
+    let log = fs::read_to_string(path)
+        .map_err(|error| format!("temporal scenario runtime log is not bounded UTF-8: {error}"))?;
+    let forbidden = [
+        "ERROR",
+        "the requirement set changed within one frame generation",
+        "runtime lease delivery violated retained-demand requirements",
+    ];
+    if let Some(line) = log
+        .lines()
+        .find(|line| forbidden.iter().any(|marker| line.contains(marker)))
+    {
+        return Err(format!(
+            "temporal scenario runtime log contains a renderer/runtime failure: {line}"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_product_automation_hard_safety_limits(script: &Value) -> anyhow::Result<()> {
@@ -4308,6 +4900,7 @@ struct ProductAutomationRun<'a> {
     automation_report: &'a Path,
     stdout_path: &'a Path,
     stderr_path: &'a Path,
+    runtime_log_path: &'a Path,
     timeout: Duration,
     scenario: &'a str,
     progress_plan: ProductAutomationProgressPlan,
@@ -4325,6 +4918,7 @@ fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<Produ
         .env("MIRANTE4D_ENABLE_AUTOMATION", "1")
         .env("MIRANTE4D_AUTOMATION_SCRIPT", run.script)
         .env("MIRANTE4D_AUTOMATION_REPORT", run.automation_report)
+        .env("MIRANTE4D_LOG_FILE", run.runtime_log_path)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     isolate_process_tree(&mut command);
@@ -4417,6 +5011,7 @@ struct WrapperReport<'a> {
     automation_report_value: Option<&'a Value>,
     stdout: &'a Path,
     stderr: &'a Path,
+    runtime_log: &'a Path,
     display: DisplayClassification,
     preflight_only: bool,
     source_closure_evidence: Value,
@@ -4465,7 +5060,7 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
     let scenario_name = report.scenario_name;
     let claim_source = "instrumented_application_commands_internal_state_and_readback";
     let pixel_content_observed = Value::Null;
-    let b3_e1_capture_evidence = if scenario_name == B3_SOURCE_VERIFICATION_SCENARIO {
+    let b3_e1_capture_evidence = if scenario_name == B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO {
         match b3_exact_e1_capture_evidence(report.automation_report_value) {
             Ok(evidence) => evidence,
             Err(reason) => json!({
@@ -4610,10 +5205,12 @@ fn wrapper_report_json(report: WrapperReport<'_>) -> Value {
             "automation_artifacts": automation_artifacts,
             "stdout": report.stdout,
             "stderr": report.stderr,
+            "runtime_log": report.runtime_log,
         },
         "logs": {
             "stdout": report.stdout,
             "stderr": report.stderr,
+            "runtime": report.runtime_log,
         },
         "environment": {
             "display": report.display.class.name(),

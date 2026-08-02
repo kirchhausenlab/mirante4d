@@ -33,8 +33,16 @@ failures are reported reliably. Install the Rust toolchain selected by
 cargo xtask run-dev
 ```
 
-This builds the application and opens a generated development dataset. For
-normal development and testing commands, see
+This builds the application and opens a generated development dataset. To
+start the ordinary dataset-independent application at its welcome launcher,
+run:
+
+```bash
+cargo run --release -p mirante4d-app
+```
+
+From there, choose an existing `.m4d` package or preprocess a new explicit
+per-channel TIFF source. For normal development and testing commands, see
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 There is no public microscopy dataset release yet. Local sample data must stay

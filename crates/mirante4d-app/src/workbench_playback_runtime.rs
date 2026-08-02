@@ -1,16 +1,20 @@
 use eframe::egui;
 use mirante4d_application::{
     ApplicationCommand, ApplicationSnapshot, CrossSectionPanelScheduleStatus, OperationKind,
+    PlaybackPhase, PresentationSlot,
 };
 use mirante4d_domain::ViewerLayout;
 use mirante4d_render_api::PresentationTarget;
 
 use crate::{
     BACKGROUND_WORK_REPAINT_INTERVAL, RenderCoordinationState,
-    dataset_requests::{DatasetDemandState, SCOPE_CURRENT_3D},
+    dataset_requests::{DatasetDemandState, SCOPE_PLAYBACK},
     import_worker_service::ImportWorkerService,
     native_presentation::NativePresentationBridge,
-    playback::{PLAYBACK_FRAME_INTERVAL, playback_tick_for_ui_time},
+    playback::{playback_frame_interval, playback_tick_for_ui_time},
+    workbench_brick_runtime::{
+        playback_successor_complete_with_renderer, scope_complete_with_renderer,
+    },
 };
 
 pub(crate) fn background_work_active(
@@ -47,6 +51,33 @@ pub(crate) fn background_work_active(
 pub(crate) struct ProgressiveRenderSubmissionWork {
     pub(crate) three_d_required: bool,
     pub(crate) any_required: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackReadinessAction {
+    Idle,
+    Wait,
+    MarkPrepared,
+    RunClock,
+}
+
+const fn playback_readiness_action(
+    phase: PlaybackPhase,
+    future_ready: bool,
+    coherent_predecessor_presented: bool,
+    requested_temporal_front_presented: bool,
+) -> PlaybackReadinessAction {
+    match phase {
+        PlaybackPhase::Stopped => PlaybackReadinessAction::Idle,
+        PlaybackPhase::Warming if future_ready && coherent_predecessor_presented => {
+            PlaybackReadinessAction::MarkPrepared
+        }
+        PlaybackPhase::Warming => PlaybackReadinessAction::Wait,
+        PlaybackPhase::Playing if future_ready && requested_temporal_front_presented => {
+            PlaybackReadinessAction::RunClock
+        }
+        PlaybackPhase::Playing => PlaybackReadinessAction::Wait,
+    }
 }
 
 /// Renderer-owned progress must not wait for unrelated dataset work to become
@@ -132,7 +163,7 @@ fn pending_application_service_work(
             matches!(
                 kind,
                 OperationKind::DatasetOpen
-                    | OperationKind::SourceVerification
+                    | OperationKind::PackageIntegrityAudit
                     | OperationKind::ProjectOpen
                     | OperationKind::ProjectSave
                     | OperationKind::Analysis
@@ -140,16 +171,12 @@ fn pending_application_service_work(
         })
 }
 
-pub(crate) const fn source_verification_polling_required(
-    automatic_request_pending: bool,
-    worker_active: bool,
-) -> bool {
-    automatic_request_pending || worker_active
-}
-
 pub(crate) fn enqueue_playback_command_if_due(
     snapshot: &ApplicationSnapshot,
+    session: &mut crate::playback_session::PlaybackSession,
     dataset: &DatasetDemandState,
+    render: &RenderCoordinationState,
+    presentation: &NativePresentationBridge,
     commands: &mut Vec<ApplicationCommand>,
     ctx: &egui::Context,
 ) {
@@ -163,14 +190,47 @@ pub(crate) fn enqueue_playback_command_if_due(
         return;
     }
 
-    if snapshot.transient().last_playback_tick().is_some()
-        && !dataset.scope_complete(SCOPE_CURRENT_3D)
-    {
-        ctx.request_repaint_after(BACKGROUND_WORK_REPAINT_INTERVAL);
-        return;
+    let interval = playback_frame_interval(snapshot.transient().playback_fps());
+    let future_ready = match snapshot.transient().playback_phase() {
+        PlaybackPhase::Warming => {
+            scope_complete_with_renderer(dataset, presentation, SCOPE_PLAYBACK)
+        }
+        PlaybackPhase::Playing => playback_successor_complete_with_renderer(dataset, presentation),
+        PlaybackPhase::Stopped => false,
+    };
+    // This predicate is temporal-only. It deliberately ignores display-input
+    // generations and spatial currentness; continuous camera/plane samples
+    // may remain unsettled while the requested temporal front commits.
+    let requested_temporal_front_presented =
+        requested_timepoint_coherently_presented(snapshot, render);
+    session.observe_readiness(
+        crate::application_view(snapshot).timepoint(),
+        timepoint_count,
+        requested_temporal_front_presented,
+        future_ready,
+    );
+    let contract_ready = session.contract().is_some();
+    match playback_readiness_action(
+        snapshot.transient().playback_phase(),
+        future_ready && contract_ready,
+        requested_temporal_front_presented,
+        requested_temporal_front_presented,
+    ) {
+        PlaybackReadinessAction::Idle => return,
+        PlaybackReadinessAction::Wait => {
+            ctx.request_repaint_after(BACKGROUND_WORK_REPAINT_INTERVAL);
+            return;
+        }
+        PlaybackReadinessAction::MarkPrepared => {
+            commands.push(ApplicationCommand::MarkPlaybackPrepared);
+            ctx.request_repaint_after(BACKGROUND_WORK_REPAINT_INTERVAL);
+            return;
+        }
+        PlaybackReadinessAction::RunClock => {}
     }
 
-    let tick = ctx.input(|input| playback_tick_for_ui_time(input.time));
+    let tick = ctx
+        .input(|input| playback_tick_for_ui_time(input.time, snapshot.transient().playback_fps()));
     if snapshot
         .transient()
         .last_playback_tick()
@@ -178,7 +238,32 @@ pub(crate) fn enqueue_playback_command_if_due(
     {
         commands.push(ApplicationCommand::AdvancePlaybackTick(tick));
     }
-    ctx.request_repaint_after(PLAYBACK_FRAME_INTERVAL);
+    ctx.request_repaint_after(interval);
+}
+
+fn requested_timepoint_coherently_presented(
+    snapshot: &ApplicationSnapshot,
+    render: &RenderCoordinationState,
+) -> bool {
+    let view = crate::application_view(snapshot);
+    requested_timepoint_coherently_presented_for_layout(view.layout(), view.timepoint(), render)
+}
+
+fn requested_timepoint_coherently_presented_for_layout(
+    layout: ViewerLayout,
+    expected_timepoint: mirante4d_domain::TimeIndex,
+    render: &RenderCoordinationState,
+) -> bool {
+    let required = match layout {
+        ViewerLayout::Single3d => &PresentationSlot::ALL[..1],
+        ViewerLayout::FourPanel => &PresentationSlot::ALL,
+    };
+    required.iter().copied().all(|slot| {
+        render
+            .surface(slot)
+            .presented_frame()
+            .is_some_and(|frame| frame.timepoint() == expected_timepoint)
+    })
 }
 
 pub(crate) fn catalog_timepoint_count(snapshot: &ApplicationSnapshot) -> u64 {
@@ -188,6 +273,92 @@ pub(crate) fn catalog_timepoint_count(snapshot: &ApplicationSnapshot) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_waits_for_temporal_pixels_but_never_for_spatial_settlement() {
+        for (future_ready, temporal_front) in [(false, false), (false, true), (true, false)] {
+            assert_eq!(
+                playback_readiness_action(
+                    PlaybackPhase::Warming,
+                    future_ready,
+                    temporal_front,
+                    temporal_front,
+                ),
+                PlaybackReadinessAction::Wait
+            );
+            assert_eq!(
+                playback_readiness_action(
+                    PlaybackPhase::Playing,
+                    future_ready,
+                    temporal_front,
+                    temporal_front,
+                ),
+                PlaybackReadinessAction::Wait
+            );
+        }
+        assert_eq!(
+            playback_readiness_action(PlaybackPhase::Warming, true, true, false),
+            PlaybackReadinessAction::MarkPrepared
+        );
+        assert_eq!(
+            playback_readiness_action(PlaybackPhase::Playing, true, false, true),
+            PlaybackReadinessAction::RunClock
+        );
+        assert_eq!(
+            playback_readiness_action(PlaybackPhase::Stopped, true, true, true),
+            PlaybackReadinessAction::Idle
+        );
+    }
+
+    #[test]
+    fn temporal_readiness_ignores_spatial_generation_but_requires_every_visible_timepoint() {
+        let initial_presentation =
+            mirante4d_render_api::PresentationViewport::new(64.0, 64.0).unwrap();
+        let initial_extent = mirante4d_render_api::RenderExtent::new(64, 64).unwrap();
+        let mut render = RenderCoordinationState::new(
+            crate::FrameFidelityStatus::new_with_presentation(initial_extent, initial_presentation),
+        );
+        for slot in [
+            PresentationSlot::Xy,
+            PresentationSlot::Xz,
+            PresentationSlot::Yz,
+        ] {
+            assert!(render.record_viewports(slot, initial_presentation, initial_extent));
+        }
+        for slot in PresentationSlot::ALL {
+            let generation = render.surface(slot).generation();
+            assert!(render.record_presented_frame(
+                slot,
+                generation,
+                crate::tests::synthetic_presented_frame(slot, initial_extent),
+            ));
+        }
+
+        let changed_presentation =
+            mirante4d_render_api::PresentationViewport::new(80.0, 72.0).unwrap();
+        let changed_extent = mirante4d_render_api::RenderExtent::new(80, 72).unwrap();
+        for slot in PresentationSlot::ALL {
+            assert!(render.record_viewports(slot, changed_presentation, changed_extent));
+            assert!(!render.surface(slot).display_current());
+        }
+
+        assert!(requested_timepoint_coherently_presented_for_layout(
+            ViewerLayout::FourPanel,
+            mirante4d_domain::TimeIndex::new(0),
+            &render,
+        ));
+        assert!(!requested_timepoint_coherently_presented_for_layout(
+            ViewerLayout::FourPanel,
+            mirante4d_domain::TimeIndex::new(1),
+            &render,
+        ));
+        render.clear_presented_frame(PresentationSlot::Yz);
+        assert!(!requested_timepoint_coherently_presented_for_layout(
+            ViewerLayout::FourPanel,
+            mirante4d_domain::TimeIndex::new(0),
+            &render,
+        ));
+    }
 
     #[test]
     fn only_loading_cross_sections_keep_background_polling() {
@@ -220,7 +391,7 @@ mod tests {
     fn source_project_and_analysis_operations_keep_application_services_polling() {
         for kind in [
             OperationKind::DatasetOpen,
-            OperationKind::SourceVerification,
+            OperationKind::PackageIntegrityAudit,
             OperationKind::ProjectOpen,
             OperationKind::ProjectSave,
             OperationKind::Analysis,
@@ -238,13 +409,5 @@ mod tests {
     fn pending_settings_keep_application_services_polling_without_an_operation() {
         assert!(pending_application_service_work([], true));
         assert!(!pending_application_service_work([], false));
-    }
-
-    #[test]
-    fn deferred_or_retiring_source_verification_keeps_ui_polling() {
-        assert!(source_verification_polling_required(true, false));
-        assert!(source_verification_polling_required(false, true));
-        assert!(source_verification_polling_required(true, true));
-        assert!(!source_verification_polling_required(false, false));
     }
 }
