@@ -9,7 +9,7 @@ fn unified_source_open_starts_with_no_owned_interactive_payloads() {
     assert_eq!(opened.dataset.retained_leases().required_len(), 0);
     assert_eq!(opened.dataset.retained_leases().retained_len(), 0);
     assert!(!opened.dataset.dispatcher().has_pending_work());
-    assert_eq!(opened.dataset.current_scale(), ScaleLevel::BASE);
+    assert_eq!(opened.dataset.current_uniform_scale(), None);
     opened.dataset.request_shutdown().unwrap();
 }
 
@@ -557,7 +557,7 @@ fn latest_transient_cross_section_stays_provisional_and_finishes_without_replann
             &mut app.render_coordination,
             cross_section_scheduler::CrossSectionScheduleInput {
                 view: application_view(&app.application.snapshot()),
-                active_layer_target: empty_target,
+                uniform_target: empty_target,
                 requirements: empty_requirements.as_ref(),
                 first_useful_requirements: 0,
                 first_useful_available: false,
@@ -2152,7 +2152,8 @@ fn unsafe_3d_profile_keeps_native_preview_visible_until_atomic_exact_strips_fini
     );
     await_visible_demand_plan(&mut app);
     assert_eq!(
-        app.render_coordination.frame_fidelity.target_scale_level, 0,
+        app.render_coordination.frame_fidelity.target_scale_level,
+        Some(0),
         "the fixture and mapped viewport must require exact scale zero"
     );
     let expected_preview_frame = app.render_intent_mailbox.snapshot().three_d_revision;
@@ -3478,7 +3479,246 @@ fn render_mode_switch_skips_membership_planning_and_admits_one_display_generatio
     app.dataset.request_shutdown().unwrap();
 }
 
- #[test]
+#[test]
+fn hiding_active_analysis_layer_keeps_remaining_visible_layers_authoritative() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    await_visible_demand_plan(&mut app);
+    let context = egui::Context::default();
+    let snapshot = app.application.snapshot();
+    let view = application_view(&snapshot);
+    let active = view.active_layer();
+    let active_layer = view.layer(active).unwrap();
+    let remaining = view
+        .layers()
+        .iter()
+        .filter(|layer| layer.visible() && layer.layer_key() != active)
+        .map(|layer| layer.layer_key())
+        .collect::<Vec<_>>();
+    assert!(
+        !remaining.is_empty(),
+        "the multichannel fixture must retain a visible layer after hiding analysis focus"
+    );
+    let hidden_active = mirante4d_project_model::LayerViewState::new(
+        active,
+        false,
+        active_layer.transfer().clone(),
+        *active_layer.render_state(),
+    );
+
+    app.apply_application_command(ApplicationCommand::SetLayerView(hidden_active), &context)
+        .unwrap();
+    assert!(await_visible_demand_plan(&mut app).current_plan_installed);
+
+    let snapshot = app.application.snapshot();
+    let view = application_view(&snapshot);
+    assert_eq!(view.active_layer(), active);
+    assert!(!view.layer(active).unwrap().visible());
+    assert_eq!(
+        app.dataset
+            .current_ideal_layer_scales()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        remaining
+    );
+    let target_scope = if app.dataset.staging_current_refinement() {
+        dataset_requests::SCOPE_CURRENT_3D_REFINEMENT
+    } else {
+        dataset_requests::SCOPE_CURRENT_3D
+    };
+    assert_eq!(
+        app.dataset
+            .scope_layer_scales(target_scope)
+            .unwrap()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        remaining
+    );
+    assert_eq!(
+        app.prepared_scope_render_plans[&target_scope]
+            .layer_scales
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        remaining
+    );
+    assert!(app.navigation_render_plans.iter().all(|plan| {
+        plan.layer_scales.keys().copied().collect::<Vec<_>>() == remaining
+    }));
+    assert_eq!(app.dataset.last_plan_error(), None);
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn changing_analysis_focus_preserves_static_render_and_residency_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    await_visible_demand_plan(&mut app);
+    let context = egui::Context::default();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !app
+        .dataset
+        .scope_complete(dataset_requests::SCOPE_CURRENT_3D)
+    {
+        assert!(std::time::Instant::now() < deadline);
+        app.drain_brick_results(&context);
+        std::thread::yield_now();
+    }
+
+    let snapshot = app.application.snapshot();
+    let view = application_view(&snapshot);
+    let next_active = view
+        .layers()
+        .iter()
+        .find(|layer| layer.layer_key() != view.active_layer())
+        .expect("the multichannel fixture has another analysis focus")
+        .layer_key();
+    let plans_before = app.visible_demand_plan_calls;
+    let generation_before = app.render_coordination.display_generation();
+    let mailbox_before = app.render_intent_mailbox.snapshot();
+    let fidelity_before = app.render_coordination.frame_fidelity.clone();
+    let current_body = app
+        .dataset
+        .scope_requirement_handle(dataset_requests::SCOPE_CURRENT_3D);
+    let refinement_body = app
+        .dataset
+        .scope_requirement_handle(dataset_requests::SCOPE_CURRENT_3D_REFINEMENT);
+    let retained_before = (
+        app.dataset.retained_leases().required_len(),
+        app.dataset.retained_leases().retained_len(),
+    );
+    let submitted_before = app
+        .dataset
+        .dispatcher()
+        .diagnostics()
+        .unwrap()
+        .submitted_requests();
+
+    app.apply_application_command(ApplicationCommand::SetActiveLayer(next_active), &context)
+        .unwrap();
+
+    assert_eq!(
+        application_view(&app.application.snapshot()).active_layer(),
+        next_active
+    );
+    assert_eq!(app.visible_demand_plan_calls, plans_before);
+    assert_eq!(app.render_coordination.display_generation(), generation_before);
+    assert_eq!(app.render_intent_mailbox.snapshot(), mailbox_before);
+    assert_eq!(app.render_coordination.frame_fidelity, fidelity_before);
+    assert!(Arc::ptr_eq(
+        &current_body,
+        &app.dataset
+            .scope_requirement_handle(dataset_requests::SCOPE_CURRENT_3D)
+    ));
+    assert!(Arc::ptr_eq(
+        &refinement_body,
+        &app
+            .dataset
+            .scope_requirement_handle(dataset_requests::SCOPE_CURRENT_3D_REFINEMENT)
+    ));
+    assert_eq!(
+        (
+            app.dataset.retained_leases().required_len(),
+            app.dataset.retained_leases().retained_len(),
+        ),
+        retained_before
+    );
+    assert_eq!(
+        app.dataset
+            .dispatcher()
+            .diagnostics()
+            .unwrap()
+            .submitted_requests(),
+        submitted_before
+    );
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn hiding_all_visible_layers_publishes_explicit_empty_3d_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    await_visible_demand_plan(&mut app);
+    let context = egui::Context::default();
+    let hidden_layers = application_view(&app.application.snapshot())
+        .layers()
+        .iter()
+        .filter(|layer| layer.visible())
+        .map(|layer| {
+            mirante4d_project_model::LayerViewState::new(
+                layer.layer_key(),
+                false,
+                layer.transfer().clone(),
+                *layer.render_state(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(!hidden_layers.is_empty());
+    for hidden in hidden_layers {
+        app.apply_application_command(ApplicationCommand::SetLayerView(hidden), &context)
+            .unwrap();
+    }
+    assert!(
+        application_view(&app.application.snapshot())
+            .layers()
+            .iter()
+            .all(|layer| !layer.visible()),
+        "the fixture command must establish an all-hidden canonical view"
+    );
+    assert!(await_visible_demand_plan(&mut app).current_plan_installed);
+    assert!(
+        app.dataset
+            .scope_is_empty(dataset_requests::SCOPE_CURRENT_3D),
+        "empty visibility did not replace the installed 3D scope: error={:?}, requirements={}, scales={:?}",
+        app.dataset.last_plan_error(),
+        app.dataset
+            .scope_requirements(dataset_requests::SCOPE_CURRENT_3D)
+            .len(),
+        app.dataset
+            .scope_layer_scales(dataset_requests::SCOPE_CURRENT_3D)
+    );
+    assert!(app.dataset.current_ideal_layer_scales().is_empty());
+    assert!(!app
+        .prepared_scope_render_plans
+        .contains_key(&dataset_requests::SCOPE_CURRENT_3D));
+    assert!(!app
+        .prepared_scope_render_plans
+        .contains_key(&dataset_requests::SCOPE_CURRENT_3D_REFINEMENT));
+    assert!(app.navigation_render_plans.is_empty());
+    assert_eq!(app.dataset.last_plan_error(), None);
+
+    app.rerender_coordinated_display_state().unwrap();
+
+    assert_eq!(
+        app.render_coordination.frame_fidelity.backend,
+        mirante4d_application::RenderBackend::Empty
+    );
+    assert_eq!(
+        app.render_coordination.frame_fidelity.reason,
+        mirante4d_application::LodDecisionReason::NoVisibleData
+    );
+    assert_eq!(
+        app.render_coordination.frame_fidelity.displayed_scale_level,
+        None
+    );
+    assert!(
+        app.render_coordination
+            .surface(PresentationSlot::ThreeD)
+            .layer_presentations()
+            .is_empty()
+    );
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
 fn differential_scope_update_keeps_overlap_and_retires_only_removed_waiters() {
     let temp = tempfile::tempdir().unwrap();
     let package = write_target_fixture(temp.path()).unwrap();
@@ -4622,6 +4862,84 @@ fn playback_prefetch_readiness_is_backed_by_retained_accounted_leases() {
         playback
             .iter()
             .all(|key| app.dataset.retained_leases().payload(*key).is_some())
+    );
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn starting_playback_rebuilds_the_static_fair_ladder_as_playback_lockstep() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let context = egui::Context::default();
+    app.render_coordination.record_viewports(
+        PresentationSlot::ThreeD,
+        PresentationViewport::new(256.0, 256.0).unwrap(),
+        mirante4d_render_api::RenderExtent::new(256, 256).unwrap(),
+    );
+
+    assert!(await_visible_demand_plan(&mut app).current_plan_installed);
+    assert!(
+        app.navigation_render_plans.iter().any(|candidate| {
+            dataset_demand_plan::uniform_layer_scale(&candidate.layer_scales).is_none()
+        }),
+        "the multichannel static fixture must install its one-layer-at-a-time intermediate rung"
+    );
+
+    app.apply_application_command(ApplicationCommand::SetPlaybackActive(true), &context)
+        .unwrap();
+    assert!(await_visible_demand_plan(&mut app).current_plan_installed);
+
+    let playback_scales = Arc::clone(
+        app.playback_session
+            .contract()
+            .expect("starting playback installs its fixed quality contract")
+            .layer_scales(),
+    );
+    assert!(
+        playback_scales
+            .values()
+            .all(|scale| *scale == mirante4d_domain::ScaleLevel::BASE),
+        "starting playback from a static ladder must not strand its quality contract at the terminal rung: {playback_scales:?}"
+    );
+    assert!(
+        app.navigation_render_plans.iter().all(|candidate| {
+            dataset_demand_plan::uniform_layer_scale(&candidate.layer_scales).is_some()
+        }),
+        "playback must rebuild the established lockstep ladder instead of retaining static mixed rungs"
+    );
+    assert_eq!(
+        app.navigation_render_plans
+            .last()
+            .map(|candidate| candidate.layer_scales.as_ref()),
+        Some(playback_scales.as_ref()),
+        "the finest retained playback rung must agree with the admitted playback contract"
+    );
+
+    let snapshot = app.application.snapshot();
+    let view = application_view(&snapshot);
+    let next_active = view
+        .layers()
+        .iter()
+        .find(|layer| layer.layer_key() != view.active_layer())
+        .expect("the playback fixture has a second analysis focus")
+        .layer_key();
+    let plans_before = app.visible_demand_plan_calls;
+    app.apply_application_command(ApplicationCommand::SetActiveLayer(next_active), &context)
+        .unwrap();
+    assert!(
+        app.visible_demand_plan_calls > plans_before,
+        "playback retains its pre-cutover active-first priority dependency and must rewarm on a focus change"
+    );
+    assert!(await_visible_demand_plan(&mut app).current_plan_installed);
+    assert_eq!(
+        app.playback_session
+            .contract()
+            .expect("playback focus rewarm reinstalls a fixed contract")
+            .layer_scales()
+            .as_ref(),
+        playback_scales.as_ref()
     );
     app.dataset.request_shutdown().unwrap();
 }

@@ -7,7 +7,7 @@ fn frame_fidelity_label_names_currently_shown_lod() {
         crate::viewport::default_presentation_viewport(),
     );
     fidelity.displayed_scale_level = Some(2);
-    fidelity.target_scale_level = 0;
+    fidelity.target_scale_level = Some(0);
     fidelity.completeness = FrameCompleteness::BudgetLimited;
     fidelity.reason = LodDecisionReason::GpuBudgetLimited;
     fidelity.backend = RenderBackend::GpuCameraMip;
@@ -33,7 +33,7 @@ fn frame_fidelity_label_keeps_exact_source_lod_concise() {
         crate::viewport::default_presentation_viewport(),
     );
     fidelity.displayed_scale_level = Some(0);
-    fidelity.target_scale_level = 0;
+    fidelity.target_scale_level = Some(0);
     fidelity.completeness = FrameCompleteness::Exact;
     fidelity.reason = LodDecisionReason::ExactS0;
     fidelity.backend = RenderBackend::GpuCameraMip;

@@ -281,7 +281,7 @@ resolution, preview upscaling, and visible timing probes are deleted. One
 gesture freezes the selected per-layer scale map, so timing or resource
 arrival cannot make its LOD or resolution flicker.
 
-The private 3D replacement renders the selected uniform exact body through one
+The private 3D replacement renders the selected exact per-layer-map body through one
 renderer-owned latest-only worker. It submits and waits for one bounded
 horizontal row batch at a time, adapts the next batch toward a 3 ms target,
 and checks cancellation between submissions. Partial rows publish no frame,
@@ -301,20 +301,23 @@ The terminal scale is a geometry contract, not a fixed ordinal. New imports
 factor-two reduce spatial dimensions until both the maximum dimension is at
 most 64 and the spatial volume is at most 262,144 voxels per layer/timepoint.
 Small datasets may remain S0; the largest representable dimension terminates
-within the profile's 64-level bound. The active terminal body remains in the
-ordinary global requirement union. When one canonical resource covers the
-complete layer, renderer control names that page directly and volume kernels
-bypass repeated sparse-directory hashing. Voxel-exact rays reuse its decoded
-address, and smooth-linear rays reuse the same address for all eight taps.
+within the profile's 64-level bound. Every visible layer's terminal body
+remains in the ordinary global requirement union. When one canonical resource
+covers the complete layer, renderer control names that page directly and
+volume kernels bypass repeated sparse-directory hashing. Voxel-exact rays
+reuse its decoded address, and smooth-linear rays reuse the same address for
+all eight taps.
 
-The 3D navigation planner keeps that terminal body mandatory and admits
-successively finer coherent full-volume rungs while an optional tail bounded
-to one quarter of the configured logical payload/resource limits, at most
-512 MiB and 16,384 resources, fits the exact global union. Each candidate
-wrapper ranks only its own one-scale body as frame-required. The rest of the
-same canonical aggregate is a permanently dormant residency-prefetch suffix:
-the sole renderer residency owner may upload it terminal-to-fine, but it
-cannot affect coverage, control, pixels, fidelity, or prefetch promotion.
+The static 3D navigation planner keeps that terminal map mandatory and admits
+successively finer coherent full-volume maps in deterministic max-min
+per-layer order while an optional tail bounded to one quarter of the
+configured logical payload/resource limits, at most 512 MiB and 16,384
+resources, fits the exact global union. Each candidate wrapper ranks only its
+own one-scale-per-layer body as frame-required. The rest of the same canonical
+aggregate is a permanently dormant residency-prefetch suffix: the sole
+renderer residency owner may upload it terminal-to-fine, but it cannot affect
+coverage, control, pixels, fidelity, or prefetch promotion. Playback retains
+its separate lockstep quality order.
 
 The transient mailbox is the sole render-revision allocator and now allocates
 the render API's `FrameIdentity` directly; the duplicate application
@@ -597,6 +600,60 @@ nonmutation, process, and artifact evidence.
 See [testing](TESTING.md) for commands and claim language.
 
 ## Viewer Performance And Development Recovery Status
+
+The 2026-08-02 static multichannel visible-layer correction is implemented and
+closed. The standard PR gate, renderer GPU equivalence checks, and fixed-LOD
+matrix pass. After normal product use, the owner explicitly accepted the
+correctness-first closeout while reporting materially worse static viewer
+performance. No controlled before/after product measurement exists, so this
+is qualitative negative evidence rather than a quantified regression, and no
+performance improvement is claimed. Static performance recovery is deferred
+to separately approved follow-up work. Durable active-layer selection is now analysis
+focus only and may be hidden. Ordered visible layers own render membership,
+and ideal, capacity-selected, navigation, and displayed fidelity are exact
+per-layer maps. Active-only changes preserve planning, residency, render
+revision, and presentation authority. Hiding the active channel leaves the
+remaining channels renderable; hiding all channels installs and publishes the
+explicit empty state. Uniform scalar LODs survive only as optional diagnostic
+summaries and cannot decide currentness or reuse.
+
+Static capacity refinement and navigation construction now use deterministic
+max-min normalized per-layer progress with authored-order ties. Playback keeps
+its prior active-first/lockstep quality ordering and its retention, runway,
+scheduling, memory, and presentation policies are unchanged. The old
+full-viewport `maximum dimension × taps` navigation estimate is replaced by a
+renderer-schedule-aligned analytical bound over projected affine coverage,
+transform-aware traversal, fixed ray work, per-layer samples/optics, and
+kernel-specific sharing. Native output resolution, complete-frame publication,
+the 12 ms interaction guideline, and existing CPU/GPU/resource ceilings are
+unchanged.
+
+The controlled warm-resident 1920x1080 matrix ran with 64x64x64 Float32
+channels, five warmups and thirty samples on the NVIDIA GeForce RTX 3070 Ti
+Laptop GPU/Vulkan adapter. The largest homogeneous four/eight-channel p95
+ratio normalized to ideal linear scaling was 1.0317 (eight-channel
+SmoothLinear MIP), below the predeclared 1.20 shader gate. Sampled work issued
+zero uploads or residency submissions; renderer-planning p95 was at most
+0.812712 ms, queue-submit p95 at most 0.309468 ms, and WGPU reported zero
+validation errors. No shader, storage, cache, upload, or playback overhaul was
+therefore made.
+
+Owner product use found one shared-path playback regression before closeout:
+starting playback could adopt the terminal rung of a static fair ladder and
+freeze the fixed contract at that coarse scale. Static and playback ladder
+baselines are now mode-local, incompatible ladders are rejected as a whole,
+and the pre-cutover playback work formula, active-first priority/rewarm input,
+and observation identity are isolated from the static work cut. The normal
+two-channel/three-timepoint application transition now proves an S0 playback
+contract after a mixed static rung, and the playback-filtered suite is a
+regression boundary rather than a new performance claim. Exact tables, model
+decisions, regression coverage, the owner closeout, and the deferred
+performance boundary are recorded in the
+[multichannel performance and visible-layer authority plan](plans/active/VIEWER_MULTICHANNEL_PERFORMANCE_AND_VISIBLE_LAYER_AUTHORITY.md).
+One ignored application GPU handoff check remains red at the identical
+immediate-refresh assertion on both the planning baseline and this tree; it is
+recorded as pre-existing harness debt, not counted as positive package
+evidence, and was not weakened.
 
 The development-simplification and viewer-recovery program is complete.
 EP-00/EP-01 qualification commands, selection, schemas, receipt/replay,

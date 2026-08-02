@@ -3,6 +3,11 @@ use mirante4d_render_api::{CameraFrame, RenderExtent};
 
 use crate::viewer_layout::{PanelId, cross_section_schedule_status_label};
 
+fn uniform_some_scale(mut scales: impl Iterator<Item = Option<u32>>) -> Option<u32> {
+    let first = scales.next()??;
+    scales.all(|scale| scale == Some(first)).then_some(first)
+}
+
 #[derive(Clone)]
 struct ViewerUiSnapshot {
     presentation_viewport: PresentationViewport,
@@ -26,7 +31,6 @@ impl MiranteWorkbenchApp {
         snapshot: &ApplicationSnapshot,
     ) -> ui_kit::Linked2dFidelityStatus {
         let view = application_view(snapshot);
-        let active_layer = view.active_layer();
         let demand_currentness = self.visible_demand_plan_currentness();
         let demand_renderability = self.visible_demand_renderability();
         let planning_or_data_work = self.pending_visible_demand_plan.is_some()
@@ -47,19 +51,46 @@ impl MiranteWorkbenchApp {
                     )
                     .ok()
                 })
-                .and_then(|scales| scales.get(&active_layer).copied())
+                .as_ref()
+                .and_then(crate::dataset_demand_plan::uniform_layer_scale)
                 .map(ScaleLevel::get);
             let schedule = surface.cross_section_schedule();
             let selected_scale_level = schedule.and_then(|schedule| schedule.target_scale_level);
-            let displayed_scale_level = surface
-                .layer_presentations()
-                .iter()
-                .find(|layer| layer.layer_ordinal == active_layer.ordinal())
-                .and_then(|layer| layer.displayed_scale_level);
-            let layer_presentation = surface
-                .layer_presentations()
-                .iter()
-                .find(|layer| layer.layer_ordinal == active_layer.ordinal());
+            let visible_presentations = || {
+                view.layers()
+                    .iter()
+                    .filter(|layer| layer.visible())
+                    .map(|layer| {
+                        surface
+                            .layer_presentations()
+                            .iter()
+                            .find(|status| status.layer_ordinal == layer.layer_key().ordinal())
+                    })
+            };
+            let displayed_scale_level = uniform_some_scale(
+                visible_presentations()
+                    .map(|status| status.and_then(|status| status.displayed_scale_level)),
+            );
+            let finest_fallback_scale_level = uniform_some_scale(
+                visible_presentations()
+                    .map(|status| status.and_then(|status| status.finest_fallback_scale_level)),
+            );
+            let fallback_scale_level = uniform_some_scale(
+                visible_presentations()
+                    .map(|status| status.and_then(|status| status.fallback_scale_level)),
+            );
+            let target_available_requirements = visible_presentations()
+                .flatten()
+                .fold(0_u64, |total, layer| {
+                    total.saturating_add(layer.target_available_requirements)
+                });
+            let target_total_requirements = visible_presentations()
+                .flatten()
+                .fold(0_u64, |total, layer| {
+                    total.saturating_add(layer.target_total_requirements)
+                });
+            let mixed = visible_presentations().flatten().any(|layer| layer.mixed);
+            let missing_visible_presentation = visible_presentations().any(|layer| layer.is_none());
             let exact = demand_currentness.cross_section(panel);
             let provisional = schedule.is_some_and(|schedule| {
                 schedule.status
@@ -67,25 +98,20 @@ impl MiranteWorkbenchApp {
             }) || (demand_renderability.cross_section(panel) && !exact);
             let refining = !exact
                 && (planning_or_data_work
-                    || layer_presentation.is_some_and(|layer| layer.mixed)
-                    || layer_presentation.is_some_and(|layer| {
-                        layer.target_available_requirements < layer.target_total_requirements
-                    })
+                    || missing_visible_presentation
+                    || mixed
+                    || target_available_requirements < target_total_requirements
                     || selected_scale_level != displayed_scale_level
                     || selected_scale_level != ideal_scale_level);
             ui_kit::LinkedPanelFidelityStatus {
                 ideal_scale_level,
                 selected_scale_level,
                 displayed_scale_level,
-                finest_fallback_scale_level: layer_presentation
-                    .and_then(|layer| layer.finest_fallback_scale_level),
-                fallback_scale_level: layer_presentation
-                    .and_then(|layer| layer.fallback_scale_level),
-                target_available_requirements: layer_presentation
-                    .map_or(0, |layer| layer.target_available_requirements),
-                target_total_requirements: layer_presentation
-                    .map_or(0, |layer| layer.target_total_requirements),
-                mixed: layer_presentation.is_some_and(|layer| layer.mixed),
+                finest_fallback_scale_level,
+                fallback_scale_level,
+                target_available_requirements,
+                target_total_requirements,
+                mixed,
                 exact,
                 provisional,
                 refining,
@@ -613,7 +639,6 @@ impl eframe::App for MiranteWorkbenchApp {
             let demand_currentness = self.visible_demand_plan_currentness();
             let demand_renderability = self.visible_demand_renderability();
             let view = application_view(&final_snapshot);
-            let active_layer = view.active_layer();
             let linked = [PanelId::Xy, PanelId::Xz, PanelId::Yz].map(|panel| {
                 let surface = self.render_coordination.surface(panel.presentation_slot());
                 let ideal = surface
@@ -629,7 +654,8 @@ impl eframe::App for MiranteWorkbenchApp {
                         )
                         .ok()
                     })
-                    .and_then(|scales| scales.get(&active_layer).copied())
+                    .as_ref()
+                    .and_then(crate::dataset_demand_plan::uniform_layer_scale)
                     .map(ScaleLevel::get);
                 let scope = match panel {
                     PanelId::Xy => crate::dataset_requests::SCOPE_CROSS_SECTION_XY,
@@ -640,14 +666,18 @@ impl eframe::App for MiranteWorkbenchApp {
                 let installed = self
                     .dataset
                     .scope_layer_scales(scope)
-                    .and_then(|scales| scales.get(&active_layer))
-                    .copied()
+                    .and_then(crate::dataset_demand_plan::uniform_layer_scale)
                     .map(ScaleLevel::get);
-                let displayed = surface
-                    .layer_presentations()
-                    .iter()
-                    .find(|layer| layer.layer_ordinal == active_layer.ordinal())
-                    .and_then(|layer| layer.displayed_scale_level);
+                let displayed =
+                    uniform_some_scale(view.layers().iter().filter(|layer| layer.visible()).map(
+                        |layer| {
+                            surface
+                                .layer_presentations()
+                                .iter()
+                                .find(|status| status.layer_ordinal == layer.layer_key().ordinal())
+                                .and_then(|status| status.displayed_scale_level)
+                        },
+                    ));
                 let exact = demand_currentness.cross_section(panel);
                 let provisional = demand_renderability.cross_section(panel) && !exact;
                 (

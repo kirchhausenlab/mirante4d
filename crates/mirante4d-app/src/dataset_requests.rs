@@ -30,7 +30,8 @@ use crate::{
         CameraDemandRequest, CameraDemandResult,
     },
     dataset_demand_plan::{
-        PreparedDatasetDemandPlan, PreparedDemandRequirements, PreparedProgressiveDatasetDemandPlan,
+        PreparedDatasetDemandPlan, PreparedDemandRequirements,
+        PreparedProgressiveDatasetDemandPlan, uniform_layer_scale,
     },
     retained_leases::{RetainedLeaseError, RetainedLeases, RetainedRequirementHandle},
 };
@@ -175,8 +176,8 @@ pub(crate) struct DatasetDemandState {
     /// CPU-authority removals that may now be released immediately when the
     /// exact payload is already resident through another presentation target.
     released_cpu_authority_candidates: HashSet<BrickKey>,
-    current_scale: ScaleLevel,
-    current_ideal_scale: ScaleLevel,
+    current_uniform_scale: Option<ScaleLevel>,
+    current_ideal_uniform_scale: Option<ScaleLevel>,
     current_ideal_layer_scales: BTreeMap<mirante4d_domain::LogicalLayerKey, ScaleLevel>,
     current_capacity_constrained: bool,
     current_covers_full_volume: bool,
@@ -517,8 +518,8 @@ impl DatasetDemandState {
             histogram_requirements_by_layer: BTreeMap::new(),
             histogram_generation_by_layer: BTreeMap::new(),
             released_cpu_authority_candidates: HashSet::new(),
-            current_scale: ScaleLevel::BASE,
-            current_ideal_scale: ScaleLevel::BASE,
+            current_uniform_scale: None,
+            current_ideal_uniform_scale: None,
             current_ideal_layer_scales: BTreeMap::new(),
             current_capacity_constrained: false,
             current_covers_full_volume: false,
@@ -724,6 +725,15 @@ impl DatasetDemandState {
         &self.retained_leases
     }
 
+    /// Retains the established playback rewarm boundary. Static analysis
+    /// focus never calls this path; a playback priority-layer change still
+    /// retires the old fixed-quality CPU authority before replanning, exactly
+    /// as it did before the visible-layer authority cut.
+    pub(crate) fn take_retained_leases_for_playback_rewarm(&mut self) -> RetainedLeases {
+        self.retained_requirements_dirty = true;
+        std::mem::take(&mut self.retained_leases)
+    }
+
     #[cfg(test)]
     pub(crate) fn retire_cpu_payload_for_foreground_test(&mut self, key: BrickKey) -> bool {
         self.retained_leases.retire_payload_handle(key)
@@ -908,23 +918,31 @@ impl DatasetDemandState {
             .unwrap_or(0)
     }
 
-    pub(crate) fn take_retained_leases(&mut self) -> RetainedLeases {
-        self.retained_requirements_dirty = true;
-        std::mem::take(&mut self.retained_leases)
+    pub(crate) const fn current_uniform_scale(&self) -> Option<ScaleLevel> {
+        self.current_uniform_scale
     }
 
-    pub(crate) const fn current_scale(&self) -> ScaleLevel {
-        self.current_scale
-    }
-
-    pub(crate) const fn current_ideal_scale(&self) -> ScaleLevel {
-        self.current_ideal_scale
+    pub(crate) const fn current_ideal_uniform_scale(&self) -> Option<ScaleLevel> {
+        self.current_ideal_uniform_scale
     }
 
     pub(crate) fn current_ideal_layer_scales(
         &self,
     ) -> &BTreeMap<mirante4d_domain::LogicalLayerKey, ScaleLevel> {
         &self.current_ideal_layer_scales
+    }
+
+    /// Exact selected target map for every and only visible 3D layer.
+    /// During an atomic refinement this is the private successor; otherwise
+    /// it is the installed display scope. Scalar uniform summaries must never
+    /// substitute for this comparison authority.
+    pub(crate) fn current_target_layer_scales(
+        &self,
+    ) -> Option<&BTreeMap<mirante4d_domain::LogicalLayerKey, ScaleLevel>> {
+        self.staged_current_plan
+            .as_ref()
+            .map(|plan| &plan.layer_scales)
+            .or_else(|| self.layer_scales_by_scope.get(&SCOPE_CURRENT_3D))
     }
 
     pub(crate) const fn current_capacity_constrained(&self) -> bool {
@@ -989,7 +1007,6 @@ impl DatasetDemandState {
         preserve_complete_presentation: bool,
     ) -> bool {
         let PreparedProgressiveDatasetDemandPlan {
-            ideal_scale,
             ideal_layer_scales,
             target,
             coarse,
@@ -997,7 +1014,7 @@ impl DatasetDemandState {
             reuse_envelope: _,
             playback_timepoint_count: _,
         } = plan;
-        self.current_ideal_scale = ideal_scale;
+        self.current_ideal_uniform_scale = uniform_layer_scale(&ideal_layer_scales);
         self.current_capacity_constrained = target.layer_scales != ideal_layer_scales;
         self.current_ideal_layer_scales = ideal_layer_scales;
         if self.current_prepared_plan_matches(&target) {
@@ -1152,7 +1169,7 @@ impl DatasetDemandState {
     fn commit_prepared_display_plan(&mut self, plan: PreparedDatasetDemandPlan) {
         self.current_playback_downshifted = plan.playback_downshifted;
         self.current_covers_full_volume = plan.covers_full_volume;
-        self.current_scale = plan.scale;
+        self.current_uniform_scale = uniform_layer_scale(&plan.layer_scales);
         self.commit_preflighted_scope_replacement(
             SCOPE_CURRENT_3D,
             plan.requirements,
@@ -1191,7 +1208,7 @@ impl DatasetDemandState {
                 .copied()
                 == Some(plan.requirements.required_prefix_len())
             && self.layer_scales_by_scope.get(&SCOPE_CURRENT_3D) == Some(&plan.layer_scales)
-            && self.current_scale == plan.scale
+            && self.current_uniform_scale == uniform_layer_scale(&plan.layer_scales)
             && self.current_covers_full_volume == plan.covers_full_volume
             && self.current_playback_downshifted == plan.playback_downshifted
             && self.staged_current_plan.is_none()
@@ -1232,7 +1249,7 @@ impl DatasetDemandState {
             .expect("the checked staged plan remains installed");
         self.current_playback_downshifted = plan.playback_downshifted;
         self.current_covers_full_volume = plan.covers_full_volume;
-        self.current_scale = plan.scale;
+        self.current_uniform_scale = uniform_layer_scale(&plan.layer_scales);
 
         self.requirements_by_scope.remove(&SCOPE_CURRENT_3D);
         let requirements = self
@@ -3350,13 +3367,11 @@ mod tests {
             crate::dataset_demand_plan::PreparedProgressiveDatasetDemandPlan::from_planning_accounted(
                 crate::dataset_demand_plan::ProgressiveDatasetDemandPlanning {
                     plan: crate::dataset_demand_plan::ProgressiveDatasetDemandPlan {
-                        ideal_scale: ScaleLevel::BASE,
                         ideal_layer_scales: BTreeMap::from([(
                             mirante4d_domain::LogicalLayerKey::new(0),
                             ScaleLevel::BASE,
                         )]),
                         target: DatasetDemandPlan {
-                            scale: ScaleLevel::BASE,
                             layer_scales: BTreeMap::from([(
                                 mirante4d_domain::LogicalLayerKey::new(0),
                                 ScaleLevel::BASE,
@@ -3491,13 +3506,11 @@ mod tests {
             crate::dataset_demand_plan::PreparedProgressiveDatasetDemandPlan::from_planning_accounted(
                 crate::dataset_demand_plan::ProgressiveDatasetDemandPlanning {
                     plan: crate::dataset_demand_plan::ProgressiveDatasetDemandPlan {
-                        ideal_scale: ScaleLevel::BASE,
                         ideal_layer_scales: BTreeMap::from([(
                             mirante4d_domain::LogicalLayerKey::new(0),
                             ScaleLevel::BASE,
                         )]),
                         target: DatasetDemandPlan {
-                            scale: ScaleLevel::BASE,
                             layer_scales: BTreeMap::from([(
                                 mirante4d_domain::LogicalLayerKey::new(0),
                                 ScaleLevel::BASE,

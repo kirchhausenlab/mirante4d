@@ -9,7 +9,7 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ViewRuntimeChange {
-    pub(crate) dataset_binding_changed: bool,
+    pub(crate) playback_priority_changed: bool,
     pub(crate) timepoint_changed: bool,
 }
 
@@ -28,9 +28,15 @@ pub(crate) fn reconcile_view_runtime(
         return Ok(ViewRuntimeChange::default());
     }
 
-    let dataset_binding_changed = previous_view.active_layer() != view.active_layer();
+    let analysis_binding_changed = previous_view.active_layer() != view.active_layer();
+    // Ordinary rendering is visible-set authoritative. Playback is outside
+    // that static cut and retains its established active-first quality
+    // priority, so an analysis-focus change remains a playback material
+    // change only while a temporal session is active.
+    let playback_priority_changed =
+        snapshot.transient().playback_active() && analysis_binding_changed;
     let timepoint_changed = previous_view.timepoint() != view.timepoint();
-    if dataset_binding_changed || timepoint_changed {
+    if analysis_binding_changed || timepoint_changed {
         let layer = snapshot
             .catalog()
             .layer(view.active_layer())
@@ -43,24 +49,25 @@ pub(crate) fn reconcile_view_runtime(
                 layer.shape().t()
             );
         }
-        if dataset_binding_changed {
-            drop(dataset.take_retained_leases());
+        if playback_priority_changed {
+            drop(dataset.take_retained_leases_for_playback_rewarm());
         }
-        if previous_view.layout() == ViewerLayout::FourPanel
-            || view.layout() == ViewerLayout::FourPanel
+        if (playback_priority_changed || timepoint_changed)
+            && (previous_view.layout() == ViewerLayout::FourPanel
+                || view.layout() == ViewerLayout::FourPanel)
         {
             render.invalidate_cross_sections();
         }
-        if dataset_binding_changed {
+        if analysis_binding_changed {
             analysis.set_roi([0; 3], layer.shape().spatial().dimensions())?;
         }
     }
 
-    if volume_render_changed(previous_view, view) {
+    if playback_priority_changed || volume_render_changed(previous_view, view) {
         render.mark_3d_display_stale();
     }
     Ok(ViewRuntimeChange {
-        dataset_binding_changed,
+        playback_priority_changed,
         timepoint_changed,
     })
 }
@@ -70,7 +77,6 @@ pub(crate) fn reconcile_view_runtime(
 /// not invalidate an otherwise reusable volume frame.
 pub(crate) fn volume_render_changed(previous: &ViewState, next: &ViewState) -> bool {
     previous.layers() != next.layers()
-        || previous.active_layer() != next.active_layer()
         || previous.timepoint() != next.timepoint()
         || previous.camera() != next.camera()
         || previous.layout() != next.layout()
@@ -82,8 +88,68 @@ pub(crate) fn volume_render_changed(previous: &ViewState, next: &ViewState) -> b
 /// reusable.
 pub(crate) fn cross_section_render_changed(previous: &ViewState, next: &ViewState) -> bool {
     previous.layers() != next.layers()
-        || previous.active_layer() != next.active_layer()
         || previous.timepoint() != next.timepoint()
         || previous.layout() != next.layout()
         || previous.cross_section() != next.cross_section()
+}
+
+#[cfg(test)]
+mod tests {
+    use mirante4d_domain::{
+        CameraView, CrossSectionView, DisplayWindow, IsoLightState, LayerTransfer, LogicalLayerKey,
+        Opacity, Projection, RenderState, RgbColor, SamplingPolicy, TimeIndex, TransferCurve,
+        UnitQuaternion, ViewerLayout, WorldPoint3,
+    };
+    use mirante4d_project_model::{LayerViewState, ViewState};
+
+    use super::{cross_section_render_changed, volume_render_changed};
+
+    fn two_layer_view(active: LogicalLayerKey) -> ViewState {
+        let transfer = LayerTransfer::new(
+            DisplayWindow::new(0.0, 1.0).unwrap(),
+            RgbColor::new([1.0, 1.0, 1.0]).unwrap(),
+            Opacity::new(1.0).unwrap(),
+            TransferCurve::linear(),
+            false,
+        );
+        let layers = [LogicalLayerKey::new(0), LogicalLayerKey::new(1)]
+            .into_iter()
+            .map(|layer| {
+                LayerViewState::new(
+                    layer,
+                    true,
+                    transfer.clone(),
+                    RenderState::mip(SamplingPolicy::VoxelExact),
+                )
+            })
+            .collect();
+        ViewState::new(
+            layers,
+            active,
+            TimeIndex::new(0),
+            CameraView::new(
+                Projection::Orthographic,
+                WorldPoint3::origin(),
+                UnitQuaternion::identity(),
+                1.0,
+                320.0,
+                10.0,
+            )
+            .unwrap(),
+            ViewerLayout::FourPanel,
+            CrossSectionView::new(WorldPoint3::origin(), UnitQuaternion::identity(), 1.0, 1.0)
+                .unwrap(),
+            IsoLightState::attached_camera(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn analysis_only_active_change_invalidates_no_render_family() {
+        let previous = two_layer_view(LogicalLayerKey::new(0));
+        let next = two_layer_view(LogicalLayerKey::new(1));
+
+        assert!(!volume_render_changed(&previous, &next));
+        assert!(!cross_section_render_changed(&previous, &next));
+    }
 }

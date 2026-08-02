@@ -59,8 +59,12 @@ fn main() -> anyhow::Result<()> {
             .displayed_scale_level
             .map(|scale| format!("s{scale}"))
             .unwrap_or_else(|| "none".to_owned());
+        let target_scale = report
+            .target_scale_level
+            .map(|scale| format!("s{scale}"))
+            .unwrap_or_else(|| "mixed/none".to_owned());
         println!(
-            "Mirante4D {APP_VERSION} opened {}: {}x{} {}, {} layer(s), {} nonzero pixels, max {}, displayed {}, target s{}",
+            "Mirante4D {APP_VERSION} opened {}: {}x{} {}, {} layer(s), {} nonzero pixels, max {}, displayed {}, target {}",
             report.dataset_label,
             report.frame_width,
             report.frame_height,
@@ -69,7 +73,7 @@ fn main() -> anyhow::Result<()> {
             report.nonzero_pixels,
             report.max_value,
             displayed_scale,
-            report.target_scale_level,
+            target_scale,
         );
         if !report.playback.is_empty() {
             let visited = report

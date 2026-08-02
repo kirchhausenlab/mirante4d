@@ -5,6 +5,12 @@ contains unresolved work only.
 
 ## Deferred
 
+- Recover static multichannel viewer performance after the correctness-first
+  visible-layer cut. Entry requires a controlled same-dataset, same-hardware
+  baseline/current comparison covering selected and displayed per-layer maps,
+  interaction latency, settlement time, I/O/decode/upload work, and GPU timing.
+  Preserve visible-layer authority, scientific semantics, native output, and
+  atomic presentation; playback requires separate explicit authorization.
 - Add float16 TIFF/storage/rendering/analysis support only through a separate
   dtype capability plan.
 - Support mixed-dtype channel publication only through a separate physical

@@ -1,8 +1,24 @@
 # Current Work
 
-Last updated: 2026-08-01
+Last updated: 2026-08-02
 
 ## Current Status
+
+The
+[multichannel performance and visible-layer authority plan](../plans/active/VIEWER_MULTICHANNEL_PERFORMANCE_AND_VISIBLE_LAYER_AUTHORITY.md)
+closed on 2026-08-02 as a correctness-first package. Ordered visible layers
+and exact per-layer maps now own static rendering, empty visibility is
+explicit, active analysis changes preserve static render and residency
+authority, static refinement is max-min fair, and the native work model follows
+projected affine coverage and actual kernel schedules. The standard PR gate,
+renderer GPU equivalence checks, and fixed-LOD matrix pass. The owner accepted
+closeout after normal product use while reporting materially worse static
+viewer performance. No controlled end-to-end before/after comparison exists,
+so no performance improvement is claimed; recovery is deferred to separately
+approved follow-up work. The corrected static-to-playback isolation remains a
+regression boundary, while playback policy itself remains excluded. One
+ignored application GPU handoff check remains recorded as baseline-failing
+harness debt rather than positive evidence for this package.
 
 The
 [large-dataset preprocessing and storage cutover](../plans/active/LARGE_DATASET_PREPROCESSING_AND_STORAGE_CUTOVER.md)
@@ -128,15 +144,12 @@ render-mode matrix and the exact three-launch crash/recovery/native-close
 scenario with zero retries, panic-free stderr, and byte-identical source
 data. This remains a local pre-alpha handoff, not a supported public release.
 
-The spatial viewer performance refactor is closed as of 2026-07-31. The owner
-exercised the normal application after the final resident-navigation-ladder
-cut and reported that four-panel and 3D behavior works as expected. No
-spatial rendering-performance repair remains active. The completed composed-
-presentation correction concerns concurrency, target assembly, and quality
-handoff across playback and interaction; it does not reopen the accepted
-spatial renderer or LOD policy. Smooth-linear sampling stays functionally
-supported but has a known fine-scale refinement cost relative to voxel-exact;
-any optimization or removal is a separate future product decision.
+The prior spatial viewer performance refactor closed as of 2026-07-31 for its
+then-defined scope. New 2026-08-02 multichannel and hidden-active evidence
+reopens only static volume layer authority, work selection, and any renderer
+boundary proved by fixed-LOD measurement. The composed-presentation
+correction remains closed; playback is not part of this package. Smooth-linear
+sampling stays supported and its exact semantics remain mandatory.
 
 The
 [resident 3D navigation ladder plan](../plans/active/VIEWER_RESIDENT_3D_NAVIGATION_LADDER.md)
@@ -433,7 +446,7 @@ deferred and separate.
 Focused formatting, storage, import, `xtask`, UI, application, selector,
 residency, capacity, currentness, and stale-result checks pass. The latest
 broad PR gate also passed every policy phase, zero-warning workspace Clippy,
-exact lane discovery, and all 1,336 applicable unit, contract, and UI tests
+exact lane discovery, and all 1,365 selected unit, contract, and UI tests
 with retries disabled. Those checks do not establish
 linked-2D monitor continuity or transition performance: the mapped zoom
 workflow targeted 3D, generic capture implicitly targeted 3D, and internal
@@ -445,7 +458,15 @@ capture boundary exists.
 
 ## Next Package
 
-No implementation package is currently selected. The
+The
+[multichannel performance and visible-layer authority plan](../plans/active/VIEWER_MULTICHANNEL_PERFORMANCE_AND_VISIBLE_LAYER_AUTHORITY.md)
+is closed. No new viewer implementation package is authorized by that
+closeout. Static multichannel performance recovery is an unresolved follow-up
+that must start with a controlled same-workload baseline/current comparison;
+the corrected static-to-playback isolation must remain green, and playback
+policy remains out of scope.
+
+The
 [large-dataset preprocessing and storage cutover](../plans/active/LARGE_DATASET_PREPROCESSING_AND_STORAGE_CUTOVER.md),
 [preprocessing application and importer cutover](../plans/active/PREPROCESSING_APPLICATION_AND_IMPORTER_CUTOVER.md),
 and

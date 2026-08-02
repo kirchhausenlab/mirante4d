@@ -210,7 +210,7 @@ pub(crate) fn runtime_diagnostics_view(app: &MiranteWorkbenchApp) -> RuntimeDiag
     rows.push((
         "LOD".to_owned(),
         format!(
-            "shown {:?}, target s{}",
+            "shown {:?}, uniform target {:?}",
             app.render_coordination.frame_fidelity.displayed_scale_level,
             app.render_coordination.frame_fidelity.target_scale_level,
         ),
@@ -221,14 +221,21 @@ pub(crate) fn runtime_diagnostics_view(app: &MiranteWorkbenchApp) -> RuntimeDiag
         .iter()
         .enumerate()
     {
+        let layer_scales = candidate
+            .layer_scales
+            .iter()
+            .map(|(layer, scale)| format!("l{}=s{}", layer.ordinal(), scale.get()))
+            .collect::<Vec<_>>()
+            .join(", ");
         rows.push((
             format!("3D candidate {index} {}", candidate.kind.label()),
             format!(
-                "s{}; {} resources / {} payload bytes; {} native work units; resident {}; target-eligible {}; interaction-safe {}; full-volume {}; {}",
-                candidate.active_scale.get(),
+                "[{layer_scales}]; {}; {} shared / {} total schedule work units; {} resources / {} payload bytes; resident {}; target-eligible {}; interaction-safe {}; full-volume {}; {}",
+                candidate.kernel.label(),
+                candidate.shared_work_units,
+                candidate.schedule_work_units,
                 candidate.resource_count,
                 candidate.payload_bytes,
-                candidate.native_work_units,
                 candidate.complete_and_resident,
                 candidate.target_quality_eligible,
                 candidate.interaction_safe,
@@ -236,6 +243,30 @@ pub(crate) fn runtime_diagnostics_view(app: &MiranteWorkbenchApp) -> RuntimeDiag
                 candidate.disposition.label(),
             ),
         ));
+        for layer in &candidate.layer_work {
+            rows.push((
+                format!(
+                    "3D candidate {index} layer {} s{}",
+                    layer.layer.ordinal(),
+                    layer.scale.get()
+                ),
+                format!(
+                    "{:?}/{:?}; projected {} px × {} steps; scheduled {} px × {} steps; {} taps/step + {} gradient taps/ray; ray {} + schedule {} + terminal {} = {} work units",
+                    layer.mode,
+                    layer.sampling,
+                    layer.projected_pixels,
+                    layer.traversal_step_bound,
+                    layer.scheduled_pixels,
+                    layer.scheduled_step_bound,
+                    layer.sample_taps_per_step,
+                    layer.gradient_taps_per_ray,
+                    layer.ray_setup_work_units,
+                    layer.scheduled_work_units,
+                    layer.terminal_work_units,
+                    layer.total_work_units(),
+                ),
+            ));
+        }
     }
     let milestones = app.display_performance_milestones;
     rows.push((
@@ -541,11 +572,13 @@ pub(crate) fn diagnostics_summary_text(app: &MiranteWorkbenchApp) -> String {
         "renderer_required_leases: {}\n\
          renderer_retained_leases: {}\n\
          renderer_cpu_absent_leases: {}\n\
-         current_scale_level: {}\n",
+         current_uniform_scale_level: {:?}\n",
         app.dataset.retained_leases().required_len(),
         app.dataset.retained_leases().retained_len(),
         app.dataset.retained_leases().missing_len(),
-        app.dataset.current_scale().get(),
+        app.dataset
+            .current_uniform_scale()
+            .map(mirante4d_domain::ScaleLevel::get),
     ));
     for (slot, panel) in app.render_coordination.iter() {
         if let Some(schedule) = panel.cross_section_schedule() {

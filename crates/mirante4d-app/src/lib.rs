@@ -225,9 +225,10 @@ fn playback_material_policy_changed(previous: &ViewState, next: &ViewState) -> b
 fn render_intent_family_for_view_change(
     previous: &ViewState,
     current: &ViewState,
+    playback_active: bool,
 ) -> Option<RenderIntentFamily> {
     let shared_changed = previous.layers() != current.layers()
-        || previous.active_layer() != current.active_layer()
+        || (playback_active && previous.active_layer() != current.active_layer())
         || previous.timepoint() != current.timepoint()
         || previous.layout() != current.layout();
     let three_d_changed = shared_changed
@@ -2748,7 +2749,8 @@ impl MiranteWorkbenchApp {
             self.render_coordination
                 .frame_fidelity
                 .displayed_scale_level
-                .unwrap_or(self.dataset.current_scale().get()),
+                .or_else(|| self.dataset.current_uniform_scale().map(ScaleLevel::get))
+                .unwrap_or(ScaleLevel::BASE.get()),
         );
         let generation = self.dataset.histogram_generation(active_key);
         self.active_histogram_cache.summary(
@@ -2932,8 +2934,11 @@ impl MiranteWorkbenchApp {
             }
             let after = self.application.snapshot();
             let playback_active = after.transient().playback_active();
-            let render_intent_family =
-                render_intent_family_for_view_change(&previous_view, application_view(&after));
+            let render_intent_family = render_intent_family_for_view_change(
+                &previous_view,
+                application_view(&after),
+                playback_active,
+            );
             if let Some(family) = render_intent_family {
                 // Establish the final semantic cutoff before either a
                 // playback-stop handoff captures it or a new playback
@@ -3069,12 +3074,12 @@ impl MiranteWorkbenchApp {
                 self.clear_cross_section_product_presentations();
             }
         }
-        if runtime_change.dataset_binding_changed {
+        if runtime_change.playback_priority_changed {
             self.clear_3d_product_presentation();
         } else if linked_runtime_changed {
             self.invalidate_cross_section_panel_display_frames();
         }
-        if runtime_change.dataset_binding_changed || runtime_change.timepoint_changed {
+        if runtime_change.playback_priority_changed || runtime_change.timepoint_changed {
             self.request_visible_bricks();
         } else {
             if volume_render_changed {
@@ -3234,9 +3239,14 @@ impl MiranteWorkbenchApp {
                                 FrameCompleteness::Exact | FrameCompleteness::Complete
                             ),
                         !terminal_empty
-                            && displayed.is_some_and(|scale| scale > fidelity.target_scale_level),
+                            && matches!(
+                                (displayed, fidelity.target_scale_level),
+                                (Some(displayed), Some(target)) if displayed > target
+                            ),
                         display_current
-                            && (terminal_empty || displayed == Some(fidelity.target_scale_level))
+                            && (terminal_empty
+                                || (fidelity.target_scale_level.is_some()
+                                    && displayed == fidelity.target_scale_level))
                             && matches!(
                                 fidelity.completeness,
                                 FrameCompleteness::Exact | FrameCompleteness::Complete

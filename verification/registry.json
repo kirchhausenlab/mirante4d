@@ -374,9 +374,13 @@
         {
           "package": "mirante4d-render-wgpu",
           "test_prefix": "gpu_tests::native_1080p_terminal_navigation_gpu_timing"
+        },
+        {
+          "package": "mirante4d-render-wgpu",
+          "test_prefix": "gpu_tests::fixed_lod_multichannel_gpu_timing_matrix"
         }
       ],
-      "expected_ignored_cases": 17
+      "expected_ignored_cases": 18
     },
     {
       "id": "WP10A-ADAPTER-FORMAT-LIFECYCLE-SCALABILITY",

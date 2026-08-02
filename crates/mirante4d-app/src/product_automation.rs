@@ -466,13 +466,35 @@ fn coordinated_visible_layout_current_complete_with_snapshot(
     let base = RenderIntentBase::from_snapshot(snapshot);
     let demand_currentness = app.visible_demand_plan_currentness();
     let generation = app.render_coordination.display_generation();
+    let three_d_target_presented =
+        app.dataset
+            .current_target_layer_scales()
+            .is_some_and(|target| {
+                if target.is_empty() {
+                    app.render_coordination.frame_fidelity.backend == crate::RenderBackend::Empty
+                        && app
+                            .render_coordination
+                            .surface(PresentationSlot::ThreeD)
+                            .layer_presentations()
+                            .is_empty()
+                } else {
+                    app.render_coordination
+                        .surface(PresentationSlot::ThreeD)
+                        .presented_frame()
+                        .is_some_and(|frame| {
+                            crate::display_refresh::presented_layer_scales_match_target(
+                                frame.progress().coverage(),
+                                target,
+                            )
+                        })
+                }
+            });
     if generation.current_presentation_generation != Some(generation.input_generation)
         || app.render_intent_mailbox.active_target(base).is_some()
         || app.resident_cross_section_coverage.is_some()
         || !demand_currentness.current_3d
         || app.dataset.staging_current_refinement()
-        || app.dataset.current_scale().get()
-            != app.render_coordination.frame_fidelity.target_scale_level
+        || !three_d_target_presented
     {
         return false;
     }
@@ -4507,7 +4529,7 @@ impl ProductAutomationController {
             } => {
                 let fidelity = &app.render_coordination.frame_fidelity;
                 let scale_matches = fidelity.displayed_scale_level == Some(*scale_level)
-                    && fidelity.target_scale_level == *scale_level;
+                    && fidelity.target_scale_level == Some(*scale_level);
                 let completeness_matches = if *exact {
                     fidelity.completeness == FrameCompleteness::Exact
                 } else {
@@ -4521,7 +4543,7 @@ impl ProductAutomationController {
                     Ok(())
                 } else {
                     Err(format!(
-                        "frame fidelity mismatch: displayed={:?}, target=s{}, completeness={:?}, exact_required={exact}",
+                        "frame fidelity mismatch: displayed={:?}, target={:?}, completeness={:?}, exact_required={exact}",
                         fidelity.displayed_scale_level,
                         fidelity.target_scale_level,
                         fidelity.completeness,
@@ -5251,7 +5273,10 @@ impl ProductAutomationController {
                 "display_coordination": display_coordination_diagnostics_json(app),
             },
             "dataset_demand": {
-                "current_scale_level": app.dataset.current_scale().get(),
+                "current_scale_level": app
+                    .dataset
+                    .current_uniform_scale()
+                    .map(mirante4d_domain::ScaleLevel::get),
                 "last_plan_error": app.dataset.last_plan_error(),
                 "dispatcher_pending": app.dataset.dispatcher().has_pending_work(),
                 "last_fault": app.dataset.dispatcher().last_fault().map(|fault| fault.to_string()),
@@ -5717,11 +5742,16 @@ fn active_lease_cohort_status(
         .scope_requirements(crate::dataset_requests::SCOPE_CURRENT_3D)
         .first()?
         .identity();
+    let scale = app
+        .dataset
+        .scope_layer_scales(crate::dataset_requests::SCOPE_CURRENT_3D)?
+        .get(&view.active_layer())
+        .copied()?;
     Some(app.dataset.retained_leases().cohort_status(
         identity,
         view.active_layer(),
         view.timepoint(),
-        app.dataset.current_scale(),
+        scale,
     ))
 }
 
@@ -6051,10 +6081,31 @@ fn planned_scope_accounting_json(app: &MiranteWorkbenchApp) -> Value {
             json!({
                 "index": index,
                 "kind": candidate.kind.label(),
-                "active_scale_level": candidate.active_scale.get(),
+                "kernel_class": candidate.kernel.label(),
+                "layer_scales": candidate.layer_scales.iter().map(|(layer, scale)| json!({
+                    "layer_ordinal": layer.ordinal(),
+                    "scale_level": scale.get(),
+                })).collect::<Vec<_>>(),
+                "shared_work_units": candidate.shared_work_units,
+                "layer_work": candidate.layer_work.iter().map(|layer| json!({
+                    "layer_ordinal": layer.layer.ordinal(),
+                    "scale_level": layer.scale.get(),
+                    "mode": format!("{:?}", layer.mode),
+                    "sampling": format!("{:?}", layer.sampling),
+                    "projected_pixels": layer.projected_pixels,
+                    "traversal_step_bound": layer.traversal_step_bound,
+                    "scheduled_pixels": layer.scheduled_pixels,
+                    "scheduled_step_bound": layer.scheduled_step_bound,
+                    "sample_taps_per_step": layer.sample_taps_per_step,
+                    "gradient_taps_per_ray": layer.gradient_taps_per_ray,
+                    "ray_setup_work_units": layer.ray_setup_work_units,
+                    "scheduled_work_units": layer.scheduled_work_units,
+                    "terminal_work_units": layer.terminal_work_units,
+                    "total_work_units": layer.total_work_units(),
+                })).collect::<Vec<_>>(),
                 "resource_count": candidate.resource_count,
                 "payload_bytes": candidate.payload_bytes,
-                "native_work_units": candidate.native_work_units,
+                "schedule_work_units": candidate.schedule_work_units,
                 "complete_and_resident": candidate.complete_and_resident,
                 "target_quality_eligible": candidate.target_quality_eligible,
                 "interaction_safe": candidate.interaction_safe,

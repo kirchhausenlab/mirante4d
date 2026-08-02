@@ -208,6 +208,9 @@ struct GpuFixtures {
     upload: Vec<BrickKey>,
     work: Vec<BrickKey>,
     multichannel: [BrickKey; 3],
+    /// Eight co-registered 64-cubed channels used only by the ignored fixed-
+    /// LOD multichannel timing matrix.
+    performance_channels: [BrickKey; 8],
     affine: BrickKey,
     /// Fine-left, fine-right, and complete coarse floor.
     multiscale_plane: [BrickKey; 3],
@@ -288,7 +291,7 @@ fn fixture_resource_grids(catalog: &DatasetCatalog) -> RenderResourceGridCatalog
                     5..=7 => 8,
                     11 => 8,
                     12 => 2,
-                    13 => 64,
+                    13 | 15..=22 => 64,
                     14 => 32,
                     ordinal => panic!("fixture layer {ordinal} has no declared resource grid"),
                 };
@@ -473,6 +476,62 @@ fn build_fixtures() -> GpuFixtures {
                 layer(
                     14,
                     "terminal-sparse-volume",
+                    [64, 64, 64],
+                    IntensityDType::Float32,
+                    ResourceValidity::AllValid,
+                ),
+                layer(
+                    15,
+                    "performance-channel-1",
+                    [64, 64, 64],
+                    IntensityDType::Float32,
+                    ResourceValidity::AllValid,
+                ),
+                layer(
+                    16,
+                    "performance-channel-2",
+                    [64, 64, 64],
+                    IntensityDType::Float32,
+                    ResourceValidity::AllValid,
+                ),
+                layer(
+                    17,
+                    "performance-channel-3",
+                    [64, 64, 64],
+                    IntensityDType::Float32,
+                    ResourceValidity::AllValid,
+                ),
+                layer(
+                    18,
+                    "performance-channel-4",
+                    [64, 64, 64],
+                    IntensityDType::Float32,
+                    ResourceValidity::AllValid,
+                ),
+                layer(
+                    19,
+                    "performance-channel-5",
+                    [64, 64, 64],
+                    IntensityDType::Float32,
+                    ResourceValidity::AllValid,
+                ),
+                layer(
+                    20,
+                    "performance-channel-6",
+                    [64, 64, 64],
+                    IntensityDType::Float32,
+                    ResourceValidity::AllValid,
+                ),
+                layer(
+                    21,
+                    "performance-channel-7",
+                    [64, 64, 64],
+                    IntensityDType::Float32,
+                    ResourceValidity::AllValid,
+                ),
+                layer(
+                    22,
+                    "performance-channel-8",
                     [64, 64, 64],
                     IntensityDType::Float32,
                     ResourceValidity::AllValid,
@@ -702,6 +761,33 @@ fn build_fixtures() -> GpuFixtures {
     }
     assert_eq!(terminal_sparse.len(), 8);
 
+    let performance_channels = std::array::from_fn(|index| {
+        let key = resource_key(15 + index as u32, [0, 0, 0], [64, 64, 64]);
+        let mut values = Vec::with_capacity(MIB as usize);
+        for z in 0_u64..64 {
+            for y in 0_u64..64 {
+                for x in 0_u64..64 {
+                    let spatial = (x + y + z) as f32 / 189.0;
+                    let value = (spatial * (0.65 + index as f32 * 0.025)).min(1.0);
+                    values.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        assert_eq!(values.len(), MIB as usize);
+        assert!(
+            payloads
+                .insert(
+                    key,
+                    PayloadBytes {
+                        values: values.into(),
+                        validity: None,
+                    },
+                )
+                .is_none()
+        );
+        key
+    });
+
     let source = Arc::new(FixtureSource { catalog, payloads });
     GpuFixtures {
         source,
@@ -711,6 +797,7 @@ fn build_fixtures() -> GpuFixtures {
         upload,
         work,
         multichannel,
+        performance_channels,
         affine,
         multiscale_plane: [fine_left, fine_right, coarse],
         terminal,
@@ -5227,6 +5314,283 @@ fn native_1080p_terminal_navigation_gpu_timing() {
     assert!(
         Instant::now() <= deadline,
         "native terminal timing exceeded its 120-second deadline"
+    );
+}
+
+#[test]
+#[ignore = "requires a trusted Vulkan GPU with timestamp-query support for measurements"]
+fn fixed_lod_multichannel_gpu_timing_matrix() {
+    const WARMUP_FRAMES: usize = 5;
+    const MEASURED_TRIALS: usize = 30;
+
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let fixtures = build_fixtures();
+    let (dataset_runtime, catalog) = start_dataset_runtime(&fixtures.source);
+    let generation = CancellationGeneration::for_scope(REQUEST_SCOPE, 41);
+    let leases = load_keys(
+        &dataset_runtime,
+        &fixtures.performance_channels,
+        generation,
+        deadline,
+    );
+    let offers = owned_leases(&fixtures.performance_channels, &leases, None);
+    let extent = RenderExtent::new(1920, 1080).expect("multichannel timing extent is valid");
+    let target = PresentationTarget::ThreeD;
+    let mut gpu = test_gpu_runtime(
+        WgpuRenderRuntimeConfig::new(512 * MIB)
+            .expect("multichannel timing ledger is valid")
+            .with_gpu_timing(true),
+        None,
+        TestPipelineAdmission::Ready,
+    );
+    activate_fixture_dataset(&mut gpu, &fixtures, &catalog);
+    assert_qualifying_adapter(gpu.diagnostics());
+    assert!(
+        gpu.diagnostics().gpu_timestamps_supported(),
+        "the multichannel timing matrix requires Vulkan timestamp queries"
+    );
+    request_target_layout(&mut gpu, target, extent);
+
+    let view = volume_view_for([31.5, 31.5, 31.5], 64.0 / 1080.0, 128.0);
+    let colors = [
+        [1.0, 0.2, 0.2],
+        [0.2, 1.0, 0.2],
+        [0.2, 0.4, 1.0],
+        [1.0, 0.8, 0.2],
+        [1.0, 0.2, 0.8],
+        [0.2, 1.0, 1.0],
+        [0.8, 0.6, 0.3],
+        [0.7, 0.7, 0.7],
+    ];
+    let dvr_state = |sampling| {
+        mirante4d_domain::RenderState::dvr(
+            sampling,
+            DvrOpacityTransfer::new(
+                DisplayWindow::new(0.0, 1.0).unwrap(),
+                TransferCurve::linear(),
+            ),
+            0.02,
+        )
+        .unwrap()
+    };
+    let iso_state = |sampling| {
+        mirante4d_domain::RenderState::iso(sampling, IsoShadingPolicy::Flat, 0.5).unwrap()
+    };
+    let layers_for = |count: usize, kernel: &str, sampling: SamplingPolicy| {
+        (0..count)
+            .map(|index| {
+                let state = match kernel {
+                    "MIP" => mirante4d_domain::RenderState::mip(sampling),
+                    "DVR" => dvr_state(sampling),
+                    "ISO" => iso_state(sampling),
+                    "Mixed" => match index % 3 {
+                        0 => mirante4d_domain::RenderState::mip(sampling),
+                        1 => dvr_state(sampling),
+                        _ => iso_state(sampling),
+                    },
+                    _ => unreachable!("the timing kernel matrix is fixed"),
+                };
+                LayerRenderIntent::new(
+                    fixtures.performance_channels[index].layer(),
+                    transfer_color_opacity(0.0, 1.0, colors[index], 0.25),
+                    state,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut next_frame = 20_000_u64;
+    let seed_layers = layers_for(8, "MIP", SamplingPolicy::VoxelExact);
+    let (seed_intent, seed_requirements) = multichannel_intent_and_requirements(
+        next_frame,
+        view,
+        extent,
+        seed_layers,
+        &fixtures.performance_channels,
+    );
+    next_frame += 1;
+    gpu.offer_residency_leases(&offers)
+        .expect("all multichannel timing leases are offered");
+    let seed = execute_coordinated_target(
+        &mut gpu,
+        target,
+        &catalog,
+        &seed_intent,
+        &seed_requirements,
+        RetainedFrameRenderPolicy::EveryUsefulFrame,
+    );
+    let seed_report = seed
+        .target(target)
+        .expect("the upload seed has a target report");
+    assert!(seed_report.presented());
+    let _ = poll_gpu_timing(
+        &mut gpu,
+        seed.gpu_timing()
+            .expect("the upload seed has a timing ticket"),
+        deadline,
+    );
+
+    let mut reference_p95 = BTreeMap::<String, u64>::new();
+    let mut maximum_homogeneous_linear_ratio = 0.0_f64;
+    let mut maximum_homogeneous_linear_case = String::new();
+    for sampling in [SamplingPolicy::VoxelExact, SamplingPolicy::SmoothLinear] {
+        for kernel in ["MIP", "DVR", "ISO", "Mixed"] {
+            let case_key = format!("{kernel}-{sampling:?}");
+            for channel_count in [1_usize, 2, 4, 8] {
+                let keys = &fixtures.performance_channels[..channel_count];
+                let (base_intent, base_requirements) = multichannel_intent_and_requirements(
+                    next_frame,
+                    view,
+                    extent,
+                    layers_for(channel_count, kernel, sampling),
+                    keys,
+                );
+                next_frame += 1;
+                for _ in 0..WARMUP_FRAMES {
+                    let intent = base_intent
+                        .clone()
+                        .with_frame(FrameIdentity::new(next_frame));
+                    next_frame += 1;
+                    let requirements = base_requirements
+                        .rebind(&intent)
+                        .expect("a fixed-LOD warmup rebinds the same resident resources");
+                    gpu.offer_residency_leases(&offers[..channel_count])
+                        .expect("warm resident channel offers remain idempotent");
+                    let cutoff = execute_coordinated_target(
+                        &mut gpu,
+                        target,
+                        &catalog,
+                        &intent,
+                        &requirements,
+                        RetainedFrameRenderPolicy::EveryUsefulFrame,
+                    );
+                    let report = cutoff.target(target).expect("warmup report exists");
+                    assert!(report.presented());
+                    assert_eq!(report.visited_resources(), 0);
+                    assert_eq!(report.uploaded_resources(), 0);
+                    assert_eq!(cutoff.residency_queue_submissions(), 0);
+                    let _ = poll_gpu_timing(
+                        &mut gpu,
+                        cutoff.gpu_timing().expect("warmup has a timing ticket"),
+                        deadline,
+                    );
+                }
+
+                let mut render_ns = Vec::with_capacity(MEASURED_TRIALS);
+                let mut cpu_planning_ns = Vec::with_capacity(MEASURED_TRIALS);
+                let mut cpu_submit_ns = Vec::with_capacity(MEASURED_TRIALS);
+                for _ in 0..MEASURED_TRIALS {
+                    let intent = base_intent
+                        .clone()
+                        .with_frame(FrameIdentity::new(next_frame));
+                    next_frame += 1;
+                    let requirements = base_requirements
+                        .rebind(&intent)
+                        .expect("a fixed-LOD sample rebinds the same resident resources");
+                    let cutoff = execute_coordinated_target(
+                        &mut gpu,
+                        target,
+                        &catalog,
+                        &intent,
+                        &requirements,
+                        RetainedFrameRenderPolicy::EveryUsefulFrame,
+                    );
+                    let report = cutoff.target(target).expect("timed report exists");
+                    assert!(report.presented());
+                    assert_eq!(report.visited_resources(), 0);
+                    assert_eq!(report.uploaded_resources(), 0);
+                    assert_eq!(cutoff.residency_queue_submissions(), 0);
+                    let cpu = cutoff
+                        .cpu_timing()
+                        .expect("CPU timing is enabled with GPU timing");
+                    cpu_planning_ns.push(cpu.planning_ns());
+                    cpu_submit_ns.push(cpu.queue_submit_ns());
+                    let timing = poll_gpu_timing(
+                        &mut gpu,
+                        cutoff.gpu_timing().expect("sample has a timing ticket"),
+                        deadline,
+                    );
+                    render_ns.push(
+                        timing
+                            .render_pass_ns()
+                            .expect("the fixed-LOD sample has a color-pass interval"),
+                    );
+                }
+                render_ns.sort_unstable();
+                cpu_planning_ns.sort_unstable();
+                cpu_submit_ns.sort_unstable();
+                let p95_ns = percentile(&render_ns, 0.95);
+                let reference_channels = if kernel == "Mixed" { 2 } else { 1 };
+                if channel_count == reference_channels {
+                    reference_p95.insert(case_key.clone(), p95_ns);
+                }
+                let ratios = reference_p95.get(&case_key).map(|baseline| {
+                    let reference_ratio = p95_ns as f64 / (*baseline).max(1) as f64;
+                    let ideal_channel_ratio = channel_count as f64 / reference_channels as f64;
+                    (reference_ratio, reference_ratio / ideal_channel_ratio)
+                });
+                if kernel != "Mixed"
+                    && matches!(channel_count, 4 | 8)
+                    && let Some((_, linear_ratio)) = ratios
+                    && linear_ratio > maximum_homogeneous_linear_ratio
+                {
+                    maximum_homogeneous_linear_ratio = linear_ratio;
+                    maximum_homogeneous_linear_case =
+                        format!("{kernel}-{sampling:?}-{channel_count}ch");
+                }
+                let reference_ratio = ratios
+                    .map(|(ratio, _)| format!("{ratio:.4}"))
+                    .unwrap_or_else(|| "n/a".to_owned());
+                let linear_ratio = ratios
+                    .map(|(_, ratio)| format!("{ratio:.4}"))
+                    .unwrap_or_else(|| "n/a".to_owned());
+                let reported_kernel = if kernel == "Mixed" && channel_count == 1 {
+                    "MIP-control"
+                } else {
+                    kernel
+                };
+                println!(
+                    "fixed-LOD multichannel GPU timing: adapter={} backend=Vulkan shape=64x64x64 extent=1920x1080 warmups={} trials={} kernel={} sampling={sampling:?} compatibility={} channels={} resources={} payload_bytes={} gpu_median_ns={} gpu_p95_ns={} gpu_max_ns={} reference_channels={} reference_ratio={} ideal_linear_normalized_ratio={} cpu_planning_p95_ns={} cpu_submit_p95_ns={} uploads_during_samples=0",
+                    sanitize_diagnostic_text(gpu.diagnostics().adapter_name()),
+                    WARMUP_FRAMES,
+                    MEASURED_TRIALS,
+                    reported_kernel,
+                    if kernel == "Mixed" && channel_count == 1 {
+                        "homogeneous-control"
+                    } else if kernel == "Mixed" {
+                        "authored-mixed"
+                    } else {
+                        "co-registered-homogeneous"
+                    },
+                    channel_count,
+                    channel_count,
+                    channel_count as u64 * MIB,
+                    percentile(&render_ns, 0.50),
+                    p95_ns,
+                    *render_ns.last().unwrap(),
+                    reference_channels,
+                    reference_ratio,
+                    linear_ratio,
+                    percentile(&cpu_planning_ns, 0.95),
+                    percentile(&cpu_submit_ns, 0.95),
+                );
+            }
+        }
+    }
+    println!(
+        "fixed-LOD multichannel shader gate: threshold=1.2000 maximum_homogeneous_linear_ratio={maximum_homogeneous_linear_ratio:.4} case={} gate_met={}",
+        maximum_homogeneous_linear_case,
+        maximum_homogeneous_linear_ratio > 1.2,
+    );
+    assert_eq!(gpu.diagnostics().validation_error_count(), 0);
+
+    drop(offers);
+    dataset_runtime.request_shutdown().unwrap();
+    drop(leases);
+    drop(dataset_runtime);
+    assert!(
+        Instant::now() <= deadline,
+        "fixed-LOD multichannel timing exceeded its 600-second deadline"
     );
 }
 

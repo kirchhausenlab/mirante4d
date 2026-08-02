@@ -629,8 +629,8 @@ const fn presentation_slot_index(slot: PresentationSlot) -> usize {
 pub(crate) fn record_ui_end(
     ready: bool,
     displayed_scale: Option<u32>,
-    selected_scale: u32,
-    ideal_scale: u32,
+    selected_scale: Option<u32>,
+    ideal_scale: Option<u32>,
     state_flags: u64,
 ) {
     TRACE.with(|slot| {
@@ -639,8 +639,8 @@ pub(crate) fn record_ui_end(
             return;
         };
         let displayed = displayed_scale.map_or(u64::from(u8::MAX), u64::from);
-        let selected = u64::from(selected_scale);
-        let ideal = u64::from(ideal_scale);
+        let selected = selected_scale.map_or(u64::from(u8::MAX), u64::from);
+        let ideal = ideal_scale.map_or(u64::from(u8::MAX), u64::from);
         let value = u64::from(ready)
             | (displayed << 8)
             | (selected << 16)

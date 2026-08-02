@@ -194,6 +194,12 @@
       "listed_in": "docs/README.md"
     },
     {
+      "path": "docs/plans/active/VIEWER_MULTICHANNEL_PERFORMANCE_AND_VISIBLE_LAYER_AUTHORITY.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
       "path": "docs/plans/active/VIEWER_RESIDENT_3D_NAVIGATION_LADDER.md",
       "truth_scope": "target",
       "authorities": [],

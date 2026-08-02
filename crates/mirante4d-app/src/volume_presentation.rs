@@ -3,25 +3,43 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use mirante4d_application::RenderGestureId;
-use mirante4d_dataset::DatasetCatalog;
+use mirante4d_dataset::{DatasetCatalog, DatasetScale};
 use mirante4d_domain::{
     CameraView, IsoShadingPolicy, LogicalLayerKey, Projection, RenderMode, RenderState,
-    SamplingPolicy, ScaleLevel, TimeIndex,
+    SamplingPolicy, ScaleLevel, Shape3D, TimeIndex, WorldPoint3,
 };
 use mirante4d_project_model::ViewState;
-use mirante4d_render_api::{FrameIdentity, PresentationViewport, RenderExtent};
+use mirante4d_render_api::{
+    CameraFrame, FrameIdentity, PresentationViewport, RenderExtent,
+    shader_control_world_to_grid_rows,
+};
 use mirante4d_render_wgpu::{GpuFrameTiming, GpuTimingTicket, VolumeColorSchedule};
 
-// Neutral work counts sample taps rather than assigning permanent costs to
-// render modes. The former 1x MIP / 2x DVR-or-ISO distinction survives only as
-// a first-observation prior; asynchronous GPU evidence replaces it per family.
-const INITIAL_INTERACTIVE_WORK_UNITS: u64 = 128_000_000;
-// Native visible navigation uses a fixed product envelope, not a learned
-// timing probe. At 1920x1080 this admits roughly 1,200 neutral sample taps per
-// pixel: enough for the normal S2/S3 voxel-exact Cell views while smooth
-// eight-tap bodies fall back to the terminal full-volume fast path.
+// Work is expressed in quarter-voxel-MIP-step quanta. This preserves the
+// existing 2.5-billion-unit navigation envelope while allowing the model to
+// represent the renderer's shared traversal and measured mode/sampling costs
+// without fractional arithmetic. The fixed-LOD 64^3 matrix justifies the
+// schedule weights below. They preserve the measured 1080p decision
+// boundaries: 8-layer voxel MIP, 4-layer fused voxel DVR, and 2-layer voxel
+// ISO remain inside 12 ms, while 2-layer smooth MIP/DVR and 1-layer smooth
+// ISO remain outside. Relative one-layer p95 versus voxel MIP was 4.46x for
+// smooth MIP, 2.16x/6.84x for voxel/smooth DVR, and 4.94x/8.89x for
+// voxel/smooth ISO on the qualified Vulkan adapter.
+const INITIAL_INTERACTIVE_WORK_UNITS: u64 = 512_000_000;
 const NATIVE_NAVIGATION_WORK_UNITS: u64 = 2_500_000_000;
-const MIN_WORK_UNITS: u64 = 1_000_000;
+const MIN_WORK_UNITS: u64 = 4_000_000;
+// Playback is outside this refactor. These are the exact pre-cutover neutral
+// work-model constants retained for playback presentation and strip sizing.
+const LEGACY_PLAYBACK_INITIAL_INTERACTIVE_WORK_UNITS: u64 = 128_000_000;
+const LEGACY_PLAYBACK_MIN_WORK_UNITS: u64 = 1_000_000;
+const RAY_SETUP_WORK_UNITS_PER_PIXEL: u64 = 4;
+const TRAVERSAL_WORK_UNITS_PER_STEP: u64 = 4;
+const MIP_SMOOTH_WORK_UNITS_PER_STEP: u64 = 14;
+const DVR_FUSED_WORK_UNITS_PER_LAYER_STEP: u64 = 7;
+const DVR_GENERAL_WORK_UNITS_PER_LAYER_STEP: u64 = 24;
+const ISO_VOXEL_WORK_UNITS_PER_STEP: u64 = 12;
+const ISO_SMOOTH_WORK_UNITS_PER_STEP: u64 = 32;
+const GRADIENT_TAP_WORK_UNITS: u64 = 4;
 const INTERACTION_GPU_BUDGET_NS: u64 = 12_000_000;
 const REFINEMENT_GPU_BUDGET_NS: u64 = 3_000_000;
 const DIRECT_CERTIFICATION_NS: u64 = 8_000_000;
@@ -43,10 +61,111 @@ struct VolumeLayerWorkClass {
     iso_display_bucket: Option<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 struct VolumeWorkFamily {
     projection: Projection,
+    model: VolumeWorkModel,
+    kernel: VolumeKernelWorkClass,
     layers: Box<[VolumeLayerWorkClass]>,
+}
+
+impl PartialEq for VolumeWorkFamily {
+    fn eq(&self, other: &Self) -> bool {
+        self.projection == other.projection
+            && self.model == other.model
+            && self.layers == other.layers
+            // The pre-cutover playback calibration family was projection +
+            // ordered render-state classes only. Static schedule classes need
+            // the new kernel distinction; playback deliberately does not.
+            && (self.model == VolumeWorkModel::LegacyPlayback || self.kernel == other.kernel)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeWorkModel {
+    StaticScheduleAligned,
+    LegacyPlayback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VolumeKernelWorkClass {
+    HomogeneousMip,
+    FusedExactDvr,
+    GeneralDvr,
+    HomogeneousIso,
+    AuthoredMixed,
+}
+
+impl VolumeKernelWorkClass {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::HomogeneousMip => "homogeneous MIP",
+            Self::FusedExactDvr => "compatible fused DVR",
+            Self::GeneralDvr => "general affine DVR",
+            Self::HomogeneousIso => "homogeneous ISO",
+            Self::AuthoredMixed => "authored Mixed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PixelRect {
+    x_start: u32,
+    y_start: u32,
+    x_end: u32,
+    y_end: u32,
+}
+
+impl PixelRect {
+    const fn full(extent: RenderExtent) -> Self {
+        Self {
+            x_start: 0,
+            y_start: 0,
+            x_end: extent.width_pixels(),
+            y_end: extent.height_pixels(),
+        }
+    }
+
+    const fn width(self) -> u32 {
+        self.x_end.saturating_sub(self.x_start)
+    }
+
+    const fn height(self) -> u32 {
+        self.y_end.saturating_sub(self.y_start)
+    }
+
+    fn pixels(self) -> u64 {
+        u64::from(self.width()).saturating_mul(u64::from(self.height()))
+    }
+
+    fn pixels_in_rows(self, y_start: u32, rows: u32) -> u64 {
+        let y_end = y_start.saturating_add(rows);
+        let overlap_start = self.y_start.max(y_start);
+        let overlap_end = self.y_end.min(y_end);
+        u64::from(self.width()).saturating_mul(u64::from(overlap_end.saturating_sub(overlap_start)))
+    }
+
+    fn union(self, other: Self) -> Self {
+        if self.width() == 0 || self.height() == 0 {
+            return other;
+        }
+        if other.width() == 0 || other.height() == 0 {
+            return self;
+        }
+        Self {
+            x_start: self.x_start.min(other.x_start),
+            y_start: self.y_start.min(other.y_start),
+            x_end: self.x_end.max(other.x_end),
+            y_end: self.y_end.max(other.y_end),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShaderGridGeometry {
+    scale: ScaleLevel,
+    shape_xyz: [u64; 3],
+    control_bits: [u32; 24],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,19 +173,76 @@ struct VolumeLayerWorkload {
     layer: LogicalLayerKey,
     scale: ScaleLevel,
     render_state: RenderState,
-    maximum_steps: u64,
+    legacy_maximum_steps: u64,
+    legacy_work_units_per_pixel: u64,
+    legacy_initial_prior_work_units_per_pixel: u64,
+    projected_rect: PixelRect,
+    traversal_step_bound: u64,
+    sample_taps_per_step: u64,
+    gradient_taps_per_ray: u64,
+    fixed_work_units_per_output_pixel: u64,
+    scheduled_rect: PixelRect,
+    scheduled_step_bound: u64,
+    scheduled_work_units_per_step: u64,
+    terminal_work_units_per_projected_pixel: u64,
+    world_corners: [[f64; 3]; 8],
+    inverse_rows: [[f32; 4]; 3],
+    shader_geometry: ShaderGridGeometry,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedVolumeWorkload {
+    fixed_work_units_per_output_pixel: u64,
+    scheduled_rect: PixelRect,
+    scheduled_step_bound: u64,
+    scheduled_work_units_per_step: u64,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct VolumeWorkloadProfile {
     extent: RenderExtent,
     presentation_viewport: PresentationViewport,
     camera: CameraView,
     timepoint: TimeIndex,
     layers: Box<[VolumeLayerWorkload]>,
-    work_per_pixel: u64,
-    initial_prior_work_per_pixel: u64,
+    shared: SharedVolumeWorkload,
+    model: VolumeWorkModel,
     family: VolumeWorkFamily,
+}
+
+impl PartialEq for VolumeWorkloadProfile {
+    fn eq(&self, other: &Self) -> bool {
+        if self.model != other.model
+            || self.extent != other.extent
+            || self.presentation_viewport != other.presentation_viewport
+            || self.camera != other.camera
+            || self.timepoint != other.timepoint
+            || self.family != other.family
+        {
+            return false;
+        }
+        if self.model == VolumeWorkModel::LegacyPlayback {
+            // Preserve the exact pre-cutover profile identity. The static
+            // estimator's projected rectangles, renderer schedule, affine
+            // controls, and kernel classification must not split playback's
+            // direct-certification or hidden-strip observations.
+            return self.legacy_work_units_per_pixel() == other.legacy_work_units_per_pixel()
+                && self.legacy_initial_prior_work_units_per_pixel()
+                    == other.legacy_initial_prior_work_units_per_pixel()
+                && self.layers.len() == other.layers.len()
+                && self
+                    .layers
+                    .iter()
+                    .zip(other.layers.iter())
+                    .all(|(left, right)| {
+                        left.layer == right.layer
+                            && left.scale == right.scale
+                            && left.render_state == right.render_state
+                            && left.legacy_maximum_steps == right.legacy_maximum_steps
+                    });
+        }
+        self.layers == other.layers && self.shared == other.shared
+    }
 }
 
 impl VolumeWorkloadProfile {
@@ -78,10 +254,60 @@ impl VolumeWorkloadProfile {
         layer_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
         extent: RenderExtent,
     ) -> anyhow::Result<Self> {
+        Self::from_view_with_model(
+            catalog,
+            view,
+            camera,
+            presentation_viewport,
+            layer_scales,
+            extent,
+            VolumeWorkModel::StaticScheduleAligned,
+        )
+    }
+
+    pub(crate) fn from_product_view(
+        catalog: &DatasetCatalog,
+        view: &ViewState,
+        camera: CameraView,
+        presentation_viewport: PresentationViewport,
+        layer_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
+        extent: RenderExtent,
+        playback_active: bool,
+    ) -> anyhow::Result<Self> {
+        if !playback_active {
+            return Self::from_view(
+                catalog,
+                view,
+                camera,
+                presentation_viewport,
+                layer_scales,
+                extent,
+            );
+        }
+        Self::from_view_with_model(
+            catalog,
+            view,
+            camera,
+            presentation_viewport,
+            layer_scales,
+            extent,
+            VolumeWorkModel::LegacyPlayback,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_view_with_model(
+        catalog: &DatasetCatalog,
+        view: &ViewState,
+        camera: CameraView,
+        presentation_viewport: PresentationViewport,
+        layer_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
+        extent: RenderExtent,
+        model: VolumeWorkModel,
+    ) -> anyhow::Result<Self> {
         let mut layers = Vec::new();
-        let mut work_per_pixel = 0_u64;
-        let mut initial_prior_work_per_pixel = 0_u64;
         let mut family_layers = Vec::new();
+        let camera_frame = CameraFrame::new(camera, presentation_viewport)?;
         for layer in view.layers().iter().filter(|layer| layer.visible()) {
             let key = layer.layer_key();
             let scale = layer_scales.get(&key).copied().ok_or_else(|| {
@@ -100,39 +326,49 @@ impl VolumeWorkloadProfile {
                         scale.get()
                     )
                 })?;
-            let shape = dataset_scale.shape();
-            let maximum_steps = shape.x().max(shape.y()).max(shape.z());
             let render_state = *layer.render_state();
-            let taps = match render_state.sampling_policy() {
+            let shape = dataset_scale.shape();
+            let legacy_maximum_steps = shape.x().max(shape.y()).max(shape.z());
+            let sample_taps_per_step = match render_state.sampling_policy() {
                 SamplingPolicy::VoxelExact => 1_u64,
                 SamplingPolicy::SmoothLinear => 8_u64,
             };
-            // This factor is deliberately not part of neutral work. It only
-            // seeds an unknown family's initial safe envelope.
-            let initial_mode_prior = if render_state.mode() == RenderMode::Mip {
-                1_u64
-            } else {
-                2_u64
-            };
-            let gradient_taps = render_state
+            let gradient_taps_per_ray = render_state
                 .iso_parameters()
                 .filter(|parameters| {
                     parameters.shading_policy()
                         == mirante4d_domain::IsoShadingPolicy::GradientLighting
                 })
-                .map_or(0_u64, |_| 6_u64.saturating_mul(taps));
-            let neutral_layer_work = maximum_steps
-                .saturating_mul(taps)
-                .saturating_add(gradient_taps)
+                .map_or(0_u64, |_| 6_u64.saturating_mul(sample_taps_per_step));
+            let legacy_initial_mode_prior = if render_state.mode() == RenderMode::Mip {
+                1_u64
+            } else {
+                2_u64
+            };
+            let legacy_work_units_per_pixel = legacy_maximum_steps
+                .saturating_mul(sample_taps_per_step)
+                .saturating_add(gradient_taps_per_ray)
                 .max(1);
-            let prior_layer_work = maximum_steps
-                .saturating_mul(taps)
-                .saturating_mul(initial_mode_prior)
-                .saturating_add(gradient_taps)
+            let legacy_initial_prior_work_units_per_pixel = legacy_maximum_steps
+                .saturating_mul(sample_taps_per_step)
+                .saturating_mul(legacy_initial_mode_prior)
+                .saturating_add(gradient_taps_per_ray)
                 .max(1);
-            work_per_pixel = work_per_pixel.saturating_add(neutral_layer_work);
-            initial_prior_work_per_pixel =
-                initial_prior_work_per_pixel.saturating_add(prior_layer_work);
+            let inverse_rows = shader_control_world_to_grid_rows(dataset_scale.grid_to_world())?;
+            // Color traversal intersects the f32 world-to-grid rows uploaded
+            // to WGSL, not the source f64 affine directly. Reconstruct its
+            // implied volume corners so projection and general-DVR interval
+            // accounting describe the geometry the shader actually sees.
+            let world_corners = shader_volume_world_corners(dataset_scale.shape(), inverse_rows)?;
+            let projected_rect = projected_pixel_rect(camera_frame, &world_corners, extent);
+            let traversal_step_bound = conservative_grid_traversal_bound(
+                camera_frame,
+                presentation_viewport,
+                extent,
+                projected_rect,
+                dataset_scale.shape(),
+                inverse_rows,
+            );
             family_layers.push(VolumeLayerWorkClass {
                 mode: render_state.mode(),
                 sampling: render_state.sampling_policy(),
@@ -148,22 +384,47 @@ impl VolumeWorkloadProfile {
                 layer: key,
                 scale,
                 render_state,
-                maximum_steps,
+                legacy_maximum_steps,
+                legacy_work_units_per_pixel,
+                legacy_initial_prior_work_units_per_pixel,
+                projected_rect,
+                traversal_step_bound,
+                sample_taps_per_step,
+                gradient_taps_per_ray,
+                fixed_work_units_per_output_pixel: 0,
+                scheduled_rect: projected_rect,
+                scheduled_step_bound: traversal_step_bound,
+                scheduled_work_units_per_step: 0,
+                terminal_work_units_per_projected_pixel: gradient_taps_per_ray
+                    .saturating_mul(GRADIENT_TAP_WORK_UNITS),
+                world_corners,
+                inverse_rows,
+                shader_geometry: shader_grid_geometry(scale, *dataset_scale)?,
             });
         }
         if layers.is_empty() {
             anyhow::bail!("3D workload requires at least one visible layer");
         }
+        let kernel = classify_kernel(&layers);
+        let shared = configure_schedule(
+            kernel,
+            camera_frame,
+            presentation_viewport,
+            extent,
+            &mut layers,
+        );
         Ok(Self {
             extent,
             presentation_viewport,
             camera,
             timepoint: view.timepoint(),
             layers: layers.into_boxed_slice(),
-            work_per_pixel: work_per_pixel.max(1),
-            initial_prior_work_per_pixel: initial_prior_work_per_pixel.max(1),
+            shared,
+            model,
             family: VolumeWorkFamily {
                 projection: camera.projection(),
+                model,
+                kernel,
                 layers: family_layers.into_boxed_slice(),
             },
         })
@@ -178,25 +439,181 @@ impl VolumeWorkloadProfile {
     }
 
     pub(crate) fn full_work_units(&self) -> u64 {
-        extent_pixels(self.extent).saturating_mul(self.work_per_pixel)
+        match self.model {
+            VolumeWorkModel::StaticScheduleAligned => {
+                self.schedule_work_units_for_row_range(0, self.extent.height_pixels())
+            }
+            VolumeWorkModel::LegacyPlayback => {
+                extent_pixels(self.extent).saturating_mul(self.legacy_work_units_per_pixel())
+            }
+        }
     }
 
     fn work_units_for_rows(&self, rows: u32) -> u64 {
-        u64::from(self.extent.width_pixels())
-            .saturating_mul(u64::from(rows))
-            .saturating_mul(self.work_per_pixel)
+        if self.model == VolumeWorkModel::LegacyPlayback {
+            return u64::from(self.extent.width_pixels())
+                .saturating_mul(u64::from(rows.min(self.extent.height_pixels())))
+                .saturating_mul(self.legacy_work_units_per_pixel());
+        }
+        let rows = rows.min(self.extent.height_pixels());
+        let maximum_row_work = (0..self.extent.height_pixels())
+            .map(|y| self.schedule_work_units_for_row_range(y, 1))
+            .max()
+            .unwrap_or(0);
+        maximum_row_work.saturating_mul(u64::from(rows))
+    }
+
+    fn work_units_for_row_range(&self, y_start: u32, rows: u32) -> u64 {
+        if self.model == VolumeWorkModel::LegacyPlayback {
+            return u64::from(self.extent.width_pixels())
+                .saturating_mul(u64::from(
+                    rows.min(self.extent.height_pixels().saturating_sub(y_start)),
+                ))
+                .saturating_mul(self.legacy_work_units_per_pixel());
+        }
+        self.schedule_work_units_for_row_range(y_start, rows)
+    }
+
+    fn schedule_work_units_for_row_range(&self, y_start: u32, rows: u32) -> u64 {
+        let rows = rows.min(self.extent.height_pixels().saturating_sub(y_start));
+        let output_pixels = u64::from(self.extent.width_pixels()).saturating_mul(u64::from(rows));
+        let mut work = output_pixels.saturating_mul(self.shared.fixed_work_units_per_output_pixel);
+        work = work.saturating_add(schedule_region_work(
+            self.shared.scheduled_rect,
+            y_start,
+            rows,
+            self.shared.scheduled_step_bound,
+            self.shared.scheduled_work_units_per_step,
+        ));
+        for layer in &self.layers {
+            work = work.saturating_add(
+                output_pixels.saturating_mul(layer.fixed_work_units_per_output_pixel),
+            );
+            work = work.saturating_add(schedule_region_work(
+                layer.scheduled_rect,
+                y_start,
+                rows,
+                layer.scheduled_step_bound,
+                layer.scheduled_work_units_per_step,
+            ));
+            work = work.saturating_add(
+                layer
+                    .projected_rect
+                    .pixels_in_rows(y_start, rows)
+                    .saturating_mul(layer.terminal_work_units_per_projected_pixel),
+            );
+        }
+        work.max(1)
     }
 
     fn initial_safe_work_units(&self) -> u64 {
-        INITIAL_INTERACTIVE_WORK_UNITS
-            .saturating_mul(self.work_per_pixel)
-            .checked_div(self.initial_prior_work_per_pixel.max(1))
-            .unwrap_or(0)
-            .max(MIN_WORK_UNITS)
+        match self.model {
+            VolumeWorkModel::StaticScheduleAligned => INITIAL_INTERACTIVE_WORK_UNITS,
+            VolumeWorkModel::LegacyPlayback => LEGACY_PLAYBACK_INITIAL_INTERACTIVE_WORK_UNITS
+                .saturating_mul(self.legacy_work_units_per_pixel())
+                .checked_div(self.legacy_initial_prior_work_units_per_pixel().max(1))
+                .unwrap_or(0)
+                .max(LEGACY_PLAYBACK_MIN_WORK_UNITS),
+        }
     }
 
     fn native_navigation_is_safe(&self) -> bool {
         self.full_work_units() <= NATIVE_NAVIGATION_WORK_UNITS
+    }
+
+    fn kernel(&self) -> VolumeKernelWorkClass {
+        self.family.kernel
+    }
+
+    fn shared_work_units(&self) -> u64 {
+        if self.model == VolumeWorkModel::LegacyPlayback {
+            return 0;
+        }
+        let output_pixels = extent_pixels(self.extent);
+        output_pixels
+            .saturating_mul(self.shared.fixed_work_units_per_output_pixel)
+            .saturating_add(schedule_region_work(
+                self.shared.scheduled_rect,
+                0,
+                self.extent.height_pixels(),
+                self.shared.scheduled_step_bound,
+                self.shared.scheduled_work_units_per_step,
+            ))
+    }
+
+    fn layer_work_facts(&self) -> Box<[VolumeLayerWorkFacts]> {
+        let output_pixels = extent_pixels(self.extent);
+        self.layers
+            .iter()
+            .map(|layer| {
+                if self.model == VolumeWorkModel::LegacyPlayback {
+                    return VolumeLayerWorkFacts {
+                        layer: layer.layer,
+                        scale: layer.scale,
+                        mode: layer.render_state.mode(),
+                        sampling: layer.render_state.sampling_policy(),
+                        projected_pixels: output_pixels,
+                        traversal_step_bound: layer.legacy_maximum_steps,
+                        scheduled_pixels: output_pixels,
+                        scheduled_step_bound: layer.legacy_maximum_steps,
+                        sample_taps_per_step: layer.sample_taps_per_step,
+                        gradient_taps_per_ray: layer.gradient_taps_per_ray,
+                        ray_setup_work_units: 0,
+                        scheduled_work_units: output_pixels
+                            .saturating_mul(layer.legacy_work_units_per_pixel),
+                        terminal_work_units: 0,
+                    };
+                }
+                let ray_setup_work_units =
+                    output_pixels.saturating_mul(layer.fixed_work_units_per_output_pixel);
+                let scheduled_work_units = schedule_region_work(
+                    layer.scheduled_rect,
+                    0,
+                    self.extent.height_pixels(),
+                    layer.scheduled_step_bound,
+                    layer.scheduled_work_units_per_step,
+                );
+                let terminal_work_units = layer
+                    .projected_rect
+                    .pixels()
+                    .saturating_mul(layer.terminal_work_units_per_projected_pixel);
+                VolumeLayerWorkFacts {
+                    layer: layer.layer,
+                    scale: layer.scale,
+                    mode: layer.render_state.mode(),
+                    sampling: layer.render_state.sampling_policy(),
+                    projected_pixels: layer.projected_rect.pixels(),
+                    traversal_step_bound: layer.traversal_step_bound,
+                    scheduled_pixels: layer.scheduled_rect.pixels(),
+                    scheduled_step_bound: layer.scheduled_step_bound,
+                    sample_taps_per_step: layer.sample_taps_per_step,
+                    gradient_taps_per_ray: layer.gradient_taps_per_ray,
+                    ray_setup_work_units,
+                    scheduled_work_units,
+                    terminal_work_units,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    fn legacy_work_units_per_pixel(&self) -> u64 {
+        self.layers.iter().fold(0_u64, |total, layer| {
+            total.saturating_add(layer.legacy_work_units_per_pixel)
+        })
+    }
+
+    fn legacy_initial_prior_work_units_per_pixel(&self) -> u64 {
+        self.layers.iter().fold(0_u64, |total, layer| {
+            total.saturating_add(layer.legacy_initial_prior_work_units_per_pixel)
+        })
+    }
+
+    const fn minimum_work_units(&self) -> u64 {
+        match self.model {
+            VolumeWorkModel::StaticScheduleAligned => MIN_WORK_UNITS,
+            VolumeWorkModel::LegacyPlayback => LEGACY_PLAYBACK_MIN_WORK_UNITS,
+        }
     }
 
     fn scale_configuration(&self) -> VolumeScaleConfiguration {
@@ -221,6 +638,474 @@ impl VolumeWorkloadProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VolumeLayerWorkFacts {
+    pub(crate) layer: LogicalLayerKey,
+    pub(crate) scale: ScaleLevel,
+    pub(crate) mode: RenderMode,
+    pub(crate) sampling: SamplingPolicy,
+    pub(crate) projected_pixels: u64,
+    pub(crate) traversal_step_bound: u64,
+    pub(crate) scheduled_pixels: u64,
+    pub(crate) scheduled_step_bound: u64,
+    pub(crate) sample_taps_per_step: u64,
+    pub(crate) gradient_taps_per_ray: u64,
+    pub(crate) ray_setup_work_units: u64,
+    pub(crate) scheduled_work_units: u64,
+    pub(crate) terminal_work_units: u64,
+}
+
+impl VolumeLayerWorkFacts {
+    pub(crate) fn total_work_units(self) -> u64 {
+        self.ray_setup_work_units
+            .saturating_add(self.scheduled_work_units)
+            .saturating_add(self.terminal_work_units)
+    }
+}
+
+fn classify_kernel(layers: &[VolumeLayerWorkload]) -> VolumeKernelWorkClass {
+    let all_mip = layers
+        .iter()
+        .all(|layer| layer.render_state.mode() == RenderMode::Mip);
+    let all_dvr = layers
+        .iter()
+        .all(|layer| layer.render_state.mode() == RenderMode::Dvr);
+    let all_iso = layers
+        .iter()
+        .all(|layer| layer.render_state.mode() == RenderMode::Isosurface);
+    if all_mip {
+        VolumeKernelWorkClass::HomogeneousMip
+    } else if all_dvr && fused_exact_dvr_compatible(layers) {
+        VolumeKernelWorkClass::FusedExactDvr
+    } else if all_dvr {
+        VolumeKernelWorkClass::GeneralDvr
+    } else if all_iso {
+        VolumeKernelWorkClass::HomogeneousIso
+    } else {
+        VolumeKernelWorkClass::AuthoredMixed
+    }
+}
+
+fn fused_exact_dvr_compatible(layers: &[VolumeLayerWorkload]) -> bool {
+    let Some(first) = layers.first() else {
+        return false;
+    };
+    first.render_state.sampling_policy() == SamplingPolicy::VoxelExact
+        && layers.iter().all(|layer| {
+            layer.render_state.sampling_policy() == SamplingPolicy::VoxelExact
+                && layer.shader_geometry == first.shader_geometry
+        })
+}
+
+fn configure_schedule(
+    kernel: VolumeKernelWorkClass,
+    camera: CameraFrame,
+    presentation: PresentationViewport,
+    extent: RenderExtent,
+    layers: &mut [VolumeLayerWorkload],
+) -> SharedVolumeWorkload {
+    let mut shared = SharedVolumeWorkload {
+        fixed_work_units_per_output_pixel: 0,
+        scheduled_rect: PixelRect::default(),
+        scheduled_step_bound: 0,
+        scheduled_work_units_per_step: 0,
+    };
+    match kernel {
+        VolumeKernelWorkClass::HomogeneousMip
+        | VolumeKernelWorkClass::HomogeneousIso
+        | VolumeKernelWorkClass::AuthoredMixed => {
+            for layer in layers {
+                layer.fixed_work_units_per_output_pixel = RAY_SETUP_WORK_UNITS_PER_PIXEL;
+                layer.scheduled_work_units_per_step = TRAVERSAL_WORK_UNITS_PER_STEP
+                    .saturating_add(independent_layer_work_units_per_step(*layer));
+            }
+        }
+        VolumeKernelWorkClass::FusedExactDvr => {
+            let first = layers
+                .first()
+                .expect("a classified volume kernel has at least one layer");
+            shared = SharedVolumeWorkload {
+                fixed_work_units_per_output_pixel: RAY_SETUP_WORK_UNITS_PER_PIXEL,
+                scheduled_rect: first.projected_rect,
+                scheduled_step_bound: first.traversal_step_bound,
+                scheduled_work_units_per_step: TRAVERSAL_WORK_UNITS_PER_STEP,
+            };
+            for layer in layers {
+                layer.scheduled_rect = shared.scheduled_rect;
+                layer.scheduled_step_bound = shared.scheduled_step_bound;
+                layer.scheduled_work_units_per_step = DVR_FUSED_WORK_UNITS_PER_LAYER_STEP;
+            }
+        }
+        VolumeKernelWorkClass::GeneralDvr => {
+            let union_rect = layers
+                .iter()
+                .map(|layer| layer.projected_rect)
+                .reduce(PixelRect::union)
+                .unwrap_or_default();
+            let traversal =
+                general_dvr_traversal_bound(camera, presentation, extent, union_rect, layers);
+            shared = SharedVolumeWorkload {
+                fixed_work_units_per_output_pixel: 0,
+                scheduled_rect: union_rect,
+                scheduled_step_bound: traversal,
+                scheduled_work_units_per_step: TRAVERSAL_WORK_UNITS_PER_STEP,
+            };
+            for layer in layers {
+                // The general shader derives every layer ray across the full
+                // output, then revisits every layer in each common-world
+                // segment. Charge both mechanics even where a particular
+                // layer contributes no scalar sample.
+                layer.fixed_work_units_per_output_pixel = RAY_SETUP_WORK_UNITS_PER_PIXEL;
+                layer.scheduled_rect = union_rect;
+                layer.scheduled_step_bound = traversal;
+                layer.scheduled_work_units_per_step = DVR_GENERAL_WORK_UNITS_PER_LAYER_STEP;
+            }
+        }
+    }
+    shared
+}
+
+fn independent_layer_work_units_per_step(layer: VolumeLayerWorkload) -> u64 {
+    match (
+        layer.render_state.mode(),
+        layer.render_state.sampling_policy(),
+    ) {
+        (RenderMode::Mip, SamplingPolicy::VoxelExact) => 0,
+        (RenderMode::Mip, SamplingPolicy::SmoothLinear) => MIP_SMOOTH_WORK_UNITS_PER_STEP,
+        (RenderMode::Dvr, SamplingPolicy::VoxelExact) => DVR_FUSED_WORK_UNITS_PER_LAYER_STEP,
+        (RenderMode::Dvr, SamplingPolicy::SmoothLinear) => DVR_GENERAL_WORK_UNITS_PER_LAYER_STEP,
+        (RenderMode::Isosurface, SamplingPolicy::VoxelExact) => ISO_VOXEL_WORK_UNITS_PER_STEP,
+        (RenderMode::Isosurface, SamplingPolicy::SmoothLinear) => ISO_SMOOTH_WORK_UNITS_PER_STEP,
+    }
+}
+
+fn schedule_region_work(
+    rect: PixelRect,
+    y_start: u32,
+    rows: u32,
+    steps: u64,
+    work_units_per_step: u64,
+) -> u64 {
+    rect.pixels_in_rows(y_start, rows)
+        .saturating_mul(steps)
+        .saturating_mul(work_units_per_step)
+}
+
+fn shader_grid_geometry(
+    scale: ScaleLevel,
+    dataset_scale: DatasetScale,
+) -> anyhow::Result<ShaderGridGeometry> {
+    let inverse = shader_control_world_to_grid_rows(dataset_scale.grid_to_world())?;
+    let mut control_bits = [0_u32; 24];
+    for (target, value) in control_bits[..12]
+        .iter_mut()
+        .zip(inverse.into_iter().flatten())
+    {
+        *target = canonical_f32(value).to_bits();
+    }
+    for (target, value) in control_bits[12..].iter_mut().zip(
+        dataset_scale.grid_to_world().row_major()[..12]
+            .iter()
+            .copied(),
+    ) {
+        let converted = value as f32;
+        if !converted.is_finite() {
+            anyhow::bail!("3D workload grid transform is not representable by the renderer");
+        }
+        *target = canonical_f32(converted).to_bits();
+    }
+    Ok(ShaderGridGeometry {
+        scale,
+        shape_xyz: [
+            dataset_scale.shape().x(),
+            dataset_scale.shape().y(),
+            dataset_scale.shape().z(),
+        ],
+        control_bits,
+    })
+}
+
+fn canonical_f32(value: f32) -> f32 {
+    if value == 0.0 { 0.0 } else { value }
+}
+
+fn shader_volume_world_corners(
+    shape: Shape3D,
+    inverse_rows: [[f32; 4]; 3],
+) -> anyhow::Result<[[f64; 3]; 8]> {
+    let [a, b, c, tx] = inverse_rows[0].map(f64::from);
+    let [d, e, f, ty] = inverse_rows[1].map(f64::from);
+    let [g, h, i, tz] = inverse_rows[2].map(f64::from);
+    let determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+        anyhow::bail!("renderer-quantized world-to-grid transform is non-invertible");
+    }
+    let inverse_determinant = determinant.recip();
+    let grid_to_world = [
+        [
+            (e * i - f * h) * inverse_determinant,
+            (c * h - b * i) * inverse_determinant,
+            (b * f - c * e) * inverse_determinant,
+        ],
+        [
+            (f * g - d * i) * inverse_determinant,
+            (a * i - c * g) * inverse_determinant,
+            (c * d - a * f) * inverse_determinant,
+        ],
+        [
+            (d * h - e * g) * inverse_determinant,
+            (b * g - a * h) * inverse_determinant,
+            (a * e - b * d) * inverse_determinant,
+        ],
+    ];
+    let translation = [tx, ty, tz];
+    let x = [-0.5, f64::from(shape.x() as f32 - 0.5)];
+    let y = [-0.5, f64::from(shape.y() as f32 - 0.5)];
+    let z = [-0.5, f64::from(shape.z() as f32 - 0.5)];
+    let mut corners = [[0.0; 3]; 8];
+    let mut index = 0;
+    for grid_z in z {
+        for grid_y in y {
+            for grid_x in x {
+                let translated_grid = [
+                    grid_x - translation[0],
+                    grid_y - translation[1],
+                    grid_z - translation[2],
+                ];
+                corners[index] = grid_to_world.map(|row| {
+                    row[0] * translated_grid[0]
+                        + row[1] * translated_grid[1]
+                        + row[2] * translated_grid[2]
+                });
+                if !corners[index].iter().all(|value| value.is_finite()) {
+                    anyhow::bail!("renderer-quantized volume corners are not finite");
+                }
+                index += 1;
+            }
+        }
+    }
+    Ok(corners)
+}
+
+fn projected_pixel_rect(
+    camera: CameraFrame,
+    world_corners: &[[f64; 3]; 8],
+    extent: RenderExtent,
+) -> PixelRect {
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for corner in world_corners {
+        let Ok(world) = WorldPoint3::new(corner[0], corner[1], corner[2]) else {
+            return PixelRect::full(extent);
+        };
+        let Ok(Some(projected)) = camera.project_world_point(world) else {
+            // If a corner reaches or crosses the eye plane, the perspective
+            // silhouette can be unbounded. Full output is the only safe
+            // analytical rectangle.
+            return PixelRect::full(extent);
+        };
+        let x = (projected.screen_x_points() / camera.presentation().width_points() + 0.5)
+            * f64::from(extent.width_pixels());
+        let y = (0.5 - projected.screen_y_points() / camera.presentation().height_points())
+            * f64::from(extent.height_pixels());
+        if !x.is_finite() || !y.is_finite() {
+            return PixelRect::full(extent);
+        }
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    let (x_start, x_end) = conservative_pixel_axis(min_x, max_x, extent.width_pixels());
+    let (y_start, y_end) = conservative_pixel_axis(min_y, max_y, extent.height_pixels());
+    PixelRect {
+        x_start,
+        y_start,
+        x_end,
+        y_end,
+    }
+}
+
+fn conservative_pixel_axis(minimum: f64, maximum: f64, limit: u32) -> (u32, u32) {
+    if maximum < 0.0 || minimum > f64::from(limit) {
+        return (0, 0);
+    }
+    let start = (minimum.floor() - 1.0).clamp(0.0, f64::from(limit)) as u32;
+    let end = (maximum.ceil() + 1.0).clamp(0.0, f64::from(limit)) as u32;
+    (start.min(end), end)
+}
+
+fn conservative_grid_traversal_bound(
+    camera: CameraFrame,
+    presentation: PresentationViewport,
+    extent: RenderExtent,
+    rect: PixelRect,
+    shape: Shape3D,
+    inverse_rows: [[f32; 4]; 3],
+) -> u64 {
+    if rect.width() == 0 || rect.height() == 0 {
+        return 0;
+    }
+    let world_directions = camera_direction_corners(camera, presentation, extent, rect);
+    let grid_directions = world_directions.map(|direction| {
+        inverse_rows.map(|row| {
+            f64::from(row[0]) * direction[0]
+                + f64::from(row[1]) * direction[1]
+                + f64::from(row[2]) * direction[2]
+        })
+    });
+    let maximum_steps = shape.x().max(shape.y()).max(shape.z());
+    let maximum_speed = (0..3)
+        .map(|axis| component_abs_max(&grid_directions, axis))
+        .fold(0.0, f64::max);
+    if !maximum_speed.is_finite() || maximum_speed <= 0.0 {
+        return maximum_steps;
+    }
+    let shape_xyz = [shape.x(), shape.y(), shape.z()];
+    let mut bound = maximum_steps;
+    for (axis, dimension) in shape_xyz.into_iter().enumerate() {
+        let minimum_component = component_abs_min(&grid_directions, axis);
+        if minimum_component > 0.0 {
+            let candidate = dimension as f64 * maximum_speed / minimum_component;
+            bound = bound.min(saturating_ceil_u64(candidate).saturating_add(1));
+        }
+    }
+    bound.max(1).min(maximum_steps)
+}
+
+fn general_dvr_traversal_bound(
+    camera: CameraFrame,
+    presentation: PresentationViewport,
+    extent: RenderExtent,
+    rect: PixelRect,
+    layers: &[VolumeLayerWorkload],
+) -> u64 {
+    if rect.width() == 0 || rect.height() == 0 {
+        return 0;
+    }
+    if layers
+        .windows(2)
+        .all(|pair| pair[0].world_corners == pair[1].world_corners)
+    {
+        return layers
+            .iter()
+            .map(|layer| layer.traversal_step_bound)
+            .max()
+            .unwrap_or(1);
+    }
+
+    let directions = camera_direction_corners(camera, presentation, extent, rect);
+    let mut world_min = [f64::INFINITY; 3];
+    let mut world_max = [f64::NEG_INFINITY; 3];
+    for corner in layers.iter().flat_map(|layer| layer.world_corners) {
+        for axis in 0..3 {
+            world_min[axis] = world_min[axis].min(corner[axis]);
+            world_max[axis] = world_max[axis].max(corner[axis]);
+        }
+    }
+    let world_size = std::array::from_fn::<_, 3, _>(|axis| world_max[axis] - world_min[axis]);
+    let mut parameter_span = world_size
+        .iter()
+        .map(|size| size * size)
+        .sum::<f64>()
+        .sqrt();
+    for (axis, world_axis_size) in world_size.into_iter().enumerate() {
+        let minimum_component = component_abs_min(&directions, axis);
+        if minimum_component > 0.0 {
+            parameter_span = parameter_span.min(world_axis_size / minimum_component);
+        }
+    }
+    let maximum_grid_speed = layers
+        .iter()
+        .flat_map(|layer| {
+            (0..3).map(move |axis| {
+                directions
+                    .iter()
+                    .map(|direction| {
+                        let row = layer.inverse_rows[axis];
+                        (f64::from(row[0]) * direction[0]
+                            + f64::from(row[1]) * direction[1]
+                            + f64::from(row[2]) * direction[2])
+                            .abs()
+                    })
+                    .fold(0.0, f64::max)
+            })
+        })
+        .fold(0.0, f64::max);
+    saturating_ceil_u64(parameter_span * maximum_grid_speed)
+        .saturating_add(1)
+        .max(1)
+}
+
+fn camera_direction_corners(
+    camera: CameraFrame,
+    presentation: PresentationViewport,
+    extent: RenderExtent,
+    rect: PixelRect,
+) -> [[f64; 3]; 4] {
+    let x_edges = [f64::from(rect.x_start), f64::from(rect.x_end)];
+    let y_edges = [f64::from(rect.y_start), f64::from(rect.y_end)];
+    let axes = camera.axes();
+    let mut directions = [[0.0; 3]; 4];
+    let mut index = 0;
+    for y in y_edges {
+        for x in x_edges {
+            let screen_x =
+                (x / f64::from(extent.width_pixels()) - 0.5) * presentation.width_points();
+            let screen_y =
+                (0.5 - y / f64::from(extent.height_pixels())) * presentation.height_points();
+            directions[index] = match camera.view().projection() {
+                Projection::Orthographic => axes.forward(),
+                Projection::Perspective => {
+                    let focal = camera.view().perspective_focal_length_screen_points();
+                    std::array::from_fn(|axis| {
+                        axes.forward()[axis]
+                            + axes.right()[axis] * screen_x / focal
+                            + axes.up()[axis] * screen_y / focal
+                    })
+                }
+            };
+            index += 1;
+        }
+    }
+    directions
+}
+
+fn component_abs_max(vectors: &[[f64; 3]; 4], axis: usize) -> f64 {
+    vectors
+        .iter()
+        .map(|vector| vector[axis].abs())
+        .fold(0.0, f64::max)
+}
+
+fn component_abs_min(vectors: &[[f64; 3]; 4], axis: usize) -> f64 {
+    let minimum = vectors
+        .iter()
+        .map(|vector| vector[axis])
+        .fold(f64::INFINITY, f64::min);
+    let maximum = vectors
+        .iter()
+        .map(|vector| vector[axis])
+        .fold(f64::NEG_INFINITY, f64::max);
+    if minimum <= 0.0 && maximum >= 0.0 {
+        0.0
+    } else {
+        minimum.abs().min(maximum.abs())
+    }
+}
+
+fn saturating_ceil_u64(value: f64) -> u64 {
+    if !value.is_finite() || value >= u64::MAX as f64 {
+        u64::MAX
+    } else if value <= 0.0 {
+        0
+    } else {
+        value.ceil() as u64
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VolumeScaleConfiguration(Box<[(LogicalLayerKey, ScaleLevel)]>);
 
@@ -230,7 +1115,6 @@ pub(crate) struct VolumePreviewCandidate {
     available: bool,
     cold_bootstrap: bool,
     full_volume: bool,
-    active_scale: ScaleLevel,
     resource_count: usize,
     payload_bytes: u64,
 }
@@ -240,7 +1124,6 @@ impl VolumePreviewCandidate {
         profile: VolumeWorkloadProfile,
         available: bool,
         cold_bootstrap: bool,
-        active_scale: ScaleLevel,
         resource_count: usize,
         payload_bytes: u64,
     ) -> Self {
@@ -249,7 +1132,6 @@ impl VolumePreviewCandidate {
             available,
             cold_bootstrap,
             full_volume: true,
-            active_scale,
             resource_count,
             payload_bytes,
         }
@@ -258,7 +1140,6 @@ impl VolumePreviewCandidate {
     pub(crate) fn target(
         profile: VolumeWorkloadProfile,
         available: bool,
-        active_scale: ScaleLevel,
         resource_count: usize,
         payload_bytes: u64,
     ) -> Self {
@@ -267,7 +1148,6 @@ impl VolumePreviewCandidate {
             available,
             cold_bootstrap: false,
             full_volume: false,
-            active_scale,
             resource_count,
             payload_bytes,
         }
@@ -322,13 +1202,16 @@ impl VolumePreviewCandidateDisposition {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VolumePreviewCandidateFacts {
     pub(crate) kind: VolumePreviewCandidateKind,
-    pub(crate) active_scale: ScaleLevel,
+    pub(crate) layer_scales: Box<[(LogicalLayerKey, ScaleLevel)]>,
+    pub(crate) kernel: VolumeKernelWorkClass,
+    pub(crate) shared_work_units: u64,
+    pub(crate) layer_work: Box<[VolumeLayerWorkFacts]>,
     pub(crate) resource_count: usize,
     pub(crate) payload_bytes: u64,
-    pub(crate) native_work_units: u64,
+    pub(crate) schedule_work_units: u64,
     pub(crate) complete_and_resident: bool,
     pub(crate) target_quality_eligible: bool,
     pub(crate) interaction_safe: bool,
@@ -574,10 +1457,13 @@ impl VolumePresentationController {
                     } else {
                         VolumePreviewCandidateKind::ExactTarget
                     },
-                    active_scale: candidate.active_scale,
+                    layer_scales: candidate.profile.scale_configuration().0,
+                    kernel: candidate.profile.kernel(),
+                    shared_work_units: candidate.profile.shared_work_units(),
+                    layer_work: candidate.profile.layer_work_facts(),
                     resource_count: candidate.resource_count,
                     payload_bytes: candidate.payload_bytes,
-                    native_work_units: candidate.profile.full_work_units(),
+                    schedule_work_units: candidate.profile.full_work_units(),
                     complete_and_resident: candidate.available,
                     target_quality_eligible,
                     interaction_safe,
@@ -710,7 +1596,7 @@ impl VolumePresentationController {
                     frame,
                     completed_strip,
                     total_strips: refinement.total_strips(),
-                    strip_work_units: profile.work_units_for_rows(rows),
+                    strip_work_units: profile.work_units_for_row_range(y, rows),
                 }
             }
         };
@@ -928,7 +1814,8 @@ impl VolumePresentationController {
             .checked_div(INTERACTION_GPU_BUDGET_NS)
             .unwrap_or(0)
             .max(
-                MIN_WORK_UNITS
+                profile
+                    .minimum_work_units()
                     .saturating_mul(REFINEMENT_GPU_BUDGET_NS)
                     .checked_div(INTERACTION_GPU_BUDGET_NS)
                     .unwrap_or(1),
@@ -976,7 +1863,12 @@ impl VolumePresentationController {
         let index = self.family_calibration_index(profile);
         let calibration = &mut self.family_calibrations[index];
         if render_ns > INTERACTION_GPU_BUDGET_NS {
-            let safe = scaled_safe_work(observed_work, render_ns, INTERACTION_GPU_BUDGET_NS);
+            let safe = scaled_safe_work(
+                observed_work,
+                render_ns,
+                INTERACTION_GPU_BUDGET_NS,
+                profile.minimum_work_units(),
+            );
             let previous = calibration.safe_work_units;
             calibration.safe_work_units = calibration.safe_work_units.min(safe);
             return calibration.safe_work_units != previous;
@@ -996,7 +1888,12 @@ fn extent_pixels(extent: RenderExtent) -> u64 {
     u64::from(extent.width_pixels()).saturating_mul(u64::from(extent.height_pixels()))
 }
 
-fn scaled_safe_work(observed_work: u64, render_ns: u64, budget_ns: u64) -> u64 {
+fn scaled_safe_work(
+    observed_work: u64,
+    render_ns: u64,
+    budget_ns: u64,
+    minimum_work_units: u64,
+) -> u64 {
     let proportional = observed_work
         .saturating_mul(budget_ns)
         .checked_div(render_ns.max(1))
@@ -1005,7 +1902,7 @@ fn scaled_safe_work(observed_work: u64, render_ns: u64, budget_ns: u64) -> u64 {
         .saturating_mul(ADAPTIVE_SAFETY_NUMERATOR)
         .checked_div(ADAPTIVE_SAFETY_DENOMINATOR)
         .unwrap_or(0)
-        .max(MIN_WORK_UNITS)
+        .max(minimum_work_units)
 }
 
 #[cfg(test)]
@@ -1014,6 +1911,8 @@ mod tests {
         CurrentnessGeneration, RenderGestureKind, RenderIntentBase, RenderIntentMailbox,
         RenderIntentSample, RenderIntentTarget, SourceSessionGeneration,
     };
+    use mirante4d_dataset::{DatasetScale, ResourceValidity};
+    use mirante4d_domain::{GridToWorld, Shape3D};
 
     use super::*;
 
@@ -1058,13 +1957,47 @@ mod tests {
                 layer: LogicalLayerKey::new(0),
                 scale,
                 render_state: RenderState::mip(SamplingPolicy::VoxelExact),
-                maximum_steps,
+                legacy_maximum_steps: maximum_steps,
+                legacy_work_units_per_pixel: work_per_pixel,
+                legacy_initial_prior_work_units_per_pixel: work_per_pixel
+                    .saturating_mul(initial_mode_prior),
+                projected_rect: PixelRect::full(extent),
+                traversal_step_bound: maximum_steps,
+                sample_taps_per_step: 1,
+                gradient_taps_per_ray: 0,
+                fixed_work_units_per_output_pixel: 0,
+                scheduled_rect: PixelRect::full(extent),
+                scheduled_step_bound: 1,
+                scheduled_work_units_per_step: work_per_pixel,
+                terminal_work_units_per_projected_pixel: 0,
+                world_corners: [[0.0; 3]; 8],
+                inverse_rows: [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                ],
+                shader_geometry: ShaderGridGeometry {
+                    scale,
+                    shape_xyz: [maximum_steps; 3],
+                    control_bits: [0; 24],
+                },
             }]
             .into_boxed_slice(),
-            work_per_pixel,
-            initial_prior_work_per_pixel: work_per_pixel.saturating_mul(initial_mode_prior),
+            shared: SharedVolumeWorkload {
+                fixed_work_units_per_output_pixel: 0,
+                scheduled_rect: PixelRect::default(),
+                scheduled_step_bound: 0,
+                scheduled_work_units_per_step: 0,
+            },
+            model: VolumeWorkModel::StaticScheduleAligned,
             family: VolumeWorkFamily {
                 projection: camera.projection(),
+                model: VolumeWorkModel::StaticScheduleAligned,
+                kernel: match mode {
+                    RenderMode::Mip => VolumeKernelWorkClass::HomogeneousMip,
+                    RenderMode::Dvr => VolumeKernelWorkClass::GeneralDvr,
+                    RenderMode::Isosurface => VolumeKernelWorkClass::HomogeneousIso,
+                },
                 layers: vec![VolumeLayerWorkClass {
                     mode,
                     sampling: SamplingPolicy::VoxelExact,
@@ -1080,18 +2013,473 @@ mod tests {
         profile: VolumeWorkloadProfile,
         available: bool,
     ) -> VolumePreviewCandidate {
-        let scale = profile.layers[0].scale;
-        VolumePreviewCandidate::navigation(profile, available, false, scale, 1, 1)
+        VolumePreviewCandidate::navigation(profile, available, false, 1, 1)
     }
 
     fn cold_navigation_candidate(profile: VolumeWorkloadProfile) -> VolumePreviewCandidate {
-        let scale = profile.layers[0].scale;
-        VolumePreviewCandidate::navigation(profile, false, true, scale, 1, 1)
+        VolumePreviewCandidate::navigation(profile, false, true, 1, 1)
     }
 
     fn target_candidate(profile: VolumeWorkloadProfile) -> VolumePreviewCandidate {
-        let scale = profile.layers[0].scale;
-        VolumePreviewCandidate::target(profile, true, scale, 1, 1)
+        VolumePreviewCandidate::target(profile, true, 1, 1)
+    }
+
+    fn analytical_camera(
+        projection: Projection,
+        target: WorldPoint3,
+        world_per_point: f64,
+        focal_points: f64,
+        distance: f64,
+        extent: RenderExtent,
+    ) -> (CameraFrame, PresentationViewport) {
+        let presentation = PresentationViewport::new(
+            f64::from(extent.width_pixels()),
+            f64::from(extent.height_pixels()),
+        )
+        .unwrap();
+        let view = CameraView::new(
+            projection,
+            target,
+            mirante4d_domain::UnitQuaternion::identity(),
+            world_per_point,
+            focal_points,
+            distance,
+        )
+        .unwrap();
+        (CameraFrame::new(view, presentation).unwrap(), presentation)
+    }
+
+    fn analytical_layer(
+        layer: u32,
+        scale: ScaleLevel,
+        dataset_scale: DatasetScale,
+        camera: CameraFrame,
+        presentation: PresentationViewport,
+        extent: RenderExtent,
+    ) -> VolumeLayerWorkload {
+        let inverse_rows =
+            shader_control_world_to_grid_rows(dataset_scale.grid_to_world()).unwrap();
+        let world_corners =
+            shader_volume_world_corners(dataset_scale.shape(), inverse_rows).unwrap();
+        let projected_rect = projected_pixel_rect(camera, &world_corners, extent);
+        let traversal_step_bound = conservative_grid_traversal_bound(
+            camera,
+            presentation,
+            extent,
+            projected_rect,
+            dataset_scale.shape(),
+            inverse_rows,
+        );
+        VolumeLayerWorkload {
+            layer: LogicalLayerKey::new(layer),
+            scale,
+            render_state: RenderState::mip(SamplingPolicy::VoxelExact),
+            legacy_maximum_steps: dataset_scale
+                .shape()
+                .x()
+                .max(dataset_scale.shape().y())
+                .max(dataset_scale.shape().z()),
+            legacy_work_units_per_pixel: traversal_step_bound.max(1),
+            legacy_initial_prior_work_units_per_pixel: traversal_step_bound.max(1),
+            projected_rect,
+            traversal_step_bound,
+            sample_taps_per_step: 1,
+            gradient_taps_per_ray: 0,
+            fixed_work_units_per_output_pixel: 0,
+            scheduled_rect: projected_rect,
+            scheduled_step_bound: traversal_step_bound,
+            scheduled_work_units_per_step: 0,
+            terminal_work_units_per_projected_pixel: 0,
+            world_corners,
+            inverse_rows,
+            shader_geometry: shader_grid_geometry(scale, dataset_scale).unwrap(),
+        }
+    }
+
+    fn analytical_world_corners(dataset_scale: DatasetScale) -> [[f64; 3]; 8] {
+        shader_volume_world_corners(
+            dataset_scale.shape(),
+            shader_control_world_to_grid_rows(dataset_scale.grid_to_world()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn measured_matrix_profile(count: usize, render_state: RenderState) -> VolumeWorkloadProfile {
+        let extent = RenderExtent::new(1_920, 1_080).unwrap();
+        let (camera, presentation_viewport) = analytical_camera(
+            Projection::Orthographic,
+            WorldPoint3::origin(),
+            1.0,
+            1_080.0,
+            128.0,
+            extent,
+        );
+        let projected_rect = PixelRect {
+            x_start: 420,
+            y_start: 0,
+            x_end: 1_500,
+            y_end: 1_080,
+        };
+        let shader_geometry = ShaderGridGeometry {
+            scale: ScaleLevel::BASE,
+            shape_xyz: [64; 3],
+            control_bits: [0; 24],
+        };
+        let mut layers = (0..count)
+            .map(|index| VolumeLayerWorkload {
+                layer: LogicalLayerKey::new(index as u32),
+                scale: ScaleLevel::BASE,
+                render_state,
+                legacy_maximum_steps: 64,
+                legacy_work_units_per_pixel: 64_u64.saturating_mul(
+                    match render_state.sampling_policy() {
+                        SamplingPolicy::VoxelExact => 1,
+                        SamplingPolicy::SmoothLinear => 8,
+                    },
+                ),
+                legacy_initial_prior_work_units_per_pixel: 64_u64
+                    .saturating_mul(match render_state.sampling_policy() {
+                        SamplingPolicy::VoxelExact => 1,
+                        SamplingPolicy::SmoothLinear => 8,
+                    })
+                    .saturating_mul(if render_state.mode() == RenderMode::Mip {
+                        1
+                    } else {
+                        2
+                    }),
+                projected_rect,
+                traversal_step_bound: 64,
+                sample_taps_per_step: match render_state.sampling_policy() {
+                    SamplingPolicy::VoxelExact => 1,
+                    SamplingPolicy::SmoothLinear => 8,
+                },
+                gradient_taps_per_ray: 0,
+                fixed_work_units_per_output_pixel: 0,
+                scheduled_rect: projected_rect,
+                scheduled_step_bound: 64,
+                scheduled_work_units_per_step: 0,
+                terminal_work_units_per_projected_pixel: 0,
+                world_corners: [[0.0; 3]; 8],
+                inverse_rows: [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                ],
+                shader_geometry,
+            })
+            .collect::<Vec<_>>();
+        let kernel = classify_kernel(&layers);
+        let shared = configure_schedule(kernel, camera, presentation_viewport, extent, &mut layers);
+        let family_layer = VolumeLayerWorkClass {
+            mode: render_state.mode(),
+            sampling: render_state.sampling_policy(),
+            iso_shading: render_state
+                .iso_parameters()
+                .map(|parameters| parameters.shading_policy()),
+            iso_display_bucket: render_state.iso_parameters().map(|_| 16),
+        };
+        VolumeWorkloadProfile {
+            extent,
+            presentation_viewport,
+            camera: camera.view(),
+            timepoint: TimeIndex::new(0),
+            layers: layers.into_boxed_slice(),
+            shared,
+            model: VolumeWorkModel::StaticScheduleAligned,
+            family: VolumeWorkFamily {
+                projection: camera.view().projection(),
+                model: VolumeWorkModel::StaticScheduleAligned,
+                kernel,
+                layers: vec![family_layer; count].into_boxed_slice(),
+            },
+        }
+    }
+
+    #[test]
+    fn measured_1080p_matrix_boundaries_drive_static_navigation_policy() {
+        let dvr = |sampling| {
+            RenderState::dvr(
+                sampling,
+                mirante4d_domain::DvrOpacityTransfer::new(
+                    mirante4d_domain::DisplayWindow::new(0.0, 1.0).unwrap(),
+                    mirante4d_domain::TransferCurve::linear(),
+                ),
+                0.02,
+            )
+            .unwrap()
+        };
+        let iso = |sampling| RenderState::iso(sampling, IsoShadingPolicy::Flat, 0.5).unwrap();
+
+        assert!(
+            measured_matrix_profile(8, RenderState::mip(SamplingPolicy::VoxelExact))
+                .native_navigation_is_safe()
+        );
+        assert!(
+            measured_matrix_profile(4, dvr(SamplingPolicy::VoxelExact)).native_navigation_is_safe()
+        );
+        assert!(
+            !measured_matrix_profile(8, dvr(SamplingPolicy::VoxelExact))
+                .native_navigation_is_safe()
+        );
+        assert!(
+            measured_matrix_profile(2, iso(SamplingPolicy::VoxelExact)).native_navigation_is_safe()
+        );
+        assert!(
+            !measured_matrix_profile(4, iso(SamplingPolicy::VoxelExact))
+                .native_navigation_is_safe()
+        );
+
+        assert!(
+            measured_matrix_profile(1, RenderState::mip(SamplingPolicy::SmoothLinear))
+                .native_navigation_is_safe()
+        );
+        assert!(
+            !measured_matrix_profile(2, RenderState::mip(SamplingPolicy::SmoothLinear))
+                .native_navigation_is_safe()
+        );
+        assert!(
+            measured_matrix_profile(1, dvr(SamplingPolicy::SmoothLinear))
+                .native_navigation_is_safe()
+        );
+        assert!(
+            !measured_matrix_profile(2, dvr(SamplingPolicy::SmoothLinear))
+                .native_navigation_is_safe()
+        );
+        assert!(
+            !measured_matrix_profile(1, iso(SamplingPolicy::SmoothLinear))
+                .native_navigation_is_safe()
+        );
+    }
+
+    #[test]
+    fn playback_retains_the_pre_cutover_neutral_work_boundary() {
+        let extent = RenderExtent::new(1_920, 1_080).unwrap();
+        let static_profile = profile_with(extent, 2_048, 512, 1, RenderMode::Mip, ScaleLevel::BASE);
+        let mut playback_profile = static_profile.clone();
+        playback_profile.model = VolumeWorkModel::LegacyPlayback;
+        playback_profile.family.model = VolumeWorkModel::LegacyPlayback;
+        playback_profile.layers[0].legacy_work_units_per_pixel = 512;
+        playback_profile.layers[0].legacy_initial_prior_work_units_per_pixel = 512;
+
+        assert!(
+            !static_profile.native_navigation_is_safe(),
+            "the schedule-aligned static model deliberately rejects this synthetic boundary"
+        );
+        assert_eq!(
+            playback_profile.full_work_units(),
+            1_920_u64 * 1_080 * 512,
+            "playback must retain the exact pre-cutover neutral sample-count formula"
+        );
+        assert!(
+            playback_profile.native_navigation_is_safe(),
+            "the static estimator must not force a previously safe playback body to a coarser rung"
+        );
+        assert_eq!(
+            playback_profile.initial_safe_work_units(),
+            LEGACY_PLAYBACK_INITIAL_INTERACTIVE_WORK_UNITS
+        );
+    }
+
+    #[test]
+    fn playback_profile_identity_ignores_static_schedule_classification() {
+        let extent = RenderExtent::new(320, 200).unwrap();
+        let mut playback = profile_with(extent, 512, 512, 1, RenderMode::Mip, ScaleLevel::BASE);
+        playback.model = VolumeWorkModel::LegacyPlayback;
+        playback.family.model = VolumeWorkModel::LegacyPlayback;
+        let mut differently_classified = playback.clone();
+        differently_classified.family.kernel = VolumeKernelWorkClass::GeneralDvr;
+        differently_classified
+            .shared
+            .fixed_work_units_per_output_pixel = u64::MAX;
+        differently_classified.layers[0].projected_rect = PixelRect::default();
+        differently_classified.layers[0].scheduled_step_bound = u64::MAX;
+        differently_classified.layers[0].scheduled_work_units_per_step = u64::MAX;
+
+        assert_eq!(
+            playback, differently_classified,
+            "static schedule facts must not split playback's pre-cutover observation identity"
+        );
+
+        playback.model = VolumeWorkModel::StaticScheduleAligned;
+        playback.family.model = VolumeWorkModel::StaticScheduleAligned;
+        differently_classified.model = VolumeWorkModel::StaticScheduleAligned;
+        differently_classified.family.model = VolumeWorkModel::StaticScheduleAligned;
+        assert_ne!(
+            playback, differently_classified,
+            "static observations still require exact schedule identity"
+        );
+    }
+
+    #[test]
+    fn projected_coverage_is_clipped_and_off_center_without_charging_the_full_viewport() {
+        let extent = RenderExtent::new(100, 100).unwrap();
+        let (camera, _) = analytical_camera(
+            Projection::Orthographic,
+            WorldPoint3::new(9.5, 9.5, 9.5).unwrap(),
+            1.0,
+            100.0,
+            100.0,
+            extent,
+        );
+        let shape = Shape3D::new(20, 20, 20).unwrap();
+        let centered = DatasetScale::new(
+            ScaleLevel::BASE,
+            shape,
+            GridToWorld::identity(),
+            ResourceValidity::AllValid,
+        );
+        let centered_rect =
+            projected_pixel_rect(camera, &analytical_world_corners(centered), extent);
+        assert!(centered_rect.width() >= 20 && centered_rect.width() <= 24);
+        assert!(centered_rect.height() >= 20 && centered_rect.height() <= 24);
+
+        let clipped = DatasetScale::new(
+            ScaleLevel::BASE,
+            shape,
+            GridToWorld::from_row_major([
+                1.0, 0.0, 0.0, 50.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ])
+            .unwrap(),
+            ResourceValidity::AllValid,
+        );
+        let clipped_rect = projected_pixel_rect(camera, &analytical_world_corners(clipped), extent);
+        assert_eq!(clipped_rect.x_end, extent.width_pixels());
+        assert!(clipped_rect.width() > 0 && clipped_rect.width() < centered_rect.width());
+
+        let offscreen = DatasetScale::new(
+            ScaleLevel::BASE,
+            shape,
+            GridToWorld::from_row_major([
+                1.0, 0.0, 0.0, 1_000.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ])
+            .unwrap(),
+            ResourceValidity::AllValid,
+        );
+        let offscreen_rect =
+            projected_pixel_rect(camera, &analytical_world_corners(offscreen), extent);
+        assert_eq!(offscreen_rect.pixels(), 0);
+    }
+
+    #[test]
+    fn perspective_eye_plane_falls_back_to_full_conservative_coverage() {
+        let extent = RenderExtent::new(160, 90).unwrap();
+        let (camera, _) = analytical_camera(
+            Projection::Perspective,
+            WorldPoint3::origin(),
+            1.0,
+            90.0,
+            10.0,
+            extent,
+        );
+        let scale = DatasetScale::new(
+            ScaleLevel::BASE,
+            Shape3D::new(20, 20, 20).unwrap(),
+            GridToWorld::from_row_major([
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 10.0, 0.0, 0.0, 0.0, 1.0,
+            ])
+            .unwrap(),
+            ResourceValidity::AllValid,
+        );
+        assert_eq!(
+            projected_pixel_rect(camera, &analytical_world_corners(scale), extent),
+            PixelRect::full(extent)
+        );
+    }
+
+    #[test]
+    fn transform_aware_traversal_uses_camera_depth_not_the_longest_shape_axis() {
+        let extent = RenderExtent::new(200, 120).unwrap();
+        let shape = Shape3D::new(10, 10, 1_000).unwrap();
+        let (camera, presentation) = analytical_camera(
+            Projection::Orthographic,
+            WorldPoint3::new(499.5, 4.5, 4.5).unwrap(),
+            1.0,
+            100.0,
+            2_000.0,
+            extent,
+        );
+        let inverse = shader_control_world_to_grid_rows(GridToWorld::identity()).unwrap();
+        let bound = conservative_grid_traversal_bound(
+            camera,
+            presentation,
+            extent,
+            PixelRect::full(extent),
+            shape,
+            inverse,
+        );
+        assert!((10..=11).contains(&bound));
+
+        let sheared = GridToWorld::from_row_major([
+            1.0, 0.0, 0.5, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ])
+        .unwrap();
+        let sheared_bound = conservative_grid_traversal_bound(
+            camera,
+            presentation,
+            extent,
+            PixelRect::full(extent),
+            shape,
+            shader_control_world_to_grid_rows(sheared).unwrap(),
+        );
+        assert!(sheared_bound > 0 && sheared_bound <= shape.x());
+    }
+
+    #[test]
+    fn mixed_scale_general_dvr_reuses_the_common_physical_interval_bound() {
+        let extent = RenderExtent::new(128, 128).unwrap();
+        let (camera, presentation) = analytical_camera(
+            Projection::Orthographic,
+            WorldPoint3::new(31.5, 31.5, 31.5).unwrap(),
+            1.0,
+            100.0,
+            128.0,
+            extent,
+        );
+        let fine = DatasetScale::new(
+            ScaleLevel::BASE,
+            Shape3D::new(64, 64, 64).unwrap(),
+            GridToWorld::identity(),
+            ResourceValidity::AllValid,
+        );
+        let coarse = DatasetScale::new(
+            ScaleLevel::new(1),
+            Shape3D::new(32, 32, 32).unwrap(),
+            GridToWorld::from_row_major([
+                2.0, 0.0, 0.0, 0.5, 0.0, 2.0, 0.0, 0.5, 0.0, 0.0, 2.0, 0.5, 0.0, 0.0, 0.0, 1.0,
+            ])
+            .unwrap(),
+            ResourceValidity::AllValid,
+        );
+        let layers = [
+            analytical_layer(0, ScaleLevel::BASE, fine, camera, presentation, extent),
+            analytical_layer(1, ScaleLevel::new(1), coarse, camera, presentation, extent),
+        ];
+        assert_eq!(layers[0].world_corners, layers[1].world_corners);
+        let union = layers[0].projected_rect.union(layers[1].projected_rect);
+        assert_eq!(
+            general_dvr_traversal_bound(camera, presentation, extent, union, &layers),
+            layers
+                .iter()
+                .map(|layer| layer.traversal_step_bound)
+                .max()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn analytical_overflow_saturates_instead_of_wrapping_safe() {
+        assert_eq!(saturating_ceil_u64(f64::INFINITY), u64::MAX);
+        assert_eq!(saturating_ceil_u64(u64::MAX as f64), u64::MAX);
+        assert_eq!(
+            schedule_region_work(
+                PixelRect::full(RenderExtent::new(2, 2).unwrap()),
+                0,
+                2,
+                u64::MAX,
+                2
+            ),
+            u64::MAX
+        );
     }
 
     #[test]
@@ -1206,7 +2594,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_costs_are_initial_priors_and_slow_families_shrink_hidden_strip_work() {
+    fn schedule_classes_are_independent_and_slow_families_shrink_hidden_strip_work() {
         let extent = RenderExtent::new(400, 250).unwrap();
         let mip = profile_with(extent, 1_000, 1_000, 1, RenderMode::Mip, ScaleLevel::BASE);
         let dvr = profile_with(extent, 1_000, 1_000, 2, RenderMode::Dvr, ScaleLevel::BASE);
@@ -1218,12 +2606,12 @@ mod tests {
         );
         assert_eq!(
             controller.safe_work_units(&dvr),
-            INITIAL_INTERACTIVE_WORK_UNITS / 2
+            INITIAL_INTERACTIVE_WORK_UNITS
         );
         assert!(!controller.observe_family_work(&dvr, 64_000_000, 3_000_000));
         assert_eq!(
             controller.safe_work_units(&dvr),
-            INITIAL_INTERACTIVE_WORK_UNITS / 2
+            INITIAL_INTERACTIVE_WORK_UNITS
         );
         assert_eq!(
             controller.safe_work_units(&mip),
@@ -1385,7 +2773,7 @@ mod tests {
                 &[
                     navigation_candidate(terminal.clone(), true),
                     navigation_candidate(intermediate.clone(), true),
-                    VolumePreviewCandidate::target(target.clone(), false, ScaleLevel::new(2), 1, 1),
+                    VolumePreviewCandidate::target(target.clone(), false, 1, 1),
                 ],
                 gesture,
             )

@@ -156,7 +156,7 @@ pub fn linked_panel_fidelity_label(fidelity: LinkedPanelFidelityStatus) -> Strin
 pub fn frame_fidelity_label(fidelity: &FrameFidelityStatus) -> String {
     let reason = frame_reason_label(fidelity.reason);
     let reason_suffix = if fidelity.displayed_scale_level == Some(0)
-        && fidelity.target_scale_level == 0
+        && fidelity.target_scale_level == Some(0)
         && fidelity.completeness == FrameCompleteness::Exact
         && fidelity.reason == LodDecisionReason::ExactS0
     {
@@ -213,37 +213,46 @@ fn frame_render_time_label(fidelity: &FrameFidelityStatus) -> String {
 }
 
 fn frame_fidelity_scale_label(fidelity: &FrameFidelityStatus) -> String {
+    let scale = |level: Option<u32>| {
+        level.map_or_else(|| "mixed/none".to_owned(), |level| format!("s{level}"))
+    };
     match fidelity.displayed_scale_level {
         Some(displayed)
-            if fidelity.adaptive_capacity_limited && displayed == fidelity.target_scale_level =>
+            if fidelity.adaptive_capacity_limited
+                && Some(displayed) == fidelity.target_scale_level =>
         {
             format!(
-                "shown s{} · adaptive / ideal s{}",
-                displayed, fidelity.ideal_scale_level
+                "shown s{} · adaptive / ideal {}",
+                displayed,
+                scale(fidelity.ideal_scale_level)
             )
         }
         Some(displayed) if fidelity.adaptive_capacity_limited => {
             format!(
-                "shown s{} / selected s{} · adaptive / ideal s{}",
-                displayed, fidelity.target_scale_level, fidelity.ideal_scale_level
+                "shown s{} / selected {} · adaptive / ideal {}",
+                displayed,
+                scale(fidelity.target_scale_level),
+                scale(fidelity.ideal_scale_level)
             )
         }
         Some(displayed) if fidelity.refinement_pending => {
             format!(
-                "shown s{} · refining toward s{}",
-                displayed, fidelity.target_scale_level
+                "shown s{} · refining toward {}",
+                displayed,
+                scale(fidelity.target_scale_level)
             )
         }
-        Some(displayed) if displayed == fidelity.target_scale_level => {
+        Some(displayed) if Some(displayed) == fidelity.target_scale_level => {
             format!("shown s{displayed}")
         }
         Some(displayed) => {
             format!(
-                "shown s{} / target s{}",
-                displayed, fidelity.target_scale_level
+                "shown s{} / target {}",
+                displayed,
+                scale(fidelity.target_scale_level)
             )
         }
-        None => format!("shown none / target s{}", fidelity.target_scale_level),
+        None => format!("shown none / target {}", scale(fidelity.target_scale_level)),
     }
 }
 
@@ -296,6 +305,7 @@ fn render_backend_label(backend: RenderBackend) -> &'static str {
         RenderBackend::GpuCameraMip => "GPU MIP",
         RenderBackend::GpuCameraIso => "GPU ISO",
         RenderBackend::GpuCameraDvr => "GPU DVR",
+        RenderBackend::GpuCameraMixed => "GPU Mixed",
     }
 }
 
@@ -508,8 +518,8 @@ mod tests {
             PresentationViewport::new(640.0, 480.0).unwrap(),
         );
         fidelity.displayed_scale_level = Some(3);
-        fidelity.target_scale_level = 3;
-        fidelity.ideal_scale_level = 2;
+        fidelity.target_scale_level = Some(3);
+        fidelity.ideal_scale_level = Some(2);
         fidelity.adaptive_capacity_limited = true;
         assert_eq!(
             frame_fidelity_scale_label(&fidelity),
@@ -524,7 +534,7 @@ mod tests {
 
         fidelity.adaptive_capacity_limited = false;
         fidelity.refinement_pending = true;
-        fidelity.target_scale_level = 2;
+        fidelity.target_scale_level = Some(2);
         assert_eq!(
             frame_fidelity_scale_label(&fidelity),
             "shown s4 · refining toward s2"

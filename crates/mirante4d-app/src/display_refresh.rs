@@ -29,6 +29,7 @@ use crate::{
     },
 };
 use mirante4d_domain::{CrossSectionView, RenderMode};
+use mirante4d_project_model::ViewState;
 use mirante4d_render_api::{
     FrameCompleteness as RenderFrameCompleteness, FrameIdentity, FrameLimitation,
     MAX_RENDER_LAYERS, PreparedRenderRequirements, PresentationTarget, PresentedFrame,
@@ -430,8 +431,7 @@ impl DisplayPerformanceMilestones {
     fn observe_three_d(
         &mut self,
         frame: &mirante4d_render_api::PresentedFrame,
-        displayed_scale_level: u32,
-        target_scale_level: u32,
+        displayed_coarser_than_target: bool,
         target_settled: bool,
     ) {
         let elapsed_ms = duration_ms(self.started_at.elapsed());
@@ -445,7 +445,7 @@ impl DisplayPerformanceMilestones {
         if complete_coverage {
             self.three_d_complete_replacement_ms
                 .get_or_insert(elapsed_ms);
-            if displayed_scale_level > target_scale_level {
+            if displayed_coarser_than_target {
                 self.three_d_complete_coarse_ms.get_or_insert(elapsed_ms);
             }
             if target_settled {
@@ -790,13 +790,14 @@ impl MiranteWorkbenchApp {
                 })?
             }
         };
-        VolumeWorkloadProfile::from_view(
+        VolumeWorkloadProfile::from_product_view(
             snapshot.catalog(),
             application_view(snapshot),
             camera,
             self.render_coordination.presentation_viewport,
             prepared.layer_scales.as_ref(),
             extent,
+            snapshot.transient().playback_active(),
         )
     }
 
@@ -810,18 +811,18 @@ impl MiranteWorkbenchApp {
     ) -> anyhow::Result<Option<(VolumeRenderPlanSource, VolumeWorkloadProfile)>> {
         let mut candidates =
             Vec::with_capacity(self.navigation_render_plans.len().saturating_add(1));
-        let active_layer = application_view(snapshot).active_layer();
         for (index, plan) in self.navigation_render_plans.iter().enumerate() {
             if plan.requirements.timepoint() != application_view(snapshot).timepoint() {
                 continue;
             }
-            let profile = VolumeWorkloadProfile::from_view(
+            let profile = VolumeWorkloadProfile::from_product_view(
                 snapshot.catalog(),
                 application_view(snapshot),
                 target_profile.camera(),
                 self.render_coordination.presentation_viewport,
                 plan.layer_scales.as_ref(),
                 target_profile.extent(),
+                snapshot.transient().playback_active(),
             )?;
             let available = first_useful_resources_complete_with_renderer(
                 &self.dataset,
@@ -838,20 +839,12 @@ impl MiranteWorkbenchApp {
                     &self.native_presentation,
                     plan,
                 );
-            let active_scale = plan
-                .layer_scales
-                .get(&active_layer)
-                .copied()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("3D navigation candidate {index} has no active-layer scale")
-                })?;
             candidates.push((
                 VolumeRenderPlanSource::Navigation(index),
                 VolumePreviewCandidate::navigation(
                     profile,
                     available,
                     cold_bootstrap,
-                    active_scale,
                     plan.primary_resource_count,
                     plan.render_payload_bytes,
                 ),
@@ -869,17 +862,11 @@ impl MiranteWorkbenchApp {
                         "scope {target_scope} has no prepared exact 3D render requirements"
                     )
                 })?;
-            let active_scale = target_plan
-                .layer_scales
-                .get(&active_layer)
-                .copied()
-                .ok_or_else(|| anyhow::anyhow!("3D target has no active-layer scale"))?;
             candidates.push((
                 VolumeRenderPlanSource::Scope(target_scope),
                 VolumePreviewCandidate::target(
                     target_profile.clone(),
                     target_available,
-                    active_scale,
                     target_plan.requirements.body().canonical().len(),
                     target_plan.render_payload_bytes,
                 ),
@@ -1202,14 +1189,7 @@ impl MiranteWorkbenchApp {
         let Some(expected) = expected else {
             return false;
         };
-        expected.iter().all(|(layer, scale)| {
-            frame
-                .progress()
-                .coverage()
-                .layer_coverages()
-                .find(|coverage| coverage.layer() == *layer)
-                .is_some_and(|coverage| coverage.scale() == Some(*scale) && !coverage.is_mixed())
-        })
+        presented_layer_scales_match_target(frame.progress().coverage(), expected)
     }
 
     fn coordinated_active_target(
@@ -1477,11 +1457,10 @@ impl MiranteWorkbenchApp {
                 return Ok(false);
             };
 
-            let active_layer_target = self
+            let uniform_target = self
                 .dataset
                 .scope_layer_scales(scope)
-                .and_then(|scales| scales.get(&view.active_layer()))
-                .copied();
+                .and_then(crate::dataset_demand_plan::uniform_layer_scale);
             let priority = self.dataset.scope_gpu_priority_handle(scope);
             let required = self.dataset.scope_required_prefix_len(scope);
             let requirements = &priority[..required];
@@ -1498,7 +1477,7 @@ impl MiranteWorkbenchApp {
                 &mut self.render_coordination,
                 CrossSectionScheduleInput {
                     view,
-                    active_layer_target,
+                    uniform_target,
                     requirements,
                     first_useful_requirements: prepared.requirements.first_useful_prefix_len(),
                     first_useful_available: first_useful_resources_complete_with_renderer(
@@ -1962,24 +1941,29 @@ impl MiranteWorkbenchApp {
                 }
             };
 
+            let presented_target_map_matches = self
+                .dataset
+                .current_target_layer_scales()
+                .is_some_and(|target| {
+                    self.render_coordination
+                        .surface(PresentationTarget::ThreeD)
+                        .presented_frame()
+                        .is_some_and(|presented| {
+                            presented.frame() == frame
+                                && presented.extent() == output_extent
+                                && presented.progress().completeness()
+                                    == RenderFrameCompleteness::Exact
+                                && presented_layer_scales_match_target(
+                                    presented.progress().coverage(),
+                                    target,
+                                )
+                        })
+                });
             let exact_frame_already_presented = !self.dataset.staging_current_refinement()
                 && self.render_coordination.frame_fidelity.display_freshness
                     == DisplayedFrameFreshness::Current
-                && self
-                    .render_coordination
-                    .frame_fidelity
-                    .displayed_scale_level
-                    == Some(self.render_coordination.frame_fidelity.target_scale_level)
                 && !self.coordinated_target_needs_execution(PresentationTarget::ThreeD)
-                && self
-                    .render_coordination
-                    .surface(PresentationTarget::ThreeD)
-                    .presented_frame()
-                    .is_some_and(|presented| {
-                        presented.frame() == frame
-                            && presented.extent() == output_extent
-                            && presented.progress().completeness() == RenderFrameCompleteness::Exact
-                    })
+                && presented_target_map_matches
                 && !self.render_coordination.frame_fidelity.three_d_preview;
             let needs_execution = !exact_frame_already_presented
                 && (request_staged_refinement
@@ -2069,11 +2053,10 @@ impl MiranteWorkbenchApp {
                 let required = self.dataset.scope_required_prefix_len(scope);
                 let requirements = &priority[..required];
                 let view = application_view(&snapshot);
-                let active_layer_target = self
+                let uniform_target = self
                     .dataset
                     .scope_layer_scales(scope)
-                    .and_then(|scales| scales.get(&view.active_layer()))
-                    .copied();
+                    .and_then(crate::dataset_demand_plan::uniform_layer_scale);
                 let all_requirements_available = scope_resources_complete_with_renderer(
                     &self.dataset,
                     &self.native_presentation,
@@ -2083,7 +2066,7 @@ impl MiranteWorkbenchApp {
                     &mut self.render_coordination,
                     CrossSectionScheduleInput {
                         view,
-                        active_layer_target,
+                        uniform_target,
                         requirements,
                         first_useful_requirements: prepared.requirements.first_useful_prefix_len(),
                         first_useful_available: first_useful_resources_complete_with_renderer(
@@ -2874,20 +2857,18 @@ impl MiranteWorkbenchApp {
         }
         let snapshot = self.application.snapshot();
         let view = application_view(&snapshot);
-        let displayed_scale_level = frame
-            .progress()
-            .coverage()
-            .layer_coverages()
-            .find(|coverage| coverage.layer() == view.active_layer())
-            .and_then(|coverage| coverage.scale())
-            .map(|scale| scale.get());
+        let displayed_scale_level = uniform_presented_scale(frame.progress().coverage());
+        let target_scales = self.dataset.current_target_layer_scales();
         let target_settled = !self.dataset.staging_current_refinement()
-            && displayed_scale_level
-                == Some(self.render_coordination.frame_fidelity.target_scale_level);
+            && target_scales.is_some_and(|target| {
+                presented_layer_scales_match_target(frame.progress().coverage(), target)
+            });
+        let displayed_coarser_than_target = target_scales.is_some_and(|target| {
+            presented_layer_scales_are_coarser_than_target(frame.progress().coverage(), target)
+        });
         self.display_performance_milestones.observe_three_d(
             frame,
-            displayed_scale_level.unwrap_or(self.dataset.current_scale().get()),
-            self.render_coordination.frame_fidelity.target_scale_level,
+            displayed_coarser_than_target,
             target_settled,
         );
         let progress = frame.progress();
@@ -2928,12 +2909,7 @@ impl MiranteWorkbenchApp {
             None if displayed_scale_level == Some(0) => LodDecisionReason::ExactS0,
             None => LodDecisionReason::ScreenEquivalentCoarserScale,
         };
-        let mode = view
-            .layer(view.active_layer())
-            .expect("the current view contains its active layer")
-            .render_state()
-            .mode();
-        self.render_coordination.frame_fidelity.backend = render_backend_for_mode(mode);
+        self.render_coordination.frame_fidelity.backend = render_backend_for_view(view);
         self.render_coordination.frame_fidelity.display_freshness =
             DisplayedFrameFreshness::Current;
         self.render_coordination.frame_fidelity.refinement_pending =
@@ -3319,7 +3295,80 @@ fn cross_section_scope(panel_id: PanelId) -> anyhow::Result<u64> {
     }
 }
 
-pub(crate) fn render_backend_for_mode(mode: RenderMode) -> RenderBackend {
+fn uniform_presented_scale(coverage: &mirante4d_render_api::FrameCoverage) -> Option<u32> {
+    let mut scales = coverage
+        .layer_coverages()
+        .map(|layer| layer.scale().map(mirante4d_domain::ScaleLevel::get));
+    let first = scales.next()??;
+    scales.all(|scale| scale == Some(first)).then_some(first)
+}
+
+pub(crate) fn presented_layer_scales_match_target(
+    coverage: &mirante4d_render_api::FrameCoverage,
+    target: &BTreeMap<mirante4d_domain::LogicalLayerKey, mirante4d_domain::ScaleLevel>,
+) -> bool {
+    layer_scale_pairs_match_target(
+        coverage
+            .layer_coverages()
+            .map(|layer| (layer.layer(), layer.scale())),
+        target,
+    )
+}
+
+fn layer_scale_pairs_match_target(
+    mut layers: impl ExactSizeIterator<
+        Item = (
+            mirante4d_domain::LogicalLayerKey,
+            Option<mirante4d_domain::ScaleLevel>,
+        ),
+    >,
+    target: &BTreeMap<mirante4d_domain::LogicalLayerKey, mirante4d_domain::ScaleLevel>,
+) -> bool {
+    layers.len() == target.len()
+        && layers.all(|(layer, scale)| target.get(&layer).copied() == scale)
+}
+
+fn presented_layer_scales_are_coarser_than_target(
+    coverage: &mirante4d_render_api::FrameCoverage,
+    target: &BTreeMap<mirante4d_domain::LogicalLayerKey, mirante4d_domain::ScaleLevel>,
+) -> bool {
+    layer_scale_pairs_are_coarser_than_target(
+        coverage
+            .layer_coverages()
+            .map(|layer| (layer.layer(), layer.scale())),
+        target,
+    )
+}
+
+fn layer_scale_pairs_are_coarser_than_target(
+    layers: impl ExactSizeIterator<
+        Item = (
+            mirante4d_domain::LogicalLayerKey,
+            Option<mirante4d_domain::ScaleLevel>,
+        ),
+    >,
+    target: &BTreeMap<mirante4d_domain::LogicalLayerKey, mirante4d_domain::ScaleLevel>,
+) -> bool {
+    if layers.len() != target.len() {
+        return false;
+    }
+    let mut coarser = false;
+    for (layer, displayed) in layers {
+        let Some(target) = target.get(&layer).copied() else {
+            return false;
+        };
+        let Some(displayed) = displayed else {
+            return false;
+        };
+        if displayed < target {
+            return false;
+        }
+        coarser |= displayed > target;
+    }
+    coarser
+}
+
+fn render_backend_for_mode(mode: RenderMode) -> RenderBackend {
     match mode {
         RenderMode::Mip => RenderBackend::GpuCameraMip,
         RenderMode::Isosurface => RenderBackend::GpuCameraIso,
@@ -3327,9 +3376,165 @@ pub(crate) fn render_backend_for_mode(mode: RenderMode) -> RenderBackend {
     }
 }
 
+/// Reports the shader family selected by the ordered visible layer set.
+/// Durable analysis focus is deliberately irrelevant and may be hidden.
+pub(crate) fn render_backend_for_view(view: &ViewState) -> RenderBackend {
+    let mut visible_modes = view
+        .layers()
+        .iter()
+        .filter(|layer| layer.visible())
+        .map(|layer| layer.render_state().mode());
+    let Some(first) = visible_modes.next() else {
+        return RenderBackend::Empty;
+    };
+    if visible_modes.all(|mode| mode == first) {
+        render_backend_for_mode(first)
+    } else {
+        RenderBackend::GpuCameraMixed
+    }
+}
+
 #[cfg(test)]
 mod requirement_lease_update_tests {
     use super::*;
+
+    fn backend_test_view(first_visible: bool, second_visible: bool) -> ViewState {
+        let transfer = || {
+            mirante4d_domain::LayerTransfer::new(
+                mirante4d_domain::DisplayWindow::new(0.0, 1.0).unwrap(),
+                mirante4d_domain::RgbColor::new([1.0, 1.0, 1.0]).unwrap(),
+                mirante4d_domain::Opacity::new(1.0).unwrap(),
+                mirante4d_domain::TransferCurve::linear(),
+                false,
+            )
+        };
+        let dvr = mirante4d_domain::RenderState::dvr(
+            mirante4d_domain::SamplingPolicy::VoxelExact,
+            mirante4d_domain::DvrOpacityTransfer::new(
+                mirante4d_domain::DisplayWindow::new(0.0, 1.0).unwrap(),
+                mirante4d_domain::TransferCurve::linear(),
+            ),
+            1.0,
+        )
+        .unwrap();
+        ViewState::new(
+            vec![
+                mirante4d_project_model::LayerViewState::new(
+                    mirante4d_domain::LogicalLayerKey::new(0),
+                    first_visible,
+                    transfer(),
+                    mirante4d_domain::RenderState::mip(
+                        mirante4d_domain::SamplingPolicy::VoxelExact,
+                    ),
+                ),
+                mirante4d_project_model::LayerViewState::new(
+                    mirante4d_domain::LogicalLayerKey::new(1),
+                    second_visible,
+                    transfer(),
+                    dvr,
+                ),
+            ],
+            mirante4d_domain::LogicalLayerKey::new(0),
+            mirante4d_domain::TimeIndex::new(0),
+            mirante4d_domain::CameraView::new(
+                mirante4d_domain::Projection::Orthographic,
+                mirante4d_domain::WorldPoint3::origin(),
+                mirante4d_domain::UnitQuaternion::identity(),
+                1.0,
+                100.0,
+                100.0,
+            )
+            .unwrap(),
+            mirante4d_domain::ViewerLayout::Single3d,
+            mirante4d_domain::CrossSectionView::new(
+                mirante4d_domain::WorldPoint3::origin(),
+                mirante4d_domain::UnitQuaternion::identity(),
+                1.0,
+                1.0,
+            )
+            .unwrap(),
+            mirante4d_domain::IsoLightState::attached_camera(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn backend_classification_uses_visible_modes_not_hidden_analysis_focus() {
+        assert_eq!(
+            render_backend_for_view(&backend_test_view(false, true)),
+            RenderBackend::GpuCameraDvr
+        );
+        assert_eq!(
+            render_backend_for_view(&backend_test_view(true, true)),
+            RenderBackend::GpuCameraMixed
+        );
+        assert_eq!(
+            render_backend_for_view(&backend_test_view(false, false)),
+            RenderBackend::Empty
+        );
+    }
+
+    #[test]
+    fn heterogeneous_layer_scale_maps_compare_without_a_scalar_alias() {
+        let target = BTreeMap::from([
+            (
+                mirante4d_domain::LogicalLayerKey::new(3),
+                mirante4d_domain::ScaleLevel::new(0),
+            ),
+            (
+                mirante4d_domain::LogicalLayerKey::new(7),
+                mirante4d_domain::ScaleLevel::new(2),
+            ),
+        ]);
+        let exact = [
+            (
+                mirante4d_domain::LogicalLayerKey::new(3),
+                Some(mirante4d_domain::ScaleLevel::new(0)),
+            ),
+            (
+                mirante4d_domain::LogicalLayerKey::new(7),
+                Some(mirante4d_domain::ScaleLevel::new(2)),
+            ),
+        ];
+        assert!(layer_scale_pairs_match_target(exact.into_iter(), &target));
+        assert!(!layer_scale_pairs_are_coarser_than_target(
+            exact.into_iter(),
+            &target
+        ));
+
+        let coarse = [
+            (
+                mirante4d_domain::LogicalLayerKey::new(3),
+                Some(mirante4d_domain::ScaleLevel::new(1)),
+            ),
+            (
+                mirante4d_domain::LogicalLayerKey::new(7),
+                Some(mirante4d_domain::ScaleLevel::new(2)),
+            ),
+        ];
+        assert!(!layer_scale_pairs_match_target(coarse.into_iter(), &target));
+        assert!(layer_scale_pairs_are_coarser_than_target(
+            coarse.into_iter(),
+            &target
+        ));
+        assert!(!layer_scale_pairs_match_target(
+            exact[..1].iter().copied(),
+            &target
+        ));
+        let extra = [
+            exact[0],
+            exact[1],
+            (
+                mirante4d_domain::LogicalLayerKey::new(9),
+                Some(mirante4d_domain::ScaleLevel::new(0)),
+            ),
+        ];
+        assert!(!layer_scale_pairs_match_target(extra.into_iter(), &target));
+        assert!(!layer_scale_pairs_match_target(
+            extra.into_iter(),
+            &BTreeMap::new()
+        ));
+    }
 
     #[test]
     fn layer_evidence_uses_the_presented_resource_scale() {

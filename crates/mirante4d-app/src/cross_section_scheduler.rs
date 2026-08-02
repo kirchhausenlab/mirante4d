@@ -25,7 +25,7 @@ pub(crate) struct CrossSectionPanelSchedulePlan {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CrossSectionScheduleInput<'a> {
     pub(crate) view: &'a ViewState,
-    pub(crate) active_layer_target: Option<ScaleLevel>,
+    pub(crate) uniform_target: Option<ScaleLevel>,
     /// The frame-visible required prefix in ranked order. Resident-navigation
     /// guard resources are prefetch state and must not downgrade a rendered
     /// current schedule when their asynchronous planning completes.
@@ -88,7 +88,7 @@ fn build_cross_section_panel_schedule(
         return Ok(CrossSectionPanelScheduleState::missing_viewport(generation));
     }
 
-    let active_layer_scale_level = input.active_layer_target.map(ScaleLevel::get);
+    let uniform_scale_level = input.uniform_target.map(ScaleLevel::get);
     let required = input.requirements.len();
     let retained = if input.all_requirements_available {
         required
@@ -121,8 +121,8 @@ fn build_cross_section_panel_schedule(
 
     Ok(CrossSectionPanelScheduleState {
         generation,
-        target_scale_level: active_layer_scale_level,
-        render_scale_level: active_layer_scale_level,
+        target_scale_level: uniform_scale_level,
+        render_scale_level: uniform_scale_level,
         fallback_scale_level: None,
         selected_bricks: required,
         occupied_selected_bricks: retained,
@@ -267,7 +267,7 @@ mod tests {
             &mut coordination,
             CrossSectionScheduleInput {
                 view: &view,
-                active_layer_target: Some(ScaleLevel::BASE),
+                uniform_target: Some(ScaleLevel::BASE),
                 requirements: &requirements,
                 first_useful_requirements: 1,
                 first_useful_available: false,
@@ -295,7 +295,7 @@ mod tests {
             &mut coordination,
             CrossSectionScheduleInput {
                 view: &view,
-                active_layer_target: Some(ScaleLevel::BASE),
+                uniform_target: Some(ScaleLevel::BASE),
                 requirements: &requirements,
                 first_useful_requirements: 1,
                 first_useful_available: true,
@@ -348,7 +348,7 @@ mod tests {
             &mut coordination,
             CrossSectionScheduleInput {
                 view: &view,
-                active_layer_target: Some(ScaleLevel::BASE),
+                uniform_target: Some(ScaleLevel::BASE),
                 requirements: &requirements,
                 first_useful_requirements: 1,
                 first_useful_available: true,

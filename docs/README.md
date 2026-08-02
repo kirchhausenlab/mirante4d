@@ -98,6 +98,17 @@ x86_64 pre-alpha package. The unpacked package passed the mapped render-mode
 and fixed three-launch crash/recovery/native-close checks.
 
 The
+[multichannel performance and visible-layer authority plan](plans/active/VIEWER_MULTICHANNEL_PERFORMANCE_AND_VISIBLE_LAYER_AUTHORITY.md)
+is the closed correctness handoff for static volume viewing. It separates
+durable analysis focus from visible render membership, removes active-layer
+scalar fidelity authority, replaces active-first capacity ordering, and
+establishes a fixed-LOD multichannel GPU evidence boundary. The owner accepted
+closeout while reporting materially worse normal-product static performance;
+no before/after performance win is claimed, and recovery is deferred to a
+separate follow-up. Playback policy and performance remain outside this
+package.
+
+The
 [resident 3D navigation ladder plan](plans/active/VIEWER_RESIDENT_3D_NAVIGATION_LADDER.md)
 is implemented, verified, and owner product-validated. It replaces the binary
 selected-target or terminal-volume preview choice with one bounded, globally
@@ -175,13 +186,12 @@ The development-simplification and viewer-recovery program completed on
 history retains the completed plan, and the verified external recovery bundle
 preserves the unpublished research spike.
 
-The spatial viewer performance refactor closed on 2026-07-31 after final owner
-product validation. The fixed playback-session and source-integrity work is
-implemented, and its separate composed-presentation correction closed on
-2026-08-01 after automated verification and owner product validation.
-Smooth-linear sampling remains supported with a known fine-scale refinement
-cost relative to voxel-exact; any optimization or removal is a separate
-future product decision.
+The prior spatial viewer performance refactor closed on 2026-07-31 after its
+then-defined product validation. New multichannel and hidden-active-layer
+evidence reopened only the static volume scope on 2026-08-02 through the
+corrective package above. The playback-session and source-integrity work and
+its composed-presentation correction remain closed. Smooth-linear sampling
+remains supported and any optimization must preserve its exact semantics.
 
 Two future outcomes remain deliberately separate from ordinary development:
 

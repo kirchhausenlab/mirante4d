@@ -63,7 +63,7 @@ pub struct AppSmokeReport {
     pub nonzero_pixels: u64,
     pub max_value: u16,
     pub displayed_scale_level: Option<u32>,
-    pub target_scale_level: u32,
+    pub target_scale_level: Option<u32>,
     pub render_mode: mirante4d_domain::RenderMode,
     pub gpu_adapter_summary: Option<String>,
     pub playback: Vec<PlaybackSmokeFrame>,
@@ -138,13 +138,16 @@ pub fn run_headless_smoke(
                 next.get()
             );
         }
+        let uniform_scale = opened.dataset.current_uniform_scale().ok_or_else(|| {
+            anyhow::anyhow!("playback smoke requires one uniform visible-layer scale")
+        })?;
         playback.push(PlaybackSmokeFrame {
             timepoint: next.get(),
             elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
             nonzero_pixels,
             max_value,
-            displayed_scale_level: opened.dataset.current_scale().get(),
-            target_scale_level: opened.dataset.current_scale().get(),
+            displayed_scale_level: uniform_scale.get(),
+            target_scale_level: uniform_scale.get(),
         });
     }
 
@@ -162,8 +165,14 @@ pub fn run_headless_smoke(
         frame_height: u64::from(opened.render_coordination.render_viewport.height_pixels()),
         nonzero_pixels,
         max_value,
-        displayed_scale_level: Some(opened.dataset.current_scale().get()),
-        target_scale_level: opened.dataset.current_scale().get(),
+        displayed_scale_level: opened
+            .dataset
+            .current_uniform_scale()
+            .map(mirante4d_domain::ScaleLevel::get),
+        target_scale_level: opened
+            .dataset
+            .current_uniform_scale()
+            .map(mirante4d_domain::ScaleLevel::get),
         render_mode,
         gpu_adapter_summary,
         playback,

@@ -1223,25 +1223,46 @@ fn plan_visible_demand(
             .unwrap_or_else(|| plan.target.requirements.clone());
         let navigation_candidates = std::mem::take(&mut plan.navigation_candidates);
         let mut prepared_navigation_candidates = Vec::with_capacity(navigation_candidates.len());
-        for candidate in navigation_candidates {
-            let render_requirements = prepare_navigation_render_requirements(
-                catalog.as_ref(),
-                &view,
-                &candidate.layer_scales,
-                &candidate.requirements,
-                &navigation_residency_requirements,
-                &mut reservations,
-            )?
-            .ok_or_else(|| anyhow::anyhow!("a full-volume navigation candidate is empty"))?;
-            prepared_navigation_candidates.push(PreparedNavigationCandidateDemand {
-                render_requirements,
-                selection_body: candidate.requirements.body().clone(),
-                layer_scales: candidate.layer_scales,
-                planned_payload_bytes: candidate.payload_bytes,
-                resource_count: candidate.primary_resource_count,
-            });
+        let target_is_empty = plan.target.layer_scales.is_empty();
+        if target_is_empty {
+            if !plan.ideal_layer_scales.is_empty()
+                || !plan.target.requirements.canonical().is_empty()
+                || plan.target.primary_resource_count != 0
+                || plan.target.playback_resource_count != 0
+                || plan.coarse.as_ref().is_some_and(|coarse| {
+                    !coarse.layer_scales.is_empty()
+                        || !coarse.requirements.canonical().is_empty()
+                        || coarse.primary_resource_count != 0
+                })
+                || navigation_candidates.iter().any(|candidate| {
+                    !candidate.layer_scales.is_empty()
+                        || !candidate.requirements.canonical().is_empty()
+                        || candidate.primary_resource_count != 0
+                })
+            {
+                anyhow::bail!("an empty visible-layer target owns non-empty 3D demand");
+            }
+        } else {
+            for candidate in navigation_candidates {
+                let render_requirements = prepare_navigation_render_requirements(
+                    catalog.as_ref(),
+                    &view,
+                    &candidate.layer_scales,
+                    &candidate.requirements,
+                    &navigation_residency_requirements,
+                    &mut reservations,
+                )?
+                .ok_or_else(|| anyhow::anyhow!("a full-volume navigation candidate is empty"))?;
+                prepared_navigation_candidates.push(PreparedNavigationCandidateDemand {
+                    render_requirements,
+                    selection_body: candidate.requirements.body().clone(),
+                    layer_scales: candidate.layer_scales,
+                    planned_payload_bytes: candidate.payload_bytes,
+                    resource_count: candidate.primary_resource_count,
+                });
+            }
         }
-        if prepared_navigation_candidates.is_empty() {
+        if !target_is_empty && prepared_navigation_candidates.is_empty() {
             anyhow::bail!("the full-volume navigation ladder is empty");
         }
         let navigation_ladder = PreparedNavigationLadderDemand {
@@ -1425,6 +1446,9 @@ fn plan_visible_demand(
     }
 
     let unchanged_renderer_requirement_bodies = unchanged_renderer_requirement_bodies.into_vec();
+    let current_target_is_empty = current_3d
+        .as_ref()
+        .is_some_and(|current| current.plan.target.layer_scales.is_empty());
     let cross_bodies = prepared_cross_sections
         .iter()
         .map(|cross| Arc::clone(cross.plan.requirements.canonical()))
@@ -1464,20 +1488,33 @@ fn plan_visible_demand(
         .iter()
         .map(|body| Arc::clone(body.canonical()))
         .collect::<Vec<_>>();
-    union_bodies.extend(
-        preserved_previous_renderer_requirement_union
-            .iter()
-            .cloned(),
-    );
+    if !current_target_is_empty {
+        union_bodies.extend(
+            preserved_previous_renderer_requirement_union
+                .iter()
+                .cloned(),
+        );
+    }
     if let Some(current) = current_3d.as_ref() {
         union_bodies.push(Arc::clone(current.current.requirements.canonical()));
         union_bodies.push(Arc::clone(current.refinement.requirements.canonical()));
         union_bodies.push(Arc::clone(current.playback.requirements.canonical()));
     }
-    if let Some(current_front) = transition_current_front_body {
+    if !current_target_is_empty && let Some(current_front) = transition_current_front_body {
         union_bodies.push(current_front);
     }
-    union_bodies.extend(transition_cross_front_bodies);
+    debug_assert_eq!(
+        transition_cross_front_bodies.len(),
+        prepared_cross_sections.len()
+    );
+    union_bodies.extend(
+        transition_cross_front_bodies
+            .into_iter()
+            .zip(prepared_cross_sections.iter())
+            .filter_map(|(front, cross)| {
+                (!cross.plan.requirements.canonical().is_empty()).then_some(front)
+            }),
+    );
     union_bodies.extend(cross_bodies);
     let mut union_reservations = PreparedAllocationReservations::new(cpu_ledger.as_ref());
     let Some(renderer_requirement_union) =
@@ -1711,7 +1748,6 @@ fn prepare_cross_section_planning(
     let mut reservations = PreparedAllocationReservations::new(cpu_ledger);
     let (plan, work, reuse_envelope) = planning.prepare_accounted(&mut reservations)?;
     let PreparedDatasetDemandPlan {
-        scale,
         layer_scales,
         requirements,
         payload_bytes,
@@ -1725,7 +1761,6 @@ fn prepare_cross_section_planning(
         &reservations,
     )?;
     let mut plan = PreparedDatasetDemandPlan {
-        scale,
         layer_scales,
         requirements,
         payload_bytes,
@@ -2894,7 +2929,7 @@ mod tests {
         assert_eq!(rejected_result_reservations.load(Ordering::Acquire), 0);
         assert_eq!(prepared.plan.requirements.ranked().len(), floor_count);
         assert_eq!(prepared.plan.primary_resource_count, floor_count);
-        assert_eq!(prepared.plan.scale, guarded.plan.scale);
+        assert_eq!(prepared.plan.layer_scales, guarded.plan.layer_scales);
         assert!(
             prepared.reuse_envelope.is_some(),
             "a same-scale guard contained by the mandatory floor remains a valid zero-cost reuse proof"
