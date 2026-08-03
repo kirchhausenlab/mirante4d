@@ -36,10 +36,10 @@ use crate::{
         SCOPE_CROSS_SECTION_XZ, SCOPE_CROSS_SECTION_YZ, SCOPE_CURRENT_3D,
         SCOPE_CURRENT_3D_REFINEMENT, SCOPE_PLAYBACK, ScopeReconciliationTargets,
     },
-    display_refresh::render_backend_for_view,
+    display_refresh::{RenderAttemptCoordinator, render_backend_for_view},
     native_presentation::NativePresentationBridge,
-    playback_session::PlaybackFrameContract,
-    presentation_scheduler::{TargetAvailability, assemble_logical_targets},
+    playback_session::{PlaybackFrameContract, PlaybackTargetSet},
+    presentation_scheduler::MissingLogicalTarget,
     product_render_intent::PRODUCT_RENDER_RESOURCE_LIMIT,
     retained_leases::RetainedRequirementHandle,
     viewer_layout::PanelId,
@@ -80,7 +80,11 @@ fn dataset_fidelity_completeness(
 fn pump_interactive_admission_with_renderer(
     dataset: &mut DatasetDemandState,
     native: &mut NativePresentationBridge,
+    render_attempt: &mut RenderAttemptCoordinator,
 ) -> Result<usize, RuntimeFault> {
+    if render_attempt.renderer_is_terminal() {
+        return dataset.pump_interactive_admission();
+    }
     let Some(product) = native.product_gpu.as_mut() else {
         return dataset.pump_interactive_admission();
     };
@@ -90,6 +94,7 @@ fn pump_interactive_admission_with_renderer(
     for event in events.iter().copied() {
         match dataset.resolve_renderer_eviction(event.key())? {
             RendererEvictionDisposition::Reoffer(lease) => {
+                let key = lease.key();
                 product
                     .renderer
                     .offer_residency_leases(&[lease])
@@ -97,6 +102,7 @@ fn pump_interactive_admission_with_renderer(
                         tracing::error!(%error, "renderer rejected an exact eviction reoffer lease");
                         RuntimeFault::new(RuntimeFaultCode::InvariantViolation)
                     })?;
+                render_attempt.observe_relevant_residency_offer(key);
                 acknowledge_through = Some(event.sequence());
             }
             RendererEvictionDisposition::Submitted
@@ -108,6 +114,7 @@ fn pump_interactive_admission_with_renderer(
     }
     if let Some(sequence) = acknowledge_through {
         product.renderer.acknowledge_residency_evictions(sequence);
+        render_attempt.observe_eviction_acknowledgement(sequence);
     }
     dataset
         .retire_released_cpu_authority_payloads(|key| product.renderer.resource_is_resident(key));
@@ -1876,6 +1883,7 @@ impl MiranteWorkbenchApp {
         match pump_interactive_admission_with_renderer(
             &mut self.dataset,
             &mut self.native_presentation,
+            &mut self.render_attempt,
         ) {
             Ok(_) => {
                 if let Some(fault) = self.dataset.dispatcher_mut().take_last_fault() {
@@ -2751,42 +2759,59 @@ impl MiranteWorkbenchApp {
             }
         }
 
-        // A worker result is an incremental physical delta. Assemble and
-        // validate the fixed logical temporal target set against compatible
-        // installed bodies before the first scope or renderer union changes.
-        // Reused is therefore a proved member, never an omitted list entry.
-        let _logical_temporal_targets = temporal_frame_contract
+        // A worker result can replace only part of the installed immutable
+        // body cohort. Before mutating any scope, prove that each temporal
+        // target will have either its new body or the exact compatible body
+        // already installed. Renderer-front reuse remains a later renderer-
+        // owned decision over the complete requests built from that cohort.
+        temporal_frame_contract
             .as_ref()
             .map(|frame| {
-                let mut availability = TargetAvailability::new();
-                if current_install.is_some() {
-                    availability.mark_prepared(PresentationTarget::ThreeD);
-                }
-                for panel in installed_panels.iter().copied() {
-                    availability.mark_prepared(panel.presentation_slot());
-                }
-                if let Some(installed) = self.visible_demand_planning_signature.as_ref() {
-                    if installed.current_3d == pending.planning.current_3d
-                        && self.installed_temporal_3d_body_matches(frame)
-                    {
-                        availability.mark_reusable(PresentationTarget::ThreeD);
+                let newly_prepared = |target| match target {
+                    PresentationTarget::ThreeD => current_install.is_some(),
+                    PresentationTarget::Xy | PresentationTarget::Xz | PresentationTarget::Yz => {
+                        installed_panels
+                            .iter()
+                            .any(|panel| panel.presentation_slot() == target)
                     }
-                    if installed
-                        .cross_sections
-                        .same_common_demand(&pending.planning.cross_sections)
-                    {
-                        for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
-                            if installed.cross_sections.panel(panel)
-                                == pending.planning.cross_sections.panel(panel)
+                };
+                let installed_matches = |target| {
+                    let Some(installed) = self.visible_demand_planning_signature.as_ref() else {
+                        return false;
+                    };
+                    match target {
+                        PresentationTarget::ThreeD => {
+                            installed.current_3d == pending.planning.current_3d
+                                && self.installed_temporal_3d_body_matches(frame)
+                        }
+                        PresentationTarget::Xy
+                        | PresentationTarget::Xz
+                        | PresentationTarget::Yz => {
+                            let panel = match target {
+                                PresentationTarget::Xy => PanelId::Xy,
+                                PresentationTarget::Xz => PanelId::Xz,
+                                PresentationTarget::Yz => PanelId::Yz,
+                                PresentationTarget::ThreeD => unreachable!(),
+                            };
+                            installed
+                                .cross_sections
+                                .same_common_demand(&pending.planning.cross_sections)
+                                && installed.cross_sections.panel(panel)
+                                    == pending.planning.cross_sections.panel(panel)
                                 && self.installed_temporal_cross_section_body_matches(panel, frame)
-                            {
-                                availability.mark_reusable(panel.presentation_slot());
-                            }
                         }
                     }
+                };
+                for target in PresentationTarget::ALL {
+                    let required = match frame.target_set() {
+                        PlaybackTargetSet::ThreeD => target == PresentationTarget::ThreeD,
+                        PlaybackTargetSet::FullLayout => true,
+                    };
+                    if required && !newly_prepared(target) && !installed_matches(target) {
+                        return Err(anyhow::Error::new(MissingLogicalTarget(target)));
+                    }
                 }
-                assemble_logical_targets(frame.target_set(), availability)
-                    .map_err(anyhow::Error::new)
+                Ok(())
             })
             .transpose()?;
 
@@ -3167,10 +3192,11 @@ impl MiranteWorkbenchApp {
             }
             return;
         }
-        let (dataset, analysis, native_presentation) = (
+        let (dataset, analysis, native_presentation, render_attempt) = (
             &mut self.dataset,
             &mut self.analysis_runtime,
             &mut self.native_presentation,
+            &mut self.render_attempt,
         );
         let mut analysis_events = Vec::new();
         let mut analysis_errors = Vec::new();
@@ -3204,23 +3230,33 @@ impl MiranteWorkbenchApp {
             };
             drained = drained.saturating_add(batch_drained);
             if !batch_installed.leases().is_empty()
+                && !render_attempt.renderer_is_terminal()
                 && let Some(product) = native_presentation.product_gpu.as_mut()
-                && let Err(error) = product
+            {
+                if let Err(error) = product
                     .renderer
                     .offer_residency_leases(batch_installed.leases())
-            {
-                tracing::error!(%error, "renderer rejected a CPU completion lease batch");
-                drain_fault = Some((
-                    RuntimeFault::new(RuntimeFaultCode::InvariantViolation),
-                    dataset.deferred_refill_preserves_presentation(),
-                ));
-                break;
+                {
+                    tracing::error!(%error, "renderer rejected a CPU completion lease batch");
+                    drain_fault = Some((
+                        RuntimeFault::new(RuntimeFaultCode::InvariantViolation),
+                        dataset.deferred_refill_preserves_presentation(),
+                    ));
+                    break;
+                }
+                for lease in batch_installed.leases() {
+                    render_attempt.observe_relevant_residency_offer(lease.key());
+                }
             }
             installed_current |= batch_installed.in_scope(SCOPE_CURRENT_3D);
             installed_any |= batch_installed.any();
             if dataset.dispatcher().admission_blocked() {
                 let preserve_presentation = dataset.deferred_refill_preserves_presentation();
-                match pump_interactive_admission_with_renderer(dataset, native_presentation) {
+                match pump_interactive_admission_with_renderer(
+                    dataset,
+                    native_presentation,
+                    render_attempt,
+                ) {
                     Ok(_) => {}
                     Err(fault) => {
                         dataset.take_deferred_refill_presentation_preservation();
@@ -3267,6 +3303,7 @@ impl MiranteWorkbenchApp {
             match pump_interactive_admission_with_renderer(
                 &mut self.dataset,
                 &mut self.native_presentation,
+                &mut self.render_attempt,
             ) {
                 Ok(_) => self.dataset.finish_deferred_refill_if_unblocked(),
                 Err(fault) => {

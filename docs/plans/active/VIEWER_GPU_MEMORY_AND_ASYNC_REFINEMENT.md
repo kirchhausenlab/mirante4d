@@ -5,6 +5,13 @@
 - Implementation authorized by owner: 2026-07-30
 - Last reviewed: 2026-07-30
 
+Later narrow correction: the
+[rendering correctness, recovery, and numerical cutover](VIEWER_RENDERING_CORRECTNESS_RECOVERY_AND_NUMERICAL_CUTOVER.md)
+supersedes cause-free hidden failure, renderer-wide hidden-worker spawn
+failure, and unscoped hidden identity exhaustion with a typed hidden-only
+capability and bounded timeout cleanup. This plan's memory ownership and
+asynchronous-refinement architecture remain historical authority.
+
 This document is the authoritative implementation and handoff plan for three
 related renderer-foundation corrections:
 

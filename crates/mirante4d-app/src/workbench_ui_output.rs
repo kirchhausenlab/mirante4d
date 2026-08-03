@@ -322,13 +322,20 @@ impl MiranteWorkbenchApp {
         // command can retire or replace their fixed-target texture revision.
         for paint in presentation_paints {
             let slot = paint.slot();
+            let target = paint.request().target();
             real_interaction_trace::record_presentation_target(
                 slot,
                 paint.rect(),
                 ui.ctx().pixels_per_point(),
             );
-            if let Err(error) = self.native_presentation.paint(ui, paint) {
-                tracing::warn!(%error, ?slot, "native presentation request was rejected");
+            match self.native_presentation.paint(ui, paint) {
+                Ok(()) => self.render_attempt.acknowledge_composition(
+                    target,
+                    self.native_presentation.texture_binding_identity(target),
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, ?slot, "native presentation request was rejected");
+                }
             }
         }
 
@@ -343,21 +350,21 @@ impl MiranteWorkbenchApp {
             }
         }
         rerender_requested |= self.render_coordination.take_refresh_request();
-        let published_after_paint = if rerender_requested {
+        let composition_turn_required = if rerender_requested {
             // Resident interactions may already have taken the immediate
             // low-latency path above. P3 keeps that responsiveness contract:
             // this remains a second coordinated observation, while clean
             // renderer targets guarantee it records no second color cutoff.
-            self.refresh_frame()
+            self.refresh_frame().requires_composition_turn()
         } else if texture_refresh_requested {
-            self.refresh_texture_only()
+            self.refresh_texture_only().requires_composition_turn()
         } else {
             false
         };
-        if published_after_paint {
+        if composition_turn_required {
             // Presentation paints were resolved earlier in this UI turn.
             // Guarantee one composition turn that can actually expose the
-            // renderer publication on the mapped window.
+            // new texture or intentional background on the mapped window.
             ui.ctx().request_repaint();
         }
         // A refresh can publish the cold coarse predecessor and enqueue the
@@ -425,9 +432,9 @@ impl MiranteWorkbenchApp {
                 if demand_plan_required {
                     self.request_transient_visible_demand(revision, sample.target());
                 }
-                let published_after_paint =
-                    (resident_camera || resident_plane) && self.refresh_frame();
-                if published_after_paint {
+                let composition_turn_required = (resident_camera || resident_plane)
+                    && self.refresh_frame().requires_composition_turn();
+                if composition_turn_required {
                     ctx.request_repaint();
                 }
                 // Nonresident input needs an immediate turn while

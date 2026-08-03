@@ -8,11 +8,12 @@ use mirante4d_application::{
     },
 };
 use mirante4d_render_api::{FrameIdentity, PresentationTarget, RenderExtent, VolumePickResult};
+use mirante4d_render_wgpu::{PipelineCompilationFailureCause, WgpuRenderRuntimeError};
 use mirante4d_ui_egui::{
     ViewerPickPurpose, ViewerPickRequest, ViewportHover, ViewportIntensity, ViewportSampleKind,
 };
 
-use crate::{BACKGROUND_WORK_REPAINT_INTERVAL, MiranteWorkbenchApp, application_view};
+use crate::{MiranteWorkbenchApp, application_view};
 
 const PICK_POLL_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
 
@@ -73,6 +74,16 @@ struct PendingPick<Ticket> {
     request: ViewerPickRequest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum PickTerminalResult {
+    Stale,
+    CancelledByNewerRequest,
+    RendererUnavailable,
+    CapabilityFailed(PipelineCompilationFailureCause),
+    RendererTerminal(WgpuRenderRuntimeError),
+    ExecutionFailed(WgpuRenderRuntimeError),
+}
+
 /// Exactly one GPU request may be pending and exactly one latest replacement
 /// may be queued. Primary clicks cannot be overwritten by hover traffic.
 #[derive(Debug)]
@@ -83,6 +94,8 @@ pub(crate) struct ViewerPickQueue<Ticket> {
     hover_interest: Option<ViewerPickRequest>,
     automation_interest: Option<ViewerPickRequest>,
     automation_completion: Option<(ViewerPickRequest, PickHit)>,
+    automation_terminal: Option<(ViewerPickRequest, PickTerminalResult)>,
+    hover_terminal: Option<(ViewerPickRequest, PickTerminalResult)>,
 }
 
 impl<Ticket> Default for ViewerPickQueue<Ticket> {
@@ -94,6 +107,8 @@ impl<Ticket> Default for ViewerPickQueue<Ticket> {
             hover_interest: None,
             automation_interest: None,
             automation_completion: None,
+            automation_terminal: None,
+            hover_terminal: None,
         }
     }
 }
@@ -111,14 +126,18 @@ impl<Ticket: Copy + Eq> ViewerPickQueue<Ticket> {
         }
         self.hover_interest =
             request.filter(|request| request.purpose() == ViewerPickPurpose::Hover);
+        if request.is_some() {
+            self.hover_terminal = None;
+        }
         match request {
             Some(request) => self.enqueue(request),
             None => {
                 if self.queued.is_some_and(|request| {
                     request.purpose() == ViewerPickPurpose::Hover
                         && self.automation_interest != Some(request)
-                }) {
-                    self.queued = None;
+                }) && let Some(request) = self.queued.take()
+                {
+                    self.record_terminal(request, PickTerminalResult::Stale);
                 }
                 if self
                     .last_completed
@@ -139,6 +158,7 @@ impl<Ticket: Copy + Eq> ViewerPickQueue<Ticket> {
         if self.automation_interest != Some(request) {
             self.automation_interest = Some(request);
             self.automation_completion = None;
+            self.automation_terminal = None;
         }
         // A prior UI hover retained only the deduplication identity, not the
         // scientific result automation must report. Force one real completion
@@ -164,6 +184,28 @@ impl<Ticket: Copy + Eq> ViewerPickQueue<Ticket> {
         self.automation_completion.take()
     }
 
+    pub(crate) fn take_automation_terminal_for(
+        &mut self,
+        purpose: ViewerPickPurpose,
+    ) -> Option<(ViewerPickRequest, PickTerminalResult)> {
+        let matches = self
+            .automation_terminal
+            .as_ref()
+            .is_some_and(|(request, _)| request.purpose() == purpose);
+        if !matches {
+            return None;
+        }
+        self.automation_interest = None;
+        self.automation_terminal.take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_hover_terminal(
+        &mut self,
+    ) -> Option<(ViewerPickRequest, PickTerminalResult)> {
+        self.hover_terminal.take()
+    }
+
     pub(crate) fn enqueue(&mut self, request: ViewerPickRequest) {
         if self
             .pending
@@ -179,6 +221,11 @@ impl<Ticket: Copy + Eq> ViewerPickQueue<Ticket> {
             .is_some_and(|queued| queued.purpose() == ViewerPickPurpose::PrimaryClick)
         {
             return;
+        }
+        if let Some(replaced) = self.queued
+            && replaced != request
+        {
+            self.record_terminal(replaced, PickTerminalResult::CancelledByNewerRequest);
         }
         self.queued = Some(request);
     }
@@ -218,6 +265,7 @@ impl<Ticket: Copy + Eq> ViewerPickQueue<Ticket> {
     pub(crate) fn record_completed(&mut self, request: ViewerPickRequest) {
         if request.purpose() == ViewerPickPurpose::Hover {
             self.last_completed = Some(request);
+            self.hover_terminal = None;
         }
     }
 
@@ -243,12 +291,23 @@ impl<Ticket: Copy + Eq> ViewerPickQueue<Ticket> {
         }
     }
 
+    pub(crate) fn terminate_pending(
+        &mut self,
+        ticket: Ticket,
+        result: PickTerminalResult,
+    ) -> Option<ViewerPickRequest> {
+        let request = self.discard_pending(ticket)?;
+        self.record_terminal(request, result);
+        Some(request)
+    }
+
     pub(crate) fn retain_current(&mut self, currentness: ViewerPickCurrentness) {
         if self
             .queued
             .is_some_and(|request| !currentness.accepts(request))
+            && let Some(request) = self.queued.take()
         {
-            self.queued = None;
+            self.record_terminal(request, PickTerminalResult::Stale);
         }
         if self
             .last_completed
@@ -263,10 +322,14 @@ impl<Ticket: Copy + Eq> ViewerPickQueue<Ticket> {
             self.hover_interest = None;
         }
         if self.automation_completion.is_none()
-            && self
+            && let Some(request) = self
                 .automation_interest
-                .is_some_and(|request| !currentness.accepts(request))
+                .filter(|request| !currentness.accepts(*request))
         {
+            // An automation waiter must observe terminality even when its
+            // already-submitted GPU ticket cannot be cancelled. Record stale
+            // now, then leave the bounded ticket to the normal drain path.
+            self.automation_terminal = Some((request, PickTerminalResult::Stale));
             self.automation_interest = None;
         }
         // Pending GPU work cannot be cancelled. It remains bounded and is
@@ -286,26 +349,68 @@ impl<Ticket: Copy + Eq> ViewerPickQueue<Ticket> {
             false
         }
     }
+    pub(crate) fn terminate_queued(
+        &mut self,
+        request: ViewerPickRequest,
+        result: PickTerminalResult,
+    ) -> bool {
+        if !self.discard_queued(request) {
+            return false;
+        }
+        self.record_terminal(request, result);
+        true
+    }
 
-    pub(crate) fn clear_unsubmitted(&mut self) {
+    pub(crate) fn terminate_all(&mut self, result: PickTerminalResult) {
+        let pending = self.pending.map(|pending| pending.request);
+        let queued = self.queued;
+        if let Some(request) = pending {
+            self.record_terminal(request, result);
+        }
+        if let Some(request) = queued
+            && Some(request) != pending
+        {
+            self.record_terminal(request, result);
+        }
+        if let Some(request) = self.automation_interest {
+            self.automation_terminal = Some((request, result));
+        }
+        self.pending = None;
         self.queued = None;
         self.last_completed = None;
         self.hover_interest = None;
-        self.automation_interest = None;
         self.automation_completion = None;
+    }
+
+    fn record_terminal(&mut self, request: ViewerPickRequest, result: PickTerminalResult) {
+        if request.purpose() == ViewerPickPurpose::Hover {
+            self.hover_terminal = Some((request, result));
+        }
+        if self.automation_interest == Some(request) {
+            self.automation_terminal = Some((request, result));
+        }
     }
 
     /// Dataset replacement invalidates even already-submitted GPU tickets.
     /// The renderer retires those source-scoped slots at the same boundary,
     /// so retaining a pending queue entry would only poll an unknown ticket.
     pub(crate) fn retire_source_generation(&mut self) {
-        self.pending = None;
-        self.clear_unsubmitted();
+        self.terminate_all(PickTerminalResult::Stale);
     }
 
     pub(crate) const fn has_work(&self) -> bool {
         self.pending.is_some() || self.queued.is_some()
     }
+}
+
+const fn is_renderer_terminal_error(error: WgpuRenderRuntimeError) -> bool {
+    matches!(
+        error,
+        WgpuRenderRuntimeError::DeviceLost
+            | WgpuRenderRuntimeError::DeviceOutOfMemory
+            | WgpuRenderRuntimeError::BackendInternal
+            | WgpuRenderRuntimeError::BackendValidation
+    )
 }
 
 fn same_pick_target(completed: ViewerPickRequest, request: Option<ViewerPickRequest>) -> bool {
@@ -338,6 +443,11 @@ impl MiranteWorkbenchApp {
         if !self.viewer_pick_queue.has_work() {
             return;
         }
+        if self.native_presentation.product_gpu.is_none() {
+            self.viewer_pick_queue
+                .terminate_all(PickTerminalResult::RendererUnavailable);
+            return;
+        }
         let snapshot = self.application_snapshot_for_ui();
         let currentness = ViewerPickCurrentness::from_snapshot(&snapshot);
         self.viewer_pick_queue.retain_current(currentness);
@@ -346,18 +456,29 @@ impl MiranteWorkbenchApp {
             Ok(false) => {
                 // Keep the latest current request queued while the renderer's
                 // one bounded compiler worker finishes the pick capability.
-                // Compiler polling owns the slower cadence; do not turn this
-                // into the 8-ms mapped-result poll loop.
-                context.request_repaint_after(BACKGROUND_WORK_REPAINT_INTERVAL);
+                // Its committed capability event owns the next UI turn.
                 return;
             }
             Err(error) => {
-                self.viewer_pick_queue.clear_unsubmitted();
-                tracing::warn!(%error, "viewer picking stopped after renderer initialization failed");
+                if is_renderer_terminal_error(error) {
+                    self.enter_product_renderer_terminal(error);
+                    tracing::error!(%error, "viewer picking observed the terminal renderer cause");
+                    return;
+                }
+                let terminal = match error {
+                    WgpuRenderRuntimeError::PipelineCompilationFailed {
+                        capability: mirante4d_render_wgpu::PipelineCapability::Pick,
+                        cause,
+                    } => PickTerminalResult::CapabilityFailed(cause),
+                    _ => PickTerminalResult::ExecutionFailed(error),
+                };
+                self.viewer_pick_queue.terminate_all(terminal);
+                tracing::warn!(%error, "viewer picking reached a terminal capability outcome");
                 return;
             }
         }
 
+        let mut renderer_terminal = None;
         let completion = self
             .viewer_pick_queue
             .pending()
@@ -374,7 +495,23 @@ impl MiranteWorkbenchApp {
                     }
                     Some(Ok(None)) => None,
                     Some(Err(error)) => {
-                        self.viewer_pick_queue.discard_pending(ticket);
+                        if is_renderer_terminal_error(error) {
+                            renderer_terminal = Some(error);
+                        }
+                        let terminal = match error {
+                            WgpuRenderRuntimeError::PickQueryMismatch
+                            | WgpuRenderRuntimeError::PickFrameUnavailable => {
+                                PickTerminalResult::Stale
+                            }
+                            WgpuRenderRuntimeError::DeviceLost
+                            | WgpuRenderRuntimeError::DeviceOutOfMemory
+                            | WgpuRenderRuntimeError::BackendInternal
+                            | WgpuRenderRuntimeError::BackendValidation => {
+                                PickTerminalResult::RendererTerminal(error)
+                            }
+                            _ => PickTerminalResult::ExecutionFailed(error),
+                        };
+                        self.viewer_pick_queue.terminate_pending(ticket, terminal);
                         tracing::warn!(%error, ?ticket, "asynchronous viewer pick failed");
                         None
                     }
@@ -384,6 +521,11 @@ impl MiranteWorkbenchApp {
                     }
                 }
             });
+
+        if let Some(error) = renderer_terminal {
+            self.enter_product_renderer_terminal(error);
+            return;
+        }
 
         if let Some((request, result)) = completion {
             let hover_wanted = self.viewer_pick_queue.hover_completion_is_wanted(request);
@@ -402,13 +544,16 @@ impl MiranteWorkbenchApp {
                 self.viewer_pick_queue.record_completed(request);
                 self.viewer_pick_queue
                     .record_automation_completion(request, hit);
+            } else if self
+                .viewer_pick_queue
+                .automation_completion_is_wanted(request)
+                || request.purpose() == ViewerPickPurpose::Hover
+            {
+                self.viewer_pick_queue
+                    .record_terminal(request, PickTerminalResult::Stale);
             }
         }
 
-        if self.native_presentation.product_gpu.is_none() {
-            self.viewer_pick_queue.clear_unsubmitted();
-            return;
-        }
         if let Some(request) = self.viewer_pick_queue.next_request() {
             let query = request.query();
             let submission = self
@@ -434,10 +579,29 @@ impl MiranteWorkbenchApp {
                     | mirante4d_render_wgpu::WgpuRenderRuntimeError::PickCapacityExceeded,
                 ) => {}
                 Err(mirante4d_render_wgpu::WgpuRenderRuntimeError::PickFrameUnavailable) => {
-                    self.viewer_pick_queue.discard_queued(request);
+                    self.viewer_pick_queue
+                        .terminate_queued(request, PickTerminalResult::Stale);
                 }
                 Err(error) => {
-                    self.viewer_pick_queue.discard_queued(request);
+                    if is_renderer_terminal_error(error) {
+                        self.enter_product_renderer_terminal(error);
+                        tracing::error!(%error, "viewer-pick submission observed the terminal renderer cause");
+                        return;
+                    }
+                    let terminal = match error {
+                        WgpuRenderRuntimeError::PickTicketExhausted
+                        | WgpuRenderRuntimeError::PipelineCompilationFailed {
+                            capability: mirante4d_render_wgpu::PipelineCapability::Pick,
+                            ..
+                        } => match error {
+                            WgpuRenderRuntimeError::PipelineCompilationFailed { cause, .. } => {
+                                PickTerminalResult::CapabilityFailed(cause)
+                            }
+                            _ => PickTerminalResult::ExecutionFailed(error),
+                        },
+                        _ => PickTerminalResult::ExecutionFailed(error),
+                    };
+                    self.viewer_pick_queue.terminate_queued(request, terminal);
                     tracing::warn!(%error, "viewer-pick submission rejected");
                 }
             }
@@ -833,6 +997,24 @@ mod tests {
     }
 
     #[test]
+    fn empty_surface_terminates_automation_authority_but_keeps_pending_ticket_drainable() {
+        let request = request(ViewerPickPurpose::Hover, 1.0);
+        let mut queue = ViewerPickQueue::<u64>::default();
+        queue.enqueue_automation(request);
+        assert!(queue.mark_submitted(5));
+        let mut empty = currentness(request);
+        empty.presented = None;
+
+        queue.retain_current(empty);
+
+        assert_eq!(queue.pending(), Some((5, request)));
+        assert_eq!(
+            queue.take_automation_terminal_for(ViewerPickPurpose::Hover),
+            Some((request, PickTerminalResult::Stale))
+        );
+    }
+
+    #[test]
     fn source_retirement_drops_pending_queued_and_completed_pick_authority() {
         let pending = request(ViewerPickPurpose::Hover, 1.0);
         let queued = request(ViewerPickPurpose::PrimaryClick, 2.0);
@@ -851,7 +1033,55 @@ mod tests {
             queue.take_automation_completion_for(ViewerPickPurpose::Hover),
             None
         );
+        assert_eq!(
+            queue.take_automation_terminal_for(ViewerPickPurpose::Hover),
+            Some((pending, PickTerminalResult::Stale))
+        );
         assert!(!queue.hover_completion_is_wanted(pending));
+    }
+
+    #[test]
+    fn pending_pick_reaches_terminal_result_after_capability_failure() {
+        let hover = request(ViewerPickPurpose::Hover, 1.0);
+        let request = request(ViewerPickPurpose::PrimaryClick, 2.0);
+        let cause = PipelineCompilationFailureCause::Validation;
+        let mut hover_queue = ViewerPickQueue::<u64>::default();
+        hover_queue.observe_ui_request(Some(hover));
+        assert!(hover_queue.mark_submitted(16));
+        hover_queue.terminate_all(PickTerminalResult::CapabilityFailed(cause));
+        assert_eq!(
+            hover_queue.take_hover_terminal(),
+            Some((hover, PickTerminalResult::CapabilityFailed(cause)))
+        );
+        assert!(!hover_queue.has_work());
+
+        let mut queue = ViewerPickQueue::<u64>::default();
+        queue.enqueue_automation(request);
+        assert!(queue.mark_submitted(17));
+
+        queue.terminate_all(PickTerminalResult::CapabilityFailed(cause));
+
+        assert!(!queue.has_work());
+        assert_eq!(queue.pending(), None);
+        assert_eq!(
+            queue.take_automation_terminal_for(ViewerPickPurpose::PrimaryClick),
+            Some((request, PickTerminalResult::CapabilityFailed(cause)))
+        );
+    }
+
+    #[test]
+    fn pick_device_failure_promotes_to_global_renderer_terminal() {
+        for error in [
+            WgpuRenderRuntimeError::DeviceLost,
+            WgpuRenderRuntimeError::DeviceOutOfMemory,
+            WgpuRenderRuntimeError::BackendInternal,
+            WgpuRenderRuntimeError::BackendValidation,
+        ] {
+            assert!(is_renderer_terminal_error(error));
+        }
+        assert!(!is_renderer_terminal_error(
+            WgpuRenderRuntimeError::VolumePickFailed
+        ));
     }
 
     #[test]

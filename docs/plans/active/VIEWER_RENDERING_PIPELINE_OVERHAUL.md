@@ -7,6 +7,13 @@
 - Real-interaction corrective amendment: OWNER APPROVED 2026-07-29
 - Last reviewed: 2026-07-29
 
+Later narrow correction: the
+[rendering correctness, recovery, and numerical cutover](VIEWER_RENDERING_CORRECTNESS_RECOVERY_AND_NUMERICAL_CUTOVER.md)
+supersedes this handoff's global pipeline-failure coupling, unchecked broad
+binary32 coordinate admission, split retry/repaint authority, and terminal
+raw-queue wake behavior. Its historical renderer/presentation architecture
+and named product evidence remain unchanged.
+
 This is a target plan, not an implemented-state record. The current product
 remains the architecture described by
 [Current State](../../CURRENT_STATE.md) until an accepted milestone changes

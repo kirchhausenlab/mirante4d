@@ -2,20 +2,19 @@
 
 use std::fmt;
 
-use glam::{DMat3, DMat4, DQuat, DVec3};
+use glam::{DMat4, DQuat, DVec3};
 use mirante4d_dataset::{
     CpuByteLease, CpuByteLedger, CpuLedgerCategory, CpuLedgerError, ResourceContractError,
     ResourceRegion,
 };
 use mirante4d_domain::{CrossSectionView, GridToWorld, Projection, Shape3D, UnitQuaternion};
 use mirante4d_render_api::{
-    CameraFrame, PresentationViewport, RenderApiError, RenderExtent, ShaderControlAffineError,
-    shader_control_world_to_grid_rows,
+    CameraFrame, PresentationViewport, RenderApiError, RenderExtent, ShaderAdmissionError,
+    ValidatedPlaneGridFootprint, ValidatedShaderAffine,
 };
 
 const EPSILON: f64 = 1.0e-9;
 const MAX_CLIPPED_POLYGON_VERTICES: usize = 10;
-const MAX_BINARY32_HALF_INTEGER_EXTENT: u64 = 1 << 23;
 const MAX_SHADER_GRID_ROUNDING_RADIUS: f64 = 0.5;
 /// The resident-plane contract covers a complete four-world-unit slice,
 /// followed by the declared 0.30/0.15-radian compound drag.  Summing the two
@@ -23,8 +22,6 @@ const MAX_SHADER_GRID_ROUNDING_RADIUS: f64 = 0.5;
 /// rotations.
 const PLANE_REUSE_TRANSLATION_WORLD: f64 = 4.0;
 const PLANE_REUSE_ROTATION_RADIANS: f64 = 0.30 + 0.15;
-const MAX_EFFECTIVE_AFFINE_CONDITION: f64 = 1.0e12;
-const MAX_EFFECTIVE_AFFINE_RESIDUAL: f64 = 1.0e-9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct RegionIndex {
@@ -85,6 +82,7 @@ pub(crate) enum SemanticPlanError {
     ControlPrecision { field: &'static str },
     DegeneratePlane,
     NonInvertibleTransform,
+    ShaderAdmission(ShaderAdmissionError),
     Resource(ResourceContractError),
     Camera(RenderApiError),
     ScratchCapacity(CpuLedgerError),
@@ -118,6 +116,7 @@ impl fmt::Display for SemanticPlanError {
             Self::NonInvertibleTransform => {
                 formatter.write_str("grid-to-world matrix must be invertible")
             }
+            Self::ShaderAdmission(error) => error.fmt(formatter),
             Self::Resource(error) => error.fmt(formatter),
             Self::Camera(error) => error.fmt(formatter),
             Self::ScratchCapacity(error) => write!(formatter, "semantic planning scratch: {error}"),
@@ -131,6 +130,7 @@ impl std::error::Error for SemanticPlanError {
             Self::Resource(error) => Some(error),
             Self::Camera(error) => Some(error),
             Self::ScratchCapacity(error) => Some(error),
+            Self::ShaderAdmission(error) => Some(error),
             Self::Capacity { .. }
             | Self::Cancelled
             | Self::ControlPrecision { .. }
@@ -273,19 +273,21 @@ impl SemanticPlaneReuseEnvelope {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct VisibilityHalfSpace {
     normal: DVec3,
-    offset: f64,
+    anchor: DVec3,
+    bias: f64,
 }
 
 impl VisibilityHalfSpace {
     fn through_eye(normal: DVec3, eye: DVec3) -> Self {
         Self {
             normal,
-            offset: -normal.dot(eye),
+            anchor: eye,
+            bias: 0.0,
         }
     }
 
     fn signed_distance(self, point: DVec3) -> f64 {
-        self.normal.dot(point) + self.offset
+        self.normal.dot(point - self.anchor) + self.bias
     }
 }
 
@@ -321,13 +323,12 @@ impl SemanticCameraReuseEnvelope {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        if !guard_planes
+        if !guard_planes.iter().all(|plane| {
+            plane.normal.is_finite() && plane.anchor.is_finite() && plane.bias.is_finite()
+        }) || !volume_corners
             .iter()
-            .all(|plane| plane.normal.is_finite() && plane.offset.is_finite())
-            || !volume_corners
-                .iter()
-                .flatten()
-                .all(|corner| corner.is_finite())
+            .flatten()
+            .all(|corner| corner.is_finite())
         {
             return Err(SemanticPlanError::Camera(
                 RenderApiError::CameraMathNotFinite,
@@ -384,7 +385,8 @@ impl From<RenderApiError> for SemanticPlanError {
 
 #[derive(Debug, Clone, Copy)]
 struct OrthographicView {
-    eye: DVec3,
+    target: DVec3,
+    distance: f64,
     forward: DVec3,
     right: DVec3,
     up: DVec3,
@@ -440,6 +442,7 @@ struct PlaneGridFootprint {
     step_y_grid_xyz: [f64; 3],
     rounding_radius_grid_xyz: [f64; 3],
     world_to_grid_rows: [[f64; 4]; 3],
+    validated_affine: ValidatedShaderAffine,
     width_pixels: u32,
     height_pixels: u32,
 }
@@ -469,13 +472,8 @@ impl SemanticPlaneLayerReuseGuard {
         footprint: PlaneGridFootprint,
         spec: SemanticRegionGridSpec,
     ) -> Result<Option<Self>, SemanticPlanError> {
-        let Some(effective_grid_to_world) =
-            EffectiveGridToWorld::from_world_to_grid_rows(footprint.world_to_grid_rows)
-        else {
-            // Exact planning remains valid, but an ill-conditioned inverse
-            // cannot establish a trustworthy constant-time reuse proof.
-            return Ok(None);
-        };
+        let effective_grid_to_world =
+            EffectiveGridToWorld::from_validated_affine(footprint.validated_affine);
         let corners_grid = footprint.corners()?;
         let corners_world =
             corners_grid.map(|corner| effective_grid_to_world.transform_point(corner));
@@ -667,83 +665,22 @@ struct Point2 {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct EffectiveGridToWorld {
-    inverse_linear: DMat3,
-    world_to_grid_translation: DVec3,
-    grid_round_trip_residual: [[f64; 3]; 3],
+    inverse_center: [[f64; 4]; 3],
+    maximum_grid_error: [f64; 3],
 }
 
 impl EffectiveGridToWorld {
-    fn from_world_to_grid_rows(rows: [[f64; 4]; 3]) -> Option<Self> {
-        if !rows.iter().flatten().all(|value| value.is_finite()) {
-            return None;
+    fn from_validated_affine(affine: ValidatedShaderAffine) -> Self {
+        Self {
+            inverse_center: affine.quantized_inverse_center(),
+            maximum_grid_error: affine.maximum_grid_error(),
         }
-        let linear = DMat3::from_cols(
-            DVec3::new(rows[0][0], rows[1][0], rows[2][0]),
-            DVec3::new(rows[0][1], rows[1][1], rows[2][1]),
-            DVec3::new(rows[0][2], rows[1][2], rows[2][2]),
-        );
-        let determinant = linear.determinant();
-        if !determinant.is_finite() || determinant == 0.0 {
-            return None;
-        }
-        let inverse_linear = linear.inverse();
-        if !inverse_linear.is_finite() {
-            return None;
-        }
-        let grid_round_trip = linear * inverse_linear;
-        let left_residual = matrix_identity_residual(grid_round_trip);
-        let right_residual = matrix_identity_residual(inverse_linear * linear);
-        if !left_residual.is_finite()
-            || !right_residual.is_finite()
-            || left_residual > MAX_EFFECTIVE_AFFINE_RESIDUAL
-            || right_residual > MAX_EFFECTIVE_AFFINE_RESIDUAL
-        {
-            return None;
-        }
-        let linear_rows = [
-            DVec3::new(rows[0][0], rows[0][1], rows[0][2]),
-            DVec3::new(rows[1][0], rows[1][1], rows[1][2]),
-            DVec3::new(rows[2][0], rows[2][1], rows[2][2]),
-        ];
-        let inverse_columns = inverse_linear.to_cols_array_2d();
-        let inverse_rows = [
-            DVec3::new(
-                inverse_columns[0][0],
-                inverse_columns[1][0],
-                inverse_columns[2][0],
-            ),
-            DVec3::new(
-                inverse_columns[0][1],
-                inverse_columns[1][1],
-                inverse_columns[2][1],
-            ),
-            DVec3::new(
-                inverse_columns[0][2],
-                inverse_columns[1][2],
-                inverse_columns[2][2],
-            ),
-        ];
-        let infinity_norm = linear_rows
-            .iter()
-            .map(|row| row.abs().element_sum())
-            .fold(0.0, f64::max);
-        let inverse_infinity_norm = inverse_rows
-            .iter()
-            .map(|row| row.abs().element_sum())
-            .fold(0.0, f64::max);
-        let condition = infinity_norm * inverse_infinity_norm;
-        if !condition.is_finite() || condition > MAX_EFFECTIVE_AFFINE_CONDITION {
-            return None;
-        }
-        Some(Self {
-            inverse_linear,
-            world_to_grid_translation: DVec3::new(rows[0][3], rows[1][3], rows[2][3]),
-            grid_round_trip_residual: matrix_identity_residual_rows(grid_round_trip),
-        })
     }
 
     fn transform_point(self, point_grid: [f64; 3]) -> DVec3 {
-        self.inverse_linear * (DVec3::from_array(point_grid) - self.world_to_grid_translation)
+        DVec3::from_array(self.inverse_center.map(|row| {
+            row[0] * point_grid[0] + row[1] * point_grid[1] + row[2] * point_grid[2] + row[3]
+        }))
     }
 
     fn grid_round_trip_error_bound(
@@ -751,35 +688,9 @@ impl EffectiveGridToWorld {
         lower_grid_xyz: [f64; 3],
         upper_grid_xyz: [f64; 3],
     ) -> [f64; 3] {
-        let translation = self.world_to_grid_translation.to_array();
-        let maximum_relative = std::array::from_fn::<_, 3, _>(|axis| {
-            (lower_grid_xyz[axis] - translation[axis])
-                .abs()
-                .max((upper_grid_xyz[axis] - translation[axis]).abs())
-        });
-        self.grid_round_trip_residual.map(|row| {
-            row.into_iter()
-                .zip(maximum_relative)
-                .map(|(residual, magnitude)| residual * magnitude)
-                .sum()
-        })
+        let _ = (lower_grid_xyz, upper_grid_xyz);
+        self.maximum_grid_error
     }
-}
-
-fn matrix_identity_residual(matrix: DMat3) -> f64 {
-    matrix_identity_residual_rows(matrix)
-        .into_iter()
-        .flatten()
-        .fold(0.0, f64::max)
-}
-
-fn matrix_identity_residual_rows(matrix: DMat3) -> [[f64; 3]; 3] {
-    let columns = matrix.to_cols_array_2d();
-    std::array::from_fn(|row| {
-        std::array::from_fn(|column| {
-            (columns[column][row] - if column == row { 1.0 } else { 0.0 }).abs()
-        })
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1655,424 +1566,49 @@ fn cross_section_plane_grid_footprint(
     extent: RenderExtent,
     spec: SemanticRegionGridSpec,
 ) -> Result<PlaneGridFootprint, SemanticPlanError> {
-    validate_shader_addressing_extent(extent, spec.volume_shape)?;
-    let controls = quantized_shader_plane_controls(view, panel, presentation, spec.grid_to_world)?;
-    let width = f64::from(extent.width_pixels());
-    let height = f64::from(extent.height_pixels());
-    let first_screen_x = (0.5 / width - 0.5) * controls.presentation_points[0];
-    let first_screen_y = (0.5 - 0.5 / height) * controls.presentation_points[1];
-    let screen_step_x = controls.presentation_points[0] / width;
-    let screen_step_y = -controls.presentation_points[1] / height;
-
-    let origin_world = std::array::from_fn(|axis| {
-        controls.center_world[axis]
-            + (controls.right_world[axis] * first_screen_x
-                + controls.up_world[axis] * first_screen_y)
-                * controls.scale_world_per_point
-    });
-    let step_x_world = std::array::from_fn(|axis| {
-        controls.right_world[axis] * screen_step_x * controls.scale_world_per_point
-    });
-    // Render targets grow downward: the next physical row moves opposite the
-    // view's positive-up axis.
-    let step_y_world = std::array::from_fn(|axis| {
-        controls.up_world[axis] * screen_step_y * controls.scale_world_per_point
-    });
-    let origin_grid_xyz = transform_affine_point(controls.world_to_grid_rows, origin_world)?;
-    let step_x_grid_xyz = transform_affine_vector(controls.world_to_grid_rows, step_x_world)?;
-    let step_y_grid_xyz = transform_affine_vector(controls.world_to_grid_rows, step_y_world)?;
-    let rounding_radius_grid_xyz = shader_grid_rounding_radius(controls, extent, origin_grid_xyz)?;
-
-    let footprint = PlaneGridFootprint {
-        origin_grid_xyz,
-        step_x_grid_xyz,
-        step_y_grid_xyz,
-        rounding_radius_grid_xyz,
-        world_to_grid_rows: controls.world_to_grid_rows,
-        width_pixels: extent.width_pixels(),
-        height_pixels: extent.height_pixels(),
-    };
-    let normal = cross3(footprint.step_x_grid_xyz, footprint.step_y_grid_xyz);
-    if normal.iter().map(|value| value.abs()).fold(0.0, f64::max) == 0.0 {
-        return Err(SemanticPlanError::DegeneratePlane);
-    }
-    Ok(footprint)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct QuantizedShaderPlaneControls {
-    center_world: [f64; 3],
-    right_world: [f64; 3],
-    up_world: [f64; 3],
-    scale_world_per_point: f64,
-    presentation_points: [f64; 2],
-    world_to_grid_rows: [[f64; 4]; 3],
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ShaderMagnitudeBound {
-    nominal_magnitude: f64,
-    error: f64,
-}
-
-fn validate_shader_addressing_extent(
-    extent: RenderExtent,
-    volume: Shape3D,
-) -> Result<(), SemanticPlanError> {
-    if u64::from(extent.width_pixels()) > MAX_BINARY32_HALF_INTEGER_EXTENT
-        || u64::from(extent.height_pixels()) > MAX_BINARY32_HALF_INTEGER_EXTENT
-    {
-        return Err(SemanticPlanError::ControlPrecision {
-            field: "cross-section physical render extent",
-        });
-    }
-    if [volume.x(), volume.y(), volume.z()]
-        .into_iter()
-        .any(|axis| axis > MAX_BINARY32_HALF_INTEGER_EXTENT)
-    {
-        return Err(SemanticPlanError::ControlPrecision {
-            field: "cross-section voxel addressing extent",
-        });
-    }
-    Ok(())
-}
-
-fn quantized_shader_plane_controls(
-    view: CrossSectionView,
-    panel: CrossSectionPlane,
-    presentation: PresentationViewport,
-    grid_to_world: GridToWorld,
-) -> Result<QuantizedShaderPlaneControls, SemanticPlanError> {
-    // Product intent construction composes and canonicalizes this quaternion
-    // before WGPU derives its axes. Mirror that exact control-side operation
-    // instead of planning from a higher-precision basis the shader never sees.
+    // Product intent construction composes this panel-relative orientation
+    // before the render API quantizes controls. Perform only that semantic
+    // composition here; all binary32 affine, camera, and error policy belongs
+    // to `ValidatedPlaneGridFootprint`.
     let composed = DQuat::from_array(view.orientation().xyzw()) * panel.relative_orientation();
     let [x, y, z, w] = composed.to_array();
     let orientation =
         UnitQuaternion::new_xyzw(x, y, z, w).map_err(|_| SemanticPlanError::ControlPrecision {
             field: "cross-section orientation control",
         })?;
-    let [right_world, up_world] = renderer_cross_section_axes(orientation.xyzw());
-    let scale_world_per_point = quantized_f32_control(
+    let composed_view = CrossSectionView::new(
+        view.center_world(),
+        orientation,
         view.scale_world_per_screen_point(),
-        "cross-section scale control",
-    )?;
-    let presentation_points = [
-        quantized_f32_control(
-            presentation.width_points(),
-            "cross-section presentation width control",
-        )?,
-        quantized_f32_control(
-            presentation.height_points(),
-            "cross-section presentation height control",
-        )?,
-    ];
-    if scale_world_per_point == 0.0
-        || presentation_points[0] == 0.0
-        || presentation_points[1] == 0.0
-    {
-        return Err(SemanticPlanError::ControlPrecision {
-            field: "cross-section plane step control",
-        });
-    }
-    let world_to_grid_rows = shader_control_world_to_grid_rows(grid_to_world)
-        .map_err(|error| match error {
-            ShaderControlAffineError::NonInvertible => SemanticPlanError::NonInvertibleTransform,
-            ShaderControlAffineError::NotRepresentable => SemanticPlanError::ControlPrecision {
-                field: "cross-section world-to-grid control",
-            },
-        })?
-        .map(|row| row.map(f64::from));
-    Ok(QuantizedShaderPlaneControls {
-        center_world: quantized_f32_vec3(
-            view.center_world().components(),
-            "cross-section center control",
-        )?,
-        right_world: quantized_f32_vec3(right_world, "cross-section right-axis control")?,
-        up_world: quantized_f32_vec3(up_world, "cross-section up-axis control")?,
-        scale_world_per_point,
-        presentation_points,
-        world_to_grid_rows,
-    })
-}
+        view.depth_world(),
+    )
+    .map_err(|_| SemanticPlanError::ControlPrecision {
+        field: "cross-section composed view control",
+    })?;
+    let validated = ValidatedPlaneGridFootprint::new(
+        composed_view,
+        presentation,
+        extent,
+        spec.grid_to_world,
+        spec.volume_shape,
+    )
+    .map_err(SemanticPlanError::ShaderAdmission)?;
 
-fn renderer_cross_section_axes(quaternion: [f64; 4]) -> [[f64; 3]; 2] {
-    let [x, y, z, w] = quaternion;
-    let rotate = |vector: [f64; 3]| {
-        let cross = [
-            y * vector[2] - z * vector[1],
-            z * vector[0] - x * vector[2],
-            x * vector[1] - y * vector[0],
-        ];
-        let twice = cross.map(|value| 2.0 * value);
-        let second = [
-            y * twice[2] - z * twice[1],
-            z * twice[0] - x * twice[2],
-            x * twice[1] - y * twice[0],
-        ];
-        std::array::from_fn(|axis| vector[axis] + w * twice[axis] + second[axis])
+    let footprint = PlaneGridFootprint {
+        origin_grid_xyz: validated.origin_grid(),
+        step_x_grid_xyz: validated.step_x_grid(),
+        step_y_grid_xyz: validated.step_y_grid(),
+        rounding_radius_grid_xyz: validated.grid_error_upper(),
+        world_to_grid_rows: validated.world_to_grid_rows(),
+        validated_affine: validated.affine(),
+        width_pixels: validated.width_pixels(),
+        height_pixels: validated.height_pixels(),
     };
-    [rotate([1.0, 0.0, 0.0]), rotate([0.0, 1.0, 0.0])]
-}
-
-fn quantized_f32_vec3(
-    values: [f64; 3],
-    field: &'static str,
-) -> Result<[f64; 3], SemanticPlanError> {
-    Ok([
-        quantized_f32_control(values[0], field)?,
-        quantized_f32_control(values[1], field)?,
-        quantized_f32_control(values[2], field)?,
-    ])
-}
-
-fn quantized_f32_control(value: f64, field: &'static str) -> Result<f64, SemanticPlanError> {
-    let converted = value as f32;
-    converted
-        .is_finite()
-        .then_some(f64::from(if converted == 0.0 { 0.0 } else { converted }))
-        .ok_or(SemanticPlanError::ControlPrecision { field })
-}
-
-fn transform_affine_point(
-    rows: [[f64; 4]; 3],
-    point: [f64; 3],
-) -> Result<[f64; 3], SemanticPlanError> {
-    let transformed =
-        rows.map(|row| row[0] * point[0] + row[1] * point[1] + row[2] * point[2] + row[3]);
-    transformed
-        .iter()
-        .all(|value| value.is_finite())
-        .then_some(transformed)
-        .ok_or(SemanticPlanError::ControlPrecision {
-            field: "cross-section nominal grid projection",
-        })
-}
-
-fn transform_affine_vector(
-    rows: [[f64; 4]; 3],
-    vector: [f64; 3],
-) -> Result<[f64; 3], SemanticPlanError> {
-    let transformed = rows.map(|row| row[0] * vector[0] + row[1] * vector[1] + row[2] * vector[2]);
-    transformed
-        .iter()
-        .all(|value| value.is_finite())
-        .then_some(transformed)
-        .ok_or(SemanticPlanError::ControlPrecision {
-            field: "cross-section nominal grid step",
-        })
-}
-
-fn shader_grid_rounding_radius(
-    controls: QuantizedShaderPlaneControls,
-    extent: RenderExtent,
-    nominal_origin_grid: [f64; 3],
-) -> Result<[f64; 3], SemanticPlanError> {
-    let screen_x =
-        shader_screen_magnitude_bound(extent.width_pixels(), controls.presentation_points[0])?;
-    let screen_y =
-        shader_screen_magnitude_bound(extent.height_pixels(), controls.presentation_points[1])?;
-    let world = [
-        shader_world_component_bound(
-            controls.center_world[0],
-            controls.right_world[0],
-            controls.up_world[0],
-            controls.scale_world_per_point,
-            screen_x,
-            screen_y,
-        )?,
-        shader_world_component_bound(
-            controls.center_world[1],
-            controls.right_world[1],
-            controls.up_world[1],
-            controls.scale_world_per_point,
-            screen_x,
-            screen_y,
-        )?,
-        shader_world_component_bound(
-            controls.center_world[2],
-            controls.right_world[2],
-            controls.up_world[2],
-            controls.scale_world_per_point,
-            screen_x,
-            screen_y,
-        )?,
-    ];
-    let grid = [
-        shader_grid_component_bound(controls.world_to_grid_rows[0], world)?,
-        shader_grid_component_bound(controls.world_to_grid_rows[1], world)?,
-        shader_grid_component_bound(controls.world_to_grid_rows[2], world)?,
-    ];
-    let mut radius = [0.0; 3];
-    for axis in 0..3 {
-        let address_magnitude = grid[axis].nominal_magnitude + grid[axis].error + 0.5;
-        let address_rounding = checked_binary32_rounding_bound(
-            1,
-            address_magnitude,
-            "cross-section voxel addressing arithmetic",
-        )?;
-        let f64_construction_rounding = 64.0
-            * f64::EPSILON
-            * (grid[axis]
-                .nominal_magnitude
-                .max(nominal_origin_grid[axis].abs())
-                + 1.0);
-        radius[axis] = grid[axis].error + address_rounding + f64_construction_rounding;
-        if !radius[axis].is_finite()
-            || radius[axis] < 0.0
-            || radius[axis] >= MAX_SHADER_GRID_ROUNDING_RADIUS
-        {
-            return Err(SemanticPlanError::ControlPrecision {
-                field: "cross-section shader grid rounding",
-            });
-        }
+    let normal = cross3(footprint.step_x_grid_xyz, footprint.step_y_grid_xyz);
+    if normal.iter().map(|value| value.abs()).fold(0.0, f64::max) == 0.0 {
+        return Err(SemanticPlanError::DegeneratePlane);
     }
-    Ok(radius)
-}
-
-fn shader_screen_magnitude_bound(
-    dimension: u32,
-    presentation_points: f64,
-) -> Result<ShaderMagnitudeBound, SemanticPlanError> {
-    let dimension = f64::from(dimension);
-    let maximum_quotient = (dimension - 0.5) / dimension;
-    let quotient_error = checked_binary32_rounding_bound(
-        1,
-        maximum_quotient,
-        "cross-section screen-coordinate division",
-    )?;
-    let centered_magnitude = 0.5 - 0.5 / dimension;
-    let centered_error = quotient_error
-        + checked_binary32_rounding_bound(
-            1,
-            centered_magnitude + quotient_error,
-            "cross-section screen-coordinate subtraction",
-        )?;
-    let nominal_magnitude = centered_magnitude * presentation_points.abs();
-    let propagated_error = presentation_points.abs() * centered_error;
-    let error = propagated_error
-        + checked_binary32_rounding_bound(
-            1,
-            nominal_magnitude + propagated_error,
-            "cross-section screen-coordinate scaling",
-        )?;
-    checked_shader_bound(ShaderMagnitudeBound {
-        nominal_magnitude,
-        error,
-    })
-}
-
-fn shader_world_component_bound(
-    center: f64,
-    right: f64,
-    up: f64,
-    scale: f64,
-    screen_x: ShaderMagnitudeBound,
-    screen_y: ShaderMagnitudeBound,
-) -> Result<ShaderMagnitudeBound, SemanticPlanError> {
-    let right_term = rounded_scaled_bound(screen_x, right)?;
-    let up_term = rounded_scaled_bound(screen_y, up)?;
-    let offset = rounded_sum_bound(right_term, up_term)?;
-    let scaled = rounded_scaled_bound(offset, scale)?;
-    rounded_sum_bound(
-        ShaderMagnitudeBound {
-            nominal_magnitude: center.abs(),
-            error: 0.0,
-        },
-        scaled,
-    )
-}
-
-fn shader_grid_component_bound(
-    row: [f64; 4],
-    world: [ShaderMagnitudeBound; 3],
-) -> Result<ShaderMagnitudeBound, SemanticPlanError> {
-    let first = rounded_scaled_bound(world[0], row[0])?;
-    let second = rounded_scaled_bound(world[1], row[1])?;
-    let third = rounded_scaled_bound(world[2], row[2])?;
-    let dot = rounded_sum_bound(rounded_sum_bound(first, second)?, third)?;
-    rounded_sum_bound(
-        dot,
-        ShaderMagnitudeBound {
-            nominal_magnitude: row[3].abs(),
-            error: 0.0,
-        },
-    )
-}
-
-fn rounded_scaled_bound(
-    input: ShaderMagnitudeBound,
-    coefficient: f64,
-) -> Result<ShaderMagnitudeBound, SemanticPlanError> {
-    let nominal_magnitude = coefficient.abs() * input.nominal_magnitude;
-    let propagated_error = coefficient.abs() * input.error;
-    let error = propagated_error
-        + checked_binary32_rounding_bound(
-            1,
-            nominal_magnitude + propagated_error,
-            "cross-section shader multiplication",
-        )?;
-    checked_shader_bound(ShaderMagnitudeBound {
-        nominal_magnitude,
-        error,
-    })
-}
-
-fn rounded_sum_bound(
-    left: ShaderMagnitudeBound,
-    right: ShaderMagnitudeBound,
-) -> Result<ShaderMagnitudeBound, SemanticPlanError> {
-    let nominal_magnitude = left.nominal_magnitude + right.nominal_magnitude;
-    let propagated_error = left.error + right.error;
-    let error = propagated_error
-        + checked_binary32_rounding_bound(
-            1,
-            nominal_magnitude + propagated_error,
-            "cross-section shader addition",
-        )?;
-    checked_shader_bound(ShaderMagnitudeBound {
-        nominal_magnitude,
-        error,
-    })
-}
-
-fn checked_shader_bound(
-    bound: ShaderMagnitudeBound,
-) -> Result<ShaderMagnitudeBound, SemanticPlanError> {
-    if bound.nominal_magnitude.is_finite()
-        && bound.error.is_finite()
-        && bound.nominal_magnitude >= 0.0
-        && bound.error >= 0.0
-        && bound.nominal_magnitude + bound.error <= f64::from(f32::MAX)
-    {
-        Ok(bound)
-    } else {
-        Err(SemanticPlanError::ControlPrecision {
-            field: "cross-section shader arithmetic",
-        })
-    }
-}
-
-fn checked_binary32_rounding_bound(
-    operation_count: u32,
-    magnitude: f64,
-    field: &'static str,
-) -> Result<f64, SemanticPlanError> {
-    if !magnitude.is_finite() || magnitude < 0.0 || magnitude > f64::from(f32::MAX) {
-        return Err(SemanticPlanError::ControlPrecision { field });
-    }
-    let bound = binary32_rounding_bound(operation_count, magnitude);
-    bound
-        .is_finite()
-        .then_some(bound)
-        .ok_or(SemanticPlanError::ControlPrecision { field })
-}
-
-fn binary32_rounding_bound(operation_count: u32, magnitude: f64) -> f64 {
-    let operation_count = f64::from(operation_count);
-    let unit_roundoff = f64::from(f32::EPSILON) / 2.0;
-    let gamma = operation_count * unit_roundoff / (1.0 - operation_count * unit_roundoff);
-    gamma * magnitude + operation_count * f64::from(f32::from_bits(1))
+    Ok(footprint)
 }
 
 fn projected_region_range(
@@ -2774,11 +2310,24 @@ fn orthographic_view(
     camera: CameraFrame,
     extent: RenderExtent,
 ) -> Result<Option<OrthographicView>, SemanticPlanError> {
-    let Some((forward, right, up)) = camera_basis(camera) else {
+    let axes = camera.axes();
+    let forward = DVec3::from_array(axes.forward());
+    let right = DVec3::from_array(axes.right());
+    let up = DVec3::from_array(axes.up());
+    let target = DVec3::from_array(camera.view().target().components());
+    let distance = camera.view().perspective_view_distance_world();
+    if !forward.is_finite()
+        || !right.is_finite()
+        || !up.is_finite()
+        || !target.is_finite()
+        || !distance.is_finite()
+        || distance <= 0.0
+    {
         return Ok(None);
-    };
+    }
     Ok(Some(OrthographicView {
-        eye: camera_eye(camera),
+        target,
+        distance,
         forward,
         right,
         up,
@@ -2827,22 +2376,30 @@ fn camera_visibility_planes(
                 ));
             };
             Ok([
-                VisibilityHalfSpace::through_eye(view.forward, view.eye),
+                VisibilityHalfSpace {
+                    normal: view.forward,
+                    anchor: view.target,
+                    bias: view.distance,
+                },
                 VisibilityHalfSpace {
                     normal: view.right,
-                    offset: view.half_width - view.right.dot(view.eye),
+                    anchor: view.target,
+                    bias: view.half_width,
                 },
                 VisibilityHalfSpace {
                     normal: -view.right,
-                    offset: view.half_width + view.right.dot(view.eye),
+                    anchor: view.target,
+                    bias: view.half_width,
                 },
                 VisibilityHalfSpace {
                     normal: view.up,
-                    offset: view.half_height - view.up.dot(view.eye),
+                    anchor: view.target,
+                    bias: view.half_height,
                 },
                 VisibilityHalfSpace {
                     normal: -view.up,
-                    offset: view.half_height + view.up.dot(view.eye),
+                    anchor: view.target,
+                    bias: view.half_height,
                 },
             ])
         }
@@ -2870,8 +2427,9 @@ fn clipped_volume_half_space_is_contained(
     guard: VisibilityHalfSpace,
 ) -> bool {
     let safely_inside_guard = |point: DVec3| {
-        let numerical_margin =
-            EPSILON * 32.0 * (1.0 + guard.normal.length() * point.length() + guard.offset.abs());
+        let numerical_margin = EPSILON
+            * 32.0
+            * (1.0 + guard.normal.length() * (point - guard.anchor).length() + guard.bias.abs());
         guard.signed_distance(point) >= numerical_margin
     };
     let next_distances = corners.map(|corner| next.signed_distance(corner) + EPSILON);
@@ -3023,7 +2581,7 @@ fn orthographic_candidate_bounds(
     let mut max_depth = f64::NEG_INFINITY;
     for corner in volume_grid_corners(spec.volume_shape) {
         let world = transform_grid_point(spec.grid_to_world, corner);
-        let depth = (world - view.eye).dot(view.forward);
+        let depth = (world - view.target).dot(view.forward) + view.distance;
         min_depth = min_depth.min(depth);
         max_depth = max_depth.max(depth);
     }
@@ -3039,8 +2597,10 @@ fn orthographic_candidate_bounds(
     for depth in [near_depth, far_depth] {
         for view_y in [-view.half_height, view.half_height] {
             for view_x in [-view.half_width, view.half_width] {
-                let world =
-                    view.eye + view.forward * depth + view.right * view_x + view.up * view_y;
+                let world = view.target
+                    + view.forward * (depth - view.distance)
+                    + view.right * view_x
+                    + view.up * view_y;
                 let grid = world_to_grid.transform_point3(world);
                 grid_min = grid_min.min(grid);
                 grid_max = grid_max.max(grid);
@@ -3134,10 +2694,10 @@ fn orthographic_region_overlaps_view(
     let mut max_view_y = f64::NEG_INFINITY;
     let mut max_depth = f64::NEG_INFINITY;
     for world in corners {
-        let relative = world - view.eye;
+        let relative = world - view.target;
         let view_x = relative.dot(view.right);
         let view_y = relative.dot(view.up);
-        let depth = relative.dot(view.forward);
+        let depth = relative.dot(view.forward) + view.distance;
         min_view_x = min_view_x.min(view_x);
         max_view_x = max_view_x.max(view_x);
         min_view_y = min_view_y.min(view_y);
@@ -3164,14 +2724,14 @@ fn orthographic_screen_contribution(
     let mut max_y = f64::NEG_INFINITY;
     let mut near_depth = f64::INFINITY;
     for corner in corners {
-        let relative = corner - view.eye;
+        let relative = corner - view.target;
         let x = relative.dot(view.right);
         let y = relative.dot(view.up);
         min_x = min_x.min(x);
         max_x = max_x.max(x);
         min_y = min_y.min(y);
         max_y = max_y.max(y);
-        near_depth = near_depth.min(relative.dot(view.forward));
+        near_depth = near_depth.min(relative.dot(view.forward) + view.distance);
     }
     screen_contribution(
         min_x,
@@ -3300,25 +2860,6 @@ fn volume_grid_corners(shape: Shape3D) -> [DVec3; 8] {
         DVec3::new(xs[0], ys[1], zs[1]),
         DVec3::new(xs[1], ys[1], zs[1]),
     ]
-}
-
-fn camera_basis(camera: CameraFrame) -> Option<(DVec3, DVec3, DVec3)> {
-    let forward = DVec3::from_array(camera.view().target().components()) - camera_eye(camera);
-    if forward.length_squared() <= EPSILON {
-        return None;
-    }
-    let forward = forward.normalize();
-    let right = forward.cross(DVec3::from_array(camera.axes().up()));
-    if right.length_squared() <= EPSILON {
-        return None;
-    }
-    let right = right.normalize();
-    let up = right.cross(forward).normalize();
-    Some((forward, right, up))
-}
-
-fn camera_eye(camera: CameraFrame) -> DVec3 {
-    DVec3::from_array(camera.eye().components())
 }
 
 fn sampled_center_half_extent(half_extent: f64, pixels: u64) -> f64 {
@@ -3571,6 +3112,41 @@ mod tests {
 
         assert_eq!(regions.len(), 9);
         assert_eq!(regions[0].origin(), [0, 64, 64]);
+    }
+
+    #[test]
+    fn orthographic_tiny_distance_uses_canonical_axes_and_stable_near_plane() {
+        let presentation = PresentationViewport::new(32.0, 32.0).unwrap();
+        for (target, distance) in [
+            (WorldPoint3::origin(), 1.0e-12),
+            (WorldPoint3::new(1.0e16, -1.0e16, 1.0e16).unwrap(), 0.25),
+        ] {
+            let camera = CameraFrame::new(
+                CameraView::new(
+                    Projection::Orthographic,
+                    target,
+                    UnitQuaternion::identity(),
+                    1.0,
+                    32.0,
+                    distance,
+                )
+                .unwrap(),
+                presentation,
+            )
+            .unwrap();
+            let view = orthographic_view(camera, RenderExtent::new(32, 32).unwrap())
+                .unwrap()
+                .expect("every positive orthographic distance is representable relatively");
+            assert_eq!(view.forward.to_array(), camera.axes().forward());
+            assert_eq!(view.right.to_array(), camera.axes().right());
+            assert_eq!(view.up.to_array(), camera.axes().up());
+            let near =
+                camera_visibility_planes(camera, RenderExtent::new(32, 32).unwrap()).unwrap()[0];
+            assert_eq!(
+                near.signed_distance(DVec3::from_array(target.components())),
+                distance
+            );
+        }
     }
 
     #[test]
@@ -4098,9 +3674,15 @@ mod tests {
                 presentation,
                 RenderExtent::new((1 << 23) + 1, 64).unwrap(),
             ),
-            Err(SemanticPlanError::ControlPrecision {
-                field: "cross-section physical render extent"
-            })
+            Err(SemanticPlanError::ShaderAdmission(
+                ShaderAdmissionError::ShaderCoordinateEnvelopeExceeded {
+                    stage: mirante4d_render_api::ShaderEnvelopeStage::PlanePixelCenter,
+                    axis: mirante4d_render_api::ShaderEnvelopeAxis::Axis(
+                        mirante4d_render_api::Axis3::X
+                    ),
+                    reason: mirante4d_render_api::ShaderEnvelopeFailure::ErrorBudget { .. },
+                }
+            ))
         ));
     }
 
@@ -4221,7 +3803,7 @@ mod tests {
     }
 
     #[test]
-    fn residual_bounded_capsule_range_keeps_large_affine_boundary_bodies() {
+    fn half_voxel_ambiguous_large_affine_is_rejected_before_capsule_planning() {
         let transform = GridToWorld::from_row_major([
             0.700_000_3,
             0.110_000_1,
@@ -4262,7 +3844,7 @@ mod tests {
         let presentation = PresentationViewport::new(32.0, 32.0).unwrap();
         let extent = RenderExtent::new(32, 32).unwrap();
         let limits = SemanticPlanLimits::new(4_096, 4_096);
-        let plan = plan_guarded_cross_section_resource_regions_cancellable(
+        let error = plan_guarded_cross_section_resource_regions_cancellable(
             initial,
             CrossSectionPlane::Yz,
             presentation,
@@ -4273,61 +3855,21 @@ mod tests {
             None,
             || false,
         )
-        .unwrap();
-        let guard = plan
-            .plane_reuse_guard
-            .expect("the large-coordinate affine still admits a bounded guard");
-        assert!(
-            guard
-                .effective_grid_to_world
-                .grid_round_trip_residual
-                .into_iter()
-                .flatten()
-                .any(|residual| residual > 0.0),
-            "the fixture must exercise a real finite-precision inverse residual"
-        );
-        let envelope =
-            SemanticPlaneReuseEnvelope::new(vec![guard], false, plan.work.candidates_visited)
-                .unwrap();
-        let guarded_origins = plan
-            .regions
-            .iter()
-            .map(|region| region.origin())
-            .collect::<BTreeSet<_>>();
-        let assert_subset = |sample: usize, phase: &str, view: CrossSectionView| {
-            assert!(
-                envelope
-                    .contains(view, CrossSectionPlane::Yz, presentation, extent)
-                    .unwrap(),
-                "{phase} sample {sample} left the residual-bounded capsule"
-            );
-            let exact = plan_cross_section_resource_regions(
-                view,
-                CrossSectionPlane::Yz,
-                presentation,
-                extent,
-                spec,
-                1,
-                limits,
-            )
-            .unwrap();
-            assert!(
-                exact
-                    .iter()
-                    .all(|region| guarded_origins.contains(&region.origin())),
-                "{phase} sample {sample} crossed an affine brick boundary outside the planned body"
-            );
-        };
-        let mut state = CrossSectionViewState::from_canonical(initial);
-        assert_subset(0, "initial", initial);
-        for sample in 1..=400 {
-            state.slice_by_world_distance(InteractionPanel::Xy, 0.01);
-            assert_subset(sample, "slice", state.into_canonical().unwrap());
-        }
-        for sample in 1..=300 {
-            state.rotate_oblique_by_panel_drag(InteractionPanel::Xy, 0.2, 0.1, 0.005);
-            assert_subset(sample, "rotation", state.into_canonical().unwrap());
-        }
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SemanticPlanError::ShaderAdmission(
+                ShaderAdmissionError::ShaderCoordinateEnvelopeExceeded {
+                    stage: mirante4d_render_api::ShaderEnvelopeStage::PlaneGridAddress,
+                    axis: mirante4d_render_api::ShaderEnvelopeAxis::Axis(
+                        mirante4d_render_api::Axis3::X
+                    ),
+                    reason: mirante4d_render_api::ShaderEnvelopeFailure::ErrorBudget {
+                        upper_voxels
+                    },
+                }
+            ) if upper_voxels >= 0.5
+        ));
     }
 
     #[test]

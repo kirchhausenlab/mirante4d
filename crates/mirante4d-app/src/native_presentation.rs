@@ -248,6 +248,7 @@ pub(crate) struct NativePresentationBridge {
     texture_renderer: Option<Arc<egui::mutex::RwLock<eframe::egui_wgpu::Renderer>>>,
     device: Option<eframe::wgpu::Device>,
     textures: BTreeMap<PresentationTarget, BoundTargetTexture>,
+    deferred_texture_frees: BTreeMap<PresentationTarget, BoundTargetTexture>,
     pub(crate) product_gpu: Option<ProductGpuRenderRuntime>,
 }
 
@@ -268,6 +269,7 @@ impl NativePresentationBridge {
             texture_renderer: Some(texture_renderer),
             device: Some(device),
             textures: BTreeMap::new(),
+            deferred_texture_frees: BTreeMap::new(),
             product_gpu: Some(ProductGpuRenderRuntime::new(product_renderer)),
         }
     }
@@ -278,6 +280,7 @@ impl NativePresentationBridge {
             texture_renderer: None,
             device: None,
             textures: BTreeMap::new(),
+            deferred_texture_frees: BTreeMap::new(),
             product_gpu: None,
         }
     }
@@ -288,6 +291,7 @@ impl NativePresentationBridge {
             texture_renderer: None,
             device: None,
             textures: BTreeMap::new(),
+            deferred_texture_frees: BTreeMap::new(),
             product_gpu: Some(ProductGpuRenderRuntime::new(product_renderer)),
         }
     }
@@ -360,11 +364,18 @@ impl NativePresentationBridge {
         texture_revision: TargetTextureRevision,
         view: &eframe::wgpu::TextureView,
     ) {
-        let existing = self.textures.get(&target).copied();
+        let existing = self
+            .textures
+            .remove(&target)
+            .or_else(|| self.deferred_texture_frees.remove(&target));
         if existing.is_some_and(|binding| {
             binding.device_generation == device_generation.get()
                 && binding.texture_revision == texture_revision.get()
         }) {
+            self.textures.insert(
+                target,
+                existing.expect("a matching native binding was observed"),
+            );
             return;
         }
         let Some(texture_renderer) = self.texture_renderer.as_ref() else {
@@ -377,9 +388,14 @@ impl NativePresentationBridge {
                     BoundTargetTexture {
                         device_generation: device_generation.get(),
                         texture_revision: texture_revision.get(),
-                        texture_id: egui::TextureId::User(
-                            u64::try_from(target.index() + 1)
-                                .expect("the fixed target index fits a texture id"),
+                        texture_id: existing.map_or_else(
+                            || {
+                                egui::TextureId::User(
+                                    u64::try_from(target.index() + 1)
+                                        .expect("the fixed target index fits a texture id"),
+                                )
+                            },
+                            |binding| binding.texture_id,
                         ),
                     },
                 );
@@ -414,8 +430,10 @@ impl NativePresentationBridge {
     }
 
     /// Applies the complete renderer-owned target set to the egui binding
-    /// layer. Omitted targets are retired here as well as in the renderer so
-    /// an old native view cannot keep a deactivated allocation alive.
+    /// authority. Omitted identities disappear immediately, while their egui
+    /// registrations survive until the start of the next UI turn. A paint
+    /// list resolved earlier in this turn can therefore finish without
+    /// retaining a deactivated target as current application state.
     pub(crate) fn retain_texture_bindings(&mut self, retained: &[PresentationTarget]) {
         let omitted = self
             .textures
@@ -428,8 +446,24 @@ impl NativePresentationBridge {
                 .textures
                 .remove(&target)
                 .expect("the omitted target came from the texture map");
-            if let Some(texture_renderer) = self.texture_renderer.as_ref() {
-                texture_renderer.write().free_texture(&binding.texture_id);
+            let previous = self.deferred_texture_frees.insert(target, binding);
+            debug_assert!(
+                previous.is_none(),
+                "one fixed target cannot own two deferred egui registrations"
+            );
+        }
+    }
+
+    /// Releases registrations omitted during the preceding UI turn. WGPU
+    /// command submission retains resources needed by an already-submitted
+    /// frame, so this one-turn boundary is sufficient and remains bounded to
+    /// the fixed four-target presentation set.
+    pub(crate) fn retire_deferred_texture_bindings(&mut self) {
+        let deferred = std::mem::take(&mut self.deferred_texture_frees);
+        if let Some(texture_renderer) = self.texture_renderer.as_ref() {
+            let mut texture_renderer = texture_renderer.write();
+            for binding in deferred.into_values() {
+                texture_renderer.free_texture(&binding.texture_id);
             }
         }
     }
@@ -457,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_layout_omission_retires_the_binding_identity() {
+    fn complete_layout_omission_retires_identity_and_defers_registration_free_one_turn() {
         let mut bridge = NativePresentationBridge::unavailable();
         bridge.textures.insert(
             PresentationTarget::ThreeD,
@@ -487,6 +521,15 @@ mod tests {
             None
         );
         assert_eq!(bridge.texture_id(PresentationTarget::Xy), None);
+        assert_eq!(bridge.deferred_texture_frees.len(), 1);
+        assert!(
+            bridge
+                .deferred_texture_frees
+                .contains_key(&PresentationTarget::Xy)
+        );
+
+        bridge.retire_deferred_texture_bindings();
+        assert!(bridge.deferred_texture_frees.is_empty());
     }
 
     #[test]

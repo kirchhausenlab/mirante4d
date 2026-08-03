@@ -25,6 +25,27 @@ exceptions have one separate tool-owned
 ## Plans
 
 The
+[viewer rendering correctness, recovery, and numerical cutover](plans/active/VIEWER_RENDERING_CORRECTNESS_RECOVERY_AND_NUMERICAL_CUTOVER.md)
+is the owner-authorized corrective package for the 2026-08-02 rendering
+audit. Its correctness/recovery/numerical hard cut is implemented in the
+current working tree, with focused CPU and trusted-GPU regressions passing.
+The package closes incomplete composed-member reuse proof, split
+execution/repaint failure authority, retryable-error projection, cause-free
+hidden-refinement failure and over-broad hidden/allocator failure scope,
+Pick/color capability coupling, affine and camera false rejection, volume
+page-traversal disagreement, and the unbounded binary32 coordinate contract.
+It also owns the previously deferred static
+performance recovery through a controlled, matching-work attribution gate.
+The required pre-edit P0 baseline was not captured before implementation, the
+private A/B/C performance campaign has not run, and its local fixed-LOD guard
+does not replace that cross-revision evidence. The mapped render-mode and
+native-navigation automation now pass; the bundled temporal fixture is
+inadmissible under the scenario's non-clipped capture gate, and a suitable
+temporal workload, clean-revision trusted lane, and owner acceptance remain
+open. No performance-recovery or owner product-validation claim follows from
+the implemented cut alone.
+
+The
 [preprocessing bounded temporal pipeline](plans/active/PREPROCESSING_BOUNDED_TEMPORAL_PIPELINE.md)
 is the owner-approved, not-yet-implemented follow-on for overlapping one
 canonical production/commit unit with at most two resource-admitted

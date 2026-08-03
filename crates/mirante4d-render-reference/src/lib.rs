@@ -5,8 +5,14 @@
 
 #![forbid(unsafe_code)]
 
+mod exact_affine_oracle;
 mod lod_oracle;
 mod numerical_oracle;
+mod traversal_oracle;
+
+pub use exact_affine_oracle::{
+    quantized_affine_grid_corners_are_bounded, quantized_affine_inverse_is_contained,
+};
 
 pub use lod_oracle::{
     LodOracleError, ProjectedAffineLodDecision, ProjectedAffineLodOracle, ProjectedScaleFacts,
@@ -19,6 +25,10 @@ pub use numerical_oracle::{
     NumericalSampleState, NumericalSampling, NumericalTapFacts, NumericalTransfer, NumericalVolume,
     NumericalVolumeFacts, NumericalVolumeMode, NumericalVolumeModeKind, NumericalVolumeQuery,
     NumericalVoxel, NumericalWorldRay,
+};
+pub use traversal_oracle::{
+    PortableDirectionComponent, TraversalOracleError, classify_portable_direction,
+    page_exit_distance_reference, segment_end_index_reference,
 };
 
 use std::collections::{BTreeMap, HashSet};
@@ -817,7 +827,11 @@ fn prepare_layer_ray(
     ray: ViewRay,
 ) -> Result<Option<PreparedLayerRay>, ReferenceRenderError> {
     let origin = layer.transform.point(ray.origin().components());
-    let direction = layer.transform.vector(ray.direction());
+    let mut direction = layer.transform.vector(ray.direction());
+    for component in &mut direction {
+        *component =
+            portable_direction_component(*component).ok_or(ReferenceRenderError::CameraMath)?;
+    }
     let Some((entry, exit)) = intersect_grid(origin, direction, layer.shape_xyz) else {
         return Ok(None);
     };
@@ -1153,14 +1167,15 @@ fn intersect_grid(
     for axis in 0..3 {
         let lower = -0.5;
         let upper = shape_xyz[axis] as f64 - 0.5;
-        if direction[axis].abs() <= f64::EPSILON {
+        let direction = portable_direction_component(direction[axis])?;
+        if direction == 0.0 {
             if origin[axis] < lower || origin[axis] >= upper {
                 return None;
             }
             continue;
         }
-        let first = (lower - origin[axis]) / direction[axis];
-        let second = (upper - origin[axis]) / direction[axis];
+        let first = (lower - origin[axis]) / direction;
+        let second = (upper - origin[axis]) / direction;
         entry = entry.max(first.min(second));
         exit = exit.min(first.max(second));
         if exit <= entry {
@@ -1168,6 +1183,24 @@ fn intersect_grid(
         }
     }
     Some((entry, exit))
+}
+
+/// Applies the same representation-level direction rule as the shared WGSL
+/// traversal. This is deliberately a binary32 bit classification, not a
+/// geometric epsilon: every finite normal value (including `5e-7`) remains
+/// directional, while either-signed zero and subnormal values are the one
+/// portable stationary representation admitted by the shader contract.
+fn portable_direction_component(value: f64) -> Option<f64> {
+    let value = value as f32;
+    if !value.is_finite() {
+        return None;
+    }
+    let magnitude_bits = value.to_bits() & 0x7fff_ffff;
+    Some(if magnitude_bits < 0x0080_0000 {
+        0.0
+    } else {
+        f64::from(value)
+    })
 }
 
 fn render_cross_section_layer(
@@ -1289,6 +1322,25 @@ mod tests {
 
     const RED_CHANNEL_VALUES: [u8; 3] = [64; 3];
     const GREEN_CHANNEL_VALUES: [u8; 3] = [192; 3];
+
+    #[test]
+    fn traversal_direction_classification_is_binary32_representation_based() {
+        for value in [5.0e-7, -5.0e-7, f64::from(f32::MIN_POSITIVE)] {
+            assert_eq!(
+                portable_direction_component(value),
+                Some(f64::from(value as f32))
+            );
+        }
+        for value in [
+            0.0,
+            -0.0,
+            f64::from(f32::from_bits(0x007f_ffff)),
+            f64::from(f32::from_bits(0x807f_ffff)),
+        ] {
+            assert_eq!(portable_direction_component(value), Some(0.0));
+        }
+        assert_eq!(portable_direction_component(f64::INFINITY), None);
+    }
 
     fn transfer() -> LayerTransfer {
         LayerTransfer::new(

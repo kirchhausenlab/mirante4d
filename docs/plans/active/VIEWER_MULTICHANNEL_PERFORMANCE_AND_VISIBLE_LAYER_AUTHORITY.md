@@ -7,6 +7,12 @@
 - Planning baseline: `e124a13ecc22a4708a798464b92a4afe9e1bf371`
 - Last reviewed: 2026-08-02
 
+The later
+[rendering correctness, recovery, and numerical cutover](VIEWER_RENDERING_CORRECTNESS_RECOVERY_AND_NUMERICAL_CUTOVER.md)
+owns the binary32 affine/traversal correction and the controlled A/B/C static-
+performance recovery that this closeout explicitly deferred. This plan's
+visible-layer authority and historical correctness evidence remain unchanged.
+
 This is the authoritative corrective plan for static multichannel volume
 rendering and for the structural failure exposed when the durable active layer
 is hidden. It reopens a narrowly defined part of the spatial viewer after the

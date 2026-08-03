@@ -149,10 +149,40 @@ impl MiranteWorkbenchApp {
         if renderer_initializing {
             messages.push("Renderer initializing…".to_owned());
         }
+        if let Some(reason) = self.render_attempt.wait_reason() {
+            let status = match reason {
+                display_refresh::RenderWaitReason::LogicalMember => {
+                    "Waiting for the complete logical frame…"
+                }
+                display_refresh::RenderWaitReason::MailboxAdvance => {
+                    "Waiting for the current render intent…"
+                }
+                display_refresh::RenderWaitReason::CandidatePlan => "Planning a renderable view…",
+                display_refresh::RenderWaitReason::InitialPipeline => "Renderer initializing…",
+                display_refresh::RenderWaitReason::SubmissionCleanup => {
+                    "Waiting for GPU work to complete…"
+                }
+                display_refresh::RenderWaitReason::EvictionAcknowledgement => {
+                    "Reconciling GPU residency…"
+                }
+                display_refresh::RenderWaitReason::RelevantResidency => {
+                    "Loading required image data…"
+                }
+                display_refresh::RenderWaitReason::HiddenWorker => "Refining exact 3D pixels…",
+            };
+            if !messages.iter().any(|message| message == status) {
+                messages.push(status.to_owned());
+            }
+        }
         if let Some(error) = &self.render_coordination.frame_fidelity.last_capacity_error
             && dataset_plan_error.as_deref() != Some(error.as_str())
         {
             messages.push(error.clone());
+        }
+        if let Some(failure) = self.render_attempt.failure()
+            && !messages.iter().any(|message| message == failure.message())
+        {
+            messages.push(failure.message().to_owned());
         }
         for (slot, panel) in self.render_coordination.iter() {
             if let Some(failure) = panel.render_failure() {
@@ -212,45 +242,62 @@ impl MiranteWorkbenchApp {
     /// Consumes at most one renderer-owned compiler event per UI turn. The
     /// application observes transitions only to schedule product work; it
     /// keeps no parallel pipeline-readiness state.
-    fn poll_product_renderer_pipeline_readiness(&mut self, ctx: &egui::Context) {
+    fn poll_product_renderer_pipeline_readiness(
+        &mut self,
+        ctx: &egui::Context,
+        events: RendererEventBatch,
+    ) {
+        if !events.any_pipeline_changed() {
+            return;
+        }
+        if self.render_attempt.renderer_is_terminal() {
+            return;
+        }
         let Some(product) = self.native_presentation.product_gpu.as_mut() else {
             return;
         };
-        let before = product.renderer.pipeline_readiness();
-        if let Err(error) = before {
-            self.viewer_pick_queue.clear_unsubmitted();
-            let error = anyhow::Error::new(error);
-            if self.record_terminal_product_renderer_failure(&error) {
-                ctx.request_repaint();
+        let before = product.renderer.pipeline_capability_statuses();
+        let after = product.renderer.poll_pipeline_capability_statuses();
+        let (before, after) = match (before, after) {
+            (Ok(before), Ok(after)) => (before, after),
+            (_, Err(error)) | (Err(error), _) => {
+                self.enter_product_renderer_terminal(error);
+                return;
             }
-            return;
-        }
-        let after = product.renderer.poll_pipeline_readiness();
-        match (before, after) {
-            (
-                Ok(mirante4d_render_wgpu::PipelineReadiness::CompilingInitial),
-                Ok(mirante4d_render_wgpu::PipelineReadiness::InitialRenderReady),
-            ) => {
+        };
+        use mirante4d_render_wgpu::PipelineCapabilityStatus as Status;
+        match (before.initial_render(), after.initial_render()) {
+            (Status::Compiling, Status::Ready) => {
                 // Refresh bits may have been consumed while demand and lease
                 // offers continued during compilation. Render the latest
                 // source and intent now that color capability exists.
                 self.render_coordination.request_refresh();
                 ctx.request_repaint();
             }
-            (
-                Ok(mirante4d_render_wgpu::PipelineReadiness::InitialRenderReady),
-                Ok(mirante4d_render_wgpu::PipelineReadiness::Ready),
-            ) => {
+            (_, Status::Failed(cause)) if before.initial_render() != Status::Failed(cause) => {
+                let error =
+                    mirante4d_render_wgpu::WgpuRenderRuntimeError::PipelineCompilationFailed {
+                        capability: mirante4d_render_wgpu::PipelineCapability::InitialRender,
+                        cause,
+                    };
+                let failure = render_state::render_failure_status(&anyhow::Error::new(error));
+                self.render_attempt.color_unavailable(failure);
+                self.viewer_pick_queue.terminate_all(
+                    viewer_pick_runtime::PickTerminalResult::CapabilityFailed(cause),
+                );
+            }
+            _ => {}
+        }
+        match (before.pick(), after.pick()) {
+            (Status::Compiling, Status::Ready) => {
                 if self.viewer_pick_queue.has_work() {
                     ctx.request_repaint();
                 }
             }
-            (_, Err(error)) => {
-                self.viewer_pick_queue.clear_unsubmitted();
-                let error = anyhow::Error::new(error);
-                if self.record_terminal_product_renderer_failure(&error) {
-                    ctx.request_repaint();
-                }
+            (_, Status::Failed(cause)) if before.pick() != Status::Failed(cause) => {
+                self.viewer_pick_queue.terminate_all(
+                    viewer_pick_runtime::PickTerminalResult::CapabilityFailed(cause),
+                );
             }
             _ => {}
         }
@@ -285,7 +332,21 @@ impl eframe::App for MiranteWorkbenchApp {
         if self.handle_process_termination_request(ui.ctx()) {
             return;
         }
-        self.poll_product_renderer_pipeline_readiness(ui.ctx());
+        // Fixed-target omissions happen after the preceding turn's paint
+        // list was resolved. Release their egui registrations only now, when
+        // no paint in this new turn can still name the retired binding.
+        self.native_presentation.retire_deferred_texture_bindings();
+        let renderer_events = self.renderer_ui_wake.begin_ui_turn();
+        if self.shader_work_envelopes.take_completed_result_wake() {
+            self.render_coordination.request_refresh();
+        }
+        self.poll_product_renderer_pipeline_readiness(ui.ctx(), renderer_events);
+        self.render_attempt.observe_renderer_events(renderer_events);
+        // Timing readback is renderer-owned asynchronous service work. It
+        // must retire on an ordinary UI service turn even when no color
+        // refresh is currently requested; otherwise its own pending ticket
+        // keeps the background loop alive forever.
+        self.poll_product_gpu_timings();
         let update_started = Instant::now();
         let generation_at_start = self.render_coordination.display_generation();
         let active_input_at_start = generation_at_start.input_generation > 0
@@ -298,6 +359,7 @@ impl eframe::App for MiranteWorkbenchApp {
             &self.dataset,
             &self.render_coordination,
             &self.native_presentation,
+            &self.render_attempt,
             false,
         ) || self.dataset.visible_demand_plan_outstanding()
             || self.pending_visible_demand_plan.is_some();
@@ -512,15 +574,14 @@ impl eframe::App for MiranteWorkbenchApp {
             .as_ref()
             .is_some_and(ProjectStoreApplicationService::has_pending_work);
         let progressive_render_work =
-            workbench_playback_runtime::progressive_render_submission_work(
-                &self.native_presentation,
-            );
+            workbench_playback_runtime::progressive_render_submission_work(&self.render_attempt);
         let background_work_active = workbench_playback_runtime::background_work_active(
             &snapshot,
             &self.import.workers,
             &self.dataset,
             &self.render_coordination,
             &self.native_presentation,
+            &self.render_attempt,
             progressive_render_work.any_required,
         );
         if workbench_playback_runtime::renderer_progress_refresh_required(
@@ -534,6 +595,13 @@ impl eframe::App for MiranteWorkbenchApp {
             // Schedule the transaction immediately; the 50 ms background
             // cadence is for external/work-queue polling, not ready color
             // continuation.
+            ui.ctx().request_repaint();
+        } else if matches!(
+            self.render_attempt.wake(),
+            display_refresh::RenderWake::Immediate
+        ) {
+            // A newly bound texture needs one composition turn but must not
+            // reopen color execution.
             ui.ctx().request_repaint();
         }
         let foreground_cross_section_loading = application_view(&snapshot).layout()

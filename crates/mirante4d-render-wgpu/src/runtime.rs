@@ -22,23 +22,29 @@ use std::{
 use mirante4d_dataset::{
     BrickKey, DatasetCatalog, ResourceLease, ResourcePayloadFacts, ResourcePayloadView,
 };
+#[cfg(test)]
+use mirante4d_render_api::Projection;
 use mirante4d_render_api::{
-    CameraFrame, FrameCompleteness, FrameCoverage, FrameIdentity, FrameLimitation, FrameProgress,
-    GpuLedgerCategory, IsoShadingPolicy, LogicalLayerKey, MAX_RENDER_REQUIREMENTS,
-    PreparedRenderRequirements, PresentationTarget, Projection, RenderExtent, RenderIntent,
-    RenderRequirement, RenderRequirements, RenderResourceGrid, RenderResourceGridCatalog,
-    RenderViewIntent, SamplingPolicy, ScaleLevel, TimeIndex, VolumePickCompleteness,
-    VolumePickPolicy, VolumePickQuery, VolumePickResult, VolumePickTicket, VolumePickValue,
-    WorldPoint3, shader_control_world_to_grid_rows,
+    Axis3, CameraFrame, FrameCompleteness, FrameCoverage, FrameIdentity, FrameLimitation,
+    FrameProgress, GpuLedgerCategory, IsoShadingPolicy, LogicalLayerKey,
+    MAX_EXACT_SHADER_GRID_END_EXCLUSIVE, MAX_RENDER_REQUIREMENTS, PreparedRenderRequirements,
+    PresentationTarget, RenderExtent, RenderIntent, RenderRequirement, RenderRequirements,
+    RenderResourceGrid, RenderResourceGridCatalog, RenderViewIntent, SamplingPolicy, ScaleLevel,
+    ShaderAdmissionError, ShaderEnvelopeAxis, ShaderEnvelopeFailure, ShaderEnvelopeStage,
+    ShaderWorkEnvelope, TimeIndex, VolumePickCompleteness, VolumePickPolicy, VolumePickQuery,
+    VolumePickResult, VolumePickTicket, VolumePickValue, WorldPoint3,
 };
 
 use super::{
-    CoordinatedFrameExecutionReport, CoordinatedLayoutReport, CoordinatedPublicationGroup,
-    CoordinatedTargetExecutionReport, CoordinatedTargetLayout, CoordinatedTargetLayoutState,
-    CoordinatedTargetRequest, CoordinatedValidationCaptureTicket, CpuFrameTiming, GpuFrameTiming,
-    GpuResidencyEvictionEvent, GpuTimingTicket, MAX_CONTROL_UPLOAD_BYTES, MAX_PAYLOAD_UPLOAD_BYTES,
+    CoordinatedFrameExecutionReport, CoordinatedLayoutReport, CoordinatedMemberDisposition,
+    CoordinatedPublicationGroup, CoordinatedTargetExecutionReport, CoordinatedTargetLayout,
+    CoordinatedTargetLayoutState, CoordinatedTargetRequest, CoordinatedValidationCaptureTicket,
+    CpuFrameTiming, GpuFrameTiming, GpuResidencyEvictionEvent, GpuTimingTicket,
+    HiddenRefinementAfterCompletion, HiddenRefinementCapabilityFailure, HiddenRefinementFailure,
+    HiddenRefinementState, MAX_CONTROL_UPLOAD_BYTES, MAX_PAYLOAD_UPLOAD_BYTES,
     MAX_RENDER_HEIGHT_PIXELS, MAX_RENDER_WIDTH_PIXELS, MAX_UPLOADS, PipelineCapability,
-    PipelineCompilationFailureCause, PipelineReadiness, RendererDeviceGeneration,
+    PipelineCapabilityStatus, PipelineCapabilityStatuses, PipelineCompilationFailureCause,
+    PipelineReadiness, RendererDeviceGeneration, RendererEvent, RendererEventSink,
     RetainedFrameRenderPolicy, TargetTextureRevision, ValidationCapture, ValidationCaptureTicket,
     VolumeColorSchedule, VolumeRefinementProgress, WgpuRenderRuntimeConfig,
     WgpuRenderRuntimeDiagnostics, WgpuRenderRuntimeError, payload_allocation_bytes,
@@ -168,6 +174,27 @@ impl GpuFailureLatch {
             wgpu::Error::Validation { .. } => WgpuRenderRuntimeError::BackendValidation,
         };
         let _ = self.first.set(error);
+    }
+
+    fn record_pipeline_failure(&self, cause: PipelineCompilationFailureCause) {
+        let error = match cause {
+            PipelineCompilationFailureCause::DeviceOutOfMemory => {
+                Some(WgpuRenderRuntimeError::DeviceOutOfMemory)
+            }
+            PipelineCompilationFailureCause::BackendInternal => {
+                Some(WgpuRenderRuntimeError::BackendInternal)
+            }
+            PipelineCompilationFailureCause::Validation
+            | PipelineCompilationFailureCause::WorkerPanicked
+            | PipelineCompilationFailureCause::WorkerStopped => None,
+        };
+        if let Some(error) = error {
+            let _ = self.first.set(error);
+        }
+    }
+
+    fn record_backend_internal(&self) {
+        let _ = self.first.set(WgpuRenderRuntimeError::BackendInternal);
     }
 
     fn ensure_available(&self) -> Result<(), WgpuRenderRuntimeError> {
@@ -1011,6 +1038,7 @@ fn control_layer_indices(intent: &RenderIntent) -> Vec<usize> {
 fn build_control(
     catalog: &DatasetCatalog,
     intent: &RenderIntent,
+    shader_work_envelope: &ShaderWorkEnvelope,
     selected_scales: &BTreeMap<LogicalLayerKey, ScaleLevel>,
     layer_indices: &[usize],
 ) -> Result<Vec<u8>, WgpuRenderRuntimeError> {
@@ -1023,7 +1051,7 @@ fn build_control(
     words[6] =
         u32::try_from(HEADER_WORDS).map_err(|_| WgpuRenderRuntimeError::ControlCapacityExceeded)?;
 
-    encode_view(&mut words, intent)?;
+    encode_view(&mut words, intent, shader_work_envelope)?;
 
     for &layer_index in layer_indices {
         let layer_intent = &intent.layers()[layer_index];
@@ -1043,10 +1071,11 @@ fn build_control(
         let scale = catalog_layer
             .scale(scale_level)
             .ok_or(WgpuRenderRuntimeError::PayloadContractMismatch)?;
-        let grid_to_world = scale.grid_to_world();
-        let transform = grid_to_world.row_major();
-        let inverse_transform = shader_control_world_to_grid_rows(grid_to_world)
-            .map_err(|_| WgpuRenderRuntimeError::UnsupportedView)?;
+        let validated_affine = shader_work_envelope
+            .affine(layer_key, scale_level)
+            .ok_or(WgpuRenderRuntimeError::ShaderWorkEnvelopeMismatch)?;
+        let transform = validated_affine.grid_to_world_rows();
+        let inverse_transform = validated_affine.world_to_grid_rows();
         let shape = scale.shape().dimensions();
         let transfer = layer_intent.transfer();
         let state = layer_intent.render_state();
@@ -1080,9 +1109,9 @@ fn build_control(
         record[4] = inverse_transform[0][0].to_bits();
         record[5] = inverse_transform[1][1].to_bits();
         record[6] = inverse_transform[2][2].to_bits();
-        record[7] = f64_to_f32(transform[3])?.to_bits();
-        record[8] = f64_to_f32(transform[7])?.to_bits();
-        record[9] = f64_to_f32(transform[11])?.to_bits();
+        record[7] = transform[0][3].to_bits();
+        record[8] = transform[1][3].to_bits();
+        record[9] = transform[2][3].to_bits();
         record[10] = transfer.window().low().to_bits();
         record[11] = transfer.window().high().to_bits();
         record[12] = color[0].to_bits();
@@ -1103,7 +1132,7 @@ fn build_control(
         }
         for row in 0..3 {
             for column in 0..4 {
-                record[44 + row * 4 + column] = f64_to_f32(transform[row * 4 + column])?.to_bits();
+                record[44 + row * 4 + column] = transform[row][column].to_bits();
             }
         }
         record[56] = match state.sampling_policy() {
@@ -1150,13 +1179,23 @@ fn build_target_control(
     requirements: &RenderRequirements,
     directory_capacity: u32,
 ) -> Result<Vec<u8>, WgpuRenderRuntimeError> {
+    let shader_work_envelope = intent
+        .shader_work_envelope()
+        .filter(|envelope| envelope.matches(catalog, intent, requirements))
+        .ok_or(WgpuRenderRuntimeError::ShaderWorkEnvelopeMismatch)?;
     let selected_scales = requirements
         .scale_chains()
         .iter()
         .map(|chain| (chain.layer(), chain.target()))
         .collect::<BTreeMap<_, _>>();
     let layer_indices = control_layer_indices(intent);
-    let mut control = build_control(catalog, intent, &selected_scales, &layer_indices)?;
+    let mut control = build_control(
+        catalog,
+        intent,
+        shader_work_envelope,
+        &selected_scales,
+        &layer_indices,
+    )?;
     let base_word_len = control.len() / std::mem::size_of::<u32>();
     let mut plane_scale_words = Vec::new();
     let timepoint = intent.timepoint().get();
@@ -1202,9 +1241,10 @@ fn build_target_control(
                         .ok_or(WgpuRenderRuntimeError::PayloadContractMismatch)?;
                     let shape = scale.shape().dimensions();
                     let cell = scale_grid.cell_shape().dimensions();
-                    let inverse_transform =
-                        shader_control_world_to_grid_rows(scale.grid_to_world())
-                            .map_err(|_| WgpuRenderRuntimeError::UnsupportedView)?;
+                    let inverse_transform = shader_work_envelope
+                        .affine(layer.layer(), scale_level)
+                        .ok_or(WgpuRenderRuntimeError::ShaderWorkEnvelopeMismatch)?
+                        .world_to_grid_rows();
                     let mut scale_record = [0_u32; PLANE_SCALE_WORDS];
                     scale_record[0] = scale_level.get();
                     scale_record[1] = u64_to_u32(shape[2])?;
@@ -1236,6 +1276,31 @@ fn resource_record(
 ) -> Result<[u32; RESOURCE_WORDS], WgpuRenderRuntimeError> {
     let origin = key.region().origin();
     let shape = key.region().shape().dimensions();
+    for (axis, origin, shape) in [Axis3::Z, Axis3::Y, Axis3::X]
+        .into_iter()
+        .zip(origin)
+        .zip(shape)
+        .map(|((axis, origin), shape)| (axis, origin, shape))
+    {
+        let end = origin.checked_add(shape).ok_or({
+            WgpuRenderRuntimeError::ShaderAdmission(
+                ShaderAdmissionError::ShaderCoordinateEnvelopeExceeded {
+                    stage: ShaderEnvelopeStage::VolumePageExit,
+                    axis: ShaderEnvelopeAxis::Axis(axis),
+                    reason: ShaderEnvelopeFailure::NonFiniteBound,
+                },
+            )
+        })?;
+        if end > MAX_EXACT_SHADER_GRID_END_EXCLUSIVE {
+            return Err(WgpuRenderRuntimeError::ShaderAdmission(
+                ShaderAdmissionError::ShaderCoordinateEnvelopeExceeded {
+                    stage: ShaderEnvelopeStage::VolumePageExit,
+                    axis: ShaderEnvelopeAxis::Axis(axis),
+                    reason: ShaderEnvelopeFailure::ErrorBudget { upper_voxels: 0.5 },
+                },
+            ));
+        }
+    }
     let mut record = [0_u32; RESOURCE_WORDS];
     record[0] = key.layer().ordinal();
     record[1] = u64_to_u32(origin[2])?;
@@ -1352,105 +1417,46 @@ fn set_control_full_resource_fast_paths(
     Ok(())
 }
 
-fn encode_view(words: &mut [u32], intent: &RenderIntent) -> Result<(), WgpuRenderRuntimeError> {
-    match intent.view() {
-        RenderViewIntent::Volume { camera, .. } => {
-            words[3] = 0;
-            let frame = CameraFrame::new(camera, intent.presentation())
-                .map_err(|_| WgpuRenderRuntimeError::UnsupportedView)?;
-            let axes = frame.axes();
-            let width = f64::from(intent.extent().width_pixels());
-            let height = f64::from(intent.extent().height_pixels());
-            let presentation = intent.presentation();
-            let screen_x = (0.5 / width - 0.5) * presentation.width_points();
-            let screen_y = (0.5 - 0.5 / height) * presentation.height_points();
-            let screen_dx = presentation.width_points() / width;
-            let screen_dy = -presentation.height_points() / height;
-            let forward = axes.forward();
-            let right = axes.right();
-            let up = axes.up();
-            let (origin, origin_dx, origin_dy, direction, direction_dx, direction_dy) = match camera
-                .projection()
-            {
-                Projection::Orthographic => {
-                    let scale = camera.orthographic_world_per_screen_point();
-                    let eye = frame.eye().components();
-                    (
-                        std::array::from_fn(|axis| {
-                            eye[axis] + right[axis] * screen_x * scale + up[axis] * screen_y * scale
-                        }),
-                        right.map(|value| value * screen_dx * scale),
-                        up.map(|value| value * screen_dy * scale),
-                        forward,
-                        [0.0; 3],
-                        [0.0; 3],
-                    )
-                }
-                Projection::Perspective => {
-                    let inverse_focal = camera.perspective_focal_length_screen_points().recip();
-                    (
-                        frame.eye().components(),
-                        [0.0; 3],
-                        [0.0; 3],
-                        std::array::from_fn(|axis| {
-                            forward[axis]
-                                + right[axis] * screen_x * inverse_focal
-                                + up[axis] * screen_y * inverse_focal
-                        }),
-                        right.map(|value| value * screen_dx * inverse_focal),
-                        up.map(|value| value * screen_dy * inverse_focal),
-                    )
-                }
-            };
-            write_vec3(words, 8, origin)?;
-            write_vec3(words, 11, origin_dx)?;
-            write_vec3(words, 14, origin_dy)?;
-            write_vec3(words, 17, direction)?;
-            write_vec3(words, 20, direction_dx)?;
-            write_vec3(words, 23, direction_dy)?;
-        }
-        RenderViewIntent::CrossSection(view) => {
-            words[3] = 1;
-            let [right, up] = cross_section_axes(view.orientation().xyzw());
-            write_vec3(words, 8, view.center_world().components())?;
-            write_vec3(words, 11, right)?;
-            write_vec3(words, 14, up)?;
-            words[17] = f64_to_f32(view.scale_world_per_screen_point())?.to_bits();
-            words[18] = f64_to_f32(intent.presentation().width_points())?.to_bits();
-            words[19] = f64_to_f32(intent.presentation().height_points())?.to_bits();
-        }
-    }
-    Ok(())
-}
-
-fn cross_section_axes(quaternion: [f64; 4]) -> [[f64; 3]; 2] {
-    let [x, y, z, w] = quaternion;
-    let rotate = |vector: [f64; 3]| {
-        let cross = [
-            y * vector[2] - z * vector[1],
-            z * vector[0] - x * vector[2],
-            x * vector[1] - y * vector[0],
-        ];
-        let twice = cross.map(|value| 2.0 * value);
-        let second = [
-            y * twice[2] - z * twice[1],
-            z * twice[0] - x * twice[2],
-            x * twice[1] - y * twice[0],
-        ];
-        std::array::from_fn(|axis| vector[axis] + w * twice[axis] + second[axis])
-    };
-    [rotate([1.0, 0.0, 0.0]), rotate([0.0, 1.0, 0.0])]
-}
-
-fn write_vec3(
+fn encode_view(
     words: &mut [u32],
-    start: usize,
-    values: [f64; 3],
+    intent: &RenderIntent,
+    shader_work_envelope: &ShaderWorkEnvelope,
 ) -> Result<(), WgpuRenderRuntimeError> {
-    for (index, value) in values.into_iter().enumerate() {
-        words[start + index] = f64_to_f32(value)?.to_bits();
+    match intent.view() {
+        RenderViewIntent::Volume { .. } => {
+            words[3] = 0;
+            let controls = shader_work_envelope
+                .volume()
+                .ok_or(WgpuRenderRuntimeError::ShaderWorkEnvelopeMismatch)?
+                .controls();
+            write_f32_vec3(words, 8, controls.origin_base());
+            write_f32_vec3(words, 11, controls.origin_step_x());
+            write_f32_vec3(words, 14, controls.origin_step_y());
+            write_f32_vec3(words, 17, controls.direction_base());
+            write_f32_vec3(words, 20, controls.direction_step_x());
+            write_f32_vec3(words, 23, controls.direction_step_y());
+        }
+        RenderViewIntent::CrossSection(_) => {
+            words[3] = 1;
+            let controls = shader_work_envelope
+                .plane()
+                .ok_or(WgpuRenderRuntimeError::ShaderWorkEnvelopeMismatch)?
+                .controls();
+            write_f32_vec3(words, 8, controls.center_world());
+            write_f32_vec3(words, 11, controls.right_world());
+            write_f32_vec3(words, 14, controls.up_world());
+            words[17] = controls.world_units_per_logical_point().to_bits();
+            words[18] = controls.screen_span()[0].to_bits();
+            words[19] = controls.screen_span()[1].to_bits();
+        }
     }
     Ok(())
+}
+
+fn write_f32_vec3(words: &mut [u32], offset: usize, values: [f32; 3]) {
+    for (axis, value) in values.into_iter().enumerate() {
+        words[offset + axis] = value.to_bits();
+    }
 }
 
 fn f64_to_f32(value: f64) -> Result<f32, WgpuRenderRuntimeError> {
@@ -1725,6 +1731,7 @@ struct PresentationState {
     texture_revision: TargetTextureRevision,
     frame_state: Option<FrameState>,
     last_rendered_frame: Option<FrameIdentity>,
+    last_rendered_intent: Option<RenderIntent>,
     /// Scheduling authority of the currently exposed 3D volume pixels.
     ///
     /// A full-size interactive preview can be pixel-identical to a direct
@@ -1762,21 +1769,97 @@ struct HiddenVolumeRefinementState {
     requirements: RenderRequirements,
     extent: RenderExtent,
     completed_rows: Arc<AtomicU32>,
-    _control_buffer: wgpu::Buffer,
-    _render_bind_group: wgpu::BindGroup,
+    /// Keeps every resource referenced by a submitted hidden pass alive. A
+    /// queue-completion callback also owns this allocation after a bounded
+    /// wait times out, so replacing or retiring the presentation cannot
+    /// release submission ownership early.
+    _resources: Arc<HiddenRefinementResources>,
     control_capacity: u64,
+    timeout_count: u8,
     status: HiddenRefinementStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 enum HiddenRefinementStatus {
     Running,
-    Complete {
-        batches: u32,
-        elapsed_ns: u64,
-        last_batch_rows: u32,
+    WaitingForSubmission {
+        completion: HiddenSubmissionCompletion,
+        after_completion: HiddenAfterSubmission,
     },
+    RetryReady,
+    Complete,
     Failed,
+    CapabilityFailed(HiddenRefinementCapabilityFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HiddenAfterSubmission {
+    RetryOnce,
+    FailRequest,
+    FailCapability(HiddenRefinementCapabilityFailure),
+}
+
+#[derive(Clone)]
+struct HiddenSubmissionCompletion {
+    complete: Arc<AtomicBool>,
+    notify_waiter: Arc<AtomicBool>,
+}
+
+fn hidden_timeout_wait(
+    timeout_count: &mut u8,
+    completion: HiddenSubmissionCompletion,
+) -> HiddenRefinementStatus {
+    *timeout_count = timeout_count.saturating_add(1);
+    let after_completion = if *timeout_count == 1 {
+        HiddenAfterSubmission::RetryOnce
+    } else {
+        HiddenAfterSubmission::FailRequest
+    };
+    HiddenRefinementStatus::WaitingForSubmission {
+        completion,
+        after_completion,
+    }
+}
+
+fn hidden_panic_wait(
+    in_flight_submission: Option<HiddenSubmissionCompletion>,
+    cause: HiddenRefinementCapabilityFailure,
+) -> HiddenRefinementStatus {
+    in_flight_submission.map_or(
+        HiddenRefinementStatus::CapabilityFailed(cause),
+        |completion| {
+            if completion.complete.load(Ordering::Acquire) {
+                HiddenRefinementStatus::CapabilityFailed(cause)
+            } else {
+                HiddenRefinementStatus::WaitingForSubmission {
+                    completion,
+                    after_completion: HiddenAfterSubmission::FailCapability(cause),
+                }
+            }
+        },
+    )
+}
+
+fn completed_hidden_submission_transition(
+    status: &HiddenRefinementStatus,
+) -> Option<HiddenRefinementStatus> {
+    let HiddenRefinementStatus::WaitingForSubmission {
+        completion,
+        after_completion,
+    } = status
+    else {
+        return None;
+    };
+    if !completion.complete.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(match after_completion {
+        HiddenAfterSubmission::RetryOnce => HiddenRefinementStatus::RetryReady,
+        HiddenAfterSubmission::FailRequest => HiddenRefinementStatus::Failed,
+        HiddenAfterSubmission::FailCapability(cause) => {
+            HiddenRefinementStatus::CapabilityFailed(*cause)
+        }
+    })
 }
 
 impl HiddenVolumeRefinementState {
@@ -1803,7 +1886,10 @@ impl HiddenVolumeRefinementState {
     }
 
     const fn is_actionable(&self) -> bool {
-        !matches!(self.status, HiddenRefinementStatus::Running)
+        matches!(
+            self.status,
+            HiddenRefinementStatus::RetryReady | HiddenRefinementStatus::Complete
+        )
     }
 }
 
@@ -1811,17 +1897,23 @@ const HIDDEN_REFINEMENT_TARGET_NS: u64 = 3_000_000;
 const HIDDEN_REFINEMENT_MAX_BATCH_ROWS: u32 = 256;
 const HIDDEN_REFINEMENT_BATCH_TIMEOUT: Duration = Duration::from_secs(2);
 
-type HiddenRefinementWake = Arc<dyn Fn() + Send + Sync + 'static>;
+type HiddenRefinementWake = Arc<dyn Fn(u64) + Send + Sync + 'static>;
+
+struct HiddenRefinementResources {
+    _control_buffer: wgpu::Buffer,
+    render_bind_group: wgpu::BindGroup,
+    color_view: wgpu::TextureView,
+    fact_view: Option<wgpu::TextureView>,
+}
 
 struct HiddenRefinementJob {
     id: u64,
     pipeline: wgpu::RenderPipeline,
-    bind_group: wgpu::BindGroup,
-    color_view: wgpu::TextureView,
-    fact_view: Option<wgpu::TextureView>,
+    resources: Arc<HiddenRefinementResources>,
     extent: RenderExtent,
     initial_batch_rows: u32,
     completed_rows: Arc<AtomicU32>,
+    latest_submission: Arc<Mutex<Option<HiddenSubmissionCompletion>>>,
 }
 
 struct HiddenRefinementMailbox {
@@ -1830,7 +1922,7 @@ struct HiddenRefinementMailbox {
     shutdown: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 enum HiddenRefinementWorkerOutcome {
     Complete {
         batches: u32,
@@ -1843,33 +1935,118 @@ enum HiddenRefinementWorkerOutcome {
         rows: u32,
         elapsed_ns: u64,
     },
-    Failed {
+    SubmissionTimedOut {
         batches: u32,
         rows: u32,
         elapsed_ns: u64,
+        completion: HiddenSubmissionCompletion,
+    },
+    WorkerPanicked {
+        rows: u32,
+        in_flight_submission: Option<HiddenSubmissionCompletion>,
+    },
+    DeviceFailed {
+        cause: WgpuRenderRuntimeError,
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 struct HiddenRefinementWorkerResult {
     job_id: u64,
     outcome: HiddenRefinementWorkerOutcome,
+}
+
+const HIDDEN_REFINEMENT_RESULT_CAPACITY: usize = 2;
+
+fn push_hidden_refinement_result(
+    results: &mut VecDeque<HiddenRefinementWorkerResult>,
+    result: HiddenRefinementWorkerResult,
+) {
+    // Cancellation is neutral and may be produced repeatedly while the
+    // latest-only mailbox is replaced. Keep at most its newest diagnostic;
+    // a terminal/current result likewise supersedes stale cancellation facts.
+    results.retain(|queued| {
+        !matches!(
+            queued.outcome,
+            HiddenRefinementWorkerOutcome::Cancelled { .. }
+        )
+    });
+    if results.len() == HIDDEN_REFINEMENT_RESULT_CAPACITY {
+        // Capability/device causes are independently latched and the newest
+        // job is the only request state that can still match a presentation.
+        let _ = results.pop_front();
+    }
+    results.push_back(result);
+    debug_assert!(results.len() <= HIDDEN_REFINEMENT_RESULT_CAPACITY);
+}
+
+fn publish_hidden_refinement_result(
+    results: &Mutex<VecDeque<HiddenRefinementWorkerResult>>,
+    accept_results: &AtomicBool,
+    result: HiddenRefinementWorkerResult,
+) -> bool {
+    let Ok(mut queue) = results.lock() else {
+        return false;
+    };
+    if !accept_results.load(Ordering::Acquire) {
+        return false;
+    }
+    push_hidden_refinement_result(&mut queue, result);
+    true
 }
 
 struct HiddenRefinementScheduler {
     mailbox: Arc<(Mutex<HiddenRefinementMailbox>, Condvar)>,
     results: Arc<Mutex<VecDeque<HiddenRefinementWorkerResult>>>,
     wake: Arc<Mutex<Option<HiddenRefinementWake>>>,
+    completion_ready: Arc<AtomicBool>,
+    accept_results: Arc<AtomicBool>,
+    capability_failure: Arc<Mutex<Option<HiddenRefinementCapabilityFailure>>>,
     worker: Option<JoinHandle<()>>,
-    next_job: u64,
+    job_identity: HiddenJobIdentity,
+}
+
+struct HiddenRefinementWorkerContext {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    gpu_failure: Arc<GpuFailureLatch>,
+    mailbox: Arc<(Mutex<HiddenRefinementMailbox>, Condvar)>,
+    results: Arc<Mutex<VecDeque<HiddenRefinementWorkerResult>>>,
+    wake: Arc<Mutex<Option<HiddenRefinementWake>>>,
+    completion_ready: Arc<AtomicBool>,
+    accept_results: Arc<AtomicBool>,
+    capability_failure: Arc<Mutex<Option<HiddenRefinementCapabilityFailure>>>,
+}
+
+struct HiddenJobIdentity {
+    next: u64,
+    exhausted: bool,
+}
+
+impl HiddenJobIdentity {
+    const fn new() -> Self {
+        Self {
+            next: 1,
+            exhausted: false,
+        }
+    }
+
+    fn allocate(&mut self) -> Result<u64, HiddenRefinementCapabilityFailure> {
+        if self.exhausted {
+            return Err(HiddenRefinementCapabilityFailure::JobIdentityExhausted);
+        }
+        let id = self.next;
+        let Some(next) = self.next.checked_add(1) else {
+            self.exhausted = true;
+            return Err(HiddenRefinementCapabilityFailure::JobIdentityExhausted);
+        };
+        self.next = next;
+        Ok(id)
+    }
 }
 
 impl HiddenRefinementScheduler {
-    fn spawn(
-        device: wgpu::Device,
-        queue: wgpu::Queue,
-        gpu_failure: Arc<GpuFailureLatch>,
-    ) -> Result<Self, WgpuRenderRuntimeError> {
+    fn spawn(device: wgpu::Device, queue: wgpu::Queue, gpu_failure: Arc<GpuFailureLatch>) -> Self {
         let mailbox = Arc::new((
             Mutex::new(HiddenRefinementMailbox {
                 latest_job: 0,
@@ -1878,31 +2055,72 @@ impl HiddenRefinementScheduler {
             }),
             Condvar::new(),
         ));
-        let results = Arc::new(Mutex::new(VecDeque::with_capacity(2)));
+        let results = Arc::new(Mutex::new(VecDeque::with_capacity(
+            HIDDEN_REFINEMENT_RESULT_CAPACITY,
+        )));
         let wake = Arc::new(Mutex::new(None::<HiddenRefinementWake>));
-        let worker_mailbox = Arc::clone(&mailbox);
-        let worker_results = Arc::clone(&results);
-        let worker_wake = Arc::clone(&wake);
+        let completion_ready = Arc::new(AtomicBool::new(false));
+        let accept_results = Arc::new(AtomicBool::new(true));
+        let capability_failure = Arc::new(Mutex::new(None));
+        let worker_context = HiddenRefinementWorkerContext {
+            device,
+            queue,
+            gpu_failure,
+            mailbox: Arc::clone(&mailbox),
+            results: Arc::clone(&results),
+            wake: Arc::clone(&wake),
+            completion_ready: Arc::clone(&completion_ready),
+            accept_results: Arc::clone(&accept_results),
+            capability_failure: Arc::clone(&capability_failure),
+        };
         let worker = thread::Builder::new()
             .name("mirante4d-hidden-refinement".to_owned())
             .spawn(move || {
-                hidden_refinement_worker(
-                    device,
-                    queue,
-                    gpu_failure,
-                    worker_mailbox,
-                    worker_results,
-                    worker_wake,
-                );
-            })
-            .map_err(|_| WgpuRenderRuntimeError::HiddenRefinementWorkerSpawnFailed)?;
-        Ok(Self {
+                hidden_refinement_worker(worker_context);
+            });
+        let worker = match worker {
+            Ok(worker) => Some(worker),
+            Err(_) => {
+                *capability_failure
+                    .lock()
+                    .expect("the hidden-refinement capability latch is never poisoned") =
+                    Some(HiddenRefinementCapabilityFailure::WorkerSpawnFailed);
+                None
+            }
+        };
+        Self {
             mailbox,
             results,
             wake,
-            worker: Some(worker),
-            next_job: 1,
-        })
+            completion_ready,
+            accept_results,
+            capability_failure,
+            worker,
+            job_identity: HiddenJobIdentity::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn failed_for_test(cause: HiddenRefinementCapabilityFailure) -> Self {
+        Self {
+            mailbox: Arc::new((
+                Mutex::new(HiddenRefinementMailbox {
+                    latest_job: 0,
+                    pending: None,
+                    shutdown: false,
+                }),
+                Condvar::new(),
+            )),
+            results: Arc::new(Mutex::new(VecDeque::with_capacity(
+                HIDDEN_REFINEMENT_RESULT_CAPACITY,
+            ))),
+            wake: Arc::new(Mutex::new(None)),
+            completion_ready: Arc::new(AtomicBool::new(false)),
+            accept_results: Arc::new(AtomicBool::new(true)),
+            capability_failure: Arc::new(Mutex::new(Some(cause))),
+            worker: None,
+            job_identity: HiddenJobIdentity::new(),
+        }
     }
 
     fn set_wake(&self, wake: HiddenRefinementWake) {
@@ -1912,16 +2130,19 @@ impl HiddenRefinementScheduler {
             .expect("the hidden-refinement wake slot is never poisoned") = Some(wake);
     }
 
-    fn allocate_job(&mut self) -> Result<u64, WgpuRenderRuntimeError> {
-        let id = self.next_job;
-        self.next_job = self
-            .next_job
-            .checked_add(1)
-            .ok_or(WgpuRenderRuntimeError::HiddenRefinementIdentityExhausted)?;
-        Ok(id)
+    fn allocate_job(&mut self) -> Result<u64, HiddenRefinementCapabilityFailure> {
+        self.ensure_capability()?;
+        match self.job_identity.allocate() {
+            Ok(id) => Ok(id),
+            Err(cause) => {
+                self.record_capability_failure(cause);
+                Err(cause)
+            }
+        }
     }
 
-    fn replace(&self, job: HiddenRefinementJob) {
+    fn replace(&self, job: HiddenRefinementJob) -> Result<(), HiddenRefinementCapabilityFailure> {
+        self.ensure_capability()?;
         let (mailbox, ready) = &*self.mailbox;
         let mut mailbox = mailbox
             .lock()
@@ -1929,6 +2150,7 @@ impl HiddenRefinementScheduler {
         mailbox.latest_job = job.id;
         mailbox.pending = Some(job);
         ready.notify_one();
+        Ok(())
     }
 
     fn cancel(&self, job_id: u64) {
@@ -1944,11 +2166,12 @@ impl HiddenRefinementScheduler {
     }
 
     fn has_result(&self) -> bool {
-        !self
-            .results
-            .lock()
-            .expect("the hidden-refinement result queue is never poisoned")
-            .is_empty()
+        self.completion_ready.load(Ordering::Acquire)
+            || !self
+                .results
+                .lock()
+                .expect("the hidden-refinement result queue is never poisoned")
+                .is_empty()
     }
 
     fn drain_results(&self) -> Vec<HiddenRefinementWorkerResult> {
@@ -1957,10 +2180,54 @@ impl HiddenRefinementScheduler {
             .map(|mut results| results.drain(..).collect())
             .unwrap_or_default()
     }
+
+    fn take_completion_notification(&self) -> bool {
+        self.completion_ready.swap(false, Ordering::AcqRel)
+    }
+
+    fn capability_failure(&self) -> Option<HiddenRefinementCapabilityFailure> {
+        *self
+            .capability_failure
+            .lock()
+            .expect("the hidden-refinement capability latch is never poisoned")
+    }
+
+    fn ensure_capability(&self) -> Result<(), HiddenRefinementCapabilityFailure> {
+        self.capability_failure().map_or(Ok(()), Err)
+    }
+
+    fn record_capability_failure(&self, cause: HiddenRefinementCapabilityFailure) {
+        let mut failure = self
+            .capability_failure
+            .lock()
+            .expect("the hidden-refinement capability latch is never poisoned");
+        if failure.is_none() {
+            *failure = Some(cause);
+        }
+    }
+
+    fn retire_terminal_work(&self) {
+        self.accept_results.store(false, Ordering::Release);
+        if let Ok(mut wake) = self.wake.lock() {
+            *wake = None;
+        }
+        let (mailbox, ready) = &*self.mailbox;
+        if let Ok(mut mailbox) = mailbox.lock() {
+            mailbox.shutdown = true;
+            mailbox.latest_job = 0;
+            mailbox.pending = None;
+            ready.notify_one();
+        }
+        if let Ok(mut results) = self.results.lock() {
+            results.clear();
+            self.completion_ready.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl Drop for HiddenRefinementScheduler {
     fn drop(&mut self) {
+        self.accept_results.store(false, Ordering::Release);
         let (mailbox, ready) = &*self.mailbox;
         if let Ok(mut mailbox) = mailbox.lock() {
             mailbox.shutdown = true;
@@ -1974,17 +2241,10 @@ impl Drop for HiddenRefinementScheduler {
     }
 }
 
-fn hidden_refinement_worker(
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    gpu_failure: Arc<GpuFailureLatch>,
-    mailbox: Arc<(Mutex<HiddenRefinementMailbox>, Condvar)>,
-    results: Arc<Mutex<VecDeque<HiddenRefinementWorkerResult>>>,
-    wake: Arc<Mutex<Option<HiddenRefinementWake>>>,
-) {
+fn hidden_refinement_worker(context: HiddenRefinementWorkerContext) {
     loop {
         let job = {
-            let (mailbox, ready) = &*mailbox;
+            let (mailbox, ready) = &*context.mailbox;
             let mut state = mailbox
                 .lock()
                 .expect("the hidden-refinement mailbox is never poisoned");
@@ -2002,37 +2262,62 @@ fn hidden_refinement_worker(
                 .expect("a woken refinement worker owns one pending job")
         };
         let job_id = job.id;
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            execute_hidden_refinement_job(&device, &queue, &gpu_failure, &mailbox, job)
-        }))
-        .ok()
-        .unwrap_or(HiddenRefinementWorkerOutcome::Failed {
-            batches: 0,
-            rows: 0,
-            elapsed_ns: 0,
-        });
-        if let Ok(mut queue) = results.lock() {
-            if queue.len() == 2 {
-                queue.pop_front();
+        let completed_rows = Arc::clone(&job.completed_rows);
+        let latest_submission = Arc::clone(&job.latest_submission);
+        let outcome = match catch_unwind(AssertUnwindSafe(|| {
+            execute_hidden_refinement_job(&context, job)
+        })) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                let mut failure = context
+                    .capability_failure
+                    .lock()
+                    .expect("the hidden-refinement capability latch is never poisoned");
+                if failure.is_none() {
+                    *failure = Some(HiddenRefinementCapabilityFailure::WorkerPanicked);
+                }
+                drop(failure);
+                let in_flight_submission = latest_submission
+                    .lock()
+                    .ok()
+                    .and_then(|submission| submission.clone());
+                if let Some(completion) = &in_flight_submission {
+                    completion.notify_waiter.store(true, Ordering::Release);
+                }
+                HiddenRefinementWorkerOutcome::WorkerPanicked {
+                    rows: completed_rows.load(Ordering::Acquire),
+                    in_flight_submission,
+                }
             }
-            queue.push_back(HiddenRefinementWorkerResult { job_id, outcome });
-        }
-        if !matches!(outcome, HiddenRefinementWorkerOutcome::Cancelled { .. })
-            && let Ok(wake) = wake.lock()
+        };
+        let worker_panicked = matches!(
+            outcome,
+            HiddenRefinementWorkerOutcome::WorkerPanicked { .. }
+        );
+        let should_wake = !matches!(outcome, HiddenRefinementWorkerOutcome::Cancelled { .. });
+        let result_was_published = publish_hidden_refinement_result(
+            &context.results,
+            &context.accept_results,
+            HiddenRefinementWorkerResult { job_id, outcome },
+        );
+        if result_was_published
+            && should_wake
+            && let Ok(wake) = context.wake.lock()
             && let Some(wake) = wake.as_ref()
         {
-            wake();
+            wake(job_id);
+        }
+        if worker_panicked {
+            return;
         }
     }
 }
 
 fn execute_hidden_refinement_job(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    gpu_failure: &GpuFailureLatch,
-    mailbox: &Arc<(Mutex<HiddenRefinementMailbox>, Condvar)>,
+    context: &HiddenRefinementWorkerContext,
     job: HiddenRefinementJob,
 ) -> HiddenRefinementWorkerOutcome {
+    let job_id = job.id;
     let mut next_y = 0_u32;
     let mut batch_rows = job
         .initial_batch_rows
@@ -2042,7 +2327,8 @@ fn execute_hidden_refinement_job(
     let mut batches = 0_u32;
     let mut last_batch_rows = batch_rows;
     while next_y < job.extent.height_pixels() {
-        let current = mailbox
+        let current = context
+            .mailbox
             .0
             .lock()
             .map(|mailbox| mailbox.latest_job)
@@ -2055,15 +2341,17 @@ fn execute_hidden_refinement_job(
             };
         }
         let rows = batch_rows.min(job.extent.height_pixels() - next_y);
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mirante4d-hidden-exact-refinement"),
-        });
+        let mut encoder = context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("mirante4d-hidden-exact-refinement"),
+            });
         encode_render_views(
             &mut encoder,
             &job.pipeline,
-            &job.bind_group,
-            &job.color_view,
-            job.fact_view.as_ref(),
+            &job.resources.render_bind_group,
+            &job.resources.color_view,
+            job.resources.fact_view.as_ref(),
             job.extent,
             ColorRenderRegion {
                 y: next_y,
@@ -2073,21 +2361,68 @@ fn execute_hidden_refinement_job(
             None,
         );
         let batch_started = Instant::now();
-        let submission = queue.submit([encoder.finish()]);
-        if device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: Some(HIDDEN_REFINEMENT_BATCH_TIMEOUT),
-            })
-            .is_err()
-            || gpu_failure.ensure_available().is_err()
-        {
-            return HiddenRefinementWorkerOutcome::Failed {
-                batches,
-                rows: next_y,
-                elapsed_ns: elapsed_nanoseconds(&started),
-            };
+        let submission = context.queue.submit([encoder.finish()]);
+        let completion = HiddenSubmissionCompletion {
+            complete: Arc::new(AtomicBool::new(false)),
+            notify_waiter: Arc::new(AtomicBool::new(false)),
+        };
+        let callback_completion = completion.clone();
+        let callback_resources = Arc::clone(&job.resources);
+        let callback_results = Arc::clone(&context.results);
+        let callback_wake = Arc::clone(&context.wake);
+        let callback_ready = Arc::clone(&context.completion_ready);
+        let callback_accept_results = Arc::clone(&context.accept_results);
+        context.queue.on_submitted_work_done(move || {
+            callback_completion.complete.store(true, Ordering::Release);
+            let should_publish_completion = callback_results.lock().is_ok_and(|_guard| {
+                if callback_accept_results.load(Ordering::Acquire)
+                    && callback_completion.notify_waiter.load(Ordering::Acquire)
+                {
+                    callback_ready.store(true, Ordering::Release);
+                    true
+                } else {
+                    false
+                }
+            });
+            if should_publish_completion
+                && let Ok(wake) = callback_wake.lock()
+                && let Some(wake) = wake.as_ref()
+            {
+                wake(job_id);
+            }
+            drop(callback_resources);
+        });
+        *job.latest_submission
+            .lock()
+            .expect("one hidden worker exclusively updates its submission token") =
+            Some(completion.clone());
+        match context.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: Some(HIDDEN_REFINEMENT_BATCH_TIMEOUT),
+        }) {
+            Ok(_) => {}
+            Err(wgpu::PollError::Timeout) => {
+                completion.notify_waiter.store(true, Ordering::Release);
+                return HiddenRefinementWorkerOutcome::SubmissionTimedOut {
+                    batches,
+                    rows: next_y,
+                    elapsed_ns: elapsed_nanoseconds(&started),
+                    completion,
+                };
+            }
+            Err(wgpu::PollError::WrongSubmissionIndex(_, _)) => {
+                context.gpu_failure.record_backend_internal();
+                return HiddenRefinementWorkerOutcome::DeviceFailed {
+                    cause: WgpuRenderRuntimeError::BackendInternal,
+                };
+            }
         }
+        if let Err(cause) = context.gpu_failure.ensure_available() {
+            return HiddenRefinementWorkerOutcome::DeviceFailed { cause };
+        }
+        *job.latest_submission
+            .lock()
+            .expect("one hidden worker exclusively updates its submission token") = None;
         let elapsed_ns = elapsed_nanoseconds(&batch_started);
         next_y = next_y.saturating_add(rows);
         last_batch_rows = rows;
@@ -2102,7 +2437,8 @@ fn execute_hidden_refinement_job(
             job.extent.height_pixels().saturating_sub(next_y),
         );
     }
-    let still_current = mailbox
+    let still_current = context
+        .mailbox
         .0
         .lock()
         .map(|mailbox| mailbox.latest_job == job.id)
@@ -2168,7 +2504,9 @@ impl CoordinatedSlot {
 struct FrameCoordinator {
     device_generation: RendererDeviceGeneration,
     next_texture_revision: u64,
+    texture_revision_exhausted: bool,
     next_private_presentation: u64,
+    private_presentation_identity_exhausted: bool,
     slots: [CoordinatedSlot; 4],
     presentations: BTreeMap<PrivatePresentationId, PresentationState>,
     pending_residency_targets: BTreeSet<PrivatePresentationId>,
@@ -2179,6 +2517,7 @@ struct FrameCoordinator {
     in_flight_color_leases: BTreeMap<u64, Vec<ResidentFrameLease>>,
     in_flight_color_cutoffs: Arc<AtomicUsize>,
     completed_color_cutoffs: Arc<Mutex<Vec<CompletedColorCutoff>>>,
+    accept_color_completions: Arc<AtomicBool>,
 }
 
 impl FrameCoordinator {
@@ -2186,7 +2525,9 @@ impl FrameCoordinator {
         Ok(Self {
             device_generation: allocate_renderer_device_generation()?,
             next_texture_revision: 1,
+            texture_revision_exhausted: false,
             next_private_presentation: 1,
+            private_presentation_identity_exhausted: false,
             slots: [CoordinatedSlot::empty(); 4],
             presentations: BTreeMap::new(),
             pending_residency_targets: BTreeSet::new(),
@@ -2197,6 +2538,7 @@ impl FrameCoordinator {
             in_flight_color_leases: BTreeMap::new(),
             in_flight_color_cutoffs: Arc::new(AtomicUsize::new(0)),
             completed_color_cutoffs: Arc::new(Mutex::new(Vec::new())),
+            accept_color_completions: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -2213,23 +2555,31 @@ impl FrameCoordinator {
     fn allocate_texture_revision(
         &mut self,
     ) -> Result<TargetTextureRevision, WgpuRenderRuntimeError> {
+        if self.texture_revision_exhausted {
+            return Err(WgpuRenderRuntimeError::TextureRevisionExhausted);
+        }
         let revision = TargetTextureRevision(self.next_texture_revision);
-        self.next_texture_revision = self
-            .next_texture_revision
-            .checked_add(1)
-            .ok_or(WgpuRenderRuntimeError::TextureRevisionExhausted)?;
+        let Some(next) = self.next_texture_revision.checked_add(1) else {
+            self.texture_revision_exhausted = true;
+            return Err(WgpuRenderRuntimeError::TextureRevisionExhausted);
+        };
+        self.next_texture_revision = next;
         Ok(revision)
     }
 
     fn allocate_private_presentation(
         &mut self,
     ) -> Result<PrivatePresentationId, WgpuRenderRuntimeError> {
+        if self.private_presentation_identity_exhausted {
+            return Err(WgpuRenderRuntimeError::PrivatePresentationIdExhausted);
+        }
         let token = PrivatePresentationId::new(self.next_private_presentation)
             .map_err(|_| WgpuRenderRuntimeError::PrivatePresentationIdExhausted)?;
-        self.next_private_presentation = self
-            .next_private_presentation
-            .checked_add(1)
-            .ok_or(WgpuRenderRuntimeError::PrivatePresentationIdExhausted)?;
+        let Some(next) = self.next_private_presentation.checked_add(1) else {
+            self.private_presentation_identity_exhausted = true;
+            return Err(WgpuRenderRuntimeError::PrivatePresentationIdExhausted);
+        };
+        self.next_private_presentation = next;
         Ok(token)
     }
 
@@ -2689,6 +3039,48 @@ struct CoordinatedExecutionPlan<'a> {
     candidate: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CoordinatedReuseChecks {
+    slot_is_current: bool,
+    target_matches: bool,
+    frame_matches: bool,
+    intent_matches: bool,
+    timepoint_matches: bool,
+    extent_matches: bool,
+    completeness_matches: bool,
+    requirement_body_matches: bool,
+    prefetch_role_matches: bool,
+    schedule_matches: bool,
+    residency_is_current: bool,
+    body_work_is_quiescent: bool,
+}
+
+impl CoordinatedReuseChecks {
+    const fn proves_reuse(self) -> bool {
+        self.slot_is_current
+            && self.target_matches
+            && self.frame_matches
+            && self.intent_matches
+            && self.timepoint_matches
+            && self.extent_matches
+            && self.completeness_matches
+            && self.requirement_body_matches
+            && self.prefetch_role_matches
+            && self.schedule_matches
+            && self.residency_is_current
+            && self.body_work_is_quiescent
+    }
+}
+
+fn same_frame_render_intent_is_compatible(
+    rendered_frame: Option<FrameIdentity>,
+    rendered_intent: Option<&RenderIntent>,
+    requested: &RenderIntent,
+) -> bool {
+    rendered_frame != Some(requested.frame())
+        || rendered_intent.is_none_or(|intent| intent.same_semantic_request(requested))
+}
+
 struct CoordinatedColorPass<'a> {
     plan: CoordinatedExecutionPlan<'a>,
     report_index: usize,
@@ -2733,12 +3125,25 @@ enum PlannedColorWork {
     HiddenRunning {
         progress: VolumeRefinementProgress,
     },
-    HiddenFailed,
+    HiddenWaitingForSubmission {
+        progress: VolumeRefinementProgress,
+        after_completion: HiddenRefinementAfterCompletion,
+    },
+    HiddenComplete {
+        progress: VolumeRefinementProgress,
+    },
+    HiddenFailed {
+        cause: HiddenRefinementFailure,
+    },
+    HiddenCapabilityFailed {
+        cause: HiddenRefinementCapabilityFailure,
+    },
 }
 
 fn planned_color_work(
     presentation: &PresentationState,
     plan: CoordinatedExecutionPlan<'_>,
+    capability_failure: Option<HiddenRefinementCapabilityFailure>,
 ) -> PlannedColorWork {
     let extent = plan.request.intent().extent();
     let full = ColorRenderRegion {
@@ -2746,31 +3151,55 @@ fn planned_color_work(
         height: extent.height_pixels(),
         clear: true,
     };
-    let VolumeColorSchedule::AtomicRefinement {
-        strip_height_pixels,
-    } = plan.request.volume_schedule()
-    else {
+    if !volume_schedule_requires_hidden_capability(plan.request.volume_schedule()) {
         return PlannedColorWork::Main {
             region: full,
             progress: None,
             publishes_frame: true,
         };
+    }
+    let VolumeColorSchedule::AtomicRefinement {
+        strip_height_pixels,
+    } = plan.request.volume_schedule()
+    else {
+        unreachable!("only an atomic schedule requires hidden capability");
     };
     let Some(refinement) = presentation
         .hidden_volume_refinement
         .as_ref()
         .filter(|state| state.matches(plan.request))
     else {
+        if let Some(cause) = capability_failure {
+            return PlannedColorWork::HiddenCapabilityFailed { cause };
+        }
         return PlannedColorWork::StartHidden {
             initial_batch_rows: strip_height_pixels,
             progress: VolumeRefinementProgress::new(0, extent.height_pixels()),
         };
     };
-    match refinement.status {
+    match &refinement.status {
         HiddenRefinementStatus::Running => PlannedColorWork::HiddenRunning {
             progress: refinement.progress(),
         },
-        HiddenRefinementStatus::Complete { .. } => {
+        HiddenRefinementStatus::WaitingForSubmission {
+            after_completion, ..
+        } => PlannedColorWork::HiddenWaitingForSubmission {
+            progress: refinement.progress(),
+            after_completion: match after_completion {
+                HiddenAfterSubmission::RetryOnce => HiddenRefinementAfterCompletion::RetryOnce,
+                HiddenAfterSubmission::FailRequest => HiddenRefinementAfterCompletion::FailRequest(
+                    HiddenRefinementFailure::SubmissionTimedOutTwice,
+                ),
+                HiddenAfterSubmission::FailCapability(cause) => {
+                    HiddenRefinementAfterCompletion::FailCapability(*cause)
+                }
+            },
+        },
+        HiddenRefinementStatus::RetryReady => PlannedColorWork::StartHidden {
+            initial_batch_rows: strip_height_pixels,
+            progress: VolumeRefinementProgress::new(0, extent.height_pixels()),
+        },
+        HiddenRefinementStatus::Complete => {
             if plan.request.hidden_promotion_authorized() {
                 PlannedColorWork::Main {
                     region: ColorRenderRegion {
@@ -2782,13 +3211,22 @@ fn planned_color_work(
                     publishes_frame: true,
                 }
             } else {
-                PlannedColorWork::HiddenRunning {
+                PlannedColorWork::HiddenComplete {
                     progress: refinement.progress(),
                 }
             }
         }
-        HiddenRefinementStatus::Failed => PlannedColorWork::HiddenFailed,
+        HiddenRefinementStatus::Failed => PlannedColorWork::HiddenFailed {
+            cause: HiddenRefinementFailure::SubmissionTimedOutTwice,
+        },
+        HiddenRefinementStatus::CapabilityFailed(cause) => {
+            PlannedColorWork::HiddenCapabilityFailed { cause: *cause }
+        }
     }
+}
+
+const fn volume_schedule_requires_hidden_capability(schedule: VolumeColorSchedule) -> bool {
+    matches!(schedule, VolumeColorSchedule::AtomicRefinement { .. })
 }
 
 const fn volume_schedule_requires_exact_promotion(
@@ -2822,6 +3260,51 @@ struct PreparedDisplayReplacement {
 struct CompletedColorCutoff {
     residency_generation: u64,
     cutoff: u64,
+}
+
+fn coordinated_reused_target_report(
+    target: PresentationTarget,
+    device_generation: RendererDeviceGeneration,
+    texture_revision: TargetTextureRevision,
+    frame: FrameIdentity,
+    progress: Option<FrameProgress>,
+) -> CoordinatedTargetExecutionReport {
+    CoordinatedTargetExecutionReport {
+        target,
+        device_generation,
+        texture_revision,
+        frame,
+        progress,
+        presented: false,
+        current: true,
+        disposition: CoordinatedMemberDisposition::Reused,
+        visited_resources: 0,
+        uploaded_resources: 0,
+        payload_upload_bytes: 0,
+        control_upload_bytes: 0,
+        residency_command_buffers: 0,
+        residency_queue_submissions: 0,
+        deferred_by_backpressure: false,
+        actionable_work_remaining: false,
+        hidden_refinement: None,
+        hidden_refinement_job: None,
+        validation_capture: None,
+        newly_resident_keys: Box::new([]),
+        evicted_keys: Box::new([]),
+    }
+}
+
+fn coordinated_zero_delta_report(
+    targets: Box<[CoordinatedTargetExecutionReport]>,
+) -> CoordinatedFrameExecutionReport {
+    CoordinatedFrameExecutionReport {
+        targets,
+        recorded_targets: Box::new([]),
+        residency_queue_submissions: 0,
+        color_queue_submissions: 0,
+        cpu_timing: None,
+        gpu_timing: None,
+    }
 }
 
 struct TimingResources {
@@ -2903,11 +3386,22 @@ struct PipelineCompiler<Initial, Pick> {
 }
 
 impl<Initial: Send + 'static, Pick: Send + 'static> PipelineCompiler<Initial, Pick> {
+    #[cfg(test)]
     fn spawn(
         compile_initial: impl FnOnce() -> Result<Initial, PipelineCompilationFailureCause>
         + Send
         + 'static,
         compile_pick: impl FnOnce() -> Result<Pick, PipelineCompilationFailureCause> + Send + 'static,
+    ) -> Result<Self, WgpuRenderRuntimeError> {
+        Self::spawn_with_event_sink(compile_initial, compile_pick, Arc::new(Mutex::new(None)))
+    }
+
+    fn spawn_with_event_sink(
+        compile_initial: impl FnOnce() -> Result<Initial, PipelineCompilationFailureCause>
+        + Send
+        + 'static,
+        compile_pick: impl FnOnce() -> Result<Pick, PipelineCompilationFailureCause> + Send + 'static,
+        event_sink: Arc<Mutex<Option<RendererEventSink>>>,
     ) -> Result<Self, WgpuRenderRuntimeError> {
         let (sender, receiver) = sync_channel(PIPELINE_COMPILE_EVENT_CAPACITY);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -2920,6 +3414,7 @@ impl<Initial: Send + 'static, Pick: Send + 'static> PipelineCompiler<Initial, Pi
                     worker_cancelled.as_ref(),
                     compile_initial,
                     compile_pick,
+                    event_sink,
                 );
             })
             .map_err(|_| WgpuRenderRuntimeError::PipelineCompilerSpawnFailed)?;
@@ -2966,6 +3461,7 @@ fn run_pipeline_compiler<Initial, Pick>(
     cancelled: &AtomicBool,
     compile_initial: impl FnOnce() -> Result<Initial, PipelineCompilationFailureCause>,
     compile_pick: impl FnOnce() -> Result<Pick, PipelineCompilationFailureCause>,
+    event_sink: Arc<Mutex<Option<RendererEventSink>>>,
 ) {
     let initial_result = catch_unwind(AssertUnwindSafe(compile_initial));
     if cancelled.load(Ordering::Acquire) {
@@ -2974,24 +3470,33 @@ fn run_pipeline_compiler<Initial, Pick>(
     let initial = match initial_result {
         Ok(Ok(initial)) => initial,
         Ok(Err(cause)) => {
-            let _ = sender.send(PipelineCompileEvent::Failed {
-                capability: PipelineCapability::InitialRender,
-                cause,
-            });
+            publish_pipeline_event(
+                &sender,
+                &event_sink,
+                PipelineCompileEvent::Failed {
+                    capability: PipelineCapability::InitialRender,
+                    cause,
+                },
+            );
             return;
         }
         Err(_) => {
-            let _ = sender.send(PipelineCompileEvent::Failed {
-                capability: PipelineCapability::InitialRender,
-                cause: PipelineCompilationFailureCause::WorkerPanicked,
-            });
+            publish_pipeline_event(
+                &sender,
+                &event_sink,
+                PipelineCompileEvent::Failed {
+                    capability: PipelineCapability::InitialRender,
+                    cause: PipelineCompilationFailureCause::WorkerPanicked,
+                },
+            );
             return;
         }
     };
-    if sender
-        .send(PipelineCompileEvent::InitialRenderReady(initial))
-        .is_err()
-    {
+    if !publish_pipeline_event(
+        &sender,
+        &event_sink,
+        PipelineCompileEvent::InitialRenderReady(initial),
+    ) {
         return;
     }
     if cancelled.load(Ordering::Acquire) {
@@ -3005,21 +3510,58 @@ fn run_pipeline_compiler<Initial, Pick>(
     let pick = match pick_result {
         Ok(Ok(pick)) => pick,
         Ok(Err(cause)) => {
-            let _ = sender.send(PipelineCompileEvent::Failed {
-                capability: PipelineCapability::Pick,
-                cause,
-            });
+            publish_pipeline_event(
+                &sender,
+                &event_sink,
+                PipelineCompileEvent::Failed {
+                    capability: PipelineCapability::Pick,
+                    cause,
+                },
+            );
             return;
         }
         Err(_) => {
-            let _ = sender.send(PipelineCompileEvent::Failed {
-                capability: PipelineCapability::Pick,
-                cause: PipelineCompilationFailureCause::WorkerPanicked,
-            });
+            publish_pipeline_event(
+                &sender,
+                &event_sink,
+                PipelineCompileEvent::Failed {
+                    capability: PipelineCapability::Pick,
+                    cause: PipelineCompilationFailureCause::WorkerPanicked,
+                },
+            );
             return;
         }
     };
-    let _ = sender.send(PipelineCompileEvent::Ready(pick));
+    publish_pipeline_event(&sender, &event_sink, PipelineCompileEvent::Ready(pick));
+}
+
+fn publish_pipeline_event<Initial, Pick>(
+    sender: &SyncSender<PipelineCompileEvent<Initial, Pick>>,
+    event_sink: &Arc<Mutex<Option<RendererEventSink>>>,
+    event: PipelineCompileEvent<Initial, Pick>,
+) -> bool {
+    let capability = match &event {
+        PipelineCompileEvent::InitialRenderReady(_) => PipelineCapability::InitialRender,
+        PipelineCompileEvent::Ready(_) => PipelineCapability::Pick,
+        PipelineCompileEvent::Failed { capability, .. } => *capability,
+    };
+    if sender.send(event).is_err() {
+        return false;
+    }
+    if let Ok(sink) = event_sink.lock()
+        && let Some(sink) = sink.as_ref()
+    {
+        sink.wake(RendererEvent::PipelineCapabilityChanged(capability));
+    }
+    true
+}
+
+fn wake_renderer_event(event_sink: &Arc<Mutex<Option<RendererEventSink>>>, event: RendererEvent) {
+    if let Ok(sink) = event_sink.lock()
+        && let Some(sink) = sink.as_ref()
+    {
+        sink.wake(event);
+    }
 }
 
 struct CurrentThreadWake(thread::Thread);
@@ -3157,7 +3699,8 @@ struct PipelineState<Initial = InitialPipelines, Pick = wgpu::ComputePipeline> {
     readiness: PipelineReadiness,
     initial: Option<Initial>,
     pick: Option<Pick>,
-    first_failure: Option<WgpuRenderRuntimeError>,
+    initial_failure: Option<PipelineCompilationFailureCause>,
+    pick_failure: Option<PipelineCompilationFailureCause>,
     compiler: Option<PipelineCompiler<Initial, Pick>>,
 }
 
@@ -3167,25 +3710,60 @@ impl<Initial, Pick> PipelineState<Initial, Pick> {
             readiness: PipelineReadiness::CompilingInitial,
             initial: None,
             pick: None,
-            first_failure: None,
+            initial_failure: None,
+            pick_failure: None,
             compiler: Some(compiler),
         }
     }
 
     fn readiness(&self) -> Result<PipelineReadiness, WgpuRenderRuntimeError> {
-        self.first_failure.map_or(Ok(self.readiness), Err)
+        self.initial_failure.map_or(Ok(self.readiness), |cause| {
+            Err(WgpuRenderRuntimeError::PipelineCompilationFailed {
+                capability: PipelineCapability::InitialRender,
+                cause,
+            })
+        })
+    }
+
+    fn capability_statuses(&self) -> PipelineCapabilityStatuses {
+        let initial_render = self.initial_failure.map_or_else(
+            || {
+                if self.initial.is_some() {
+                    PipelineCapabilityStatus::Ready
+                } else {
+                    PipelineCapabilityStatus::Compiling
+                }
+            },
+            PipelineCapabilityStatus::Failed,
+        );
+        let pick = self.pick_failure.map_or_else(
+            || {
+                if self.pick.is_some() {
+                    PipelineCapabilityStatus::Ready
+                } else if self.initial_failure.is_some() {
+                    PipelineCapabilityStatus::Failed(PipelineCompilationFailureCause::WorkerStopped)
+                } else {
+                    PipelineCapabilityStatus::Compiling
+                }
+            },
+            PipelineCapabilityStatus::Failed,
+        );
+        PipelineCapabilityStatuses {
+            initial_render,
+            pick,
+        }
     }
 
     fn capability_is_ready(
         &self,
         capability: PipelineCapability,
     ) -> Result<bool, WgpuRenderRuntimeError> {
-        if let Some(failure) = self.first_failure {
-            return Err(failure);
-        }
-        Ok(match capability {
-            PipelineCapability::InitialRender => self.initial.is_some(),
-            PipelineCapability::Pick => self.pick.is_some(),
+        let (ready, failure) = match capability {
+            PipelineCapability::InitialRender => (self.initial.is_some(), self.initial_failure),
+            PipelineCapability::Pick => (self.pick.is_some(), self.pick_failure),
+        };
+        failure.map_or(Ok(ready), |cause| {
+            Err(WgpuRenderRuntimeError::PipelineCompilationFailed { capability, cause })
         })
     }
 
@@ -3199,8 +3777,14 @@ impl<Initial, Pick> PipelineState<Initial, Pick> {
     }
 
     fn poll(&mut self) -> Result<PipelineReadiness, WgpuRenderRuntimeError> {
-        if let Some(failure) = self.first_failure {
-            return Err(failure);
+        if let Some(cause) = self.initial_failure {
+            return Err(WgpuRenderRuntimeError::PipelineCompilationFailed {
+                capability: PipelineCapability::InitialRender,
+                cause,
+            });
+        }
+        if self.pick_failure.is_some() {
+            return Ok(self.readiness);
         }
         let event = match self.compiler.as_ref().map(PipelineCompiler::try_next) {
             None => return Ok(self.readiness),
@@ -3255,13 +3839,9 @@ impl<Initial, Pick> PipelineState<Initial, Pick> {
         capability: PipelineCapability,
         cause: PipelineCompilationFailureCause,
     ) -> WgpuRenderRuntimeError {
-        let error = WgpuRenderRuntimeError::PipelineCompilationFailed { capability, cause };
-        if self.first_failure.is_none() {
-            self.first_failure = Some(error);
-        }
+        self.record_capability_failure(capability, cause);
         self.join_terminal_compiler();
-        self.first_failure
-            .expect("the first pipeline compilation failure was latched")
+        WgpuRenderRuntimeError::PipelineCompilationFailed { capability, cause }
     }
 
     fn latch_detached_failure(
@@ -3269,13 +3849,28 @@ impl<Initial, Pick> PipelineState<Initial, Pick> {
         capability: PipelineCapability,
         cause: PipelineCompilationFailureCause,
     ) -> WgpuRenderRuntimeError {
-        let error = WgpuRenderRuntimeError::PipelineCompilationFailed { capability, cause };
-        if self.first_failure.is_none() {
-            self.first_failure = Some(error);
-        }
+        self.record_capability_failure(capability, cause);
         self.cancel_and_detach_compiler();
-        self.first_failure
-            .expect("the first pipeline compilation failure was latched")
+        WgpuRenderRuntimeError::PipelineCompilationFailed { capability, cause }
+    }
+
+    fn record_capability_failure(
+        &mut self,
+        capability: PipelineCapability,
+        cause: PipelineCompilationFailureCause,
+    ) {
+        match capability {
+            PipelineCapability::InitialRender => {
+                if self.initial_failure.is_none() {
+                    self.initial_failure = Some(cause);
+                }
+            }
+            PipelineCapability::Pick => {
+                if self.pick_failure.is_none() {
+                    self.pick_failure = Some(cause);
+                }
+            }
+        }
     }
 
     fn join_terminal_compiler(&mut self) {
@@ -4922,6 +5517,23 @@ impl ResidencyOwner {
         self.frame_leases.remove_offers(retired);
     }
 
+    fn retire_terminal_work(&mut self) {
+        self.pending_leases.clear();
+        self.frame_leases = ResidentFrameLeases::new();
+        self.retired_frame_leases.clear();
+        for evictable in &mut self.payload_evictable_lru {
+            evictable.clear();
+        }
+        for (key, resource) in &self.resident {
+            if resource.allocated_bytes != 0 {
+                self.payload_evictable_lru[resource.segment as usize]
+                    .insert((resource.last_used_frame, *key));
+            }
+        }
+        self.recently_evicted.clear();
+        self.recently_evicted_order.clear();
+    }
+
     fn has_relevant_offer(&self, lease: ResidentFrameLease) -> bool {
         self.frame_leases.has_relevant_pending(lease)
     }
@@ -5527,18 +6139,76 @@ pub(super) struct Runtime {
     timing: Option<TimingResources>,
     pick: PickResources,
     hidden_refinement: HiddenRefinementScheduler,
+    renderer_event_sink: Arc<Mutex<Option<RendererEventSink>>>,
     in_flight_submissions: Arc<AtomicUsize>,
+    next_submission_event: u64,
+    completed_submission_event: Arc<AtomicU64>,
     validation_error_count: Arc<AtomicUsize>,
     config: WgpuRenderRuntimeConfig,
     diagnostics: WgpuRenderRuntimeDiagnostics,
 }
 
 impl Runtime {
-    pub(super) fn set_hidden_refinement_wake(
-        &mut self,
-        wake: Arc<dyn Fn() + Send + Sync + 'static>,
-    ) {
-        self.hidden_refinement.set_wake(wake);
+    pub(super) fn set_renderer_event_sink(&mut self, sink: RendererEventSink) {
+        *self
+            .renderer_event_sink
+            .lock()
+            .expect("the renderer event sink is never poisoned") = Some(sink.clone());
+        let hidden_sink = sink.clone();
+        self.hidden_refinement.set_wake(Arc::new(move |job| {
+            hidden_sink.wake(RendererEvent::HiddenWorkerResult { job });
+        }));
+        // The compiler can publish either bounded channel item before the
+        // native event sink is installed. Replaying both capability facts at
+        // registration guarantees the app drains any already-buffered
+        // InitialRender then Pick publication in order. If an item is still
+        // absent, the worker's later publication supplies the real transition
+        // wake. These are notifications only, never readiness assertions.
+        sink.wake(RendererEvent::PipelineCapabilityChanged(
+            PipelineCapability::InitialRender,
+        ));
+        sink.wake(RendererEvent::PipelineCapabilityChanged(
+            PipelineCapability::Pick,
+        ));
+    }
+
+    pub(super) fn retire_terminal_work(&mut self) {
+        if let Ok(mut sink) = self.renderer_event_sink.lock() {
+            *sink = None;
+        }
+        self.hidden_refinement.retire_terminal_work();
+        self.frame_coordinator
+            .accept_color_completions
+            .store(false, Ordering::Release);
+        if let Ok(mut completed) = self.frame_coordinator.completed_color_cutoffs.lock() {
+            completed.clear();
+        }
+        self.frame_coordinator.in_flight_color_leases.clear();
+        self.frame_coordinator.pending_residency_targets.clear();
+        self.frame_coordinator.last_recorded_targets.clear();
+        for presentation in self.frame_coordinator.presentations.values_mut() {
+            presentation.frame_state = None;
+            presentation.last_rendered_intent = None;
+            presentation.last_rendered_requirements = None;
+            presentation.last_progress = None;
+            presentation.availability = None;
+            presentation.last_rendered_layers.clear();
+            presentation.last_rendered_modes.clear();
+            presentation.last_rendered_sampling.clear();
+            presentation.pending_capture = None;
+            presentation.hidden_volume_refinement = None;
+        }
+        self.residency.retire_terminal_work();
+        if let Some(timing) = &mut self.timing {
+            for slot in &mut timing.slots {
+                slot.state = TimingSlotState::Free;
+            }
+            timing.completed.clear();
+            timing.completed_order.clear();
+        }
+        for slot in &mut self.pick.slots {
+            slot.state = PickSlotState::Free;
+        }
     }
 
     #[cfg(test)]
@@ -5737,16 +6407,18 @@ impl Runtime {
         let validation_capture = config.validation_capture();
         let pick_device = device.clone();
         let pick_layout = pick_pipeline_layout.clone();
-        let compiler = PipelineCompiler::spawn(
+        let renderer_event_sink = Arc::new(Mutex::new(None));
+        let compiler = PipelineCompiler::spawn_with_event_sink(
             move || compile_initial_pipelines(&initial_device, &initial_layout, validation_capture),
             move || compile_pick_pipeline(&pick_device, &pick_layout),
+            Arc::clone(&renderer_event_sink),
         )?;
         let pipelines = PipelineState::compiling(compiler);
         let hidden_refinement = HiddenRefinementScheduler::spawn(
             device.clone(),
             queue.clone(),
             Arc::clone(&gpu_failure),
-        )?;
+        );
         gpu_failure.ensure_available()?;
         let payload_arena_allocated_bytes = payload_segments
             .iter()
@@ -5785,7 +6457,10 @@ impl Runtime {
             timing,
             pick,
             hidden_refinement,
+            renderer_event_sink,
             in_flight_submissions: Arc::new(AtomicUsize::new(0)),
+            next_submission_event: 1,
+            completed_submission_event: Arc::new(AtomicU64::new(0)),
             validation_error_count,
             config,
             diagnostics: WgpuRenderRuntimeDiagnostics {
@@ -5903,6 +6578,29 @@ impl Runtime {
         &self.diagnostics
     }
 
+    pub(super) const fn device_generation(&self) -> RendererDeviceGeneration {
+        self.frame_coordinator.device_generation
+    }
+
+    /// Identity of the next queue-completion transition that can reduce the
+    /// runtime's bounded in-flight submission count. The value is read only
+    /// after an operation reports submission backpressure or after it records
+    /// a cleanup submission.
+    pub(super) fn next_submission_completion_event(&self) -> u64 {
+        self.completed_submission_event
+            .load(Ordering::Acquire)
+            .saturating_add(1)
+    }
+
+    fn allocate_submission_event(&mut self) -> u64 {
+        let event = self.next_submission_event;
+        // Saturation is intentionally safe: at the representational limit a
+        // physical completion still remains a causal wake, while wrapping to
+        // an old identity could falsely match stale application state.
+        self.next_submission_event = self.next_submission_event.saturating_add(1);
+        event
+    }
+
     pub(super) fn pipeline_readiness(&self) -> Result<PipelineReadiness, WgpuRenderRuntimeError> {
         self.ensure_device_available()?;
         self.pipelines.readiness()
@@ -5913,7 +6611,15 @@ impl Runtime {
     ) -> Result<PipelineReadiness, WgpuRenderRuntimeError> {
         self.ensure_device_available()?;
         let before = self.pipelines.readiness;
-        let readiness = self.pipelines.poll()?;
+        let readiness = match self.pipelines.poll() {
+            Ok(readiness) => readiness,
+            Err(error @ WgpuRenderRuntimeError::PipelineCompilationFailed { cause, .. }) => {
+                self.gpu_failure.record_pipeline_failure(cause);
+                self.ensure_device_available()?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         self.ensure_device_available()?;
         match (before, readiness) {
             (PipelineReadiness::CompilingInitial, PipelineReadiness::InitialRenderReady) => {
@@ -5935,6 +6641,30 @@ impl Runtime {
     ) -> Result<bool, WgpuRenderRuntimeError> {
         self.ensure_device_available()?;
         self.pipelines.capability_is_ready(capability)
+    }
+
+    pub(super) fn pipeline_capability_statuses(
+        &self,
+    ) -> Result<PipelineCapabilityStatuses, WgpuRenderRuntimeError> {
+        self.ensure_device_available()?;
+        Ok(self.pipelines.capability_statuses())
+    }
+
+    pub(super) fn poll_pipeline_capability_statuses(
+        &mut self,
+    ) -> Result<PipelineCapabilityStatuses, WgpuRenderRuntimeError> {
+        match self.poll_pipeline_readiness() {
+            Ok(_) => {}
+            Err(WgpuRenderRuntimeError::PipelineCompilationFailed {
+                cause:
+                    PipelineCompilationFailureCause::Validation
+                    | PipelineCompilationFailureCause::WorkerPanicked
+                    | PipelineCompilationFailureCause::WorkerStopped,
+                ..
+            }) => {}
+            Err(error) => return Err(error),
+        }
+        self.pipeline_capability_statuses()
     }
 
     pub(super) const fn payload_capacity_bytes(&self) -> u64 {
@@ -6075,10 +6805,20 @@ impl Runtime {
 
         if let Some(encoder) = encoder {
             self.queue.submit([encoder.finish()]);
+            let submission_event = self.allocate_submission_event();
+            let completed_submission_event = Arc::clone(&self.completed_submission_event);
             let in_flight = Arc::clone(&self.in_flight_submissions);
+            let event_sink = Arc::clone(&self.renderer_event_sink);
             let submitted = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
             self.queue.on_submitted_work_done(move || {
                 in_flight.fetch_sub(1, Ordering::AcqRel);
+                completed_submission_event.fetch_max(submission_event, Ordering::AcqRel);
+                wake_renderer_event(
+                    &event_sink,
+                    RendererEvent::SubmissionCompleted {
+                        submission: submission_event,
+                    },
+                );
             });
             self.diagnostics.queue_submissions =
                 self.diagnostics.queue_submissions.saturating_add(1);
@@ -6254,10 +6994,20 @@ impl Runtime {
         }
         self.ensure_device_available()?;
         self.queue.submit([encoder.finish()]);
+        let submission_event = self.allocate_submission_event();
+        let completed_submission_event = Arc::clone(&self.completed_submission_event);
         let in_flight = Arc::clone(&self.in_flight_submissions);
+        let event_sink = Arc::clone(&self.renderer_event_sink);
         let submitted = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
         self.queue.on_submitted_work_done(move || {
             in_flight.fetch_sub(1, Ordering::AcqRel);
+            completed_submission_event.fetch_max(submission_event, Ordering::AcqRel);
+            wake_renderer_event(
+                &event_sink,
+                RendererEvent::SubmissionCompleted {
+                    submission: submission_event,
+                },
+            );
         });
 
         let moved_resources = plan.relocations.len() as u64;
@@ -6338,7 +7088,13 @@ impl Runtime {
         }
     }
 
-    fn collect_hidden_refinement_results(&mut self) {
+    fn collect_hidden_refinement_results(&mut self) -> Result<(), WgpuRenderRuntimeError> {
+        // Swap before inspecting per-presentation completion flags. If a
+        // callback races after this point it sets the aggregate flag again;
+        // if it raced before, its release-store is observed by the scan below.
+        let _ = self.hidden_refinement.take_completion_notification();
+        let mut device_failure = None;
+        let mut retry_targets = Vec::new();
         for result in self.hidden_refinement.drain_results() {
             let matching =
                 self.frame_coordinator
@@ -6393,20 +7149,17 @@ impl Runtime {
                             refinement
                                 .completed_rows
                                 .store(refinement.extent.height_pixels(), Ordering::Release);
-                            refinement.status = HiddenRefinementStatus::Complete {
-                                batches,
-                                elapsed_ns,
-                                last_batch_rows,
-                            };
+                            refinement.status = HiddenRefinementStatus::Complete;
                             presentation.logical_target
                         };
                         self.frame_coordinator.slot_mut(target).color_retry_pending = true;
                     }
                 }
-                HiddenRefinementWorkerOutcome::Failed {
+                HiddenRefinementWorkerOutcome::SubmissionTimedOut {
                     batches,
                     rows,
                     elapsed_ns,
+                    completion,
                 } => {
                     self.diagnostics.hidden_refinement_jobs_failed = self
                         .diagnostics
@@ -6414,23 +7167,92 @@ impl Runtime {
                         .saturating_add(1);
                     self.record_hidden_refinement_work(batches, rows, elapsed_ns, None);
                     if let Some(token) = matching {
-                        let target = {
-                            let presentation = self
-                                .frame_coordinator
-                                .presentations
-                                .get_mut(&token)
-                                .expect("a matched hidden failure retains its presentation");
-                            presentation
-                                .hidden_volume_refinement
-                                .as_mut()
-                                .expect("a matched hidden failure retains its job state")
-                                .status = HiddenRefinementStatus::Failed;
-                            presentation.logical_target
-                        };
-                        self.frame_coordinator.slot_mut(target).color_retry_pending = true;
+                        let presentation = self
+                            .frame_coordinator
+                            .presentations
+                            .get_mut(&token)
+                            .expect("a matched hidden timeout retains its presentation");
+                        let refinement = presentation
+                            .hidden_volume_refinement
+                            .as_mut()
+                            .expect("a matched hidden timeout retains its job state");
+                        refinement.status =
+                            hidden_timeout_wait(&mut refinement.timeout_count, completion);
                     }
                 }
+                HiddenRefinementWorkerOutcome::WorkerPanicked {
+                    rows,
+                    in_flight_submission,
+                } => {
+                    self.diagnostics.hidden_refinement_jobs_failed = self
+                        .diagnostics
+                        .hidden_refinement_jobs_failed
+                        .saturating_add(1);
+                    self.record_hidden_refinement_work(0, rows, 0, None);
+                    let cause = HiddenRefinementCapabilityFailure::WorkerPanicked;
+                    self.hidden_refinement.record_capability_failure(cause);
+                    for (token, presentation) in &mut self.frame_coordinator.presentations {
+                        let Some(refinement) = presentation.hidden_volume_refinement.as_mut()
+                        else {
+                            continue;
+                        };
+                        let next = if refinement.job_id == result.job_id {
+                            hidden_panic_wait(in_flight_submission.clone(), cause)
+                        } else {
+                            match &refinement.status {
+                                HiddenRefinementStatus::WaitingForSubmission {
+                                    completion, ..
+                                } if !completion.complete.load(Ordering::Acquire) => {
+                                    HiddenRefinementStatus::WaitingForSubmission {
+                                        completion: completion.clone(),
+                                        after_completion: HiddenAfterSubmission::FailCapability(
+                                            cause,
+                                        ),
+                                    }
+                                }
+                                HiddenRefinementStatus::Complete
+                                | HiddenRefinementStatus::Failed
+                                | HiddenRefinementStatus::CapabilityFailed(_) => continue,
+                                HiddenRefinementStatus::Running
+                                | HiddenRefinementStatus::RetryReady
+                                | HiddenRefinementStatus::WaitingForSubmission { .. } => {
+                                    HiddenRefinementStatus::CapabilityFailed(cause)
+                                }
+                            }
+                        };
+                        refinement.status = next;
+                        if refinement.is_actionable() {
+                            retry_targets.push((*token, presentation.logical_target));
+                        }
+                    }
+                }
+                HiddenRefinementWorkerOutcome::DeviceFailed { cause } => {
+                    self.diagnostics.hidden_refinement_jobs_failed = self
+                        .diagnostics
+                        .hidden_refinement_jobs_failed
+                        .saturating_add(1);
+                    device_failure.get_or_insert(cause);
+                }
             }
+        }
+
+        for (token, presentation) in &mut self.frame_coordinator.presentations {
+            let Some(refinement) = presentation.hidden_volume_refinement.as_mut() else {
+                continue;
+            };
+            let Some(next) = completed_hidden_submission_transition(&refinement.status) else {
+                continue;
+            };
+            refinement.status = next;
+            retry_targets.push((*token, presentation.logical_target));
+        }
+        for (_, target) in retry_targets {
+            self.frame_coordinator.slot_mut(target).color_retry_pending = true;
+        }
+        if let Some(cause) = device_failure {
+            Err(cause)
+        } else {
+            Ok(())
         }
     }
 
@@ -6485,6 +7307,7 @@ impl Runtime {
         &mut self,
         leases: &[Arc<dyn ResourceLease>],
     ) -> Result<(), WgpuRenderRuntimeError> {
+        self.ensure_device_available()?;
         let admitted = self.residency.offer_leases(leases)?;
         if !admitted.is_empty() {
             let active = self
@@ -6857,7 +7680,12 @@ impl Runtime {
         if !slot.desired {
             return Err(WgpuRenderRuntimeError::CoordinatedTargetNotConfigured { target });
         }
-        Ok(slot.color_retry_pending
+        Ok(self.coordinated_target_has_actionable_work(target))
+    }
+
+    fn coordinated_target_has_actionable_work(&self, target: PresentationTarget) -> bool {
+        let slot = self.frame_coordinator.slot(target);
+        slot.color_retry_pending
             || [slot.front, slot.candidate]
                 .into_iter()
                 .flatten()
@@ -6882,7 +7710,7 @@ impl Runtime {
                     .display
                     .extent;
                 slot.desired_extent != Some(front_extent)
-            }))
+            })
     }
 
     pub(super) fn poll_coordinated_hidden_refinement_ready(
@@ -6896,7 +7724,7 @@ impl Runtime {
                 target: request.target(),
             });
         }
-        self.collect_hidden_refinement_results();
+        self.collect_hidden_refinement_results()?;
         let slot = self.frame_coordinator.slot(request.target());
         Ok([slot.front, slot.candidate]
             .into_iter()
@@ -6908,7 +7736,7 @@ impl Runtime {
                     .and_then(|presentation| presentation.hidden_volume_refinement.as_ref())
                     .is_some_and(|refinement| {
                         refinement.matches(request)
-                            && matches!(refinement.status, HiddenRefinementStatus::Complete { .. })
+                            && matches!(&refinement.status, HiddenRefinementStatus::Complete)
                     })
             }))
     }
@@ -7079,6 +7907,7 @@ impl Runtime {
                 texture_revision,
                 frame_state: None,
                 last_rendered_frame: None,
+                last_rendered_intent: None,
                 last_rendered_volume_schedule: None,
                 last_rendered_timepoint: None,
                 last_rendered_volume: false,
@@ -7152,6 +7981,7 @@ impl Runtime {
             let released = presentation.frame_state.take().map(|state| state.residency);
             presentation.availability = None;
             presentation.last_rendered_frame = None;
+            presentation.last_rendered_intent = None;
             presentation.last_rendered_volume_schedule = None;
             presentation.last_rendered_timepoint = None;
             presentation.last_rendered_volume = false;
@@ -7365,7 +8195,9 @@ impl Runtime {
             .iter()
             .any(|request| request.intent().timepoint() != timepoint)
             || PresentationTarget::ALL.into_iter().any(|target| {
-                group.contains(target) && !self.frame_coordinator.slot(target).desired
+                group.contains(target)
+                    && (!self.frame_coordinator.slot(target).desired
+                        || !requests.iter().any(|request| request.target() == target))
             })
         {
             return Err(WgpuRenderRuntimeError::InvalidCoordinatedPublicationGroup);
@@ -7435,12 +8267,19 @@ impl Runtime {
         Ok(ordered)
     }
 
-    fn coordinated_plan_is_already_ready(
+    fn coordinated_front_satisfies_request(
         &self,
-        group: CoordinatedPublicationGroup,
-        plan: CoordinatedExecutionPlan<'_>,
+        request: CoordinatedTargetRequest<'_>,
+        exact_required: bool,
     ) -> bool {
-        let Ok(front) = self.frame_coordinator.front_token(plan.request.target()) else {
+        let slot = self.frame_coordinator.slot(request.target());
+        if !slot.desired
+            || slot.color_retry_pending
+            || slot.desired_extent != Some(request.output_extent())
+        {
+            return false;
+        }
+        let Ok(front) = self.frame_coordinator.front_token(request.target()) else {
             return false;
         };
         let presentation = self
@@ -7448,36 +8287,107 @@ impl Runtime {
             .presentations
             .get(&front)
             .expect("a coordinated front token owns one presentation");
-        presentation.last_rendered_frame == Some(plan.request.intent().frame())
-            && presentation.display.extent == plan.request.intent().extent()
-            && presentation.last_progress.as_ref().is_some_and(|progress| {
-                coordinated_progress_satisfies_group(group, progress.completeness())
-            })
-            && presentation
-                .last_rendered_requirements
-                .as_ref()
-                .is_some_and(|rendered| {
-                    rendered.shares_resources_with(plan.request.requirements())
-                        && rendered.prefetch_promoted()
-                            == plan.request.requirements().prefetch_promoted()
+        let schedule_matches = match request.intent().view() {
+            RenderViewIntent::Volume { .. } => {
+                presentation.last_rendered_volume_schedule == Some(request.volume_schedule())
+            }
+            RenderViewIntent::CrossSection(_) => {
+                presentation.last_rendered_volume_schedule.is_none()
+                    && request.volume_schedule() == VolumeColorSchedule::Direct
+            }
+        };
+        let (requirement_body_matches, prefetch_role_matches) = presentation
+            .last_rendered_requirements
+            .as_ref()
+            .map_or((false, false), |rendered| {
+                (
+                    rendered.shares_resources_with(request.requirements()),
+                    rendered.prefetch_promoted() == request.requirements().prefetch_promoted(),
+                )
+            });
+        CoordinatedReuseChecks {
+            slot_is_current: slot.desired
+                && !slot.color_retry_pending
+                && slot.desired_extent == Some(request.output_extent()),
+            target_matches: presentation.logical_target == request.target(),
+            frame_matches: presentation.last_rendered_frame == Some(request.intent().frame()),
+            intent_matches: presentation.last_rendered_intent.as_ref() == Some(request.intent()),
+            timepoint_matches: presentation.last_rendered_timepoint
+                == Some(request.intent().timepoint()),
+            extent_matches: presentation.display.extent == request.output_extent(),
+            completeness_matches: presentation.last_progress.as_ref().is_some_and(|progress| {
+                !exact_required || progress.completeness() == FrameCompleteness::Exact
+            }),
+            requirement_body_matches,
+            prefetch_role_matches,
+            schedule_matches,
+            residency_is_current: !presentation.rendered_residency_freshness.requires_refresh(),
+            body_work_is_quiescent: !self.coordinated_presentation_has_actionable_body_work(front),
+        }
+        .proves_reuse()
+    }
+
+    fn coordinated_reused_report(
+        &self,
+        request: CoordinatedTargetRequest<'_>,
+    ) -> CoordinatedTargetExecutionReport {
+        let front = self
+            .frame_coordinator
+            .front_token(request.target())
+            .expect("a reusable logical member retains its front");
+        let presentation = self
+            .frame_coordinator
+            .presentations
+            .get(&front)
+            .expect("a reusable logical member retains its presentation");
+        coordinated_reused_target_report(
+            request.target(),
+            self.frame_coordinator.device_generation,
+            presentation.texture_revision,
+            request.intent().frame(),
+            presentation.last_progress.clone(),
+        )
+    }
+
+    /// Reconstitutes the complete logical report in the renderer-validated
+    /// request order. An absent executed report is legal only for a member
+    /// whose current front still satisfies the request at this observation.
+    fn coordinated_complete_reports(
+        &self,
+        ordered: &[CoordinatedTargetRequest<'_>],
+        mut executed: [Option<CoordinatedTargetExecutionReport>; 4],
+        exact_required: bool,
+    ) -> Box<[CoordinatedTargetExecutionReport]> {
+        ordered
+            .iter()
+            .copied()
+            .map(|request| {
+                executed[request.target().index()].take().unwrap_or_else(|| {
+                    assert!(
+                        self.coordinated_front_satisfies_request(request, exact_required),
+                        "an omitted physical member must retain the renderer's current reuse proof"
+                    );
+                    self.coordinated_reused_report(request)
                 })
-            && !presentation.rendered_residency_freshness.requires_refresh()
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
     }
 
     fn coordinated_atomic_publication_ready(
         &self,
         group: CoordinatedPublicationGroup,
-        plans: &[CoordinatedExecutionPlan<'_>],
+        logical_requests: &[CoordinatedTargetRequest<'_>],
         color_passes: &[CoordinatedColorPass<'_>],
     ) -> bool {
         PresentationTarget::ALL.into_iter().all(|target| {
             if !group.contains(target) {
                 return true;
             }
-            let Some(plan) = plans
+            let Some(request) = logical_requests
                 .iter()
                 .copied()
-                .find(|plan| plan.request.target() == target)
+                .find(|request| request.target() == target)
             else {
                 return false;
             };
@@ -7485,7 +8395,7 @@ impl Runtime {
                 pass.plan.request.target() == target
                     && coordinated_progress_satisfies_group(group, pass.progress.completeness())
                     && pass.publishes_frame
-            }) || self.coordinated_plan_is_already_ready(group, plan)
+            }) || self.coordinated_front_satisfies_request(request, group.exact_required())
         })
     }
 
@@ -7624,9 +8534,25 @@ impl Runtime {
             && request.intent().frame() < latest
         {
             return Err(WgpuRenderRuntimeError::StaleFrame {
+                target: Some(request.target()),
                 actual: request.intent().frame(),
                 current: latest,
             });
+        }
+        let slot = self.frame_coordinator.slot(request.target());
+        for token in [slot.front, slot.candidate].into_iter().flatten() {
+            let presentation = self
+                .frame_coordinator
+                .presentations
+                .get(&token)
+                .expect("a coordinated slot owns every registered presentation");
+            if !same_frame_render_intent_is_compatible(
+                presentation.last_rendered_frame,
+                presentation.last_rendered_intent.as_ref(),
+                request.intent(),
+            ) {
+                return Err(WgpuRenderRuntimeError::FrameContractMismatch);
+            }
         }
         Ok(())
     }
@@ -7803,10 +8729,8 @@ impl Runtime {
         active_target: PresentationTarget,
         targets: &[CoordinatedTargetRequest<'_>],
     ) -> Result<CoordinatedFrameExecutionReport, WgpuRenderRuntimeError> {
-        self.pipelines
-            .ensure_capability(PipelineCapability::InitialRender)?;
         self.ensure_device_available()?;
-        self.collect_hidden_refinement_results();
+        self.collect_hidden_refinement_results()?;
         if !self.residency.catalog_is_active(catalog) {
             return Err(WgpuRenderRuntimeError::PayloadContractMismatch);
         }
@@ -7834,8 +8758,38 @@ impl Runtime {
             }
         }
 
-        let mut plans = Vec::with_capacity(ordered.len());
-        for request in ordered {
+        let exact_required = atomic_publication_group.is_none_or(|group| group.exact_required());
+        let mut initially_reused = [false; 4];
+        for request in &ordered {
+            initially_reused[request.target().index()] =
+                self.coordinated_front_satisfies_request(*request, exact_required);
+        }
+        if ordered
+            .iter()
+            .all(|request| initially_reused[request.target().index()])
+        {
+            let reports = ordered
+                .into_iter()
+                .map(|request| self.coordinated_reused_report(request))
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            self.frame_coordinator.last_recorded_targets.clear();
+            return Ok(coordinated_zero_delta_report(reports));
+        }
+        self.pipelines
+            .ensure_capability(PipelineCapability::InitialRender)?;
+
+        // Reused logical members are report members, not physical execution
+        // members. Excluding them before any pipeline/control/allocation
+        // preflight prevents an unchanged front from failing a mixed cutoff
+        // for work it does not need and makes the physical delta exact.
+        let execution_requests = ordered
+            .iter()
+            .copied()
+            .filter(|request| !initially_reused[request.target().index()])
+            .collect::<Vec<_>>();
+        let mut plans = Vec::with_capacity(execution_requests.len());
+        for request in execution_requests {
             let (token, candidate) = self.coordinated_execution_token(request)?;
             if matches!(
                 request.volume_schedule(),
@@ -8015,34 +8969,37 @@ impl Runtime {
                     .slot_mut(plan.request.target())
                     .color_retry_pending = true;
             }
-            let reports = plans
-                .into_iter()
-                .map(|plan| {
-                    let state = self
-                        .coordinated_layout_state(plan.request.target())
-                        .expect("a validated coordinated plan retains its desired front");
-                    CoordinatedTargetExecutionReport {
-                        target: plan.request.target(),
-                        device_generation: state.device_generation,
-                        texture_revision: state.texture_revision,
-                        frame: plan.request.intent().frame(),
-                        progress: None,
-                        presented: false,
-                        visited_resources: 0,
-                        uploaded_resources: 0,
-                        payload_upload_bytes: 0,
-                        control_upload_bytes: 0,
-                        residency_command_buffers: 0,
-                        residency_queue_submissions: 0,
-                        deferred_by_backpressure: true,
-                        volume_refinement: None,
-                        validation_capture: None,
-                        newly_resident_keys: Box::new([]),
-                        evicted_keys: Box::new([]),
-                    }
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
+            let mut executed = std::array::from_fn(|_| None);
+            for plan in plans {
+                let state = self
+                    .coordinated_layout_state(plan.request.target())
+                    .expect("a validated coordinated plan retains its desired front");
+                let report = CoordinatedTargetExecutionReport {
+                    target: plan.request.target(),
+                    device_generation: state.device_generation,
+                    texture_revision: state.texture_revision,
+                    frame: plan.request.intent().frame(),
+                    progress: None,
+                    presented: false,
+                    current: false,
+                    disposition: CoordinatedMemberDisposition::Executed,
+                    visited_resources: 0,
+                    uploaded_resources: 0,
+                    payload_upload_bytes: 0,
+                    control_upload_bytes: 0,
+                    residency_command_buffers: 0,
+                    residency_queue_submissions: 0,
+                    deferred_by_backpressure: true,
+                    actionable_work_remaining: true,
+                    hidden_refinement: None,
+                    hidden_refinement_job: None,
+                    validation_capture: None,
+                    newly_resident_keys: Box::new([]),
+                    evicted_keys: Box::new([]),
+                };
+                executed[plan.request.target().index()] = Some(report);
+            }
+            let reports = self.coordinated_complete_reports(&ordered, executed, exact_required);
             self.frame_coordinator.last_recorded_targets.clear();
             return Ok(CoordinatedFrameExecutionReport {
                 targets: reports,
@@ -8139,7 +9096,8 @@ impl Runtime {
         let color_cpu_start = self.cpu_timing_start();
         let mut color_passes = Vec::with_capacity(prepared.len());
         let mut hidden_passes = Vec::with_capacity(1);
-        let mut volume_refinement_by_report = vec![None; prepared.len()];
+        let mut hidden_refinement_by_report = vec![None; prepared.len()];
+        let hidden_capability_failure = self.hidden_refinement.capability_failure();
         let mut control_bytes = 0_u64;
         let mut replacement_display_bytes = 0_u64;
         let mut capture_bytes = 0_u64;
@@ -8221,7 +9179,7 @@ impl Runtime {
             let new_display = preflight_displays[report_index].take();
             let new_texture_revision = preflight_texture_revisions[report_index].take();
             debug_assert_eq!(new_display.is_some(), new_texture_revision.is_some());
-            match planned_color_work(presentation, *plan) {
+            match planned_color_work(presentation, *plan, hidden_capability_failure) {
                 PlannedColorWork::Main {
                     region,
                     progress: volume_refinement,
@@ -8255,7 +9213,8 @@ impl Runtime {
                     initial_batch_rows,
                     progress: volume_refinement,
                 } => {
-                    volume_refinement_by_report[report_index] = Some(volume_refinement);
+                    hidden_refinement_by_report[report_index] =
+                        Some(HiddenRefinementState::Running(volume_refinement));
                     hidden_passes.push(CoordinatedHiddenPass {
                         plan: *plan,
                         report_index,
@@ -8268,15 +9227,35 @@ impl Runtime {
                 PlannedColorWork::HiddenRunning {
                     progress: volume_refinement,
                 } => {
-                    volume_refinement_by_report[report_index] = Some(volume_refinement);
+                    hidden_refinement_by_report[report_index] =
+                        Some(HiddenRefinementState::Running(volume_refinement));
                 }
-                PlannedColorWork::HiddenFailed => {
-                    return Err(WgpuRenderRuntimeError::HiddenRefinementFailed);
+                PlannedColorWork::HiddenWaitingForSubmission {
+                    progress,
+                    after_completion,
+                } => {
+                    hidden_refinement_by_report[report_index] =
+                        Some(HiddenRefinementState::WaitingForSubmission {
+                            progress,
+                            after_completion,
+                        });
+                }
+                PlannedColorWork::HiddenComplete { progress } => {
+                    hidden_refinement_by_report[report_index] =
+                        Some(HiddenRefinementState::Complete(progress));
+                }
+                PlannedColorWork::HiddenFailed { cause } => {
+                    hidden_refinement_by_report[report_index] =
+                        Some(HiddenRefinementState::Failed(cause));
+                }
+                PlannedColorWork::HiddenCapabilityFailed { cause } => {
+                    hidden_refinement_by_report[report_index] =
+                        Some(HiddenRefinementState::CapabilityFailed(cause));
                 }
             }
         }
         if atomic_publication_group.is_some_and(|group| {
-            !self.coordinated_atomic_publication_ready(group, &plans, &color_passes)
+            !self.coordinated_atomic_publication_ready(group, &ordered, &color_passes)
         }) {
             // Residency and private refinement above are productive even when
             // another visible target is not ready. Dropping the public color
@@ -8330,7 +9309,14 @@ impl Runtime {
                 .initial()
                 .expect("coordinated pipelines were preflighted");
             for mut pass in hidden_passes {
-                let job_id = self.hidden_refinement.allocate_job()?;
+                let job_id = match self.hidden_refinement.allocate_job() {
+                    Ok(job_id) => job_id,
+                    Err(cause) => {
+                        hidden_refinement_by_report[pass.report_index] =
+                            Some(HiddenRefinementState::CapabilityFailed(cause));
+                        continue;
+                    }
+                };
                 let control_capacity =
                     align_copy(pass.control.len() as u64).max(INITIAL_CONTROL_BYTES);
                 let control_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -8359,7 +9345,12 @@ impl Runtime {
                     .presentations
                     .get_mut(&pass.plan.token)
                     .expect("a coordinated hidden pass retains its allocation");
-                if let Some(previous) = presentation.hidden_volume_refinement.take() {
+                let previous = presentation.hidden_volume_refinement.take();
+                let timeout_count = previous
+                    .as_ref()
+                    .filter(|refinement| refinement.matches(pass.plan.request))
+                    .map_or(0, |refinement| refinement.timeout_count);
+                if let Some(previous) = previous {
                     self.hidden_refinement.cancel(previous.job_id);
                 }
                 if let Some(display) = pass.new_display.take() {
@@ -8368,28 +9359,42 @@ impl Runtime {
                 if let Some(revision) = pass.new_texture_revision {
                     presentation.texture_revision = revision;
                 }
+                let resources = Arc::new(HiddenRefinementResources {
+                    _control_buffer: control_buffer,
+                    render_bind_group,
+                    color_view: presentation.display.color_view.clone(),
+                    fact_view: presentation.display.fact_view.clone(),
+                });
                 presentation.hidden_volume_refinement = Some(HiddenVolumeRefinementState {
                     job_id,
                     frame: pass.plan.request.intent().frame(),
                     requirements: pass.plan.request.requirements().clone(),
                     extent: pass.plan.request.intent().extent(),
                     completed_rows: Arc::clone(&completed_rows),
-                    _control_buffer: control_buffer,
-                    _render_bind_group: render_bind_group.clone(),
+                    _resources: Arc::clone(&resources),
                     control_capacity,
+                    timeout_count,
                     status: HiddenRefinementStatus::Running,
                 });
                 let job = HiddenRefinementJob {
                     id: job_id,
                     pipeline: pipelines.for_intent(pass.plan.request.intent()).clone(),
-                    bind_group: render_bind_group,
-                    color_view: presentation.display.color_view.clone(),
-                    fact_view: presentation.display.fact_view.clone(),
+                    resources,
                     extent: presentation.display.extent,
                     initial_batch_rows: pass.initial_batch_rows,
                     completed_rows,
+                    latest_submission: Arc::new(Mutex::new(None)),
                 };
-                self.hidden_refinement.replace(job);
+                if let Err(cause) = self.hidden_refinement.replace(job) {
+                    presentation
+                        .hidden_volume_refinement
+                        .as_mut()
+                        .expect("the rejected hidden job retains its state")
+                        .status = HiddenRefinementStatus::CapabilityFailed(cause);
+                    hidden_refinement_by_report[pass.report_index] =
+                        Some(HiddenRefinementState::CapabilityFailed(cause));
+                    continue;
+                }
                 self.frame_coordinator
                     .slot_mut(pass.plan.request.target())
                     .color_retry_pending = false;
@@ -8622,6 +9627,11 @@ impl Runtime {
             let in_flight_color = Arc::clone(&self.frame_coordinator.in_flight_color_cutoffs);
             let completed_color_cutoffs =
                 Arc::clone(&self.frame_coordinator.completed_color_cutoffs);
+            let accept_color_completions =
+                Arc::clone(&self.frame_coordinator.accept_color_completions);
+            let event_sink = Arc::clone(&self.renderer_event_sink);
+            let submission_event = self.allocate_submission_event();
+            let completed_submission_event = Arc::clone(&self.completed_submission_event);
             let residency_generation = self.frame_coordinator.residency_generation;
             let submitted = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
             let submitted_color = in_flight_color.fetch_add(1, Ordering::AcqRel) + 1;
@@ -8631,15 +9641,25 @@ impl Runtime {
                 .peak_in_flight_color_cutoffs
                 .max(submitted_color);
             self.queue.on_submitted_work_done(move || {
-                completed_color_cutoffs
+                let mut completed = completed_color_cutoffs
                     .lock()
-                    .expect("the color-completion queue is never poisoned")
-                    .push(CompletedColorCutoff {
+                    .expect("the color-completion queue is never poisoned");
+                if accept_color_completions.load(Ordering::Acquire) {
+                    completed.push(CompletedColorCutoff {
                         residency_generation,
                         cutoff: color_cutoff,
                     });
+                }
+                drop(completed);
                 in_flight.fetch_sub(1, Ordering::AcqRel);
                 in_flight_color.fetch_sub(1, Ordering::AcqRel);
+                completed_submission_event.fetch_max(submission_event, Ordering::AcqRel);
+                wake_renderer_event(
+                    &event_sink,
+                    RendererEvent::SubmissionCompleted {
+                        submission: submission_event,
+                    },
+                );
             });
             self.diagnostics.current_in_flight_submissions = submitted;
             self.diagnostics.peak_in_flight_submissions =
@@ -8701,10 +9721,12 @@ impl Runtime {
             if let Some(revision) = pass.new_texture_revision {
                 presentation.texture_revision = revision;
             }
-            volume_refinement_by_report[pass.report_index] = pass.volume_refinement;
+            hidden_refinement_by_report[pass.report_index] =
+                pass.volume_refinement.map(HiddenRefinementState::Complete);
             debug_assert!(pass.publishes_frame);
             presentation.hidden_volume_refinement = None;
             presentation.last_rendered_frame = Some(pass.plan.request.intent().frame());
+            presentation.last_rendered_intent = Some(pass.plan.request.intent().clone());
             presentation.last_rendered_volume_schedule = matches!(
                 pass.plan.request.intent().view(),
                 RenderViewIntent::Volume { .. }
@@ -8824,35 +9846,59 @@ impl Runtime {
             .iter()
             .map(|(_, report)| report.queue_submissions)
             .sum();
-        let reports = prepared
-            .into_iter()
-            .enumerate()
-            .map(|(index, (plan, report))| {
-                let state = self
-                    .coordinated_layout_state(plan.request.target())
-                    .expect("a submitted coordinated cutoff retains every desired front");
-                CoordinatedTargetExecutionReport {
-                    target: plan.request.target(),
-                    device_generation: state.device_generation,
-                    texture_revision: state.texture_revision,
-                    frame: report.frame,
-                    progress: report.progress,
-                    presented: presented_by_report[index],
-                    visited_resources: report.visited_resources,
-                    uploaded_resources: report.uploaded_resources,
-                    payload_upload_bytes: report.payload_upload_bytes,
-                    control_upload_bytes: color_control_bytes_by_report[index],
-                    residency_command_buffers: report.command_buffers,
-                    residency_queue_submissions: report.queue_submissions,
-                    deferred_by_backpressure: report.deferred_by_backpressure,
-                    volume_refinement: volume_refinement_by_report[index],
-                    validation_capture: capture_by_report[index],
-                    newly_resident_keys: report.newly_resident_keys,
-                    evicted_keys: report.evicted_keys,
-                }
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let mut executed = std::array::from_fn(|_| None);
+        for (index, (plan, report)) in prepared.into_iter().enumerate() {
+            let state = self
+                .coordinated_layout_state(plan.request.target())
+                .expect("a submitted coordinated cutoff retains every desired front");
+            let target = plan.request.target();
+            let hidden_refinement = hidden_refinement_by_report[index];
+            let hidden_refinement_job = match hidden_refinement {
+                Some(
+                    HiddenRefinementState::Running(_)
+                    | HiddenRefinementState::WaitingForSubmission { .. },
+                ) => Some(
+                    self.frame_coordinator
+                        .presentations
+                        .get(&plan.token)
+                        .and_then(|presentation| presentation.hidden_volume_refinement.as_ref())
+                        .expect("a reported hidden wait retains its exact worker job")
+                        .job_id,
+                ),
+                Some(
+                    HiddenRefinementState::RetryReady
+                    | HiddenRefinementState::Failed(_)
+                    | HiddenRefinementState::CapabilityFailed(_)
+                    | HiddenRefinementState::Complete(_),
+                )
+                | None => None,
+            };
+            let execution_report = CoordinatedTargetExecutionReport {
+                target: plan.request.target(),
+                device_generation: state.device_generation,
+                texture_revision: state.texture_revision,
+                frame: report.frame,
+                progress: report.progress,
+                presented: presented_by_report[index],
+                current: self.coordinated_front_satisfies_request(plan.request, exact_required),
+                disposition: CoordinatedMemberDisposition::Executed,
+                visited_resources: report.visited_resources,
+                uploaded_resources: report.uploaded_resources,
+                payload_upload_bytes: report.payload_upload_bytes,
+                control_upload_bytes: color_control_bytes_by_report[index],
+                residency_command_buffers: report.command_buffers,
+                residency_queue_submissions: report.queue_submissions,
+                deferred_by_backpressure: report.deferred_by_backpressure,
+                actionable_work_remaining: self.coordinated_target_has_actionable_work(target),
+                hidden_refinement,
+                hidden_refinement_job,
+                validation_capture: capture_by_report[index],
+                newly_resident_keys: report.newly_resident_keys,
+                evicted_keys: report.evicted_keys,
+            };
+            executed[target.index()] = Some(execution_report);
+        }
+        let reports = self.coordinated_complete_reports(&ordered, executed, exact_required);
         Ok(CoordinatedFrameExecutionReport {
             targets: reports,
             recorded_targets,
@@ -8900,6 +9946,7 @@ impl Runtime {
             && intent.frame() < current.frame
         {
             return Err(WgpuRenderRuntimeError::StaleFrame {
+                target: None,
                 actual: intent.frame(),
                 current: current.frame,
             });
@@ -9453,10 +10500,20 @@ impl Runtime {
             }
             command_buffers = 1;
             queue_submissions = 1;
+            let submission_event = self.allocate_submission_event();
+            let completed_submission_event = Arc::clone(&self.completed_submission_event);
             let in_flight = Arc::clone(&self.in_flight_submissions);
+            let event_sink = Arc::clone(&self.renderer_event_sink);
             let submitted = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
             self.queue.on_submitted_work_done(move || {
                 in_flight.fetch_sub(1, Ordering::AcqRel);
+                completed_submission_event.fetch_max(submission_event, Ordering::AcqRel);
+                wake_renderer_event(
+                    &event_sink,
+                    RendererEvent::SubmissionCompleted {
+                        submission: submission_event,
+                    },
+                );
             });
             self.diagnostics.current_in_flight_submissions = submitted;
             self.diagnostics.peak_in_flight_submissions =
@@ -10075,6 +11132,8 @@ impl Runtime {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("mirante4d-pick-command-encoder"),
             });
+        let submission_event = self.allocate_submission_event();
+        let completed_submission_event = Arc::clone(&self.completed_submission_event);
         let pick_pipeline = self.pipelines.pick()?;
         let slot = &mut self.pick.slots[slot_index];
         encoder.copy_buffer_to_buffer(&staging, 0, &slot.query_buffer, 0, PICK_QUERY_BYTES);
@@ -10100,12 +11159,21 @@ impl Runtime {
         let command_buffer = encoder.finish();
         gpu_failure.ensure_available()?;
         let in_flight_counter = Arc::clone(&self.in_flight_submissions);
+        let submission_event_sink = Arc::clone(&self.renderer_event_sink);
+        let map_event_sink = Arc::clone(&self.renderer_event_sink);
         let submitted = in_flight_counter.fetch_add(1, Ordering::AcqRel) + 1;
         let mapped = Arc::new(Mutex::new(None));
         let callback = Arc::clone(&mapped);
         self.queue.submit([command_buffer]);
         self.queue.on_submitted_work_done(move || {
             in_flight_counter.fetch_sub(1, Ordering::AcqRel);
+            completed_submission_event.fetch_max(submission_event, Ordering::AcqRel);
+            wake_renderer_event(
+                &submission_event_sink,
+                RendererEvent::SubmissionCompleted {
+                    submission: submission_event,
+                },
+            );
         });
         slot.readback
             .slice(..)
@@ -10113,6 +11181,7 @@ impl Runtime {
                 if let Ok(mut status) = callback.lock() {
                     *status = Some(result.map_err(|_| ()));
                 }
+                wake_renderer_event(&map_event_sink, RendererEvent::PickMapCompleted);
             });
         slot.state = PickSlotState::Pending {
             ticket,
@@ -10239,6 +11308,7 @@ impl Runtime {
             && intent.frame() < current.frame
         {
             return Err(WgpuRenderRuntimeError::StaleFrame {
+                target: None,
                 actual: intent.frame(),
                 current: current.frame,
             });
@@ -10728,13 +11798,17 @@ mod tests {
     }
 
     fn frame_intent(frame: u64, layer: LogicalLayerKey) -> RenderIntent {
+        frame_intent_at(frame, layer, 0.0)
+    }
+
+    fn frame_intent_at(frame: u64, layer: LogicalLayerKey, center_x: f64) -> RenderIntent {
         RenderIntent::new(
             FrameIdentity::new(frame),
             DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(1)),
             TimeIndex::new(0),
             RenderViewIntent::cross_section(
                 CrossSectionView::new(
-                    WorldPoint3::new(0.0, 0.0, 0.0).expect("test center is finite"),
+                    WorldPoint3::new(center_x, 0.0, 0.0).expect("test center is finite"),
                     UnitQuaternion::identity(),
                     1.0,
                     1.0,
@@ -10819,6 +11893,413 @@ mod tests {
             HIDDEN_REFINEMENT_MAX_BATCH_ROWS
         );
         assert_eq!(adapted_hidden_batch_rows(64, 1_000_000, 7), 7);
+    }
+
+    fn incomplete_hidden_submission() -> HiddenSubmissionCompletion {
+        HiddenSubmissionCompletion {
+            complete: Arc::new(AtomicBool::new(false)),
+            notify_waiter: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    #[test]
+    fn hidden_timeout_waits_for_submission_then_retries_once() {
+        let completion = incomplete_hidden_submission();
+        let mut timeout_count = 0;
+        let waiting = hidden_timeout_wait(&mut timeout_count, completion.clone());
+        assert_eq!(timeout_count, 1);
+        assert!(matches!(
+            waiting,
+            HiddenRefinementStatus::WaitingForSubmission {
+                after_completion: HiddenAfterSubmission::RetryOnce,
+                ..
+            }
+        ));
+        assert!(completed_hidden_submission_transition(&waiting).is_none());
+
+        completion.complete.store(true, Ordering::Release);
+        assert!(matches!(
+            completed_hidden_submission_transition(&waiting),
+            Some(HiddenRefinementStatus::RetryReady)
+        ));
+    }
+
+    #[test]
+    fn hidden_second_timeout_latches_without_publishing_partial_rows() {
+        let mut timeout_count = 1;
+        let completion = incomplete_hidden_submission();
+        let waiting = hidden_timeout_wait(&mut timeout_count, completion.clone());
+        assert_eq!(timeout_count, 2);
+        assert!(matches!(
+            waiting,
+            HiddenRefinementStatus::WaitingForSubmission {
+                after_completion: HiddenAfterSubmission::FailRequest,
+                ..
+            }
+        ));
+        assert!(!matches!(waiting, HiddenRefinementStatus::Complete));
+        assert!(completed_hidden_submission_transition(&waiting).is_none());
+
+        completion.complete.store(true, Ordering::Release);
+        assert!(matches!(
+            completed_hidden_submission_transition(&waiting),
+            Some(HiddenRefinementStatus::Failed)
+        ));
+    }
+
+    #[test]
+    fn hidden_worker_panic_retains_front_and_quarantines_in_flight_candidate() {
+        let cause = HiddenRefinementCapabilityFailure::WorkerPanicked;
+        let completion = incomplete_hidden_submission();
+        let waiting = hidden_panic_wait(Some(completion.clone()), cause);
+        assert!(matches!(
+            waiting,
+            HiddenRefinementStatus::WaitingForSubmission {
+                after_completion: HiddenAfterSubmission::FailCapability(
+                    HiddenRefinementCapabilityFailure::WorkerPanicked
+                ),
+                ..
+            }
+        ));
+        assert!(completed_hidden_submission_transition(&waiting).is_none());
+        assert!(!volume_schedule_requires_hidden_capability(
+            VolumeColorSchedule::Direct
+        ));
+
+        completion.complete.store(true, Ordering::Release);
+        assert!(matches!(
+            completed_hidden_submission_transition(&waiting),
+            Some(HiddenRefinementStatus::CapabilityFailed(
+                HiddenRefinementCapabilityFailure::WorkerPanicked
+            ))
+        ));
+        assert!(matches!(
+            hidden_panic_wait(None, cause),
+            HiddenRefinementStatus::CapabilityFailed(
+                HiddenRefinementCapabilityFailure::WorkerPanicked
+            )
+        ));
+    }
+
+    #[test]
+    fn hidden_device_failure_uses_global_first_cause() {
+        let latch = GpuFailureLatch::default();
+        latch.record_device_loss(wgpu::DeviceLostReason::Unknown);
+        let outcome = HiddenRefinementWorkerOutcome::DeviceFailed {
+            cause: latch.ensure_available().unwrap_err(),
+        };
+        latch.record_backend_internal();
+        assert_eq!(
+            latch.ensure_available(),
+            Err(WgpuRenderRuntimeError::DeviceLost)
+        );
+        assert!(matches!(
+            outcome,
+            HiddenRefinementWorkerOutcome::DeviceFailed {
+                cause: WgpuRenderRuntimeError::DeviceLost
+            }
+        ));
+    }
+
+    #[test]
+    fn hidden_worker_spawn_failure_is_capability_local() {
+        let mut scheduler = HiddenRefinementScheduler::failed_for_test(
+            HiddenRefinementCapabilityFailure::WorkerSpawnFailed,
+        );
+        assert_eq!(
+            scheduler.allocate_job(),
+            Err(HiddenRefinementCapabilityFailure::WorkerSpawnFailed)
+        );
+        assert!(!volume_schedule_requires_hidden_capability(
+            VolumeColorSchedule::Direct
+        ));
+        assert!(!volume_schedule_requires_hidden_capability(
+            VolumeColorSchedule::InteractivePreview
+        ));
+        assert!(volume_schedule_requires_hidden_capability(
+            VolumeColorSchedule::AtomicRefinement {
+                strip_height_pixels: 8,
+            }
+        ));
+    }
+
+    #[test]
+    fn resource_identity_exhaustion_is_operation_scoped() {
+        let mut coordinator = FrameCoordinator::new().expect("the test coordinator allocates");
+        coordinator.next_private_presentation = u64::MAX;
+        assert_eq!(
+            coordinator.allocate_private_presentation(),
+            Err(WgpuRenderRuntimeError::PrivatePresentationIdExhausted)
+        );
+        assert!(coordinator.private_presentation_identity_exhausted);
+        assert_eq!(
+            coordinator.allocate_private_presentation(),
+            Err(WgpuRenderRuntimeError::PrivatePresentationIdExhausted)
+        );
+        assert_eq!(
+            coordinator
+                .allocate_texture_revision()
+                .expect("private-presentation exhaustion does not poison texture revisions")
+                .get(),
+            1
+        );
+
+        coordinator.next_texture_revision = u64::MAX;
+        assert_eq!(
+            coordinator.allocate_texture_revision(),
+            Err(WgpuRenderRuntimeError::TextureRevisionExhausted)
+        );
+        assert!(coordinator.texture_revision_exhausted);
+        assert_eq!(
+            coordinator.allocate_texture_revision(),
+            Err(WgpuRenderRuntimeError::TextureRevisionExhausted)
+        );
+
+        let mut hidden = HiddenJobIdentity {
+            next: u64::MAX,
+            exhausted: false,
+        };
+        assert_eq!(
+            hidden.allocate(),
+            Err(HiddenRefinementCapabilityFailure::JobIdentityExhausted)
+        );
+        assert!(hidden.exhausted);
+        assert_eq!(
+            hidden.allocate(),
+            Err(HiddenRefinementCapabilityFailure::JobIdentityExhausted)
+        );
+    }
+
+    #[test]
+    fn composed_all_reused_validates_body_role_and_renderer_lineage() {
+        let valid = CoordinatedReuseChecks {
+            slot_is_current: true,
+            target_matches: true,
+            frame_matches: true,
+            intent_matches: true,
+            timepoint_matches: true,
+            extent_matches: true,
+            completeness_matches: true,
+            requirement_body_matches: true,
+            prefetch_role_matches: true,
+            schedule_matches: true,
+            residency_is_current: true,
+            body_work_is_quiescent: true,
+        };
+        assert!(valid.proves_reuse());
+        for invalid in [
+            CoordinatedReuseChecks {
+                slot_is_current: false,
+                ..valid
+            },
+            CoordinatedReuseChecks {
+                target_matches: false,
+                ..valid
+            },
+            CoordinatedReuseChecks {
+                frame_matches: false,
+                ..valid
+            },
+            CoordinatedReuseChecks {
+                intent_matches: false,
+                ..valid
+            },
+            CoordinatedReuseChecks {
+                timepoint_matches: false,
+                ..valid
+            },
+            CoordinatedReuseChecks {
+                extent_matches: false,
+                ..valid
+            },
+            CoordinatedReuseChecks {
+                completeness_matches: false,
+                ..valid
+            },
+            CoordinatedReuseChecks {
+                requirement_body_matches: false,
+                ..valid
+            },
+            CoordinatedReuseChecks {
+                prefetch_role_matches: false,
+                ..valid
+            },
+            CoordinatedReuseChecks {
+                schedule_matches: false,
+                ..valid
+            },
+            CoordinatedReuseChecks {
+                residency_is_current: false,
+                ..valid
+            },
+            CoordinatedReuseChecks {
+                body_work_is_quiescent: false,
+                ..valid
+            },
+        ] {
+            assert!(!invalid.proves_reuse());
+        }
+
+        let resident = key(3, 0, 0, 1);
+        let requirements = frame_requirements(43, &[resident]);
+        let progress = FrameProgress::new(
+            FrameCoverage::from_available(&requirements, &[resident])
+                .expect("the reuse fixture has valid coverage"),
+            FrameCompleteness::Exact,
+            None,
+        )
+        .expect("full coverage is exact progress");
+        let report = coordinated_reused_target_report(
+            PresentationTarget::ThreeD,
+            RendererDeviceGeneration(37),
+            TargetTextureRevision(41),
+            FrameIdentity::new(43),
+            Some(progress),
+        );
+        assert_eq!(report.device_generation().get(), 37);
+        assert_eq!(report.texture_revision().get(), 41);
+        assert_eq!(report.target(), PresentationTarget::ThreeD);
+        assert_eq!(report.frame(), FrameIdentity::new(43));
+        assert!(report.progress().is_some_and(|progress| {
+            progress.completeness() == FrameCompleteness::Exact && progress.coverage().is_full()
+        }));
+        assert!(report.current());
+        assert_eq!(report.disposition(), CoordinatedMemberDisposition::Reused);
+    }
+
+    #[test]
+    fn composed_zero_delta_submits_nothing_after_current_renderer_proof() {
+        let resident = key(3, 0, 0, 1);
+        let requirements = frame_requirements(13, &[resident]);
+        let progress = FrameProgress::new(
+            FrameCoverage::from_available(&requirements, &[resident])
+                .expect("the exact reuse fixture has valid coverage"),
+            FrameCompleteness::Exact,
+            None,
+        )
+        .expect("full coverage is exact progress");
+        let reports = PresentationTarget::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, target)| {
+                coordinated_reused_target_report(
+                    target,
+                    RendererDeviceGeneration(7),
+                    TargetTextureRevision(11 + index as u64),
+                    FrameIdentity::new(13),
+                    Some(progress.clone()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let cutoff = coordinated_zero_delta_report(reports);
+        assert_eq!(cutoff.targets().len(), 4);
+        assert!(cutoff.targets().iter().all(|target| {
+            target.current()
+                && target.disposition() == CoordinatedMemberDisposition::Reused
+                && target.visited_resources() == 0
+                && target.uploaded_resources() == 0
+                && !target.actionable_work_remaining()
+                && target.progress().is_some_and(|progress| {
+                    progress.completeness() == FrameCompleteness::Exact
+                        && progress.coverage().is_full()
+                })
+        }));
+        assert!(cutoff.recorded_targets().is_empty());
+        assert_eq!(cutoff.residency_queue_submissions(), 0);
+        assert_eq!(cutoff.color_queue_submissions(), 0);
+        assert!(cutoff.cpu_timing().is_none());
+        assert!(cutoff.gpu_timing().is_none());
+    }
+
+    #[test]
+    fn same_frame_changed_render_intent_is_contract_mismatch() {
+        let layer = LogicalLayerKey::new(7);
+        let rendered = frame_intent_at(19, layer, 0.0);
+        let unchanged_clone = rendered.clone();
+        let changed = frame_intent_at(19, layer, 1.0);
+        assert!(same_frame_render_intent_is_compatible(
+            Some(FrameIdentity::new(19)),
+            Some(&rendered),
+            &unchanged_clone,
+        ));
+        assert!(!same_frame_render_intent_is_compatible(
+            Some(FrameIdentity::new(19)),
+            Some(&rendered),
+            &changed,
+        ));
+        assert!(same_frame_render_intent_is_compatible(
+            Some(FrameIdentity::new(18)),
+            Some(&rendered),
+            &changed,
+        ));
+    }
+
+    #[test]
+    fn hidden_worker_result_queue_is_bounded_under_replacement_cancellation() {
+        let mut results = VecDeque::new();
+        for job_id in 1..=128 {
+            push_hidden_refinement_result(
+                &mut results,
+                HiddenRefinementWorkerResult {
+                    job_id,
+                    outcome: HiddenRefinementWorkerOutcome::Cancelled {
+                        batches: 0,
+                        rows: 0,
+                        elapsed_ns: 0,
+                    },
+                },
+            );
+        }
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].job_id, 128);
+
+        for job_id in 129..=132 {
+            push_hidden_refinement_result(
+                &mut results,
+                HiddenRefinementWorkerResult {
+                    job_id,
+                    outcome: HiddenRefinementWorkerOutcome::Complete {
+                        batches: 1,
+                        rows: 1,
+                        elapsed_ns: 1,
+                        last_batch_rows: 1,
+                    },
+                },
+            );
+            assert!(results.len() <= HIDDEN_REFINEMENT_RESULT_CAPACITY);
+        }
+        assert_eq!(results.back().map(|result| result.job_id), Some(132));
+    }
+
+    #[test]
+    fn terminal_hidden_scheduler_rejects_late_worker_result() {
+        let scheduler = HiddenRefinementScheduler::failed_for_test(
+            HiddenRefinementCapabilityFailure::WorkerSpawnFailed,
+        );
+        scheduler.retire_terminal_work();
+        let published = publish_hidden_refinement_result(
+            &scheduler.results,
+            &scheduler.accept_results,
+            HiddenRefinementWorkerResult {
+                job_id: 7,
+                outcome: HiddenRefinementWorkerOutcome::Complete {
+                    batches: 1,
+                    rows: 1,
+                    elapsed_ns: 1,
+                    last_batch_rows: 1,
+                },
+            },
+        );
+        assert!(!published);
+        assert!(!scheduler.has_result());
+        assert!(
+            scheduler
+                .results
+                .lock()
+                .expect("the test result queue is not poisoned")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -11184,17 +12665,22 @@ mod tests {
             )
             .expect("test requirements are valid")
         };
+        let forward_requirements = requirements_for(&forward);
+        let forward_envelope =
+            ShaderWorkEnvelope::for_intent(&catalog, &forward, &forward_requirements)
+                .expect("forward shader work is valid");
+        let forward = forward.with_shader_work_envelope(forward_envelope);
+        let reversed_requirements = requirements_for(&reversed);
+        let reversed_envelope =
+            ShaderWorkEnvelope::for_intent(&catalog, &reversed, &reversed_requirements)
+                .expect("reversed shader work is valid");
+        let reversed = reversed.with_shader_work_envelope(reversed_envelope);
         let forward_control =
-            build_target_control(&catalog, &grids, &forward, &requirements_for(&forward), 17)
+            build_target_control(&catalog, &grids, &forward, &forward_requirements, 17)
                 .expect("forward control is valid");
-        let reversed_control = build_target_control(
-            &catalog,
-            &grids,
-            &reversed,
-            &requirements_for(&reversed),
-            17,
-        )
-        .expect("reversed control is valid");
+        let reversed_control =
+            build_target_control(&catalog, &grids, &reversed, &reversed_requirements, 17)
+                .expect("reversed control is valid");
         let forward_words = bytemuck::cast_slice::<u8, u32>(&forward_control);
         let reversed_words = bytemuck::cast_slice::<u8, u32>(&reversed_control);
 
@@ -11810,6 +13296,116 @@ mod tests {
         }
         assert_eq!(state.initial, Some(31));
         assert_eq!(state.pick, Some(47));
+    }
+
+    #[test]
+    fn pick_validation_failure_preserves_ready_initial_render_capability() {
+        let compiler = PipelineCompiler::spawn(
+            || Ok::<_, PipelineCompilationFailureCause>(31_u8),
+            || Err::<u8, _>(PipelineCompilationFailureCause::Validation),
+        )
+        .expect("the bounded compiler worker starts");
+        let mut state = PipelineState::compiling(compiler);
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+
+        loop {
+            match state.poll() {
+                Ok(PipelineReadiness::CompilingInitial) => {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Ok(PipelineReadiness::InitialRenderReady) => break,
+                Ok(PipelineReadiness::Ready) => panic!("Pick unexpectedly compiled"),
+                Err(error) => panic!("InitialRender unexpectedly failed: {error}"),
+            }
+        }
+
+        let pick_error = loop {
+            match state.poll() {
+                Ok(PipelineReadiness::InitialRenderReady) => {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => break error,
+                Ok(readiness) => panic!("Pick failure published {readiness:?}"),
+            }
+        };
+        assert_eq!(
+            pick_error,
+            WgpuRenderRuntimeError::PipelineCompilationFailed {
+                capability: PipelineCapability::Pick,
+                cause: PipelineCompilationFailureCause::Validation,
+            }
+        );
+        assert_eq!(
+            state.capability_is_ready(PipelineCapability::InitialRender),
+            Ok(true),
+            "a Pick-local validation failure cannot revoke ready color pipelines"
+        );
+        assert_eq!(
+            state.capability_is_ready(PipelineCapability::Pick),
+            Err(pick_error)
+        );
+    }
+
+    #[test]
+    fn pick_device_failure_promotes_to_global_renderer_terminal() {
+        for (cause, terminal) in [
+            (
+                PipelineCompilationFailureCause::DeviceOutOfMemory,
+                WgpuRenderRuntimeError::DeviceOutOfMemory,
+            ),
+            (
+                PipelineCompilationFailureCause::BackendInternal,
+                WgpuRenderRuntimeError::BackendInternal,
+            ),
+        ] {
+            let compiler = PipelineCompiler::spawn(
+                || Ok::<_, PipelineCompilationFailureCause>(31_u8),
+                move || Err::<u8, _>(cause),
+            )
+            .expect("the bounded compiler worker starts");
+            let mut state = PipelineState::compiling(compiler);
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match state.poll() {
+                    Ok(PipelineReadiness::CompilingInitial) => {
+                        assert!(Instant::now() < deadline);
+                        thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Ok(PipelineReadiness::InitialRenderReady) => break,
+                    Ok(PipelineReadiness::Ready) => panic!("Pick unexpectedly compiled"),
+                    Err(error) => panic!("InitialRender unexpectedly failed: {error}"),
+                }
+            }
+
+            let pick_error = loop {
+                match state.poll() {
+                    Ok(PipelineReadiness::InitialRenderReady) => {
+                        assert!(Instant::now() < deadline);
+                        thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error) => break error,
+                    Ok(readiness) => panic!("Pick failure published {readiness:?}"),
+                }
+            };
+            assert_eq!(
+                pick_error,
+                WgpuRenderRuntimeError::PipelineCompilationFailed {
+                    capability: PipelineCapability::Pick,
+                    cause,
+                }
+            );
+
+            let latch = GpuFailureLatch::default();
+            latch.record_pipeline_failure(cause);
+            for capability in [PipelineCapability::InitialRender, PipelineCapability::Pick] {
+                let globally_gated = latch
+                    .ensure_available()
+                    .and_then(|()| state.capability_is_ready(capability));
+                assert_eq!(globally_gated, Err(terminal));
+            }
+        }
     }
 
     #[test]

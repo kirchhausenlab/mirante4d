@@ -811,6 +811,7 @@ pub(super) enum ProductAutomationAssertCondition {
         target: ProductAutomationPresentationTarget,
     },
     NoRenderError,
+    EmptyPresentation,
     FrameFidelity {
         scale_level: u32,
         complete: bool,
@@ -906,6 +907,7 @@ impl ProductAutomationAssertCondition {
         match self {
             Self::NonblankPanel { .. } => "nonblank_panel",
             Self::NoRenderError => "no_render_error",
+            Self::EmptyPresentation => "empty_presentation",
             Self::FrameFidelity { .. } => "frame_fidelity",
             Self::RenderMode { .. } => "render_mode",
             Self::LayerRenderMode { .. } => "layer_render_mode",

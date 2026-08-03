@@ -12,6 +12,12 @@
   bounded temporal residency, source-admission, lazy-integrity, or explicit
   package-audit work.
 
+Later narrow correction: the
+[rendering correctness, recovery, and numerical cutover](VIEWER_RENDERING_CORRECTNESS_RECOVERY_AND_NUMERICAL_CUTOVER.md)
+supersedes this plan's application-only prepared/reused classification with a
+renderer-validated complete logical-member set. This plan's historical
+temporal/spatial independence and owner evidence remain unchanged.
+
 ## Implementation Result — 2026-08-01
 
 The hard cut is complete. One private `ComposedPresentationScheduler` now

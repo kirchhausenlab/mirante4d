@@ -2,7 +2,10 @@ use std::{
     collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -41,6 +44,7 @@ mod retained_leases;
 mod runtime_diagnostics_panel;
 mod semantic_demand;
 mod semantic_tiles;
+mod shader_work_envelope_cache;
 mod smoke;
 mod transfer_presets;
 mod unified_source_open;
@@ -114,7 +118,7 @@ use mirante4d_project_store::{
     ProjectStoreFault, ProjectStorePath, ProjectStoreRequestId,
 };
 use mirante4d_render_api::PresentationViewport;
-use mirante4d_render_wgpu::{WgpuRenderRuntime, WgpuRenderRuntimeConfig};
+use mirante4d_render_wgpu::{RendererEvent, WgpuRenderRuntime, WgpuRenderRuntimeConfig};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy, recommended_for_current_system};
 use mirante4d_ui_egui as ui_kit;
 pub use process_termination::ProcessTerminationLatch;
@@ -136,6 +140,157 @@ use workbench_controls::{
 #[derive(Debug, Clone)]
 struct DeterministicFailureLatch<S> {
     signature: S,
+}
+
+struct RendererUiWake {
+    context: egui::Context,
+    ui_turn_pending: AtomicBool,
+    closed: AtomicBool,
+    renderer_terminal: AtomicBool,
+    renderer_device_generation: u64,
+    renderer_event_bits: AtomicU8,
+    completed_submission: AtomicU64,
+    hidden_worker_job: AtomicU64,
+}
+
+const INITIAL_PIPELINE_EVENT: u8 = 1 << 0;
+const PICK_PIPELINE_EVENT: u8 = 1 << 1;
+const SUBMISSION_COMPLETED_EVENT: u8 = 1 << 2;
+const HIDDEN_WORKER_EVENT: u8 = 1 << 3;
+const PICK_MAP_EVENT: u8 = 1 << 4;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RendererEventBatch {
+    renderer_device_generation: u64,
+    bits: u8,
+    completed_submission: u64,
+    hidden_worker_job: u64,
+}
+
+impl RendererEventBatch {
+    const fn initial_pipeline_changed(self) -> bool {
+        self.bits & INITIAL_PIPELINE_EVENT != 0
+    }
+
+    const fn pick_pipeline_changed(self) -> bool {
+        self.bits & PICK_PIPELINE_EVENT != 0
+    }
+
+    const fn any_pipeline_changed(self) -> bool {
+        self.initial_pipeline_changed() || self.pick_pipeline_changed()
+    }
+
+    fn submission_completed(self) -> Option<u64> {
+        (self.bits & SUBMISSION_COMPLETED_EVENT != 0).then_some(self.completed_submission)
+    }
+
+    fn hidden_worker_result(self) -> Option<u64> {
+        (self.bits & HIDDEN_WORKER_EVENT != 0).then_some(self.hidden_worker_job)
+    }
+}
+
+impl RendererUiWake {
+    fn new(context: egui::Context, renderer_device_generation: u64) -> Self {
+        Self {
+            context,
+            ui_turn_pending: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            renderer_terminal: AtomicBool::new(false),
+            renderer_device_generation,
+            renderer_event_bits: AtomicU8::new(0),
+            completed_submission: AtomicU64::new(0),
+            hidden_worker_job: AtomicU64::new(0),
+        }
+    }
+
+    fn wake(&self) {
+        if self.renderer_terminal.load(Ordering::Acquire) {
+            return;
+        }
+        self.request_ui_turn();
+    }
+
+    fn wake_renderer_event(&self, event: RendererEvent) {
+        if self.renderer_terminal.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let bit = match event {
+            RendererEvent::PipelineCapabilityChanged(
+                mirante4d_render_wgpu::PipelineCapability::InitialRender,
+            ) => INITIAL_PIPELINE_EVENT,
+            RendererEvent::PipelineCapabilityChanged(
+                mirante4d_render_wgpu::PipelineCapability::Pick,
+            ) => PICK_PIPELINE_EVENT,
+            RendererEvent::SubmissionCompleted { submission } => {
+                self.completed_submission
+                    .fetch_max(submission, Ordering::AcqRel);
+                SUBMISSION_COMPLETED_EVENT
+            }
+            RendererEvent::HiddenWorkerResult { job } => {
+                self.hidden_worker_job.fetch_max(job, Ordering::AcqRel);
+                HIDDEN_WORKER_EVENT
+            }
+            RendererEvent::PickMapCompleted => PICK_MAP_EVENT,
+        };
+        self.renderer_event_bits.fetch_or(bit, Ordering::Release);
+        if self.renderer_terminal.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
+            self.renderer_event_bits.store(0, Ordering::Release);
+            return;
+        }
+        self.request_ui_turn();
+    }
+
+    fn request_ui_turn(&self) {
+        if self.closed.load(Ordering::Acquire) || self.renderer_terminal.load(Ordering::Acquire) {
+            return;
+        }
+        if self
+            .ui_turn_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if self.closed.load(Ordering::Acquire) || self.renderer_terminal.load(Ordering::Acquire) {
+            self.ui_turn_pending.store(false, Ordering::Release);
+            return;
+        }
+        self.context.request_repaint();
+    }
+
+    fn begin_ui_turn(&self) -> RendererEventBatch {
+        let _ = self.ui_turn_pending.swap(false, Ordering::AcqRel);
+        let mut bits = self.renderer_event_bits.swap(0, Ordering::AcqRel);
+        if bits & (INITIAL_PIPELINE_EVENT | PICK_PIPELINE_EVENT)
+            == (INITIAL_PIPELINE_EVENT | PICK_PIPELINE_EVENT)
+        {
+            // The compiler channel is ordered: InitialRender always precedes
+            // Pick. Preserve the Pick notification for one successor turn so
+            // the app consumes at most one compiler publication per turn.
+            bits &= !PICK_PIPELINE_EVENT;
+            self.renderer_event_bits
+                .fetch_or(PICK_PIPELINE_EVENT, Ordering::Release);
+            self.request_ui_turn();
+        }
+        RendererEventBatch {
+            renderer_device_generation: self.renderer_device_generation,
+            bits,
+            completed_submission: self.completed_submission.load(Ordering::Acquire),
+            hidden_worker_job: self.hidden_worker_job.load(Ordering::Acquire),
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.ui_turn_pending.store(false, Ordering::Release);
+        self.renderer_event_bits.store(0, Ordering::Release);
+    }
+
+    fn enter_renderer_terminal(&self) {
+        self.renderer_terminal.store(true, Ordering::Release);
+        self.renderer_event_bits.store(0, Ordering::Release);
+        self.ui_turn_pending.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -598,6 +753,8 @@ pub struct MiranteWorkbenchApp {
     dataset: dataset_requests::DatasetDemandState,
     render_coordination: RenderCoordinationState,
     native_presentation: native_presentation::NativePresentationBridge,
+    renderer_ui_wake: Arc<RendererUiWake>,
+    shader_work_envelopes: shader_work_envelope_cache::ShaderWorkEnvelopeCache,
     viewer_pick_queue: viewer_pick_runtime::ViewerPickQueue<VolumePickTicket>,
     volume_presentation: volume_presentation::VolumePresentationController,
     progressive_display_pacer: workbench_brick_runtime::ProgressiveDisplayRefreshPacer,
@@ -608,8 +765,7 @@ pub struct MiranteWorkbenchApp {
         Option<DeterministicFailureLatch<workbench_brick_runtime::VisibleDemandFailureSignature>>,
     visible_demand_placeability_limit:
         Option<workbench_brick_runtime::VisibleDemandPlaceabilityLimit>,
-    viewer_render_failure_latch:
-        Option<DeterministicFailureLatch<display_refresh::ProductRenderFailureSignature>>,
+    render_attempt: display_refresh::RenderAttemptCoordinator,
     dataset_runtime_epoch: u64,
     prepared_scope_render_plans: BTreeMap<u64, workbench_brick_runtime::PreparedScopeRenderPlan>,
     navigation_render_plans: Vec<workbench_brick_runtime::PreparedScopeRenderPlan>,
@@ -673,6 +829,14 @@ pub struct MiranteWorkbenchApp {
     source_open_service: Option<current_source_open_service::CurrentSourceOpenService>,
     package_integrity_audit_service:
         Option<package_integrity_audit_service::PackageIntegrityAuditService>,
+}
+
+impl Drop for MiranteWorkbenchApp {
+    fn drop(&mut self) {
+        // Late WGPU callbacks hold only a weak reference to this bridge. Close
+        // it before renderer/worker teardown so a racing callback is a no-op.
+        self.renderer_ui_wake.close();
+    }
 }
 
 impl MiranteWorkbenchApp {
@@ -788,10 +952,28 @@ impl MiranteWorkbenchApp {
                 .with_gpu_timing(gpu_timing),
         )
         .map_err(|error| anyhow::anyhow!("the progressive GPU renderer is required: {error}"))?;
-        let hidden_refinement_context = egui_ctx.clone();
-        product_renderer.set_hidden_refinement_wake(Arc::new(move || {
-            hidden_refinement_context.request_repaint();
-        }));
+        let renderer_ui_wake = Arc::new(RendererUiWake::new(
+            egui_ctx.clone(),
+            product_renderer.device_generation().get(),
+        ));
+        let weak_renderer_ui_wake = Arc::downgrade(&renderer_ui_wake);
+        product_renderer.set_renderer_event_sink(mirante4d_render_wgpu::RendererEventSink::new(
+            move |event| {
+                if let Some(wake) = weak_renderer_ui_wake.upgrade() {
+                    wake.wake_renderer_event(event);
+                }
+            },
+        ));
+        let weak_shader_envelope_wake = Arc::downgrade(&renderer_ui_wake);
+        let shader_work_envelopes = shader_work_envelope_cache::ShaderWorkEnvelopeCache::new(
+            dataset.cpu_ledger_arc(),
+            move || {
+                if let Some(wake) = weak_shader_envelope_wake.upgrade() {
+                    wake.wake();
+                }
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("failed to start shader work-envelope worker: {error}"))?;
         product_renderer
             .activate_dataset_generation(catalog.as_ref())
             .map_err(|error| anyhow::anyhow!("the dataset GPU grid is invalid: {error}"))?;
@@ -841,6 +1023,8 @@ impl MiranteWorkbenchApp {
             dataset,
             render_coordination,
             native_presentation,
+            renderer_ui_wake,
+            shader_work_envelopes,
             viewer_pick_queue: viewer_pick_runtime::ViewerPickQueue::default(),
             volume_presentation: volume_presentation::VolumePresentationController::default(),
             progressive_display_pacer:
@@ -851,7 +1035,7 @@ impl MiranteWorkbenchApp {
             pending_visible_demand_plan: None,
             visible_demand_failure_latch: None,
             visible_demand_placeability_limit: None,
-            viewer_render_failure_latch: None,
+            render_attempt: display_refresh::RenderAttemptCoordinator::default(),
             dataset_runtime_epoch: 0,
             prepared_scope_render_plans: BTreeMap::new(),
             navigation_render_plans: Vec::new(),
@@ -2695,7 +2879,8 @@ impl MiranteWorkbenchApp {
         self.pending_visible_demand_plan = None;
         self.visible_demand_failure_latch = None;
         self.visible_demand_placeability_limit = None;
-        self.viewer_render_failure_latch = None;
+        self.render_attempt.settle();
+        self.shader_work_envelopes.invalidate_all();
         self.dataset_runtime_epoch = self.dataset_runtime_epoch.saturating_add(1);
         self.prepared_scope_render_plans.clear();
         self.navigation_render_plans.clear();

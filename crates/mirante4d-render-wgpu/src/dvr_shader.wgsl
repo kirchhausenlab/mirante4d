@@ -62,7 +62,21 @@ fn render_fused_dvr(world_origin: vec3<f32>, world_direction: vec3<f32>) -> Pixe
             }
             any_work = true;
         }
-        let next = segment_end_index(ray.entry, step, index, segment_exit, count);
+        let predicted_end = segment_end_index(ray.entry, step, index, segment_exit, count);
+        var next = predicted_end;
+        for (var layer_index = 0u; layer_index < layer_count; layer_index += 1u) {
+            let page = lookup_page(layer_index, coordinate);
+            next = page_segment_end_index(
+                layer_index,
+                page,
+                origin,
+                direction,
+                ray.entry,
+                step,
+                index,
+                next,
+            );
+        }
         if !any_work {
             index = next;
             continue;
@@ -211,7 +225,39 @@ fn render_general_dvr(world_origin: vec3<f32>, world_direction: vec3<f32>) -> Pi
             any_work = true;
         }
 
-        let next = segment_end_index(entry, step, index, segment_exit, count);
+        let predicted_end = segment_end_index(entry, step, index, segment_exit, count);
+        var next = predicted_end;
+        for (var layer_index = 0u; layer_index < layer_count; layer_index += 1u) {
+            let ray = volume_ray(layer_index, world_origin, world_direction);
+            if !ray.intersects || distance >= ray.exit {
+                continue;
+            }
+            if distance < ray.entry {
+                next = distance_boundary_end_index(
+                    entry,
+                    step,
+                    index,
+                    next,
+                    ray.entry,
+                );
+                continue;
+            }
+            let grid = ray.origin + ray.direction * distance;
+            if !grid_inside(layer_index, grid) {
+                continue;
+            }
+            let page = lookup_page(layer_index, grid_coordinate(layer_index, grid));
+            next = page_segment_end_index(
+                layer_index,
+                page,
+                ray.origin,
+                ray.direction,
+                entry,
+                step,
+                index,
+                next,
+            );
+        }
         if !any_work {
             index = next;
             continue;

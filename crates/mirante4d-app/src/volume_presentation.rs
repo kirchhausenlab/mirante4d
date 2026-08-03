@@ -3,15 +3,15 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use mirante4d_application::RenderGestureId;
-use mirante4d_dataset::{DatasetCatalog, DatasetScale};
+use mirante4d_dataset::DatasetCatalog;
 use mirante4d_domain::{
     CameraView, IsoShadingPolicy, LogicalLayerKey, Projection, RenderMode, RenderState,
     SamplingPolicy, ScaleLevel, Shape3D, TimeIndex, WorldPoint3,
 };
 use mirante4d_project_model::ViewState;
 use mirante4d_render_api::{
-    CameraFrame, FrameIdentity, PresentationViewport, RenderExtent,
-    shader_control_world_to_grid_rows,
+    CameraFrame, FrameIdentity, MAX_EXACT_SHADER_SAMPLE_COUNT, PresentationViewport, RenderExtent,
+    ShaderAdmissionError, ValidatedShaderAffine,
 };
 use mirante4d_render_wgpu::{GpuFrameTiming, GpuTimingTicket, VolumeColorSchedule};
 
@@ -354,12 +354,14 @@ impl VolumeWorkloadProfile {
                 .saturating_mul(legacy_initial_mode_prior)
                 .saturating_add(gradient_taps_per_ray)
                 .max(1);
-            let inverse_rows = shader_control_world_to_grid_rows(dataset_scale.grid_to_world())?;
+            let validated_affine =
+                ValidatedShaderAffine::new(dataset_scale.grid_to_world(), dataset_scale.shape())?;
+            let inverse_rows = validated_affine.world_to_grid_rows();
             // Color traversal intersects the f32 world-to-grid rows uploaded
             // to WGSL, not the source f64 affine directly. Reconstruct its
             // implied volume corners so projection and general-DVR interval
             // accounting describe the geometry the shader actually sees.
-            let world_corners = shader_volume_world_corners(dataset_scale.shape(), inverse_rows)?;
+            let world_corners = shader_volume_world_corners(validated_affine)?;
             let projected_rect = projected_pixel_rect(camera_frame, &world_corners, extent);
             let traversal_step_bound = conservative_grid_traversal_bound(
                 camera_frame,
@@ -369,6 +371,14 @@ impl VolumeWorkloadProfile {
                 dataset_scale.shape(),
                 inverse_rows,
             );
+            if traversal_step_bound > MAX_EXACT_SHADER_SAMPLE_COUNT {
+                return Err(ShaderAdmissionError::ShaderSampleCountExceeded {
+                    layer: key,
+                    bound: traversal_step_bound,
+                    maximum: MAX_EXACT_SHADER_SAMPLE_COUNT,
+                }
+                .into());
+            }
             family_layers.push(VolumeLayerWorkClass {
                 mode: render_state.mode(),
                 sampling: render_state.sampling_policy(),
@@ -399,7 +409,7 @@ impl VolumeWorkloadProfile {
                     .saturating_mul(GRADIENT_TAP_WORK_UNITS),
                 world_corners,
                 inverse_rows,
-                shader_geometry: shader_grid_geometry(scale, *dataset_scale)?,
+                shader_geometry: shader_grid_geometry(scale, validated_affine),
             });
         }
         if layers.is_empty() {
@@ -413,6 +423,18 @@ impl VolumeWorkloadProfile {
             extent,
             &mut layers,
         );
+        if shared.scheduled_step_bound > MAX_EXACT_SHADER_SAMPLE_COUNT {
+            let layer = layers
+                .first()
+                .expect("a configured volume workload has one layer")
+                .layer;
+            return Err(ShaderAdmissionError::ShaderSampleCountExceeded {
+                layer,
+                bound: shared.scheduled_step_bound,
+                maximum: MAX_EXACT_SHADER_SAMPLE_COUNT,
+            }
+            .into());
+        }
         Ok(Self {
             extent,
             presentation_viewport,
@@ -793,9 +815,9 @@ fn schedule_region_work(
 
 fn shader_grid_geometry(
     scale: ScaleLevel,
-    dataset_scale: DatasetScale,
-) -> anyhow::Result<ShaderGridGeometry> {
-    let inverse = shader_control_world_to_grid_rows(dataset_scale.grid_to_world())?;
+    validated_affine: ValidatedShaderAffine,
+) -> ShaderGridGeometry {
+    let inverse = validated_affine.world_to_grid_rows();
     let mut control_bits = [0_u32; 24];
     for (target, value) in control_bits[..12]
         .iter_mut()
@@ -803,88 +825,73 @@ fn shader_grid_geometry(
     {
         *target = canonical_f32(value).to_bits();
     }
-    for (target, value) in control_bits[12..].iter_mut().zip(
-        dataset_scale.grid_to_world().row_major()[..12]
-            .iter()
-            .copied(),
-    ) {
-        let converted = value as f32;
-        if !converted.is_finite() {
-            anyhow::bail!("3D workload grid transform is not representable by the renderer");
-        }
-        *target = canonical_f32(converted).to_bits();
+    for (target, value) in control_bits[12..]
+        .iter_mut()
+        .zip(validated_affine.grid_to_world_rows().into_iter().flatten())
+    {
+        *target = canonical_f32(value).to_bits();
     }
-    Ok(ShaderGridGeometry {
+    ShaderGridGeometry {
         scale,
         shape_xyz: [
-            dataset_scale.shape().x(),
-            dataset_scale.shape().y(),
-            dataset_scale.shape().z(),
+            validated_affine.grid_shape().x(),
+            validated_affine.grid_shape().y(),
+            validated_affine.grid_shape().z(),
         ],
         control_bits,
-    })
+    }
 }
 
 fn canonical_f32(value: f32) -> f32 {
     if value == 0.0 { 0.0 } else { value }
 }
 
-fn shader_volume_world_corners(
-    shape: Shape3D,
-    inverse_rows: [[f32; 4]; 3],
-) -> anyhow::Result<[[f64; 3]; 8]> {
-    let [a, b, c, tx] = inverse_rows[0].map(f64::from);
-    let [d, e, f, ty] = inverse_rows[1].map(f64::from);
-    let [g, h, i, tz] = inverse_rows[2].map(f64::from);
-    let determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
-    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
-        anyhow::bail!("renderer-quantized world-to-grid transform is non-invertible");
-    }
-    let inverse_determinant = determinant.recip();
-    let grid_to_world = [
-        [
-            (e * i - f * h) * inverse_determinant,
-            (c * h - b * i) * inverse_determinant,
-            (b * f - c * e) * inverse_determinant,
-        ],
-        [
-            (f * g - d * i) * inverse_determinant,
-            (a * i - c * g) * inverse_determinant,
-            (c * d - a * f) * inverse_determinant,
-        ],
-        [
-            (d * h - e * g) * inverse_determinant,
-            (b * g - a * h) * inverse_determinant,
-            (a * e - b * d) * inverse_determinant,
-        ],
+fn shader_volume_world_corners(affine: ValidatedShaderAffine) -> anyhow::Result<[[f64; 3]; 8]> {
+    let shape = affine.grid_shape();
+    let center = affine.quantized_inverse_center();
+    let radius = affine.quantized_inverse_radius();
+    let bounds = [
+        [-0.5, shape.x() as f64 - 0.5],
+        [-0.5, shape.y() as f64 - 0.5],
+        [-0.5, shape.z() as f64 - 0.5],
     ];
-    let translation = [tx, ty, tz];
-    let x = [-0.5, f64::from(shape.x() as f32 - 0.5)];
-    let y = [-0.5, f64::from(shape.y() as f32 - 0.5)];
-    let z = [-0.5, f64::from(shape.z() as f32 - 0.5)];
-    let mut corners = [[0.0; 3]; 8];
-    let mut index = 0;
-    for grid_z in z {
-        for grid_y in y {
-            for grid_x in x {
-                let translated_grid = [
-                    grid_x - translation[0],
-                    grid_y - translation[1],
-                    grid_z - translation[2],
-                ];
-                corners[index] = grid_to_world.map(|row| {
-                    row[0] * translated_grid[0]
-                        + row[1] * translated_grid[1]
-                        + row[2] * translated_grid[2]
-                });
-                if !corners[index].iter().all(|value| value.is_finite()) {
-                    anyhow::bail!("renderer-quantized volume corners are not finite");
-                }
-                index += 1;
-            }
+    let mut minimum = [f64::INFINITY; 3];
+    let mut maximum = [f64::NEG_INFINITY; 3];
+    for bits in 0_u8..8 {
+        let grid = [
+            bounds[0][usize::from(bits & 1 != 0)],
+            bounds[1][usize::from(bits & 2 != 0)],
+            bounds[2][usize::from(bits & 4 != 0)],
+        ];
+        for world_axis in 0..3 {
+            let value = center[world_axis][0] * grid[0]
+                + center[world_axis][1] * grid[1]
+                + center[world_axis][2] * grid[2]
+                + center[world_axis][3];
+            let error = radius[world_axis][0] * grid[0].abs()
+                + radius[world_axis][1] * grid[1].abs()
+                + radius[world_axis][2] * grid[2].abs()
+                + radius[world_axis][3];
+            minimum[world_axis] = minimum[world_axis].min(value - error);
+            maximum[world_axis] = maximum[world_axis].max(value + error);
         }
     }
-    Ok(corners)
+    if !minimum
+        .into_iter()
+        .chain(maximum)
+        .all(|value| value.is_finite())
+    {
+        anyhow::bail!("validated renderer volume bounds are not finite");
+    }
+    Ok(std::array::from_fn(|bits| {
+        std::array::from_fn(|axis| {
+            if bits & (1 << axis) == 0 {
+                minimum[axis]
+            } else {
+                maximum[axis]
+            }
+        })
+    }))
 }
 
 fn projected_pixel_rect(
@@ -987,7 +994,7 @@ fn general_dvr_traversal_bound(
     }
     if layers
         .windows(2)
-        .all(|pair| pair[0].world_corners == pair[1].world_corners)
+        .all(|pair| shader_world_bounds_match(&pair[0].world_corners, &pair[1].world_corners))
     {
         return layers
             .iter()
@@ -1037,6 +1044,16 @@ fn general_dvr_traversal_bound(
     saturating_ceil_u64(parameter_span * maximum_grid_speed)
         .saturating_add(1)
         .max(1)
+}
+
+fn shader_world_bounds_match(left: &[[f64; 3]; 8], right: &[[f64; 3]; 8]) -> bool {
+    left.iter()
+        .flatten()
+        .zip(right.iter().flatten())
+        .all(|(left, right)| {
+            let tolerance = 64.0 * f64::EPSILON * (1.0 + left.abs().max(right.abs()));
+            (left - right).abs() <= tolerance
+        })
 }
 
 fn camera_direction_corners(
@@ -2057,10 +2074,11 @@ mod tests {
         presentation: PresentationViewport,
         extent: RenderExtent,
     ) -> VolumeLayerWorkload {
-        let inverse_rows =
-            shader_control_world_to_grid_rows(dataset_scale.grid_to_world()).unwrap();
-        let world_corners =
-            shader_volume_world_corners(dataset_scale.shape(), inverse_rows).unwrap();
+        let affine =
+            ValidatedShaderAffine::new(dataset_scale.grid_to_world(), dataset_scale.shape())
+                .unwrap();
+        let inverse_rows = affine.world_to_grid_rows();
+        let world_corners = shader_volume_world_corners(affine).unwrap();
         let projected_rect = projected_pixel_rect(camera, &world_corners, extent);
         let traversal_step_bound = conservative_grid_traversal_bound(
             camera,
@@ -2092,14 +2110,14 @@ mod tests {
             terminal_work_units_per_projected_pixel: 0,
             world_corners,
             inverse_rows,
-            shader_geometry: shader_grid_geometry(scale, dataset_scale).unwrap(),
+            shader_geometry: shader_grid_geometry(scale, affine),
         }
     }
 
     fn analytical_world_corners(dataset_scale: DatasetScale) -> [[f64; 3]; 8] {
         shader_volume_world_corners(
-            dataset_scale.shape(),
-            shader_control_world_to_grid_rows(dataset_scale.grid_to_world()).unwrap(),
+            ValidatedShaderAffine::new(dataset_scale.grid_to_world(), dataset_scale.shape())
+                .unwrap(),
         )
         .unwrap()
     }
@@ -2398,7 +2416,9 @@ mod tests {
             2_000.0,
             extent,
         );
-        let inverse = shader_control_world_to_grid_rows(GridToWorld::identity()).unwrap();
+        let inverse = ValidatedShaderAffine::new(GridToWorld::identity(), shape)
+            .unwrap()
+            .world_to_grid_rows();
         let bound = conservative_grid_traversal_bound(
             camera,
             presentation,
@@ -2419,7 +2439,9 @@ mod tests {
             extent,
             PixelRect::full(extent),
             shape,
-            shader_control_world_to_grid_rows(sheared).unwrap(),
+            ValidatedShaderAffine::new(sheared, shape)
+                .unwrap()
+                .world_to_grid_rows(),
         );
         assert!(sheared_bound > 0 && sheared_bound <= shape.x());
     }
@@ -2454,7 +2476,10 @@ mod tests {
             analytical_layer(0, ScaleLevel::BASE, fine, camera, presentation, extent),
             analytical_layer(1, ScaleLevel::new(1), coarse, camera, presentation, extent),
         ];
-        assert_eq!(layers[0].world_corners, layers[1].world_corners);
+        assert!(shader_world_bounds_match(
+            &layers[0].world_corners,
+            &layers[1].world_corners
+        ));
         let union = layers[0].projected_rect.union(layers[1].projected_rect);
         assert_eq!(
             general_dvr_traversal_bound(camera, presentation, extent, union, &layers),

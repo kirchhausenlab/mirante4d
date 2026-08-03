@@ -205,6 +205,9 @@ fn frame_display_freshness_label(fidelity: &FrameFidelityStatus) -> Option<&'sta
 }
 
 fn frame_render_time_label(fidelity: &FrameFidelityStatus) -> String {
+    if fidelity.backend == RenderBackend::Empty {
+        return "render not required".to_owned();
+    }
     fidelity
         .frame_time_ms
         .filter(|ms| *ms > 0.0)
@@ -437,6 +440,22 @@ mod tests {
             assert_eq!(frame_failure_kind_label(value), expected);
         }
         assert_eq!(render_backend_label(RenderBackend::Empty), "empty");
+    }
+
+    #[test]
+    fn explicit_empty_fidelity_does_not_claim_a_pending_render() {
+        let mut fidelity = FrameFidelityStatus::new_with_presentation(
+            RenderExtent::new(64, 64).unwrap(),
+            PresentationViewport::new(64.0, 64.0).unwrap(),
+        );
+        fidelity.backend = RenderBackend::Empty;
+        fidelity.completeness = FrameCompleteness::Complete;
+        fidelity.reason = LodDecisionReason::NoVisibleData;
+        fidelity.display_freshness = DisplayedFrameFreshness::Current;
+
+        assert_eq!(frame_render_time_label(&fidelity), "render not required");
+        assert!(frame_fidelity_label(&fidelity).contains("render not required"));
+        assert!(!frame_fidelity_label(&fidelity).contains("render pending"));
     }
 
     #[test]

@@ -5,6 +5,13 @@
 - Implementation authorized by owner: 2026-07-30
 - Last reviewed: 2026-07-31
 
+Later narrow correction: the
+[rendering correctness, recovery, and numerical cutover](VIEWER_RENDERING_CORRECTNESS_RECOVERY_AND_NUMERICAL_CUTOVER.md)
+supersedes generic retryable-error projection and repeated checked identity
+allocation with one typed attempt/wake authority and operation-scoped
+exhaustion facts. This plan's physical-placeability and retained-front
+recovery result remains unchanged.
+
 This plan is the completed correctness handoff for the linked-2D physical
 placeability incident. [Current State](../../CURRENT_STATE.md) remains the
 authority for implemented facts.

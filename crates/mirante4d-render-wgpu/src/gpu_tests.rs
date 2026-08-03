@@ -22,18 +22,20 @@ use mirante4d_domain::{
     WorldPoint3,
 };
 use mirante4d_render_api::{
-    FrameCompleteness, FrameIdentity, FrameProgress, LayerRenderIntent, PresentationTarget,
-    PresentationViewport, PresentedFrame, RenderExtent, RenderIntent, RenderPassKind,
-    RenderRequirement, RenderRequirementRole, RenderRequirements, RenderResourceGrid,
-    RenderResourceGridCatalog, RenderViewIntent, VolumePickCompleteness, VolumePickHitKind,
-    VolumePickPolicy, VolumePickQuery, VolumePickResult, VolumePickTicket, VolumePickValue,
+    CameraFrame, FrameCompleteness, FrameIdentity, FrameProgress, LayerRenderIntent,
+    PresentationTarget, PresentationViewport, PresentedFrame, RenderExtent, RenderIntent,
+    RenderPassKind, RenderRequirement, RenderRequirementRole, RenderRequirements,
+    RenderResourceGrid, RenderResourceGridCatalog, RenderViewIntent, VolumePickCompleteness,
+    VolumePickHitKind, VolumePickPolicy, VolumePickQuery, VolumePickResult, VolumePickTicket,
+    VolumePickValue,
 };
 use mirante4d_render_reference::{
     NumericalColorFacts, NumericalConformanceContract, NumericalConformanceOracle,
-    NumericalDvrParameters, NumericalPickCompleteness, NumericalPickFacts, NumericalPickKind,
-    NumericalSampling, NumericalTransfer, NumericalVolume, NumericalVolumeFacts,
-    NumericalVolumeMode, NumericalVolumeQuery, NumericalVoxel, NumericalWorldRay, ReferenceFrame,
-    ReferenceRenderer,
+    NumericalDvrParameters, NumericalIsoParameters, NumericalIsoShading, NumericalPickCompleteness,
+    NumericalPickFacts, NumericalPickKind, NumericalSampling, NumericalTransfer, NumericalVolume,
+    NumericalVolumeFacts, NumericalVolumeMode, NumericalVolumeQuery, NumericalVoxel,
+    NumericalWorldRay, PortableDirectionComponent, ReferenceFrame, ReferenceRenderer,
+    classify_portable_direction, page_exit_distance_reference, segment_end_index_reference,
 };
 
 use super::{
@@ -218,6 +220,8 @@ struct GpuFixtures {
     terminal: BrickKey,
     /// The same terminal samples covered by eight ordinary sparse pages.
     terminal_sparse: Vec<BrickKey>,
+    /// The same samples on a translated affine, used to force general DVR.
+    terminal_shifted: BrickKey,
 }
 
 fn layer(
@@ -291,7 +295,7 @@ fn fixture_resource_grids(catalog: &DatasetCatalog) -> RenderResourceGridCatalog
                     5..=7 => 8,
                     11 => 8,
                     12 => 2,
-                    13 | 15..=22 => 64,
+                    13 | 15..=23 => 64,
                     14 => 32,
                     ordinal => panic!("fixture layer {ordinal} has no declared resource grid"),
                 };
@@ -536,6 +540,18 @@ fn build_fixtures() -> GpuFixtures {
                     IntensityDType::Float32,
                     ResourceValidity::AllValid,
                 ),
+                layer_with_transform(
+                    23,
+                    "terminal-shifted-volume",
+                    [64, 64, 64],
+                    IntensityDType::Float32,
+                    ResourceValidity::AllValid,
+                    GridToWorld::from_row_major([
+                        1.0, 0.0, 0.0, 0.25, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+                        1.0,
+                    ])
+                    .expect("the translated terminal transform is valid"),
+                ),
             ],
         )
         .expect("fixture catalog is valid"),
@@ -712,12 +728,25 @@ fn build_fixtures() -> GpuFixtures {
         }
     }
     assert_eq!(terminal_values.len(), MIB as usize);
+    let terminal_payload: Arc<[u8]> = terminal_values.into();
     assert!(
         payloads
             .insert(
                 terminal,
                 PayloadBytes {
-                    values: terminal_values.into(),
+                    values: Arc::clone(&terminal_payload),
+                    validity: None,
+                },
+            )
+            .is_none()
+    );
+    let terminal_shifted = resource_key(23, [0, 0, 0], [64, 64, 64]);
+    assert!(
+        payloads
+            .insert(
+                terminal_shifted,
+                PayloadBytes {
+                    values: terminal_payload,
                     validity: None,
                 },
             )
@@ -802,6 +831,7 @@ fn build_fixtures() -> GpuFixtures {
         multiscale_plane: [fine_left, fine_right, coarse],
         terminal,
         terminal_sparse,
+        terminal_shifted,
     }
 }
 
@@ -1368,6 +1398,655 @@ fn numerical_volume_facts(
         .expect("the independent EP-00 volume facts are bounded")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraversalKernel {
+    Mip,
+    Dvr,
+    GeneralDvr,
+    Iso,
+    Mixed,
+}
+
+impl TraversalKernel {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Mip => "MIP",
+            Self::Dvr => "DVR",
+            Self::GeneralDvr => "general DVR",
+            Self::Iso => "ISO",
+            Self::Mixed => "Mixed",
+        }
+    }
+}
+
+fn traversal_orientation(direction_x: f64) -> UnitQuaternion {
+    assert!(direction_x.is_finite() && direction_x.abs() < 1.0);
+    // Rotating canonical -Z about +Y by `angle` produces forward X
+    // `-sin(angle)`. Build from the desired component so the center ray is an
+    // independently inspectable exact fixture rather than a screen-offset
+    // approximation.
+    let angle = -direction_x.asin();
+    UnitQuaternion::new_xyzw(0.0, (0.5 * angle).sin(), 0.0, (0.5 * angle).cos())
+        .expect("the traversal camera orientation is finite and nonzero")
+}
+
+fn traversal_volume_view(direction_x: f64, target_x: f64) -> RenderViewIntent {
+    RenderViewIntent::volume(
+        CameraView::new(
+            Projection::Orthographic,
+            WorldPoint3::new(target_x, 31.5, 31.5).expect("the traversal target is finite"),
+            traversal_orientation(direction_x),
+            1.0,
+            1.0,
+            96.0,
+        )
+        .expect("the traversal camera is valid"),
+        IsoLightState::attached_camera(),
+    )
+}
+
+fn traversal_layer_transfer_with_opacity(
+    kernel: TraversalKernel,
+    color: [f32; 3],
+    opacity: f32,
+) -> LayerTransfer {
+    LayerTransfer::new(
+        DisplayWindow::new(0.0, 1.0).expect("the traversal window is valid"),
+        RgbColor::new(color).expect("the traversal color is valid"),
+        Opacity::new(opacity).expect("the traversal opacity is valid"),
+        TransferCurve::linear(),
+        kernel == TraversalKernel::Iso,
+    )
+}
+
+fn traversal_layer_transfer(kernel: TraversalKernel, color: [f32; 3]) -> LayerTransfer {
+    traversal_layer_transfer_with_opacity(kernel, color, 1.0)
+}
+
+fn traversal_state(
+    kernel: TraversalKernel,
+    sampling: SamplingPolicy,
+) -> mirante4d_domain::RenderState {
+    match kernel {
+        TraversalKernel::Mip | TraversalKernel::Mixed => {
+            mirante4d_domain::RenderState::mip(sampling)
+        }
+        TraversalKernel::Dvr | TraversalKernel::GeneralDvr => mirante4d_domain::RenderState::dvr(
+            sampling,
+            DvrOpacityTransfer::new(
+                DisplayWindow::new(0.0, 1.0).expect("the traversal DVR window is valid"),
+                TransferCurve::linear(),
+            ),
+            0.001,
+        )
+        .expect("the traversal DVR state is valid"),
+        TraversalKernel::Iso => {
+            mirante4d_domain::RenderState::iso(sampling, IsoShadingPolicy::Flat, 0.55)
+                .expect("the traversal ISO state is valid")
+        }
+    }
+}
+
+fn traversal_numerical_contract(
+    kernel: TraversalKernel,
+) -> (NumericalTransfer, NumericalVolumeMode, VolumePickPolicy) {
+    let inverted = kernel == TraversalKernel::Iso;
+    let transfer = NumericalTransfer::new([0.0, 1.0], 1.0, inverted, [1.0, 0.0, 0.0], 1.0)
+        .expect("the independent traversal transfer is valid");
+    let (mode, policy) = match kernel {
+        TraversalKernel::Mip | TraversalKernel::Mixed => {
+            (NumericalVolumeMode::Mip, VolumePickPolicy::MipArgmax)
+        }
+        TraversalKernel::Dvr | TraversalKernel::GeneralDvr => (
+            NumericalVolumeMode::Dvr(
+                NumericalDvrParameters::new([0.0, 1.0], 1.0, 0.001)
+                    .expect("the independent traversal DVR parameters are valid"),
+            ),
+            VolumePickPolicy::MaximumOpacityContribution,
+        ),
+        TraversalKernel::Iso => (
+            NumericalVolumeMode::Iso(
+                NumericalIsoParameters::new(0.55, NumericalIsoShading::Flat)
+                    .expect("the independent traversal ISO parameters are valid"),
+            ),
+            VolumePickPolicy::FirstThresholdHit,
+        ),
+    };
+    (transfer, mode, policy)
+}
+
+fn traversal_intent_and_requirements(
+    frame: u64,
+    kernel: TraversalKernel,
+    sampling: SamplingPolicy,
+    view: RenderViewIntent,
+    extent: RenderExtent,
+    fixtures: &GpuFixtures,
+) -> (RenderIntent, RenderRequirements) {
+    let mut keys = fixtures.terminal_sparse.clone();
+    let mut layers = vec![LayerRenderIntent::new(
+        LogicalLayerKey::new(14),
+        traversal_layer_transfer(kernel, [1.0, 0.0, 0.0]),
+        traversal_state(kernel, sampling),
+    )];
+    if kernel == TraversalKernel::Mixed {
+        keys.push(fixtures.terminal);
+        layers.push(LayerRenderIntent::new(
+            LogicalLayerKey::new(13),
+            traversal_layer_transfer(TraversalKernel::Iso, [0.0, 1.0, 0.0]),
+            traversal_state(TraversalKernel::Iso, sampling),
+        ));
+    } else if kernel == TraversalKernel::GeneralDvr {
+        keys.push(fixtures.terminal_shifted);
+        layers.push(LayerRenderIntent::new(
+            LogicalLayerKey::new(23),
+            traversal_layer_transfer_with_opacity(kernel, [0.0, 1.0, 0.0], 0.0),
+            traversal_state(kernel, sampling),
+        ));
+    }
+    multichannel_intent_and_requirements(frame, view, extent, layers, &keys)
+}
+
+fn traversal_numerical_volume() -> NumericalVolume {
+    let mut voxels = Vec::with_capacity(64 * 64 * 64);
+    for z in 0_u32..64 {
+        for y in 0_u32..64 {
+            for x in 0_u32..64 {
+                let encoded = (x + y + z) as f32 / 189.0_f32;
+                voxels.push(NumericalVoxel::Valid(f64::from(encoded)));
+            }
+        }
+    }
+    NumericalVolume::new([64, 64, 64], GridToWorld::identity(), voxels)
+        .expect("the independent traversal volume is valid")
+}
+
+fn traversal_numerical_facts(
+    volume: &NumericalVolume,
+    intent: &RenderIntent,
+    kernel: TraversalKernel,
+    sampling: SamplingPolicy,
+) -> NumericalVolumeFacts {
+    let RenderViewIntent::Volume { camera, .. } = intent.view() else {
+        panic!("a traversal fixture always uses a volume camera")
+    };
+    let ray = CameraFrame::new(camera, intent.presentation())
+        .and_then(|frame| {
+            frame.ray_for_render_pixel(
+                0.0,
+                0.0,
+                intent.extent().width_pixels(),
+                intent.extent().height_pixels(),
+            )
+        })
+        .expect("the traversal center ray is finite");
+    let ray = NumericalWorldRay::new(ray.origin().components(), ray.direction())
+        .expect("the independent traversal ray is valid");
+    let portable_direction = ray.direction().map(|component| {
+        classify_portable_direction(component)
+            .expect("the traversal direction is finite")
+            .value()
+    });
+    let grid_speed = portable_direction
+        .into_iter()
+        .map(f32::abs)
+        .fold(0.0_f32, f32::max);
+    let (transfer, mode, _) = traversal_numerical_contract(kernel);
+    NumericalConformanceOracle::new()
+        .volume(
+            volume,
+            NumericalVolumeQuery::new(
+                ray,
+                match sampling {
+                    SamplingPolicy::VoxelExact => NumericalSampling::VoxelExact,
+                    SamplingPolicy::SmoothLinear => NumericalSampling::SmoothLinear,
+                },
+                transfer,
+                mode,
+                f64::from(grid_speed).recip(),
+            )
+            .expect("the independent traversal query is valid"),
+        )
+        .expect("the independent traversal facts are bounded")
+}
+
+fn execute_traversal_case(
+    gpu: &mut WgpuRenderRuntime,
+    catalog: &DatasetCatalog,
+    leases: &[Arc<dyn ResourceLease>],
+    numerical_volume: &NumericalVolume,
+    frame: u64,
+    kernel: TraversalKernel,
+    sampling: SamplingPolicy,
+    direction_x: f64,
+    target_x: f64,
+    fixtures: &GpuFixtures,
+    deadline: Instant,
+) {
+    let target = PresentationTarget::ThreeD;
+    let extent = RenderExtent::new(1, 1).expect("the traversal extent is valid");
+    let (intent, requirements) = traversal_intent_and_requirements(
+        frame,
+        kernel,
+        sampling,
+        traversal_volume_view(direction_x, target_x),
+        extent,
+        fixtures,
+    );
+    gpu.offer_residency_leases(leases)
+        .expect("the traversal leases are offered");
+    let report = execute_coordinated_target(
+        gpu,
+        target,
+        catalog,
+        &intent,
+        &requirements,
+        RetainedFrameRenderPolicy::EveryUsefulFrame,
+    );
+    let target_report = report
+        .target(target)
+        .expect("the traversal target has one report");
+    assert_eq!(
+        target_report.progress().map(FrameProgress::completeness),
+        Some(FrameCompleteness::Exact)
+    );
+    let presented = presented_frame(target, &intent, target_report);
+    let capture = poll_coordinated_capture(
+        gpu,
+        target_report
+            .validation_capture()
+            .expect("the traversal case owns one validation capture"),
+        deadline,
+    );
+    let lease_refs = leases.iter().map(Arc::as_ref).collect::<Vec<_>>();
+    let reference = ReferenceRenderer::new()
+        .render(catalog, &intent, &lease_refs)
+        .expect("the independent reference renders the traversal case");
+    assert!(
+        compare_reference(&capture, &reference) <= 1,
+        "{} {sampling:?} traversal color differed from the independent reference",
+        kernel.label(),
+    );
+
+    let expected = traversal_numerical_facts(numerical_volume, &intent, kernel, sampling);
+    if kernel != TraversalKernel::Mixed {
+        assert_numerical_color(
+            &format!("{} {sampling:?} traversal", kernel.label()),
+            &capture,
+            [0, 0],
+            expected.color(),
+        );
+    }
+    let (_, _, policy) = traversal_numerical_contract(kernel);
+    let query = VolumePickQuery::new(
+        &presented,
+        TimeIndex::new(0),
+        LogicalLayerKey::new(14),
+        [0.0, 0.0],
+        policy,
+    )
+    .expect("the traversal pick query is valid");
+    let ticket = gpu
+        .request_coordinated_pick(target, query)
+        .expect("the traversal pick is accepted");
+    assert_numerical_pick(
+        &format!("{} {sampling:?} traversal", kernel.label()),
+        poll_pick(gpu, ticket, deadline),
+        expected
+            .pick()
+            .expect("the traversal fixture has one independent pick"),
+    );
+}
+
+#[test]
+#[ignore = "requires the trusted HW2 Vulkan workstation"]
+fn volume_page_traversal_crosses_sub_epsilon_direction_for_all_kernels_and_pick() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let fixtures = build_fixtures();
+    let (dataset_runtime, catalog) = start_dataset_runtime(&fixtures.source);
+    let mut all_keys = fixtures.terminal_sparse.clone();
+    all_keys.push(fixtures.terminal);
+    all_keys.push(fixtures.terminal_shifted);
+    let lease_map = load_keys(
+        &dataset_runtime,
+        &all_keys,
+        CancellationGeneration::for_scope(REQUEST_SCOPE, 900),
+        deadline,
+    );
+    let sparse_leases = owned_leases(&fixtures.terminal_sparse, &lease_map, None);
+    let mut mixed_keys = fixtures.terminal_sparse.clone();
+    mixed_keys.push(fixtures.terminal);
+    let mixed_leases = owned_leases(&mixed_keys, &lease_map, None);
+    let mut general_keys = fixtures.terminal_sparse.clone();
+    general_keys.push(fixtures.terminal_shifted);
+    let general_leases = owned_leases(&general_keys, &lease_map, None);
+    let numerical_volume = traversal_numerical_volume();
+    let mut gpu = test_gpu_runtime(
+        WgpuRenderRuntimeConfig::new(64 * MIB)
+            .expect("the traversal GPU ledger is valid")
+            .with_validation_capture(true),
+        None,
+        TestPipelineAdmission::Ready,
+    );
+    activate_fixture_dataset(&mut gpu, &fixtures, &catalog);
+    request_target_layout(
+        &mut gpu,
+        PresentationTarget::ThreeD,
+        RenderExtent::new(1, 1).unwrap(),
+    );
+
+    let mut frame = 900_u64;
+    for direction_x in [5.0e-7_f64, -5.0e-7_f64] {
+        assert!(matches!(
+            classify_portable_direction(direction_x).unwrap(),
+            PortableDirectionComponent::Moving(_)
+        ));
+        let (lower_x, upper_x, point_x) = if direction_x.is_sign_positive() {
+            (-0.5, 31.5, 31.499_984)
+        } else {
+            (31.5, 63.5, 31.500_016)
+        };
+        let boundary = page_exit_distance_reference(
+            [lower_x, -0.5, -f64::from(f32::MAX)],
+            [upper_x, 63.5, f64::from(f32::MAX)],
+            [point_x, 31.5, 0.0],
+            [direction_x, 0.0, -(1.0 - direction_x * direction_x).sqrt()],
+            0.0,
+            64.0,
+        )
+        .expect("the independent traversal crossing is finite");
+        assert!(
+            boundary > 0.0 && boundary < 64.0,
+            "the independently resolved X page boundary must precede ray exit: {boundary}"
+        );
+        let target_x = 31.5 + direction_x.signum() * 8.0e-6;
+
+        for sampling in [SamplingPolicy::VoxelExact, SamplingPolicy::SmoothLinear] {
+            for kernel in [
+                TraversalKernel::Mip,
+                TraversalKernel::Dvr,
+                TraversalKernel::GeneralDvr,
+                TraversalKernel::Iso,
+                TraversalKernel::Mixed,
+            ] {
+                execute_traversal_case(
+                    &mut gpu,
+                    &catalog,
+                    match kernel {
+                        TraversalKernel::Mixed => &mixed_leases,
+                        TraversalKernel::GeneralDvr => &general_leases,
+                        _ => &sparse_leases,
+                    },
+                    &numerical_volume,
+                    frame,
+                    kernel,
+                    sampling,
+                    direction_x,
+                    target_x,
+                    &fixtures,
+                    deadline,
+                );
+                frame += 1;
+            }
+        }
+    }
+    assert_eq!(gpu.diagnostics().validation_error_count(), 0);
+
+    dataset_runtime
+        .request_shutdown()
+        .expect("the traversal fixture begins bounded shutdown");
+    drop(sparse_leases);
+    drop(mixed_leases);
+    drop(general_leases);
+    drop(lease_map);
+    drop(dataset_runtime);
+}
+
+#[test]
+#[ignore = "requires the trusted HW2 Vulkan workstation"]
+fn volume_page_traversal_zero_direction_stays_in_one_page() {
+    assert_eq!(
+        classify_portable_direction(0.0).unwrap(),
+        PortableDirectionComponent::Stationary
+    );
+    let exit =
+        page_exit_distance_reference([-0.5; 3], [31.5; 3], [15.5; 3], [0.0, -0.0, 0.0], 0.0, 64.0)
+            .expect("zero direction has one finite page segment");
+    assert_eq!(exit, 64.0);
+    assert_eq!(
+        segment_end_index_reference(0.0, 1.0, 0, exit, 64)
+            .expect("the stationary page consumes the remaining samples"),
+        64
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let fixtures = build_fixtures();
+    let (dataset_runtime, catalog) = start_dataset_runtime(&fixtures.source);
+    let lease_map = load_keys(
+        &dataset_runtime,
+        &fixtures.terminal_sparse,
+        CancellationGeneration::for_scope(REQUEST_SCOPE, 920),
+        deadline,
+    );
+    let leases = owned_leases(&fixtures.terminal_sparse, &lease_map, None);
+    let numerical_volume = traversal_numerical_volume();
+    let mut gpu = test_gpu_runtime(
+        WgpuRenderRuntimeConfig::new(64 * MIB)
+            .expect("the stationary traversal GPU ledger is valid")
+            .with_validation_capture(true),
+        None,
+        TestPipelineAdmission::Ready,
+    );
+    activate_fixture_dataset(&mut gpu, &fixtures, &catalog);
+    request_target_layout(
+        &mut gpu,
+        PresentationTarget::ThreeD,
+        RenderExtent::new(1, 1).unwrap(),
+    );
+    for (offset, sampling) in [
+        (0_u64, SamplingPolicy::VoxelExact),
+        (1, SamplingPolicy::SmoothLinear),
+    ] {
+        execute_traversal_case(
+            &mut gpu,
+            &catalog,
+            &leases,
+            &numerical_volume,
+            920 + offset,
+            TraversalKernel::Mip,
+            sampling,
+            0.0,
+            15.5,
+            &fixtures,
+            deadline,
+        );
+    }
+    assert_eq!(gpu.diagnostics().validation_error_count(), 0);
+
+    dataset_runtime
+        .request_shutdown()
+        .expect("the stationary traversal fixture begins bounded shutdown");
+    drop(leases);
+    drop(lease_map);
+    drop(dataset_runtime);
+}
+
+#[test]
+#[ignore = "requires the trusted HW2 Vulkan workstation"]
+fn volume_page_traversal_subnormal_direction_is_portably_canonicalized_or_rejected() {
+    let subnormal = f64::from(f32::from_bits(0x0040_0000));
+    assert_eq!(
+        classify_portable_direction(subnormal).unwrap(),
+        PortableDirectionComponent::Stationary
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let fixtures = build_fixtures();
+    let (dataset_runtime, catalog) = start_dataset_runtime(&fixtures.source);
+    let mut all_keys = fixtures.terminal_sparse.clone();
+    all_keys.push(fixtures.terminal);
+    all_keys.push(fixtures.terminal_shifted);
+    let lease_map = load_keys(
+        &dataset_runtime,
+        &all_keys,
+        CancellationGeneration::for_scope(REQUEST_SCOPE, 930),
+        deadline,
+    );
+    let sparse_leases = owned_leases(&fixtures.terminal_sparse, &lease_map, None);
+    let mut mixed_keys = fixtures.terminal_sparse.clone();
+    mixed_keys.push(fixtures.terminal);
+    let mixed_leases = owned_leases(&mixed_keys, &lease_map, None);
+    let mut general_keys = fixtures.terminal_sparse.clone();
+    general_keys.push(fixtures.terminal_shifted);
+    let general_leases = owned_leases(&general_keys, &lease_map, None);
+    let numerical_volume = traversal_numerical_volume();
+    let extent = RenderExtent::new(1, 1).unwrap();
+    let (admission_intent, admission_requirements) = traversal_intent_and_requirements(
+        930,
+        TraversalKernel::Mip,
+        SamplingPolicy::VoxelExact,
+        traversal_volume_view(subnormal, 15.5),
+        extent,
+        &fixtures,
+    );
+    let admission = mirante4d_render_api::ShaderWorkEnvelope::for_intent(
+        &catalog,
+        &admission_intent,
+        &admission_requirements,
+    )
+    .expect("a safely discardable subnormal component is admitted");
+    let mirante4d_render_api::ShaderWorkEnvelope::Volume(admission) = admission else {
+        panic!("the traversal admission fixture is volumetric")
+    };
+    assert_eq!(
+        classify_portable_direction(f64::from(admission.controls().direction_base()[0])).unwrap(),
+        PortableDirectionComponent::Stationary,
+        "the exact binary32 shader control is canonical stationary"
+    );
+    assert!(
+        admission.facts().iter().all(|facts| facts
+            .grid_error_upper()
+            .into_iter()
+            .all(|upper| upper < 0.5)),
+        "the complete admitted work envelope retains the half-voxel bound"
+    );
+
+    let mut gpu = test_gpu_runtime(
+        WgpuRenderRuntimeConfig::new(64 * MIB)
+            .expect("the subnormal traversal GPU ledger is valid")
+            .with_validation_capture(true),
+        None,
+        TestPipelineAdmission::Ready,
+    );
+    activate_fixture_dataset(&mut gpu, &fixtures, &catalog);
+    request_target_layout(&mut gpu, PresentationTarget::ThreeD, extent);
+    let mut frame = 930_u64;
+    for sampling in [SamplingPolicy::VoxelExact, SamplingPolicy::SmoothLinear] {
+        for kernel in [
+            TraversalKernel::Mip,
+            TraversalKernel::Dvr,
+            TraversalKernel::GeneralDvr,
+            TraversalKernel::Iso,
+            TraversalKernel::Mixed,
+        ] {
+            execute_traversal_case(
+                &mut gpu,
+                &catalog,
+                match kernel {
+                    TraversalKernel::Mixed => &mixed_leases,
+                    TraversalKernel::GeneralDvr => &general_leases,
+                    _ => &sparse_leases,
+                },
+                &numerical_volume,
+                frame,
+                kernel,
+                sampling,
+                subnormal,
+                15.5,
+                &fixtures,
+                deadline,
+            );
+            frame += 1;
+        }
+    }
+    assert_eq!(gpu.diagnostics().validation_error_count(), 0);
+
+    dataset_runtime
+        .request_shutdown()
+        .expect("the subnormal traversal fixture begins bounded shutdown");
+    drop(sparse_leases);
+    drop(mixed_leases);
+    drop(general_leases);
+    drop(lease_map);
+    drop(dataset_runtime);
+}
+
+#[test]
+#[ignore = "requires the trusted HW2 Vulkan workstation"]
+fn volume_page_traversal_far_boundary_overflow_clamps_only_to_ray_exit() {
+    let direction_x = 2.0 * f64::from(f32::MIN_POSITIVE);
+    assert!(matches!(
+        classify_portable_direction(direction_x).unwrap(),
+        PortableDirectionComponent::Moving(_)
+    ));
+    let exit = page_exit_distance_reference(
+        [-0.5; 3],
+        [f64::from(f32::MAX), 31.5, 31.5],
+        [15.5; 3],
+        [direction_x, 0.0, 0.0],
+        0.0,
+        64.0,
+    )
+    .expect("the irrelevant far boundary does not require its overflowing quotient");
+    assert_eq!(exit, 64.0);
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let fixtures = build_fixtures();
+    let (dataset_runtime, catalog) = start_dataset_runtime(&fixtures.source);
+    let lease_map = load_keys(
+        &dataset_runtime,
+        &fixtures.terminal_sparse,
+        CancellationGeneration::for_scope(REQUEST_SCOPE, 940),
+        deadline,
+    );
+    let leases = owned_leases(&fixtures.terminal_sparse, &lease_map, None);
+    let numerical_volume = traversal_numerical_volume();
+    let mut gpu = test_gpu_runtime(
+        WgpuRenderRuntimeConfig::new(64 * MIB)
+            .expect("the far-boundary traversal GPU ledger is valid")
+            .with_validation_capture(true),
+        None,
+        TestPipelineAdmission::Ready,
+    );
+    activate_fixture_dataset(&mut gpu, &fixtures, &catalog);
+    request_target_layout(
+        &mut gpu,
+        PresentationTarget::ThreeD,
+        RenderExtent::new(1, 1).unwrap(),
+    );
+    execute_traversal_case(
+        &mut gpu,
+        &catalog,
+        &leases,
+        &numerical_volume,
+        940,
+        TraversalKernel::Mip,
+        SamplingPolicy::VoxelExact,
+        direction_x,
+        15.5,
+        &fixtures,
+        deadline,
+    );
+    assert_eq!(gpu.diagnostics().validation_error_count(), 0);
+
+    dataset_runtime
+        .request_shutdown()
+        .expect("the far-boundary traversal fixture begins bounded shutdown");
+    drop(leases);
+    drop(lease_map);
+    drop(dataset_runtime);
+}
+
 struct ComparisonInput<'a> {
     catalog: &'a DatasetCatalog,
     intent: &'a RenderIntent,
@@ -1389,6 +2068,17 @@ fn request_target_layout(
     );
 }
 
+fn validated_fixture_intent(
+    catalog: &DatasetCatalog,
+    intent: &RenderIntent,
+    requirements: &RenderRequirements,
+) -> RenderIntent {
+    intent.clone().with_shader_work_envelope(
+        mirante4d_render_api::ShaderWorkEnvelope::for_intent(catalog, intent, requirements)
+            .expect("the GPU fixture has a valid shader-work envelope"),
+    )
+}
+
 fn execute_coordinated_target(
     gpu: &mut WgpuRenderRuntime,
     target: PresentationTarget,
@@ -1397,11 +2087,16 @@ fn execute_coordinated_target(
     requirements: &RenderRequirements,
     render_policy: RetainedFrameRenderPolicy,
 ) -> super::CoordinatedFrameExecutionReport {
+    let validated_intent = if intent.shader_work_envelope().is_some() {
+        intent.clone()
+    } else {
+        validated_fixture_intent(catalog, intent, requirements)
+    };
     let request = CoordinatedTargetRequest::new(
         target,
-        intent,
+        &validated_intent,
         requirements,
-        intent.frame().get(),
+        validated_intent.frame().get(),
         render_policy,
     );
     gpu.execute_coordinated_frame(catalog, target, &[request])
@@ -2713,6 +3408,7 @@ fn coordinated_atomic_volume_strips_stay_hidden_and_match_the_direct_frame() {
         preview_extent,
         &fixtures.semantic[1],
     );
+    let preview_intent = validated_fixture_intent(&catalog, &preview_intent, &preview_requirements);
     let preview_request = CoordinatedTargetRequest::new(
         PresentationTarget::ThreeD,
         &preview_intent,
@@ -2753,6 +3449,7 @@ fn coordinated_atomic_volume_strips_stay_hidden_and_match_the_direct_frame() {
 
     let (striped_intent, striped_requirements) =
         intent_and_requirements(201, 1, mode, volume_view(), extent, &fixtures.semantic[1]);
+    let striped_intent = validated_fixture_intent(&catalog, &striped_intent, &striped_requirements);
     let striped_request = CoordinatedTargetRequest::new(
         PresentationTarget::ThreeD,
         &striped_intent,
@@ -2820,6 +3517,8 @@ fn coordinated_atomic_volume_strips_stay_hidden_and_match_the_direct_frame() {
 
     let (replacement_intent, replacement_requirements) =
         intent_and_requirements(202, 1, mode, volume_view(), extent, &fixtures.semantic[1]);
+    let replacement_intent =
+        validated_fixture_intent(&catalog, &replacement_intent, &replacement_requirements);
     let replacement_request = CoordinatedTargetRequest::new(
         PresentationTarget::ThreeD,
         &replacement_intent,
@@ -3014,6 +3713,8 @@ fn coordinated_atomic_volume_strips_stay_hidden_and_match_the_direct_frame() {
 
     let (full_preview_intent, full_preview_requirements) =
         intent_and_requirements(210, 1, mode, volume_view(), extent, &fixtures.semantic[1]);
+    let full_preview_intent =
+        validated_fixture_intent(&catalog, &full_preview_intent, &full_preview_requirements);
     let full_preview_request = CoordinatedTargetRequest::new(
         PresentationTarget::ThreeD,
         &full_preview_intent,
@@ -3114,9 +3815,10 @@ fn assert_atomic_striped_capture_matches_direct(
     mode_label: &str,
 ) {
     let strip_height_pixels = 16;
+    let striped_intent = validated_fixture_intent(catalog, striped_intent, striped_requirements);
     let request = CoordinatedTargetRequest::new(
         PresentationTarget::ThreeD,
-        striped_intent,
+        &striped_intent,
         striped_requirements,
         striped_intent.frame().get(),
         RetainedFrameRenderPolicy::ExactFrameOnly,
@@ -3256,6 +3958,8 @@ fn coordinated_four_target_resident_cutoff_has_real_pixels_one_submit_and_idle_z
         extent,
         &fixtures.semantic[1],
     );
+    let prewarm_3d_intent =
+        validated_fixture_intent(&catalog, &prewarm_3d_intent, &prewarm_3d_requirements);
     let prewarm_3d = CoordinatedTargetRequest::new(
         PresentationTarget::ThreeD,
         &prewarm_3d_intent,
@@ -3287,6 +3991,8 @@ fn coordinated_four_target_resident_cutoff_has_real_pixels_one_submit_and_idle_z
         extent,
         &fixtures.semantic[2],
     );
+    let incomplete_3d_intent =
+        validated_fixture_intent(&catalog, &incomplete_3d_intent, &incomplete_3d_requirements);
     let incomplete_3d = CoordinatedTargetRequest::new(
         PresentationTarget::ThreeD,
         &incomplete_3d_intent,
@@ -3347,6 +4053,8 @@ fn coordinated_four_target_resident_cutoff_has_real_pixels_one_submit_and_idle_z
         extent,
         &fixtures.semantic[2],
     );
+    let prewarm_xz_intent =
+        validated_fixture_intent(&catalog, &prewarm_xz_intent, &prewarm_xz_requirements);
     let prewarm_xz = CoordinatedTargetRequest::new(
         PresentationTarget::Xz,
         &prewarm_xz_intent,
@@ -3421,6 +4129,10 @@ fn coordinated_four_target_resident_cutoff_has_real_pixels_one_submit_and_idle_z
     let yz_requirements = prewarm_xz_requirements
         .rebind(&yz_intent)
         .expect("the second resident body rebinds to YZ");
+    let three_d_intent = validated_fixture_intent(&catalog, &three_d_intent, &three_d_requirements);
+    let xy_intent = validated_fixture_intent(&catalog, &xy_intent, &xy_requirements);
+    let xz_intent = validated_fixture_intent(&catalog, &xz_intent, &xz_requirements);
+    let yz_intent = validated_fixture_intent(&catalog, &yz_intent, &yz_requirements);
     let requests = [
         CoordinatedTargetRequest::new(
             PresentationTarget::ThreeD,
@@ -3697,6 +4409,8 @@ fn cross_target_upload_after_progress_snapshot_remains_dirty_until_consumed() {
     );
     gpu.offer_residency_leases(&offers[1..])
         .expect("the shared successor resource is offered");
+    let xy_intent = validated_fixture_intent(&catalog, &xy_intent, &xy_requirements);
+    let xz_intent = validated_fixture_intent(&catalog, &xz_intent, &xz_requirements);
     let xy_request = CoordinatedTargetRequest::new(
         PresentationTarget::Xy,
         &xy_intent,
@@ -5322,6 +6036,7 @@ fn native_1080p_terminal_navigation_gpu_timing() {
 fn fixed_lod_multichannel_gpu_timing_matrix() {
     const WARMUP_FRAMES: usize = 5;
     const MEASURED_TRIALS: usize = 30;
+    const HOMOGENEOUS_LINEAR_RATIO_LIMIT: f64 = 1.2;
 
     let deadline = Instant::now() + Duration::from_secs(600);
     let fixtures = build_fixtures();
@@ -5577,10 +6292,14 @@ fn fixed_lod_multichannel_gpu_timing_matrix() {
             }
         }
     }
+    let gate_met = maximum_homogeneous_linear_ratio <= HOMOGENEOUS_LINEAR_RATIO_LIMIT;
     println!(
-        "fixed-LOD multichannel shader gate: threshold=1.2000 maximum_homogeneous_linear_ratio={maximum_homogeneous_linear_ratio:.4} case={} gate_met={}",
+        "fixed-LOD multichannel shader gate: threshold={HOMOGENEOUS_LINEAR_RATIO_LIMIT:.4} maximum_homogeneous_linear_ratio={maximum_homogeneous_linear_ratio:.4} case={} gate_met={gate_met}",
         maximum_homogeneous_linear_case,
-        maximum_homogeneous_linear_ratio > 1.2,
+    );
+    assert!(
+        gate_met,
+        "fixed-LOD homogeneous linear ratio {maximum_homogeneous_linear_ratio:.4} for {maximum_homogeneous_linear_case} exceeded {HOMOGENEOUS_LINEAR_RATIO_LIMIT:.4}"
     );
     assert_eq!(gpu.diagnostics().validation_error_count(), 0);
 

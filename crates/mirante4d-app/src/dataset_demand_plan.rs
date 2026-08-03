@@ -1327,14 +1327,20 @@ fn current_plan_union_fits(
         && decoded_bytes <= limits.max_playback_decoded_bytes)
 }
 
-fn retryable_refinement_capacity(error: &PlanAttemptError) -> bool {
+fn retryable_refinement_rejection(error: &PlanAttemptError) -> bool {
     match error {
         PlanAttemptError::Capacity(_) => true,
         PlanAttemptError::Other(error) => {
             error.downcast_ref::<CpuLedgerError>().is_some()
                 || error
                     .downcast_ref::<SemanticPlanError>()
-                    .is_some_and(|error| matches!(error, SemanticPlanError::ScratchCapacity(_)))
+                    .is_some_and(|error| {
+                        matches!(
+                            error,
+                            SemanticPlanError::ScratchCapacity(_)
+                                | SemanticPlanError::ShaderAdmission(_)
+                        )
+                    })
         }
         PlanAttemptError::Cancelled => false,
     }
@@ -2327,7 +2333,7 @@ fn plan_adaptive_current_3d_exact(
         ) {
             Ok(planning) => planning,
             Err(PlanAttemptError::Cancelled) => return Ok(None),
-            Err(error) if retryable_refinement_capacity(&error) => {
+            Err(error) if retryable_refinement_rejection(&error) => {
                 blocked.insert(layer);
                 continue;
             }
@@ -2345,7 +2351,7 @@ fn plan_adaptive_current_3d_exact(
             limits,
             scratch_ledger,
         ) {
-            if retryable_refinement_capacity(&error) {
+            if retryable_refinement_rejection(&error) {
                 blocked.insert(layer);
                 continue;
             }
@@ -2407,7 +2413,7 @@ fn plan_adaptive_current_3d_exact(
                     limits,
                     scratch_ledger,
                 ) {
-                    if retryable_refinement_capacity(&error) {
+                    if retryable_refinement_rejection(&error) {
                         continue;
                     }
                     match error {
@@ -4204,7 +4210,19 @@ mod tests {
     }
 
     #[test]
-    fn finer_candidate_over_each_scalar_bound_selects_the_truthful_catalog_floor() {
+    fn candidate_limit_rejection_is_neutral_until_every_minimum_fails() {
+        assert!(retryable_refinement_rejection(&PlanAttemptError::Capacity(
+            DatasetDemandCapacityExcess {
+                dimension: DatasetDemandCapacityDimension::Resources,
+                required: 2,
+                available: 1,
+            }
+        )));
+        assert!(retryable_refinement_rejection(&PlanAttemptError::Other(
+            anyhow::Error::new(SemanticPlanError::ShaderAdmission(
+                mirante4d_render_api::ShaderAdmissionError::SingularAffine,
+            ))
+        )));
         let (catalog, view) = two_layer_catalog_and_view();
         let camera = CameraView::new(
             Projection::Orthographic,
@@ -4278,6 +4296,17 @@ mod tests {
                 "{name} must not label a coarse body as the rejected fine ideal"
             );
         }
+
+        let error = plan_progressive_current_3d(
+            &catalog,
+            &view,
+            presentation,
+            extent,
+            DatasetDemandPlanLimits::new(4_096, 64, floor.payload_bytes.saturating_sub(1)),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.is::<DatasetDemandPlanCapacityError>());
     }
 
     #[test]

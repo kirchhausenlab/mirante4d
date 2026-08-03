@@ -1,6 +1,6 @@
 # Testing And Validation
 
-Last updated: 2026-08-01
+Last updated: 2026-08-02
 
 Testing exists to expose meaningful failures quickly. It is not a measure of
 project seriousness, and a large passing suite is not a substitute for using
@@ -107,6 +107,140 @@ retains the clean-revision, hardware/adapter, timeout, independent-oracle, and
 normal verification-report checks. Ordinary GPU test source is not registered
 as a hash-bound fixture, and passing tests are not reinterpreted by a separate
 qualification-receipt parser.
+
+The rendering-correctness cut adds four trusted page-traversal cases under
+`volume_page_traversal_`. They cover positive/negative `5e-7` crossings,
+binary32 zero and subnormal handling, an irrelevant overflowing far boundary,
+fused and general-affine DVR, the other volume kernels, both sampling modes,
+and Pick against independent color/coverage/validity/position facts.
+
+The controlled A/B/C static-recovery campaign is a separate designated-
+workstation qualification, not a routine trusted-GPU run:
+
+```bash
+MIRANTE4D_XTASK_ALLOW_STATIC_RECOVERY=1 \
+  cargo run --release -p xtask -- \
+  representative-static-rendering-recovery \
+  --config /absolute/private/campaign-config.json
+```
+
+The private configuration uses schema
+`mirante4d-private-static-rendering-recovery-config-1` and has this exact
+shape (the shown identities and paths are placeholders):
+
+```json
+{
+  "schema": "mirante4d-private-static-rendering-recovery-config-1",
+  "campaign_token": "random-campaign-local-token",
+  "workload": "/private/dataset.m4d",
+  "workload_identity_sha256": "<64 lowercase hex>",
+  "private_output_directory": "/private/recovery-output",
+  "raw_report": "/private/recovery-output/raw-report.json",
+  "evidence_overlay_patch": "/private/evidence-overlay.patch",
+  "evidence_overlay_sha256": "<SHA-256 of the exact patch bytes>",
+  "revisions": [
+    {
+      "label": "A",
+      "worktree": "/worktrees/revision-a",
+      "source_commit": "24f7da1531056c950cb5479098bd723c5fd8dc91",
+      "measured_commit": "<full overlay commit>",
+      "measured_tree": "<full measured tree>",
+      "collector": "/absolute/revision-a/collector"
+    },
+    {
+      "label": "B",
+      "worktree": "/worktrees/revision-b",
+      "source_commit": "d5032c43525ddfa9d524d490e3391aa800c6d470",
+      "measured_commit": "<full overlay commit>",
+      "measured_tree": "<full measured tree>",
+      "collector": "/absolute/revision-b/collector"
+    },
+    {
+      "label": "C",
+      "worktree": "/worktrees/revision-c",
+      "source_commit": "<full candidate commit before the overlay>",
+      "measured_commit": "<full overlay commit>",
+      "measured_tree": "<full measured tree>",
+      "collector": "/absolute/revision-c/collector"
+    }
+  ]
+}
+```
+
+The config, overlay patch, collector fragments, and raw report are mode-0600
+single-link files beneath nonsymlink mode-0700 private directories outside the
+repository. Each measured worktree must be clean; its measured commit must be
+exactly one commit above the declared source, and the configured patch must
+reverse-apply cleanly to it. Use a new empty output directory and random token
+for every campaign. The command never overwrites fragments, raw evidence, or
+the sanitized summary.
+
+Each collector receives the same fixed arguments printed by
+`representative-static-rendering-recovery --help` and must emit schema
+`mirante4d-private-static-rendering-recovery-fragment-1`. The orchestrator
+rejects anything other than all 27 A/B/C fragments in block orders A/B/C,
+B/C/A, and C/A/B. It also rejects changed host, Vulkan adapter session,
+settings identity, viewport, workload identity, overlay identity, process or
+environment evidence shape, incomplete 32-case fixed-LOD topology, missing
+raw timing/counter vectors, noncanonical per-layer maps, or malformed
+independent scientific facts.
+
+Evaluation uses nearest-rank run p95 without interpolation and then the median
+of three run values. A is excluded per row when its scientific work differs;
+B is never replaced by a nonmatching comparison. C must match independent
+pixel, coverage, validity, map, and Exact/current facts. Fixed-LOD GPU p95 is
+limited to `1.05` times the better admissible A/B median. Warm UI p95 and cold
+Exact settlement use the greater of `1.10` times baseline or baseline plus
+1 ms. Warm reads/decodes/requests/uploads/evictions/allocator plans/body
+rebuilds, settled-idle work, duplicate color submissions, hidden scheduler
+overrun, renderer/validation failures, unsupported timestamps, or two invalid
+baselines keep the quantitative gate open.
+
+Raw paths, workload hashes, settings/scientific digests, camera facts,
+read/decode identities, process arguments, and host-identifying strings stay
+in the private raw report. Only a campaign-token summary, public revision
+bindings, per-block aggregates, ratios, gates, and the deterministic first
+attribution boundary are written under
+`target/mirante4d/static-rendering-recovery/`. To revalidate and sanitize an
+already finalized private raw report without rerunning the workload, use:
+
+```bash
+cargo run --release -p xtask -- \
+  representative-static-rendering-recovery \
+  --raw-report /absolute/private/raw-report.json
+```
+
+The command exits nonzero after writing the sanitized diagnostic whenever a
+gate is unevaluated or failed. Such a report is evidence that R11 remains
+open; it is not a performance qualification.
+
+For the current rendering-correctness implementation, invoke the local matrix
+and focused trusted cases directly when the worktree is intentionally dirty:
+
+```bash
+cargo test -p mirante4d-render-wgpu \
+  fixed_lod_multichannel_gpu_timing_matrix --lib -- \
+  --ignored --nocapture --test-threads=1
+cargo test -p mirante4d-render-wgpu \
+  volume_page_traversal_ --lib -- \
+  --ignored --nocapture --test-threads=1
+```
+
+Those direct invocations are supporting diagnostics only. They do not bypass
+the `trusted-gpu` clean-revision guard and cannot close P7. On the designated
+RTX 3070 Ti Laptop GPU/Vulkan adapter, the current matrix's worst homogeneous
+linear normalized ratio is `1.0181` with `gate_met=true`, zero sample uploads,
+and zero validation errors. The separate private A/B/C threshold remains
+`1.05` against the better admissible baseline.
+
+Current real-display automation passes `target_fixture_render_modes` and
+`representative_native_navigation`. The bundled three-timepoint fixture is not
+valid evidence for `representative_temporal_playback`: the scenario observes
+an Exact/current t1 presentation, then rejects the t1 capture because its
+retained t0 transfer window yields no intermediate RGB pixels. Do not weaken
+that capture gate or count the stopped run as temporal qualification; use a
+suitable multi-timepoint package whose retained window produces non-clipped,
+pixel-distinct t0 and t1 frames.
 
 Focused release diagnostics are available for resident rendering and
 rendering:
