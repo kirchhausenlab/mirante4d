@@ -4562,6 +4562,14 @@ fn coordinated_target_pins_are_union_scoped_and_layout_retirement_releases_them(
         None,
         TestPipelineAdmission::Ready,
     );
+    let renderer_events = Arc::new(Mutex::new(VecDeque::new()));
+    let event_queue = Arc::clone(&renderer_events);
+    gpu.set_renderer_event_sink(RendererEventSink::new(move |event| {
+        event_queue
+            .lock()
+            .expect("the renderer test event queue is never poisoned")
+            .push_back(event);
+    }));
     activate_fixture_dataset(&mut gpu, &fixtures, &catalog);
     let presentations = PresentationTarget::ALL;
     let layout = presentations.map(|target| CoordinatedTargetLayout::new(target, extent));
@@ -4601,7 +4609,10 @@ fn coordinated_target_pins_are_union_scoped_and_layout_retirement_releases_them(
                     .expect("the pin target has one report")
                     .clone();
                 if !report.deferred_by_backpressure() {
-                    break report;
+                    let submitted_through = cutoff
+                        .submitted_through_event()
+                        .expect("the accepted pin fixture report names its final submission");
+                    break (report, submitted_through);
                 }
                 assert!(Instant::now() < deadline, "pin fixture staging timed out");
                 std::thread::yield_now();
@@ -4609,33 +4620,49 @@ fn coordinated_target_pins_are_union_scoped_and_layout_retirement_releases_them(
         };
 
     for (index, target) in presentations.into_iter().enumerate() {
-        let report = execute(&mut gpu, target, 700 + index as u64, fixtures.upload[index]);
+        let (report, _) = execute(&mut gpu, target, 700 + index as u64, fixtures.upload[index]);
         assert_eq!(report.newly_resident_keys(), &[fixtures.upload[index]]);
     }
     for index in 4..9 {
-        let report = execute(
+        let (report, submitted_through) = execute(
             &mut gpu,
             presentations[0],
             700 + index as u64,
             fixtures.upload[index],
         );
+        if index == 7 {
+            // Establish a real queue-completion boundary before asking which
+            // inactive page is oldest. Temporary submission leases are an
+            // implementation detail and must not make this semantic pin test
+            // depend on how quickly the workstation drains its queue.
+            wait_for_submission_completion(&mut gpu, &renderer_events, submitted_through, deadline);
+        }
         if index == 8 {
-            assert_eq!(report.evicted_keys().len(), 1);
-            assert!(
-                !fixtures.upload[1..4].contains(&report.evicted_keys()[0]),
-                "other live presentations' current resources are pinned"
+            assert_eq!(
+                report.evicted_keys(),
+                &[fixtures.upload[0]],
+                "the oldest inactive page leaves while every live presentation keeps its current resource pinned"
             );
         }
     }
+    let mut warm_submitted_through = None;
     for (index, target) in presentations.into_iter().enumerate().take(4).skip(1) {
-        let warm = execute(&mut gpu, target, 720 + index as u64, fixtures.upload[index]);
+        let (warm, submitted_through) =
+            execute(&mut gpu, target, 720 + index as u64, fixtures.upload[index]);
         assert_eq!(warm.uploaded_resources(), 0);
         assert!(warm.evicted_keys().is_empty());
+        warm_submitted_through = Some(submitted_through);
     }
+    wait_for_submission_completion(
+        &mut gpu,
+        &renderer_events,
+        warm_submitted_through.expect("the final warm revisit names its submission"),
+        deadline,
+    );
 
     gpu.request_coordinated_layout(&[CoordinatedTargetLayout::new(presentations[0], extent)])
         .expect("omitted fixed targets retire their frame leases and pins");
-    let replacement = execute(&mut gpu, presentations[0], 730, fixtures.upload[0]);
+    let (replacement, _) = execute(&mut gpu, presentations[0], 730, fixtures.upload[0]);
     assert_eq!(replacement.newly_resident_keys(), &[fixtures.upload[0]]);
     assert_eq!(
         replacement.evicted_keys(),
@@ -4650,7 +4677,7 @@ fn coordinated_target_pins_are_union_scoped_and_layout_retirement_releases_them(
     assert_eq!(gpu.resident_payload_bytes(), 0);
     assert_eq!(gpu.diagnostics().empty_resident_metadata_records(), 0);
     activate_fixture_dataset(&mut gpu, &fixtures, &catalog);
-    let replacement_generation = execute(&mut gpu, presentations[0], 740, fixtures.upload[0]);
+    let (replacement_generation, _) = execute(&mut gpu, presentations[0], 740, fixtures.upload[0]);
     assert_eq!(
         replacement_generation.newly_resident_keys(),
         &[fixtures.upload[0]]
