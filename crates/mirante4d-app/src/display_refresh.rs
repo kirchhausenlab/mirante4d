@@ -16,9 +16,11 @@ use crate::{
         install_if_current_texture_revision,
     },
     presentation_scheduler::{
-        PresentationTransaction, TargetAvailability, assemble_logical_targets,
+        FixedPresentationTargetRequests, PresentationQuality, PresentationTransaction,
+        PresentationTransactionMember, PresentationTransactionTargets,
     },
     product_render_intent::{ProductRenderRequest, cross_section_intent, volume_intent},
+    shader_work_envelope_cache::{ShaderWorkEnvelopeBuildError, ShaderWorkEnvelopeLookup},
     viewer_layout::PanelId,
     volume_presentation::{
         VolumePreviewCandidate, VolumePreviewCandidateDisposition, VolumeWorkloadProfile,
@@ -36,8 +38,11 @@ use mirante4d_render_api::{
     RenderExtent, RenderRequirements, RenderViewIntent,
 };
 use mirante4d_render_wgpu::{
-    CoordinatedFrameExecutionReport, CoordinatedPublicationGroup, CoordinatedTargetLayout,
-    CoordinatedTargetRequest, CpuFrameTiming, RetainedFrameRenderPolicy, VolumeColorSchedule,
+    CoordinatedFrameExecutionReport, CoordinatedLogicalTargetSet, CoordinatedMemberDisposition,
+    CoordinatedPublicationGroup, CoordinatedTargetExecutionReport, CoordinatedTargetLayout,
+    CoordinatedTargetRequest, CpuFrameTiming, HiddenRefinementCapabilityFailure,
+    HiddenRefinementFailure, HiddenRefinementState, PipelineCapability,
+    PipelineCompilationFailureCause, RetainedFrameRenderPolicy, VolumeColorSchedule,
     WgpuRenderRuntimeError,
 };
 
@@ -147,43 +152,74 @@ impl PanelPerformanceMilestones {
     }
 }
 
-/// Exact immutable inputs for one terminal product-render failure.
+/// Exact immutable inputs for one product color attempt.
 ///
 /// The requirement body deliberately uses allocation identity: replacing a
 /// prepared body is a real planning event even when it happens to contain the
-/// same keys. Frame identity covers every render-intent change, while retained
-/// CPU payload generation and dataset-runtime epoch cover replaceable inputs.
+/// same keys. CPU lease arrival is deliberately absent: relevant residency
+/// owns an exact keyed wake instead of becoming a global retry clock.
 #[derive(Debug, Clone)]
-pub(crate) struct ProductRenderFailureSignature {
+pub(crate) struct RenderAttemptFingerprint {
+    source_generation: SourceSessionGeneration,
+    layout: CanonicalViewerLayout,
     frames: [Option<FrameIdentity>; 4],
+    timepoints: [Option<TimeIndex>; 4],
     requirements: [Option<RenderRequirements>; 4],
-    retained_lease_generation: u64,
+    surface_generations: [Option<u64>; 4],
+    extents: [Option<RenderExtent>; 4],
+    layer_scales: [Option<Arc<BTreeMap<LogicalLayerKey, ScaleLevel>>>; 4],
+    schedules: [Option<VolumeColorSchedule>; 4],
     dataset_runtime_epoch: u64,
+    cpu_capacity_epoch: u64,
+    renderer_device_generation: u64,
 }
 
-impl ProductRenderFailureSignature {
+impl RenderAttemptFingerprint {
     fn new(
+        snapshot: &ApplicationSnapshot,
         requests: &[CoordinatedOwnedRequest],
-        retained_lease_generation: u64,
         dataset_runtime_epoch: u64,
+        cpu_capacity_epoch: u64,
+        renderer_device_generation: u64,
     ) -> Self {
         let mut frames = [None; 4];
+        let mut timepoints = [None; 4];
         let mut requirements = std::array::from_fn(|_| None);
+        let mut surface_generations = [None; 4];
+        let mut extents = [None; 4];
+        let mut layer_scales = std::array::from_fn(|_| None);
+        let mut schedules = [None; 4];
         for request in requests {
             let index = request.target.index();
             frames[index] = Some(request.request.intent.frame());
+            timepoints[index] = Some(request.request.intent.timepoint());
             requirements[index] = Some(request.request.requirements.clone());
+            surface_generations[index] = Some(request.surface_generation);
+            extents[index] = Some(request.output_extent);
+            layer_scales[index] = Some(Arc::clone(&request.layer_scales));
+            schedules[index] = Some(request.volume_schedule);
         }
         Self {
+            source_generation: snapshot.source_generation(),
+            layout: application_view(snapshot).layout(),
             frames,
+            timepoints,
             requirements,
-            retained_lease_generation,
+            surface_generations,
+            extents,
+            layer_scales,
+            schedules,
             dataset_runtime_epoch,
+            cpu_capacity_epoch,
+            renderer_device_generation,
         }
     }
 
     fn matches_current(&self, current: &Self) -> bool {
-        self.frames == current.frames
+        self.source_generation == current.source_generation
+            && self.layout == current.layout
+            && self.frames == current.frames
+            && self.timepoints == current.timepoints
             && self
                 .requirements
                 .iter()
@@ -196,26 +232,678 @@ impl ProductRenderFailureSignature {
                     (None, None) => true,
                     _ => false,
                 })
-            && self.retained_lease_generation == current.retained_lease_generation
+            && self.surface_generations == current.surface_generations
+            && self.extents == current.extents
+            && self.schedules == current.schedules
+            && self
+                .layer_scales
+                .iter()
+                .zip(&current.layer_scales)
+                .all(|(left, right)| match (left, right) {
+                    (Some(left), Some(right)) => left.as_ref() == right.as_ref(),
+                    (None, None) => true,
+                    _ => false,
+                })
             && self.dataset_runtime_epoch == current.dataset_runtime_epoch
+            && self.cpu_capacity_epoch == current.cpu_capacity_epoch
+            && self.renderer_device_generation == current.renderer_device_generation
     }
 }
 
-/// Only outcomes with a concrete asynchronous completion path bypass the
-/// latch. Eviction-log capacity is backpressure rather than a terminal
-/// configuration failure because normal event acknowledgement can clear it
-/// without changing any render-signature input.
-fn product_render_failure_is_deterministic(error: WgpuRenderRuntimeError) -> bool {
-    !matches!(
-        error,
-        WgpuRenderRuntimeError::StaleFrame { .. }
-            | WgpuRenderRuntimeError::PipelineNotReady { .. }
-            | WgpuRenderRuntimeError::PickCapacityExceeded
-            | WgpuRenderRuntimeError::PickBackpressure
-            | WgpuRenderRuntimeError::PayloadPlacementUnavailable { .. }
-            | WgpuRenderRuntimeError::PayloadRecoveryDeferred
-            | WgpuRenderRuntimeError::ResidencyEvictionEventCapacityExceeded { .. }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenderWaitReason {
+    LogicalMember,
+    MailboxAdvance,
+    CandidatePlan,
+    InitialPipeline,
+    SubmissionCleanup,
+    EvictionAcknowledgement,
+    RelevantResidency,
+    HiddenWorker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RenderWaitKey {
+    LogicalMember {
+        target: PresentationTarget,
+        family_revision: u64,
+    },
+    MailboxAdvance {
+        target: PresentationTarget,
+        minimum_frame: u64,
+    },
+    CandidatePlan {
+        demand_revision: u64,
+    },
+    InitialPipeline {
+        device_generation: u64,
+    },
+    SubmissionCleanup {
+        submission: u64,
+    },
+    EvictionAcknowledgement {
+        ledger_revision: u64,
+    },
+    RelevantResidency {
+        target: PresentationTarget,
+        requirements: RenderRequirements,
+    },
+    HiddenWorker {
+        target: PresentationTarget,
+        job: u64,
+    },
+}
+
+impl RenderWaitKey {
+    const fn reason(&self) -> RenderWaitReason {
+        match self {
+            Self::LogicalMember { .. } => RenderWaitReason::LogicalMember,
+            Self::MailboxAdvance { .. } => RenderWaitReason::MailboxAdvance,
+            Self::CandidatePlan { .. } => RenderWaitReason::CandidatePlan,
+            Self::InitialPipeline { .. } => RenderWaitReason::InitialPipeline,
+            Self::SubmissionCleanup { .. } => RenderWaitReason::SubmissionCleanup,
+            Self::EvictionAcknowledgement { .. } => RenderWaitReason::EvictionAcknowledgement,
+            Self::RelevantResidency { .. } => RenderWaitReason::RelevantResidency,
+            Self::HiddenWorker { .. } => RenderWaitReason::HiddenWorker,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WaitingWake {
+    Event(RenderWaitKey),
+    #[allow(
+        dead_code,
+        reason = "bounded auxiliary map polling is installed by the Pick/capture cutover"
+    )]
+    After {
+        reason: RenderWaitReason,
+        interval: Duration,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum RenderAttemptState {
+    Idle,
+    Ready {
+        fingerprint: RenderAttemptFingerprint,
+    },
+    Waiting {
+        fingerprint: RenderAttemptFingerprint,
+        reason: RenderWaitReason,
+        wake: WaitingWake,
+    },
+    Failed {
+        fingerprint: RenderAttemptFingerprint,
+        failure: ResidentRenderFailureStatus,
+    },
+    ColorUnavailable {
+        failure: ResidentRenderFailureStatus,
+    },
+    RendererTerminal {
+        failure: ResidentRenderFailureStatus,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RenderWake {
+    Immediate,
+    Waiting(WaitingWake),
+    None,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RenderAttemptCoordinator {
+    state: RenderAttemptState,
+    ready_pending_admission: bool,
+    pending_composition: [Option<(u64, u64)>; 4],
+    acknowledged_composition: [Option<(u64, u64)>; 4],
+    execution_decisions: u64,
+    wait_decisions: u64,
+    failure_decisions: u64,
+}
+
+impl Default for RenderAttemptCoordinator {
+    fn default() -> Self {
+        Self {
+            state: RenderAttemptState::Idle,
+            ready_pending_admission: false,
+            pending_composition: [None; 4],
+            acknowledged_composition: [None; 4],
+            execution_decisions: 0,
+            wait_decisions: 0,
+            failure_decisions: 0,
+        }
+    }
+}
+
+impl RenderAttemptCoordinator {
+    pub(crate) const fn state(&self) -> &RenderAttemptState {
+        &self.state
+    }
+
+    pub(crate) const fn renderer_is_terminal(&self) -> bool {
+        matches!(&self.state, RenderAttemptState::RendererTerminal { .. })
+    }
+
+    pub(crate) fn begin(&mut self, fingerprint: RenderAttemptFingerprint) -> bool {
+        match &self.state {
+            RenderAttemptState::Ready {
+                fingerprint: previous,
+            } if previous.matches_current(&fingerprint) => {
+                if !self.ready_pending_admission {
+                    return false;
+                }
+            }
+            RenderAttemptState::Failed {
+                fingerprint: previous,
+                ..
+            }
+            | RenderAttemptState::Waiting {
+                fingerprint: previous,
+                ..
+            } if previous.matches_current(&fingerprint) => return false,
+            RenderAttemptState::Waiting {
+                wake:
+                    WaitingWake::Event(RenderWaitKey::MailboxAdvance {
+                        target,
+                        minimum_frame,
+                    }),
+                ..
+            } if fingerprint.frames[target.index()]
+                .is_none_or(|frame| frame.get() < *minimum_frame) =>
+            {
+                return false;
+            }
+            RenderAttemptState::ColorUnavailable { .. }
+            | RenderAttemptState::RendererTerminal { .. } => return false,
+            RenderAttemptState::Idle
+            | RenderAttemptState::Ready { .. }
+            | RenderAttemptState::Waiting { .. }
+            | RenderAttemptState::Failed { .. } => {}
+        }
+        self.execution_decisions = self.execution_decisions.saturating_add(1);
+        self.ready_pending_admission = false;
+        self.state = RenderAttemptState::Ready { fingerprint };
+        true
+    }
+
+    /// Authorizes exactly one successor execution for the fingerprint whose
+    /// completed report proved that immediately actionable renderer work
+    /// remains. This is distinct from merely being in `Ready`: `begin` puts
+    /// the admitted attempt in that state while it executes, and an unchanged
+    /// UI turn must not manufacture another admission without this report or
+    /// a matching causal wake.
+    pub(crate) fn continue_ready(&mut self, fingerprint: &RenderAttemptFingerprint) {
+        let RenderAttemptState::Ready {
+            fingerprint: admitted,
+        } = &self.state
+        else {
+            debug_assert!(false, "only an admitted ready attempt can continue");
+            return;
+        };
+        if !admitted.matches_current(fingerprint) {
+            debug_assert!(false, "a render report cannot continue a different attempt");
+            return;
+        }
+        self.ready_pending_admission = true;
+    }
+
+    pub(crate) fn wait(&mut self, fingerprint: RenderAttemptFingerprint, key: RenderWaitKey) {
+        let reason = key.reason();
+        self.wait_decisions = self.wait_decisions.saturating_add(1);
+        self.ready_pending_admission = false;
+        self.state = RenderAttemptState::Waiting {
+            fingerprint,
+            reason,
+            wake: WaitingWake::Event(key),
+        };
+    }
+
+    pub(crate) fn fail(
+        &mut self,
+        fingerprint: RenderAttemptFingerprint,
+        failure: ResidentRenderFailureStatus,
+    ) {
+        self.failure_decisions = self.failure_decisions.saturating_add(1);
+        self.ready_pending_admission = false;
+        self.state = RenderAttemptState::Failed {
+            fingerprint,
+            failure,
+        };
+    }
+
+    pub(crate) fn settle(&mut self) {
+        self.ready_pending_admission = false;
+        self.state = RenderAttemptState::Idle;
+    }
+
+    pub(crate) fn color_unavailable(&mut self, failure: ResidentRenderFailureStatus) {
+        self.ready_pending_admission = false;
+        self.state = RenderAttemptState::ColorUnavailable { failure };
+    }
+
+    pub(crate) fn renderer_terminal(&mut self, failure: ResidentRenderFailureStatus) {
+        self.ready_pending_admission = false;
+        self.state = RenderAttemptState::RendererTerminal { failure };
+        self.pending_composition = [None; 4];
+    }
+
+    pub(crate) fn note_published_texture(
+        &mut self,
+        target: PresentationTarget,
+        device_generation: u64,
+        texture_revision: u64,
+    ) {
+        let identity = (device_generation, texture_revision);
+        let index = target.index();
+        if self.acknowledged_composition[index].is_some_and(|acknowledged| acknowledged >= identity)
+            || self.pending_composition[index].is_some_and(|pending| pending >= identity)
+        {
+            return;
+        }
+        self.pending_composition[index] = Some(identity);
+    }
+
+    pub(crate) fn acknowledge_composition(
+        &mut self,
+        target: PresentationTarget,
+        identity: Option<(u64, u64)>,
+    ) {
+        let index = target.index();
+        if self.pending_composition[index] == identity {
+            self.acknowledged_composition[index] = identity;
+            self.pending_composition[index] = None;
+        }
+    }
+
+    /// Retires a texture identity whose target intentionally became a
+    /// background/empty surface. There will be no later image paint capable
+    /// of acknowledging that identity, so retaining it would manufacture an
+    /// immediate repaint loop after the semantic surface was already current.
+    pub(crate) fn retire_composition(&mut self, target: PresentationTarget) {
+        self.pending_composition[target.index()] = None;
+    }
+
+    pub(crate) fn wake(&self) -> RenderWake {
+        match &self.state {
+            RenderAttemptState::Ready { .. } if self.ready_pending_admission => {
+                RenderWake::Immediate
+            }
+            RenderAttemptState::Waiting { wake, .. } => RenderWake::Waiting(wake.clone()),
+            RenderAttemptState::Idle
+            | RenderAttemptState::Ready { .. }
+            | RenderAttemptState::Failed { .. }
+            | RenderAttemptState::ColorUnavailable { .. }
+            | RenderAttemptState::RendererTerminal { .. } => {
+                if self.pending_composition.iter().any(Option::is_some) {
+                    RenderWake::Immediate
+                } else {
+                    RenderWake::None
+                }
+            }
+        }
+    }
+
+    pub(crate) fn target_ready(&self, target: PresentationTarget) -> bool {
+        self.ready_pending_admission
+            && matches!(
+            &self.state,
+            RenderAttemptState::Ready { fingerprint }
+                if fingerprint.frames[target.index()].is_some()
+            )
+    }
+
+    pub(crate) fn observe_renderer_events(&mut self, events: RendererEventBatch) {
+        let RenderAttemptState::Waiting {
+            fingerprint,
+            wake: WaitingWake::Event(key),
+            ..
+        } = &self.state
+        else {
+            return;
+        };
+        let matches = match key {
+            RenderWaitKey::InitialPipeline { device_generation } => {
+                events.initial_pipeline_changed()
+                    && events.renderer_device_generation == *device_generation
+            }
+            RenderWaitKey::SubmissionCleanup { submission } => events
+                .submission_completed()
+                .is_some_and(|completed| completed >= *submission),
+            RenderWaitKey::HiddenWorker { job, .. } => events
+                .hidden_worker_result()
+                .is_some_and(|completed| completed == *job),
+            RenderWaitKey::LogicalMember { .. }
+            | RenderWaitKey::MailboxAdvance { .. }
+            | RenderWaitKey::CandidatePlan { .. }
+            | RenderWaitKey::EvictionAcknowledgement { .. }
+            | RenderWaitKey::RelevantResidency { .. } => false,
+        };
+        if !matches {
+            return;
+        }
+        self.ready_pending_admission = true;
+        self.state = RenderAttemptState::Ready {
+            fingerprint: fingerprint.clone(),
+        };
+    }
+
+    pub(crate) fn observe_eviction_acknowledgement(&mut self, ledger_revision: u64) {
+        let RenderAttemptState::Waiting {
+            fingerprint,
+            wake:
+                WaitingWake::Event(RenderWaitKey::EvictionAcknowledgement {
+                    ledger_revision: awaited,
+                }),
+            ..
+        } = &self.state
+        else {
+            return;
+        };
+        if ledger_revision < *awaited {
+            return;
+        }
+        self.ready_pending_admission = true;
+        self.state = RenderAttemptState::Ready {
+            fingerprint: fingerprint.clone(),
+        };
+    }
+
+    pub(crate) fn observe_relevant_residency_offer(
+        &mut self,
+        resource: mirante4d_dataset::BrickKey,
+    ) {
+        let RenderAttemptState::Waiting {
+            fingerprint,
+            wake: WaitingWake::Event(RenderWaitKey::RelevantResidency { requirements, .. }),
+            ..
+        } = &self.state
+        else {
+            return;
+        };
+        if !requirements.is_required_resource(resource) {
+            return;
+        }
+        self.ready_pending_admission = true;
+        self.state = RenderAttemptState::Ready {
+            fingerprint: fingerprint.clone(),
+        };
+    }
+
+    pub(crate) fn failure(&self) -> Option<&ResidentRenderFailureStatus> {
+        match &self.state {
+            RenderAttemptState::Failed { failure, .. }
+            | RenderAttemptState::ColorUnavailable { failure }
+            | RenderAttemptState::RendererTerminal { failure } => Some(failure),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn wait_reason(&self) -> Option<RenderWaitReason> {
+        match &self.state {
+            RenderAttemptState::Waiting { reason, .. } => Some(*reason),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColorRuntimeDisposition {
+    ColorUnavailable,
+    RendererTerminal,
+    Wait(RenderWaitReason),
+    Stale,
+    PlacementRecovery,
+    DeterministicFailure,
+    AuxiliaryOnly,
+}
+
+/// Total color-boundary classification. This intentionally has no wildcard:
+/// a new renderer error cannot silently inherit retry or failure semantics.
+const fn classify_color_runtime_error(error: WgpuRenderRuntimeError) -> ColorRuntimeDisposition {
+    use ColorRuntimeDisposition as Disposition;
+    use WgpuRenderRuntimeError as Error;
+    match error {
+        Error::InvalidConfiguration
+        | Error::SoftwareAdapter
+        | Error::UnsupportedBackend
+        | Error::AdapterLimitsInsufficient
+        | Error::DeviceLimitsInsufficient
+        | Error::PipelineCompilerSpawnFailed
+        | Error::RendererDeviceGenerationExhausted => Disposition::ColorUnavailable,
+        Error::DeviceLost
+        | Error::DeviceOutOfMemory
+        | Error::BackendInternal
+        | Error::BackendValidation => Disposition::RendererTerminal,
+        Error::PipelineCompilationFailed { capability, cause } => match cause {
+            PipelineCompilationFailureCause::DeviceOutOfMemory
+            | PipelineCompilationFailureCause::BackendInternal => Disposition::RendererTerminal,
+            PipelineCompilationFailureCause::Validation
+            | PipelineCompilationFailureCause::WorkerPanicked
+            | PipelineCompilationFailureCause::WorkerStopped => match capability {
+                PipelineCapability::InitialRender => Disposition::ColorUnavailable,
+                PipelineCapability::Pick => Disposition::AuxiliaryOnly,
+            },
+        },
+        Error::PipelineNotReady { capability } => match capability {
+            PipelineCapability::InitialRender => {
+                Disposition::Wait(RenderWaitReason::InitialPipeline)
+            }
+            PipelineCapability::Pick => Disposition::AuxiliaryOnly,
+        },
+        Error::StaleFrame { .. } => Disposition::Stale,
+        Error::ResidencyEvictionEventCapacityExceeded { .. } => {
+            Disposition::Wait(RenderWaitReason::EvictionAcknowledgement)
+        }
+        Error::PayloadRecoveryDeferred => Disposition::Wait(RenderWaitReason::SubmissionCleanup),
+        Error::PayloadPlacementUnavailable { .. } => Disposition::PlacementRecovery,
+        Error::UnknownValidationCapture
+        | Error::StaleValidationCapture
+        | Error::ValidationCaptureFailed
+        | Error::UnknownGpuTiming
+        | Error::GpuTimingFailed
+        | Error::PickQueryMismatch
+        | Error::PickFrameUnavailable
+        | Error::PickCapacityExceeded
+        | Error::PickTicketExhausted
+        | Error::PickBackpressure
+        | Error::UnknownVolumePick
+        | Error::VolumePickFailed => Disposition::AuxiliaryOnly,
+        Error::FrameContractMismatch
+        | Error::ExtentExceeded
+        | Error::RequirementSetChanged
+        | Error::InvalidResourceGridCatalog
+        | Error::RequirementCapacityExceeded { .. }
+        | Error::PresentationCapacityExceeded { .. }
+        | Error::PresentationNotRegistered
+        | Error::PrivatePresentationIdExhausted
+        | Error::TextureRevisionExhausted
+        | Error::DuplicateCoordinatedTarget { .. }
+        | Error::CoordinatedTargetNotConfigured { .. }
+        | Error::CoordinatedTargetViewMismatch { .. }
+        | Error::InvalidVolumeColorSchedule { .. }
+        | Error::InvalidCoordinatedPublicationGroup
+        | Error::CoordinatedTargetExtentMismatch { .. }
+        | Error::LeaseCapacityExceeded { .. }
+        | Error::DuplicateLease
+        | Error::UnexpectedLease
+        | Error::PayloadContractMismatch
+        | Error::UnsupportedView
+        | Error::ShaderAdmission(_)
+        | Error::ShaderWorkEnvelopeMismatch
+        | Error::CoordinateLimitExceeded
+        | Error::ControlCapacityExceeded
+        | Error::CapacityExceeded { .. }
+        | Error::ResidentMetadataCapacityExceeded { .. }
+        | Error::FrameProgressContract => Disposition::DeterministicFailure,
+    }
+}
+
+fn hidden_refinement_failure_status(
+    state: HiddenRefinementState,
+) -> Option<ResidentRenderFailureStatus> {
+    match state {
+        HiddenRefinementState::Failed(HiddenRefinementFailure::SubmissionTimedOutTwice) => {
+            Some(ResidentRenderFailureStatus::new(
+                FrameFailureKind::AllocationFailed,
+                "hidden exact refinement timed out twice for this render request",
+            ))
+        }
+        HiddenRefinementState::CapabilityFailed(cause) => {
+            let message = match cause {
+                HiddenRefinementCapabilityFailure::WorkerSpawnFailed => {
+                    "hidden exact refinement worker could not be started"
+                }
+                HiddenRefinementCapabilityFailure::WorkerPanicked => {
+                    "hidden exact refinement worker stopped after a panic"
+                }
+                HiddenRefinementCapabilityFailure::JobIdentityExhausted => {
+                    "hidden exact refinement job identities are exhausted"
+                }
+            };
+            Some(ResidentRenderFailureStatus::new(
+                FrameFailureKind::BackendLimit,
+                message,
+            ))
+        }
+        HiddenRefinementState::Running(_)
+        | HiddenRefinementState::WaitingForSubmission { .. }
+        | HiddenRefinementState::RetryReady
+        | HiddenRefinementState::Complete(_) => None,
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ColorAttemptObservation {
+    Current,
+    Ready,
+    Waiting(RenderWaitKey),
+    Failed(ResidentRenderFailureStatus),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ColorAttemptTargetFacts {
+    target: PresentationTarget,
+    current: bool,
+    presented: bool,
+    deferred_by_backpressure: bool,
+    actionable_work_remaining: bool,
+    hidden_waiting: bool,
+    hidden_refinement: Option<HiddenRefinementState>,
+}
+
+#[derive(Debug, Clone)]
+enum ColorAttemptClass {
+    Current,
+    Ready,
+    SubmissionWait,
+    HiddenWait(PresentationTarget),
+    RelevantResidency(PresentationTarget),
+    Failed(ResidentRenderFailureStatus),
+}
+
+fn classify_color_attempt_facts(facts: &[ColorAttemptTargetFacts]) -> ColorAttemptClass {
+    if let Some(failure) = facts
+        .iter()
+        .filter_map(|target| target.hidden_refinement)
+        .find_map(hidden_refinement_failure_status)
+    {
+        return ColorAttemptClass::Failed(failure);
+    }
+    if facts.iter().all(|target| target.current) {
+        return ColorAttemptClass::Current;
+    }
+    if facts.iter().any(|target| target.deferred_by_backpressure) {
+        return ColorAttemptClass::SubmissionWait;
+    }
+    if let Some(target) = facts.iter().find(|target| target.hidden_waiting) {
+        return ColorAttemptClass::HiddenWait(target.target);
+    }
+    if facts.iter().any(|target| target.actionable_work_remaining) {
+        return ColorAttemptClass::Ready;
+    }
+    ColorAttemptClass::RelevantResidency(
+        facts
+            .iter()
+            .find(|target| !target.current)
+            .map_or(PresentationTarget::ThreeD, |target| target.target),
     )
+}
+
+const fn report_member_should_apply(
+    facts: ColorAttemptTargetFacts,
+    disposition: CoordinatedMemberDisposition,
+) -> bool {
+    facts.presented
+        || (facts.current && matches!(disposition, CoordinatedMemberDisposition::Reused))
+}
+
+/// Normalizes the complete renderer report before any presentation or UI
+/// state is changed. In particular, neutral backpressure and incomplete
+/// residency never travel through the generic failure/fidelity path.
+fn normalize_color_attempt_observation(
+    report: &CoordinatedFrameExecutionReport,
+    requests: &[CoordinatedOwnedRequest],
+    active_target: PresentationTarget,
+    next_submission: u64,
+) -> ColorAttemptObservation {
+    let facts = report
+        .targets()
+        .iter()
+        .map(|target| {
+            let hidden_refinement = target.hidden_refinement();
+            ColorAttemptTargetFacts {
+                target: target.target(),
+                current: target.current(),
+                presented: target.presented(),
+                deferred_by_backpressure: target.deferred_by_backpressure(),
+                actionable_work_remaining: target.actionable_work_remaining(),
+                hidden_waiting: matches!(
+                    hidden_refinement,
+                    Some(
+                        HiddenRefinementState::Running(_)
+                            | HiddenRefinementState::WaitingForSubmission { .. }
+                    )
+                ),
+                hidden_refinement,
+            }
+        })
+        .collect::<Vec<_>>();
+    match classify_color_attempt_facts(&facts) {
+        ColorAttemptClass::Current => ColorAttemptObservation::Current,
+        ColorAttemptClass::Ready => ColorAttemptObservation::Ready,
+        ColorAttemptClass::SubmissionWait => {
+            ColorAttemptObservation::Waiting(RenderWaitKey::SubmissionCleanup {
+                submission: next_submission,
+            })
+        }
+        ColorAttemptClass::HiddenWait(target) => {
+            ColorAttemptObservation::Waiting(RenderWaitKey::HiddenWorker {
+                target,
+                job: report
+                    .target(target)
+                    .and_then(CoordinatedTargetExecutionReport::hidden_refinement_job)
+                    .expect("a renderer-reported hidden wait contains its exact job identity"),
+            })
+        }
+        ColorAttemptClass::RelevantResidency(target) => {
+            let residency_request = requests
+                .iter()
+                .find(|request| request.target == target)
+                .or_else(|| {
+                    requests
+                        .iter()
+                        .find(|request| request.target == active_target)
+                })
+                .expect("a coordinated report belongs to one prepared request");
+            ColorAttemptObservation::Waiting(RenderWaitKey::RelevantResidency {
+                target: residency_request.target,
+                requirements: residency_request.request.requirements.clone(),
+            })
+        }
+        ColorAttemptClass::Failed(failure) => ColorAttemptObservation::Failed(failure),
+    }
 }
 
 pub(crate) const fn display_refresh_path_label(path: DisplayRefreshPath) -> &'static str {
@@ -272,6 +960,122 @@ pub(crate) struct DisplayRefreshWorkTiming {
     visible_brick_request_ms: f64,
 }
 
+/// What changed in the fixed viewer composition during one coordinated
+/// renderer observation.
+///
+/// A texture publication and an intentional background/empty publication are
+/// equally visible changes, but only the former necessarily has a GPU color
+/// submission. Keeping the distinction typed prevents callers from once
+/// again treating a renderer counter as composition authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisplayCompositionChange {
+    Unchanged,
+    TexturePublished,
+    SurfaceCleared,
+    TexturePublishedAndSurfaceCleared,
+}
+
+impl DisplayCompositionChange {
+    pub(crate) const fn requires_composition_turn(self) -> bool {
+        !matches!(self, Self::Unchanged)
+    }
+
+    const fn from_observations(texture_published: bool, surface_cleared: bool) -> Self {
+        match (texture_published, surface_cleared) {
+            (false, false) => Self::Unchanged,
+            (true, false) => Self::TexturePublished,
+            (false, true) => Self::SurfaceCleared,
+            (true, true) => Self::TexturePublishedAndSurfaceCleared,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayCompositionBackground {
+    ThreeD(RenderBackend),
+    CrossSection {
+        active: bool,
+        schedule: Option<CrossSectionPanelScheduleState>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DisplayTargetCompositionSnapshot {
+    active: bool,
+    frame: Option<PresentedFrame>,
+    texture_binding: Option<(u64, u64)>,
+    background: DisplayCompositionBackground,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DisplayCompositionSnapshot {
+    targets: [DisplayTargetCompositionSnapshot; 4],
+}
+
+impl DisplayCompositionSnapshot {
+    fn capture(app: &MiranteWorkbenchApp) -> Self {
+        let snapshot = app.application.snapshot();
+        let four_panel = application_view(&snapshot).layout() == CanonicalViewerLayout::FourPanel;
+        Self {
+            targets: PresentationTarget::ALL.map(|target| {
+                let active = target == PresentationTarget::ThreeD || four_panel;
+                let surface = app.render_coordination.surface(target);
+                let background = if target == PresentationTarget::ThreeD {
+                    DisplayCompositionBackground::ThreeD(
+                        app.render_coordination.frame_fidelity.backend,
+                    )
+                } else {
+                    DisplayCompositionBackground::CrossSection {
+                        active,
+                        schedule: active.then(|| surface.cross_section_schedule()).flatten(),
+                    }
+                };
+                DisplayTargetCompositionSnapshot {
+                    active,
+                    frame: surface.presented_frame().cloned(),
+                    texture_binding: app.native_presentation.texture_binding_identity(target),
+                    background,
+                }
+            }),
+        }
+    }
+
+    fn change_from(&self, before: &Self) -> DisplayCompositionChange {
+        let mut texture_published = false;
+        let mut surface_cleared = false;
+        for (before, after) in before.targets.iter().zip(&self.targets) {
+            if before == after {
+                continue;
+            }
+            if before.active != after.active {
+                if after.active && after.frame.is_some() {
+                    texture_published = true;
+                } else {
+                    surface_cleared = true;
+                }
+            }
+            if before.frame != after.frame {
+                if after.active && after.frame.is_some() {
+                    texture_published = true;
+                } else {
+                    surface_cleared = true;
+                }
+            }
+            if before.texture_binding != after.texture_binding {
+                if after.active && after.frame.is_some() && after.texture_binding.is_some() {
+                    texture_published = true;
+                } else if before.texture_binding.is_some() && after.texture_binding.is_none() {
+                    surface_cleared = true;
+                }
+            }
+            if after.active && after.frame.is_none() && before.background != after.background {
+                surface_cleared = true;
+            }
+        }
+        DisplayCompositionChange::from_observations(texture_published, surface_cleared)
+    }
+}
+
 struct CoordinatedOwnedRequest {
     target: PresentationTarget,
     panel: PanelId,
@@ -285,6 +1089,57 @@ struct CoordinatedOwnedRequest {
     atomic_publication_group: Option<CoordinatedPublicationGroup>,
     cross_section: Option<(u64, CrossSectionPanelScheduleState)>,
     staged_3d_refinement: bool,
+}
+
+// The logical variant deliberately keeps its fixed one/four-target storage
+// inline. This value lives for one refresh turn; boxing it would add an
+// allocator dependency to every coordinated logical frame solely to reduce a
+// bounded 2.2 KiB stack value.
+#[allow(clippy::large_enum_variant)]
+enum CoordinatedRequestCohort {
+    Physical(Vec<CoordinatedOwnedRequest>),
+    Logical(FixedPresentationTargetRequests<CoordinatedOwnedRequest>),
+}
+
+impl CoordinatedRequestCohort {
+    fn as_slice(&self) -> &[CoordinatedOwnedRequest] {
+        match self {
+            Self::Physical(requests) => requests,
+            Self::Logical(requests) => requests.as_slice(),
+        }
+    }
+
+    const fn is_logical(&self) -> bool {
+        matches!(self, Self::Logical(_))
+    }
+}
+
+enum BorrowedCoordinatedRequestCohort<'a> {
+    Physical(Vec<CoordinatedTargetRequest<'a>>),
+    Logical(FixedPresentationTargetRequests<CoordinatedTargetRequest<'a>>),
+}
+
+fn borrow_coordinated_request(
+    request: &CoordinatedOwnedRequest,
+    display_generation: u64,
+    staged_promotion_ready: bool,
+) -> CoordinatedTargetRequest<'_> {
+    let borrowed = CoordinatedTargetRequest::new(
+        request.target,
+        &request.request.intent,
+        &request.request.requirements,
+        display_generation,
+        request.render_policy,
+    )
+    .with_volume_schedule(
+        request.output_extent,
+        request.volume_schedule,
+        request.panel == PanelId::ThreeD,
+    )
+    .with_hidden_promotion_authorized(!request.staged_3d_refinement || staged_promotion_ready);
+    request.atomic_publication_group.map_or(borrowed, |group| {
+        borrowed.with_atomic_publication_group(group)
+    })
 }
 
 struct PreparedCoordinatedStagedPromotion {
@@ -530,6 +1385,30 @@ pub(crate) fn duration_ms(duration: Duration) -> f64 {
 }
 
 impl MiranteWorkbenchApp {
+    pub(crate) fn enter_product_renderer_terminal(&mut self, error: WgpuRenderRuntimeError) {
+        let failure = render_state::render_failure_status(&anyhow::Error::new(error));
+        self.render_attempt.renderer_terminal(failure);
+        self.renderer_ui_wake.enter_renderer_terminal();
+        self.shader_work_envelopes.invalidate_all();
+        self.viewer_pick_queue.terminate_all(
+            viewer_pick_runtime::PickTerminalResult::RendererTerminal(error),
+        );
+        let pending_timings = self
+            .native_presentation
+            .product_gpu
+            .as_mut()
+            .map(|product| {
+                product.renderer.retire_terminal_work();
+                product.pending_validation_captures.clear();
+                product.completed_validation_captures = std::array::from_fn(|_| None);
+                product.pending_gpu_timings.drain(..).collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for ticket in pending_timings {
+            self.volume_presentation.discard_timing(ticket);
+        }
+    }
+
     pub(crate) fn application_snapshot_for_ui(&self) -> ApplicationSnapshot {
         let snapshot = self.application.snapshot();
         let demand_currentness = self.visible_demand_plan_currentness();
@@ -599,7 +1478,7 @@ impl MiranteWorkbenchApp {
         }
         self.render_coordination
             .clear_presented_frame(PresentationSlot::ThreeD);
-        self.viewer_render_failure_latch = None;
+        self.render_attempt.settle();
         self.render_coordination.frame_fidelity.display_freshness =
             DisplayedFrameFreshness::Unknown;
         self.render_coordination.frame_fidelity.three_d_preview = false;
@@ -627,6 +1506,19 @@ impl MiranteWorkbenchApp {
         self.render_coordination
             .frame_fidelity
             .three_d_refinement_strips_total = 0;
+        self.render_attempt
+            .retire_composition(PresentationTarget::ThreeD);
+
+        // A cleared 3D surface owns no pickable frame. Retain submitted GPU
+        // work only long enough to drain it, while immediately removing old
+        // frame authority from queued/completed requests and visible hover.
+        let pick_currentness = viewer_pick_runtime::ViewerPickCurrentness::from_snapshot(
+            &self.application_snapshot_for_ui(),
+        );
+        self.viewer_pick_queue.retain_current(pick_currentness);
+        self.egui_ui.hovered_pixel = None;
+        self.egui_ui.hovered_source_readout = None;
+        self.egui_ui.viewer_tools.clear_hover();
     }
 
     fn record_current_empty_3d_presentation(&mut self) {
@@ -645,9 +1537,17 @@ impl MiranteWorkbenchApp {
         self.render_coordination.frame_fidelity.reason = LodDecisionReason::NoVisibleData;
         self.render_coordination.frame_fidelity.display_freshness =
             DisplayedFrameFreshness::Current;
+        self.render_coordination.frame_fidelity.ideal_scale_level = None;
+        self.render_coordination.frame_fidelity.target_scale_level = None;
         self.render_coordination
             .frame_fidelity
             .displayed_scale_level = None;
+        self.render_coordination
+            .frame_fidelity
+            .adaptive_capacity_limited = false;
+        self.render_coordination.frame_fidelity.refinement_pending = false;
+        self.render_coordination.frame_fidelity.frame_time_ms = None;
+        self.render_coordination.frame_fidelity.visible_bricks = 0;
         self.render_coordination.frame_fidelity.resident_bricks = 0;
         self.render_coordination
             .frame_fidelity
@@ -674,6 +1574,8 @@ impl MiranteWorkbenchApp {
         self.render_coordination
             .frame_fidelity
             .three_d_refinement_strips_total = 0;
+        self.render_coordination.frame_fidelity.last_failure_kind = None;
+        self.render_coordination.frame_fidelity.last_capacity_error = None;
     }
 
     pub(crate) fn clear_cross_section_product_presentations(&mut self) {
@@ -693,7 +1595,7 @@ impl MiranteWorkbenchApp {
         ] {
             self.render_coordination.clear_presented_frame(slot);
         }
-        self.viewer_render_failure_latch = None;
+        self.render_attempt.settle();
     }
 
     fn clear_cross_section_product_presentation(&mut self, panel_id: PanelId) {
@@ -702,7 +1604,33 @@ impl MiranteWorkbenchApp {
             product.clear_validation_capture(target);
         }
         self.render_coordination.clear_presented_frame(target);
-        self.viewer_render_failure_latch = None;
+        self.render_attempt.settle();
+    }
+
+    fn record_current_empty_cross_section_presentation(&mut self, panel_id: PanelId) {
+        debug_assert!(panel_id.cross_section_panel().is_some());
+        let target = panel_id.presentation_slot();
+        self.clear_cross_section_product_presentation(panel_id);
+        self.render_attempt.retire_composition(target);
+        let generation = self.render_coordination.surface(target).generation();
+        let schedule = CrossSectionPanelScheduleState {
+            generation,
+            target_scale_level: None,
+            render_scale_level: None,
+            fallback_scale_level: None,
+            selected_bricks: 0,
+            occupied_selected_bricks: 0,
+            missing_occupied_bricks: 0,
+            estimated_decoded_bytes: 0,
+            decoded_budget_bytes: 0,
+            status: CrossSectionPanelScheduleStatus::Empty,
+            reason: CrossSectionPanelScheduleReason::NoSelectedData,
+        };
+        assert!(
+            self.render_coordination
+                .record_empty_cross_section_presentation(target, generation, schedule),
+            "a synchronous empty linked publication must match its current surface generation"
+        );
     }
 
     pub(crate) fn invalidate_cross_section_panel_display_frames(&mut self) {
@@ -721,7 +1649,7 @@ impl MiranteWorkbenchApp {
         for slot in PresentationSlot::ALL {
             self.render_coordination.clear_presented_frame(slot);
         }
-        self.viewer_render_failure_latch = None;
+        self.render_attempt.settle();
         self.render_coordination.frame_fidelity.display_freshness =
             DisplayedFrameFreshness::Unknown;
     }
@@ -1078,6 +2006,29 @@ impl MiranteWorkbenchApp {
             );
         }
         let requirements = prepared.requirements.bind(&intent)?;
+        let shader_work_envelope = match self.shader_work_envelopes.resolve_or_submit(
+            panel.presentation_slot(),
+            Arc::clone(snapshot.catalog()),
+            &intent,
+            &requirements,
+        ) {
+            ShaderWorkEnvelopeLookup::Ready(envelope) => envelope,
+            ShaderWorkEnvelopeLookup::Pending => return Ok(None),
+            ShaderWorkEnvelopeLookup::Failed(ShaderWorkEnvelopeBuildError::Admission(error)) => {
+                return Err(
+                    crate::semantic_demand::SemanticPlanError::ShaderAdmission(error).into(),
+                );
+            }
+            ShaderWorkEnvelopeLookup::Failed(ShaderWorkEnvelopeBuildError::Capacity(error)) => {
+                return Err(
+                    crate::semantic_demand::SemanticPlanError::ScratchCapacity(error).into(),
+                );
+            }
+            ShaderWorkEnvelopeLookup::Failed(ShaderWorkEnvelopeBuildError::WorkerPanicked) => {
+                anyhow::bail!("shader work-envelope worker panicked");
+            }
+        };
+        let intent = intent.with_shared_shader_work_envelope(shader_work_envelope);
         let existing_presentation = self
             .render_coordination
             .surface(panel.presentation_slot())
@@ -1097,10 +2048,9 @@ impl MiranteWorkbenchApp {
         } else {
             retained_frame_render_policy(true, existing_presentation)
         };
-        // The exact atomic group is derived only after fixed-shape logical
-        // assembly has distinguished prepared targets from compatible reused
-        // fronts. Until then, transaction membership is enough to require
-        // hidden exact rendering for every prepared member.
+        // The exact atomic group is attached only after fixed-shape logical
+        // assembly. Reuse remains exclusively renderer-owned; every member
+        // crosses the boundary with its complete immutable request.
         let atomic_publication_group = None;
         let render_policy = if transaction.is_some() {
             RetainedFrameRenderPolicy::ExactFrameOnly
@@ -1127,69 +2077,6 @@ impl MiranteWorkbenchApp {
             cross_section,
             staged_3d_refinement,
         }))
-    }
-
-    fn retained_exact_frame_for_request(
-        &self,
-        request: &CoordinatedOwnedRequest,
-    ) -> Option<PresentedFrame> {
-        self.render_coordination
-            .surface(request.target)
-            .presented_frame()
-            .filter(|frame| {
-                frame.target() == request.target
-                    && frame.frame() == request.request.intent.frame()
-                    && frame.extent() == request.output_extent
-                    && frame.progress().completeness() == RenderFrameCompleteness::Exact
-            })
-            .cloned()
-    }
-
-    fn transaction_target_is_compatibly_reusable(
-        &self,
-        transaction: &PresentationTransaction,
-        target: PresentationTarget,
-    ) -> bool {
-        let surface = self.render_coordination.surface(target);
-        let Some(frame) = surface.presented_frame() else {
-            return false;
-        };
-        if frame.target() != target
-            || frame.timepoint() != transaction.timepoint()
-            || frame.frame() != transaction.expected_revision(target)
-            || surface.render_viewport() != Some(frame.extent())
-            || frame.progress().completeness() != RenderFrameCompleteness::Exact
-        {
-            return false;
-        }
-        let expected = if let Some(contract) = transaction.temporal_contract() {
-            Some(contract.layer_scales().as_ref())
-        } else {
-            let scope = match target {
-                PresentationTarget::ThreeD => {
-                    if self.dataset.staging_current_refinement()
-                        && self
-                            .prepared_scope_render_plans
-                            .contains_key(&SCOPE_CURRENT_3D_REFINEMENT)
-                    {
-                        SCOPE_CURRENT_3D_REFINEMENT
-                    } else {
-                        SCOPE_CURRENT_3D
-                    }
-                }
-                PresentationTarget::Xy => SCOPE_CROSS_SECTION_XY,
-                PresentationTarget::Xz => SCOPE_CROSS_SECTION_XZ,
-                PresentationTarget::Yz => SCOPE_CROSS_SECTION_YZ,
-            };
-            self.prepared_scope_render_plans
-                .get(&scope)
-                .filter(|plan| plan.requirements.timepoint() == transaction.timepoint())
-                .map(|plan| plan.layer_scales.as_ref())
-        };
-        let Some(expected) = expected else {
-            return false;
-        };
-        presented_layer_scales_match_target(frame.progress().coverage(), expected)
     }
 
     fn coordinated_active_target(
@@ -1265,20 +2152,44 @@ impl MiranteWorkbenchApp {
                 texture_revision,
                 &view,
             );
+            self.render_attempt.note_published_texture(
+                target,
+                device_generation.get(),
+                texture_revision.get(),
+            );
         }
         Ok(duration_ms(started.elapsed()))
     }
 
-    fn coordinated_target_needs_execution(&self, target: PresentationTarget) -> bool {
-        self.native_presentation
-            .product_gpu
-            .as_ref()
-            .is_none_or(|product| {
-                product
-                    .renderer
-                    .coordinated_target_requires_execution(target)
-                    .unwrap_or(true)
-            })
+    /// Retires every renderer/native presentation target for a semantically
+    /// empty visible layout. Empty publication is independent of color
+    /// pipeline readiness; a terminal device cause remains recorded on the
+    /// renderer authority without relabelling the empty surface as failed.
+    fn retire_empty_coordinated_layout(&mut self) -> anyhow::Result<f64> {
+        if self.native_presentation.product_gpu.is_none()
+            || self.render_attempt.renderer_is_terminal()
+        {
+            self.native_presentation.retain_texture_bindings(&[]);
+            return Ok(0.0);
+        }
+        match self.apply_coordinated_layout(&[]) {
+            Ok(elapsed_ms) => Ok(elapsed_ms),
+            Err(error) => {
+                let terminal = error
+                    .downcast_ref::<WgpuRenderRuntimeError>()
+                    .copied()
+                    .filter(|error| {
+                        classify_color_runtime_error(*error)
+                            == ColorRuntimeDisposition::RendererTerminal
+                    });
+                let Some(terminal) = terminal else {
+                    return Err(error);
+                };
+                self.enter_product_renderer_terminal(terminal);
+                self.native_presentation.retain_texture_bindings(&[]);
+                Ok(0.0)
+            }
+        }
     }
 
     fn record_presented_volume_schedule(&mut self, request: &CoordinatedOwnedRequest) {
@@ -1327,61 +2238,6 @@ impl MiranteWorkbenchApp {
             .scope_resources_complete_with_gpu_residency(SCOPE_CURRENT_3D_REFINEMENT, |key| {
                 product.renderer.resource_is_resident(key)
             })
-    }
-
-    fn adopt_retained_exact_request(
-        &mut self,
-        request: &CoordinatedOwnedRequest,
-    ) -> anyhow::Result<bool> {
-        let request_execution_required =
-            self.native_presentation
-                .product_gpu
-                .as_ref()
-                .is_none_or(|product| {
-                    product
-                        .renderer
-                        .coordinated_target_requires_render_presentation(
-                            request.target,
-                            request.request.intent.extent(),
-                            &request.request.requirements,
-                            request.volume_schedule,
-                        )
-                        .unwrap_or(true)
-                });
-        if request.staged_3d_refinement || request_execution_required {
-            return Ok(false);
-        }
-        let Some(frame) = self.retained_exact_frame_for_request(request) else {
-            return Ok(false);
-        };
-        if let Some((generation, schedule)) = request.cross_section {
-            let coverage = frame.progress().coverage();
-            let schedule = cross_section_schedule_for_presented_coverage(
-                schedule,
-                frame.progress().completeness(),
-                coverage.available_requirements(),
-                coverage.total_requirements(),
-            );
-            if !self.render_coordination.record_cross_section_presentation(
-                request.target,
-                generation,
-                schedule,
-            ) {
-                return Ok(false);
-            }
-        }
-        self.record_coordinated_product_frame(
-            request.panel,
-            request.surface_generation,
-            &frame,
-            None,
-        );
-        self.record_presented_volume_schedule(request);
-        self.record_coordinated_layer_presentations_with_scales(
-            request.panel,
-            Some(request.layer_scales.as_ref()),
-        );
-        Ok(true)
     }
 
     /// Atomically rebinds the already-rendered exact transient planes into
@@ -1436,7 +2292,7 @@ impl MiranteWorkbenchApp {
             if !Arc::ptr_eq(
                 prepared.requirements.body().canonical(),
                 &canonical_resources,
-            ) || self.coordinated_target_needs_execution(target)
+            ) || self.render_attempt.target_ready(target)
                 || self.native_presentation.texture_id(target).is_none()
             {
                 return Ok(false);
@@ -1525,7 +2381,7 @@ impl MiranteWorkbenchApp {
                     .record_cross_section_presentation(target, generation, schedule),
                 "a preflighted linked adoption must retain its surface generation"
             );
-            self.record_coordinated_product_frame(panel, generation, &frame, None);
+            self.record_coordinated_product_frame(panel, generation, &frame, None, true);
             self.record_coordinated_layer_presentations(panel, scope);
         }
         Ok(true)
@@ -1569,6 +2425,77 @@ impl MiranteWorkbenchApp {
     pub(crate) fn rerender_coordinated_display_state(
         &mut self,
     ) -> anyhow::Result<DisplayRefreshWorkTiming> {
+        let snapshot = self.application.snapshot();
+        let four_panel = application_view(&snapshot).layout() == CanonicalViewerLayout::FourPanel;
+        let canonical_view_is_empty = application_view(&snapshot)
+            .layers()
+            .iter()
+            .all(|layer| !layer.visible());
+        if canonical_view_is_empty {
+            // The canonical view is the display cutoff authority. Do not wait
+            // for a worker-prepared empty demand body before removing pixels:
+            // the previous nonempty renderer front is precisely what makes
+            // an empty aggregate-union preflight invalid. Publish the empty
+            // surface first, retire that front and its frame lease, and only
+            // then consume or submit the latest-only empty demand plan.
+            self.record_current_empty_3d_presentation();
+            if four_panel {
+                for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
+                    self.record_current_empty_cross_section_presentation(panel);
+                }
+            }
+            let egui_texture_ms = self.retire_empty_coordinated_layout()?;
+
+            let demand_started = Instant::now();
+            self.request_visible_bricks();
+            let visible_brick_request_ms = duration_ms(demand_started.elapsed());
+            // Planning is allowed to report its own pending state, but it
+            // cannot relabel the already-authoritative canonical empty
+            // surface as Loading while the zero-body transaction catches up.
+            self.record_current_empty_3d_presentation();
+            if four_panel {
+                for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
+                    self.record_current_empty_cross_section_presentation(panel);
+                }
+            }
+            let demand_currentness = self.visible_demand_plan_currentness();
+            let semantic_empty_is_current = demand_currentness.current_3d
+                && self.dataset.scope_is_empty(SCOPE_CURRENT_3D)
+                && (!four_panel
+                    || [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+                        .into_iter()
+                        .all(|panel| {
+                            let scope = cross_section_scope(panel)
+                                .expect("a fixed linked panel owns one demand scope");
+                            demand_currentness.cross_section(panel)
+                                && self.dataset.scope_is_empty(scope)
+                        }));
+            if semantic_empty_is_current {
+                // A temporal or retained-quality cutoff whose complete target
+                // set is empty is Exact by semantics. Complete it without
+                // manufacturing renderer members.
+                if let Some(transaction) = self.presentation_scheduler.transaction(
+                    &snapshot,
+                    &self.playback_session,
+                    &self.render_intent_mailbox,
+                ) {
+                    self.complete_presentation_transaction(&snapshot, &transaction);
+                }
+            }
+            self.observe_coordinated_display_milestones(false);
+            self.record_current_layout_presentation_if_complete();
+            return Ok(DisplayRefreshWorkTiming::new(
+                DisplayRenderTiming {
+                    path: DisplayRefreshPath::UiBackground,
+                    render_ms: 0.0,
+                    gpu_upload_ms: None,
+                    gpu_compute_ms: None,
+                    egui_texture_ms,
+                },
+                visible_brick_request_ms,
+            ));
+        }
+
         let demand_started = Instant::now();
         self.request_visible_bricks();
         let visible_brick_request_ms = duration_ms(demand_started.elapsed());
@@ -1580,6 +2507,47 @@ impl MiranteWorkbenchApp {
             // Empty is a terminal semantic result, not GPU work. Publish it
             // even while the renderer is unavailable or still compiling.
             self.record_current_empty_3d_presentation();
+        }
+        let current_linked_layout_is_empty = !four_panel
+            || [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+                .into_iter()
+                .all(|panel| {
+                    let scope = cross_section_scope(panel)
+                        .expect("a fixed linked panel owns one demand scope");
+                    demand_currentness.cross_section(panel) && self.dataset.scope_is_empty(scope)
+                });
+        if current_3d_is_empty && current_linked_layout_is_empty {
+            if four_panel {
+                for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
+                    self.record_current_empty_cross_section_presentation(panel);
+                }
+            }
+
+            // A temporal or retained-quality cutoff whose complete target set
+            // is empty is already Exact by semantics. Complete that logical
+            // transaction without manufacturing empty renderer members.
+            if let Some(transaction) = self.presentation_scheduler.transaction(
+                &snapshot,
+                &self.playback_session,
+                &self.render_intent_mailbox,
+            ) {
+                self.complete_presentation_transaction(&snapshot, &transaction);
+            }
+            let egui_texture_ms = self.retire_empty_coordinated_layout()?;
+            self.observe_coordinated_display_milestones(false);
+            self.record_current_layout_presentation_if_complete();
+            return Ok(DisplayRefreshWorkTiming::new(
+                DisplayRenderTiming {
+                    path: DisplayRefreshPath::UiBackground,
+                    render_ms: 0.0,
+                    gpu_upload_ms: None,
+                    gpu_compute_ms: None,
+                    egui_texture_ms,
+                },
+                visible_brick_request_ms,
+            ));
+        }
+        if current_3d_is_empty {
             self.record_current_layout_presentation_if_complete();
         }
         if !self
@@ -1598,7 +2566,6 @@ impl MiranteWorkbenchApp {
             ));
         }
 
-        let snapshot = self.application.snapshot();
         let presentation_transaction = self.presentation_scheduler.transaction(
             &snapshot,
             &self.playback_session,
@@ -1667,20 +2634,10 @@ impl MiranteWorkbenchApp {
         let transaction_requires_three_d = presentation_transaction
             .as_ref()
             .is_some_and(|transaction| transaction.contains(PresentationTarget::ThreeD));
-        let transaction_reuses_three_d =
-            presentation_transaction
-                .as_ref()
-                .is_some_and(|transaction| {
-                    self.transaction_target_is_compatibly_reusable(
-                        transaction,
-                        PresentationTarget::ThreeD,
-                    )
-                });
         if (transaction_requires_three_d
             || demand_currentness.current_3d
             || resident_navigation_intent)
             && !current_3d_is_empty
-            && !(presentation_transaction.is_some() && transaction_reuses_three_d)
         {
             let retained_complete = self
                 .render_coordination
@@ -1962,7 +2919,7 @@ impl MiranteWorkbenchApp {
             let exact_frame_already_presented = !self.dataset.staging_current_refinement()
                 && self.render_coordination.frame_fidelity.display_freshness
                     == DisplayedFrameFreshness::Current
-                && !self.coordinated_target_needs_execution(PresentationTarget::ThreeD)
+                && !self.render_attempt.target_ready(PresentationTarget::ThreeD)
                 && presented_target_map_matches
                 && !self.render_coordination.frame_fidelity.three_d_preview;
             let needs_execution = !exact_frame_already_presented
@@ -1977,7 +2934,7 @@ impl MiranteWorkbenchApp {
                         && self.render_coordination.frame_fidelity.three_d_preview)
                     || self.render_coordination.frame_fidelity.display_freshness
                         != DisplayedFrameFreshness::Current
-                    || self.coordinated_target_needs_execution(PresentationTarget::ThreeD));
+                    || self.render_attempt.target_ready(PresentationTarget::ThreeD));
             let needs_execution = needs_execution
                 || presentation_transaction
                     .as_ref()
@@ -2001,8 +2958,6 @@ impl MiranteWorkbenchApp {
                     navigation_candidate,
                     presentation_transaction.as_ref(),
                 )?
-                && (presentation_transaction.is_some()
-                    || !self.adopt_retained_exact_request(&request)?)
             {
                 requests.push(request);
             }
@@ -2013,18 +2968,6 @@ impl MiranteWorkbenchApp {
                 let transaction_requires_panel = presentation_transaction
                     .as_ref()
                     .is_some_and(|transaction| transaction.contains(panel.presentation_slot()));
-                let transaction_reuses_panel =
-                    presentation_transaction
-                        .as_ref()
-                        .is_some_and(|transaction| {
-                            self.transaction_target_is_compatibly_reusable(
-                                transaction,
-                                panel.presentation_slot(),
-                            )
-                        });
-                if transaction_requires_panel && transaction_reuses_panel {
-                    continue;
-                }
                 // A playback-stop handoff is a quality-only transaction. Its
                 // retained front remains the visible authority until the
                 // ordinary stationary planner has produced a current body
@@ -2129,93 +3072,100 @@ impl MiranteWorkbenchApp {
                     false,
                     None,
                     presentation_transaction.as_ref(),
-                )? && (presentation_transaction.is_some()
-                    || !self.adopt_retained_exact_request(&request)?)
-                {
+                )? {
                     requests.push(request);
                 }
             }
         }
 
-        let logical_transaction = if let Some(transaction) = presentation_transaction.as_ref() {
-            let mut availability = TargetAvailability::new();
-            for request in &requests {
-                availability.mark_prepared(request.target);
-            }
-            for target in PresentationTarget::ALL {
-                if transaction.contains(target)
-                    && self.transaction_target_is_compatibly_reusable(transaction, target)
-                {
-                    availability.mark_reusable(target);
-                }
-            }
-            match assemble_logical_targets(transaction.target_set(), availability) {
-                Ok(logical) => Some(logical),
-                Err(_) => {
-                    // A physical planning delta may be partial while one
-                    // target's stationary or temporal body is still being
-                    // prepared. That is ordinary readiness backpressure. The
-                    // complete retained front stays visible and no variable-
-                    // length request list is submitted as a logical frame.
-                    self.observe_coordinated_display_milestones(false);
-                    self.record_current_layout_presentation_if_complete();
-                    return Ok(DisplayRefreshWorkTiming::new(
-                        DisplayRenderTiming {
-                            path: DisplayRefreshPath::UiBackground,
-                            render_ms: 0.0,
-                            gpu_upload_ms: None,
-                            gpu_compute_ms: None,
-                            egui_texture_ms: 0.0,
-                        },
-                        visible_brick_request_ms,
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-
-        if let Some(logical) = logical_transaction.as_ref() {
-            let physical_targets = logical.physical_targets();
-            debug_assert_eq!(
-                requests
-                    .iter()
-                    .map(|request| request.target)
-                    .collect::<Vec<_>>(),
-                physical_targets,
-                "the physical request projection must match fixed-shape logical assembly"
-            );
-            let Some(publication_group) = logical.physical_publication_group() else {
-                // Every logical member is already an exact compatible front.
-                // No renderer submission can add evidence; complete the
-                // semantic transaction directly instead of leaving it
-                // reserved forever or manufacturing GPU work.
-                let transaction = presentation_transaction
+        let request_cohort = if let Some(transaction) = presentation_transaction.as_ref() {
+            let incomplete_fingerprint = RenderAttemptFingerprint::new(
+                &snapshot,
+                &requests,
+                self.dataset_runtime_epoch,
+                self.dataset.cpu_capacity_epoch(),
+                self.native_presentation
+                    .product_gpu
                     .as_ref()
-                    .expect("a logical transaction retains its semantic cutoff");
-                self.complete_presentation_transaction(&snapshot, transaction);
-                self.observe_coordinated_display_milestones(false);
-                self.record_current_layout_presentation_if_complete();
-                return Ok(DisplayRefreshWorkTiming::new(
-                    DisplayRenderTiming {
-                        path: DisplayRefreshPath::UiBackground,
-                        render_ms: 0.0,
-                        gpu_upload_ms: None,
-                        gpu_compute_ms: None,
-                        egui_texture_ms: 0.0,
-                    },
-                    visible_brick_request_ms,
+                    .map_or(0, |product| product.renderer.device_generation().get()),
+            );
+            let mut members = std::array::from_fn(|_| None);
+            for request in std::mem::take(&mut requests) {
+                let target = request.target;
+                let member = PresentationTransactionMember::new(
+                    request.target,
+                    transaction.source_generation(),
+                    transaction.timepoint(),
+                    transaction.expected_revision(request.target),
+                    request.surface_generation,
+                    PresentationQuality::exact(Arc::clone(&request.layer_scales)),
+                    request,
+                );
+                if members[target.index()].replace(member).is_some() {
+                    anyhow::bail!(
+                        "a composed presentation assembled target {target:?} more than once"
+                    );
+                }
+            }
+            let mut logical =
+                match PresentationTransactionTargets::from_slots(transaction.target_set(), members)
+                {
+                    Ok(logical) => logical,
+                    Err(missing) => {
+                        // A logical transaction is fixed-shape. Until every immutable
+                        // body exists, retain the predecessor and do not submit a
+                        // shorter physical vector as if it were the semantic frame.
+                        self.render_attempt.wait(
+                            incomplete_fingerprint,
+                            RenderWaitKey::LogicalMember {
+                                target: missing.0,
+                                family_revision: transaction.expected_revision(missing.0).get(),
+                            },
+                        );
+                        self.observe_coordinated_display_milestones(false);
+                        self.record_current_layout_presentation_if_complete();
+                        return Ok(DisplayRefreshWorkTiming::new(
+                            DisplayRenderTiming {
+                                path: DisplayRefreshPath::UiBackground,
+                                render_ms: 0.0,
+                                gpu_upload_ms: None,
+                                gpu_compute_ms: None,
+                                egui_texture_ms: 0.0,
+                            },
+                            visible_brick_request_ms,
+                        ));
+                    }
+                };
+            let publication_group = transaction.publication_group();
+            logical.for_each_mut(|member| {
+                debug_assert_eq!(member.source_generation(), transaction.source_generation());
+                debug_assert_eq!(member.timepoint(), transaction.timepoint());
+                debug_assert_eq!(
+                    member.spatial_frame(),
+                    transaction.expected_revision(member.target())
+                );
+                debug_assert_eq!(
+                    member.surface_generation(),
+                    member.prepared_request().surface_generation
+                );
+                debug_assert!(Arc::ptr_eq(
+                    member.quality().layer_scales(),
+                    &member.prepared_request().layer_scales
                 ));
-            };
-            for request in &mut requests {
+                let request = member.prepared_request_mut();
                 request.atomic_publication_group = Some(publication_group);
                 request.render_policy = RetainedFrameRenderPolicy::ExactFrameOnly;
-            }
-        }
+            });
+            CoordinatedRequestCohort::Logical(logical.into_prepared_requests())
+        } else {
+            CoordinatedRequestCohort::Physical(requests)
+        };
+        let logical_transaction = request_cohort.is_logical();
+        let requests = request_cohort.as_slice();
 
-        let desired = self.desired_coordinated_layout(&snapshot, &requests);
+        let desired = self.desired_coordinated_layout(&snapshot, requests);
         let egui_texture_ms = self.apply_coordinated_layout(&desired)?;
-        let Some(active_target) = self.coordinated_active_target(&snapshot, &requests) else {
+        let Some(active_target) = self.coordinated_active_target(&snapshot, requests) else {
             self.observe_coordinated_display_milestones(false);
             self.record_current_layout_presentation_if_complete();
             return Ok(DisplayRefreshWorkTiming::new(
@@ -2230,18 +3180,22 @@ impl MiranteWorkbenchApp {
             ));
         };
 
-        let failure_signature = ProductRenderFailureSignature::new(
-            &requests,
-            self.dataset.retained_leases().generation(),
-            self.dataset_runtime_epoch,
-        );
-        if self
-            .viewer_render_failure_latch
+        let renderer_device_generation = self
+            .native_presentation
+            .product_gpu
             .as_ref()
-            .is_some_and(|latch| {
-                latch.blocks(|failure| failure.matches_current(&failure_signature))
-            })
-        {
+            .ok_or_else(|| anyhow::anyhow!("progressive GPU renderer is unavailable"))?
+            .renderer
+            .device_generation()
+            .get();
+        let attempt_fingerprint = RenderAttemptFingerprint::new(
+            &snapshot,
+            requests,
+            self.dataset_runtime_epoch,
+            self.dataset.cpu_capacity_epoch(),
+            renderer_device_generation,
+        );
+        if !self.render_attempt.begin(attempt_fingerprint.clone()) {
             return Ok(DisplayRefreshWorkTiming::new(
                 DisplayRenderTiming {
                     path: DisplayRefreshPath::UiBackground,
@@ -2253,7 +3207,6 @@ impl MiranteWorkbenchApp {
                 visible_brick_request_ms,
             ));
         }
-        self.viewer_render_failure_latch = None;
         let display_generation = self
             .render_coordination
             .display_generation()
@@ -2298,31 +3251,39 @@ impl MiranteWorkbenchApp {
         {
             self.product_render_attempts = self.product_render_attempts.saturating_add(1);
         }
-        let borrowed = requests
-            .iter()
-            .map(|request| {
-                let borrowed = CoordinatedTargetRequest::new(
-                    request.target,
-                    &request.request.intent,
-                    &request.request.requirements,
-                    self.render_coordination
-                        .display_generation()
-                        .input_generation,
-                    request.render_policy,
-                )
-                .with_volume_schedule(
-                    request.output_extent,
-                    request.volume_schedule,
-                    request.panel == PanelId::ThreeD,
-                )
-                .with_hidden_promotion_authorized(
-                    !request.staged_3d_refinement || prepared_staged_promotion.is_some(),
-                );
-                request.atomic_publication_group.map_or(borrowed, |group| {
-                    borrowed.with_atomic_publication_group(group)
-                })
-            })
-            .collect::<Vec<_>>();
+        let staged_promotion_ready = prepared_staged_promotion.is_some();
+        let borrowed = match &request_cohort {
+            CoordinatedRequestCohort::Physical(requests) => {
+                let mut borrowed = Vec::with_capacity(requests.len());
+                for request in requests {
+                    borrowed.push(borrow_coordinated_request(
+                        request,
+                        display_generation,
+                        staged_promotion_ready,
+                    ));
+                }
+                BorrowedCoordinatedRequestCohort::Physical(borrowed)
+            }
+            CoordinatedRequestCohort::Logical(FixedPresentationTargetRequests::ThreeD(
+                [three_d],
+            )) => BorrowedCoordinatedRequestCohort::Logical(
+                FixedPresentationTargetRequests::ThreeD([borrow_coordinated_request(
+                    three_d,
+                    display_generation,
+                    staged_promotion_ready,
+                )]),
+            ),
+            CoordinatedRequestCohort::Logical(FixedPresentationTargetRequests::FourPanel(
+                [three_d, xy, xz, yz],
+            )) => BorrowedCoordinatedRequestCohort::Logical(
+                FixedPresentationTargetRequests::FourPanel([
+                    borrow_coordinated_request(three_d, display_generation, staged_promotion_ready),
+                    borrow_coordinated_request(xy, display_generation, staged_promotion_ready),
+                    borrow_coordinated_request(xz, display_generation, staged_promotion_ready),
+                    borrow_coordinated_request(yz, display_generation, staged_promotion_ready),
+                ]),
+            ),
+        };
         let placement_target_group = match (
             requests
                 .iter()
@@ -2342,15 +3303,43 @@ impl MiranteWorkbenchApp {
                 .product_gpu
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("progressive GPU renderer is unavailable"))?;
-            match product.renderer.execute_coordinated_frame(
-                snapshot.catalog(),
-                active_target,
-                &borrowed,
-            ) {
+            let execution = match &borrowed {
+                BorrowedCoordinatedRequestCohort::Logical(
+                    FixedPresentationTargetRequests::ThreeD([three_d]),
+                ) => product.renderer.execute_coordinated_logical_frame(
+                    snapshot.catalog(),
+                    active_target,
+                    CoordinatedLogicalTargetSet::three_d(*three_d)?,
+                ),
+                BorrowedCoordinatedRequestCohort::Logical(
+                    FixedPresentationTargetRequests::FourPanel([three_d, xy, xz, yz]),
+                ) => product.renderer.execute_coordinated_logical_frame(
+                    snapshot.catalog(),
+                    active_target,
+                    CoordinatedLogicalTargetSet::four_panel(*three_d, *xy, *xz, *yz)?,
+                ),
+                BorrowedCoordinatedRequestCohort::Physical(requests) => product
+                    .renderer
+                    .execute_coordinated_frame(snapshot.catalog(), active_target, requests),
+            };
+            match execution {
                 Ok(report) => report,
                 Err(error @ WgpuRenderRuntimeError::StaleFrame { .. }) => {
                     product.stale_frames_rejected = product.stale_frames_rejected.saturating_add(1);
                     tracing::debug!(%error, "stale coordinated frame was rejected");
+                    let (stale_target, revision) = match error {
+                        WgpuRenderRuntimeError::StaleFrame {
+                            target, current, ..
+                        } => (target.unwrap_or(active_target), current.get()),
+                        _ => unreachable!("the enclosing pattern is a stale frame"),
+                    };
+                    self.render_attempt.wait(
+                        attempt_fingerprint.clone(),
+                        RenderWaitKey::MailboxAdvance {
+                            target: stale_target,
+                            minimum_frame: revision,
+                        },
+                    );
                     return Ok(DisplayRefreshWorkTiming::new(
                         DisplayRenderTiming {
                             path: DisplayRefreshPath::UiBackground,
@@ -2369,7 +3358,12 @@ impl MiranteWorkbenchApp {
                                 %error,
                                 "compacted fragmented GPU payload residency; coordinated frame will retry"
                             );
-                            self.render_coordination.request_refresh();
+                            self.render_attempt.wait(
+                                attempt_fingerprint.clone(),
+                                RenderWaitKey::SubmissionCleanup {
+                                    submission: product.renderer.next_submission_completion_event(),
+                                },
+                            );
                             return Ok(DisplayRefreshWorkTiming::new(
                                 DisplayRenderTiming {
                                     path: DisplayRefreshPath::UiBackground,
@@ -2382,7 +3376,12 @@ impl MiranteWorkbenchApp {
                             ));
                         }
                         Err(WgpuRenderRuntimeError::PayloadRecoveryDeferred) => {
-                            self.render_coordination.request_refresh();
+                            self.render_attempt.wait(
+                                attempt_fingerprint.clone(),
+                                RenderWaitKey::SubmissionCleanup {
+                                    submission: product.renderer.next_submission_completion_event(),
+                                },
+                            );
                             return Ok(DisplayRefreshWorkTiming::new(
                                 DisplayRenderTiming {
                                     path: DisplayRefreshPath::UiBackground,
@@ -2405,6 +3404,12 @@ impl MiranteWorkbenchApp {
                             target_group = placement_target_group,
                             "residual GPU placement refusal will retry through adaptive visible-demand selection"
                         );
+                        self.render_attempt.wait(
+                            attempt_fingerprint.clone(),
+                            RenderWaitKey::CandidatePlan {
+                                demand_revision: self.dataset_runtime_epoch,
+                            },
+                        );
                         return Ok(DisplayRefreshWorkTiming::new(
                             DisplayRenderTiming {
                                 path: DisplayRefreshPath::UiBackground,
@@ -2416,42 +3421,152 @@ impl MiranteWorkbenchApp {
                             visible_brick_request_ms,
                         ));
                     }
-                    return Err(error.into());
+                    let failure = render_state::render_failure_status(&anyhow::Error::new(error));
+                    self.render_attempt
+                        .fail(attempt_fingerprint.clone(), failure);
+                    tracing::error!(%error, "deterministic coordinated render request failed");
+                    return Ok(DisplayRefreshWorkTiming::new(
+                        DisplayRenderTiming {
+                            path: DisplayRefreshPath::UiBackground,
+                            render_ms: duration_ms(render_started.elapsed()),
+                            gpu_upload_ms: None,
+                            gpu_compute_ms: None,
+                            egui_texture_ms,
+                        },
+                        visible_brick_request_ms,
+                    ));
                 }
                 Err(error) => {
-                    if product_render_failure_is_deterministic(error) {
-                        self.viewer_render_failure_latch =
-                            Some(DeterministicFailureLatch::new(failure_signature));
+                    let disposition = classify_color_runtime_error(error);
+                    let failure = render_state::render_failure_status(&anyhow::Error::new(error));
+                    match disposition {
+                        ColorRuntimeDisposition::ColorUnavailable => {
+                            self.render_attempt.color_unavailable(failure);
+                        }
+                        ColorRuntimeDisposition::RendererTerminal => {
+                            self.enter_product_renderer_terminal(error);
+                        }
+                        ColorRuntimeDisposition::Wait(reason) => {
+                            let key = match reason {
+                                RenderWaitReason::InitialPipeline => {
+                                    RenderWaitKey::InitialPipeline {
+                                        device_generation: renderer_device_generation,
+                                    }
+                                }
+                                RenderWaitReason::SubmissionCleanup => {
+                                    RenderWaitKey::SubmissionCleanup {
+                                        submission: product
+                                            .renderer
+                                            .next_submission_completion_event(),
+                                    }
+                                }
+                                RenderWaitReason::EvictionAcknowledgement => {
+                                    RenderWaitKey::EvictionAcknowledgement {
+                                        ledger_revision: product
+                                            .renderer
+                                            .pending_residency_evictions(1)
+                                            .first()
+                                            .map_or(0, |event| event.sequence()),
+                                    }
+                                }
+                                RenderWaitReason::HiddenWorker => unreachable!(
+                                    "hidden-worker waits originate only in a complete execution report"
+                                ),
+                                RenderWaitReason::LogicalMember
+                                | RenderWaitReason::MailboxAdvance
+                                | RenderWaitReason::CandidatePlan
+                                | RenderWaitReason::RelevantResidency => {
+                                    unreachable!(
+                                        "application-owned waits do not originate as renderer errors"
+                                    )
+                                }
+                            };
+                            self.render_attempt.wait(attempt_fingerprint.clone(), key);
+                        }
+                        ColorRuntimeDisposition::DeterministicFailure => {
+                            self.render_attempt
+                                .fail(attempt_fingerprint.clone(), failure);
+                            tracing::error!(%error, "deterministic coordinated render request failed");
+                        }
+                        ColorRuntimeDisposition::AuxiliaryOnly => {
+                            tracing::warn!(%error, "auxiliary renderer outcome reached the color boundary");
+                        }
+                        ColorRuntimeDisposition::Stale
+                        | ColorRuntimeDisposition::PlacementRecovery => {
+                            unreachable!("stale and placement outcomes have dedicated handling")
+                        }
                     }
-                    return Err(error.into());
+                    return Ok(DisplayRefreshWorkTiming::new(
+                        DisplayRenderTiming {
+                            path: DisplayRefreshPath::UiBackground,
+                            render_ms: duration_ms(render_started.elapsed()),
+                            gpu_upload_ms: None,
+                            gpu_compute_ms: None,
+                            egui_texture_ms,
+                        },
+                        visible_brick_request_ms,
+                    ));
                 }
             }
         };
-        self.viewer_render_failure_latch = None;
+        let next_submission = self
+            .native_presentation
+            .product_gpu
+            .as_ref()
+            .map_or(0, |product| {
+                product.renderer.next_submission_completion_event()
+            });
+        let observation =
+            normalize_color_attempt_observation(&report, requests, active_target, next_submission);
+        if let ColorAttemptObservation::Failed(failure) = &observation {
+            // A local hidden-refinement failure leaves the predecessor and all
+            // public transaction state untouched. Residency consequences are
+            // still retired below because the renderer has already committed
+            // those authoritative directory changes.
+            self.render_attempt
+                .fail(attempt_fingerprint.clone(), failure.clone());
+            let refill_admission = self.retire_coordinated_gpu_resident_payloads(&report) > 0;
+            if refill_admission {
+                self.dataset.defer_interactive_admission_refill(true);
+            }
+            tracing::error!("hidden exact refinement failed for the current render request");
+            return Ok(DisplayRefreshWorkTiming::new(
+                DisplayRenderTiming {
+                    path: DisplayRefreshPath::UiBackground,
+                    render_ms: duration_ms(render_started.elapsed()),
+                    gpu_upload_ms: None,
+                    gpu_compute_ms: None,
+                    egui_texture_ms,
+                },
+                visible_brick_request_ms,
+            ));
+        }
         self.apply_coordinated_execution_report(
             &snapshot,
-            &requests,
+            requests,
             &report,
             prepared_staged_promotion,
             presentation_transaction.as_ref(),
-            logical_transaction.is_some(),
+            logical_transaction,
         );
         let refill_admission = self.retire_coordinated_gpu_resident_payloads(&report) > 0;
         if refill_admission {
             self.dataset.defer_interactive_admission_refill(true);
         }
-        // A bounded in-flight deferral produces no strip-progress record, but
-        // the renderer still owns an executable hidden candidate. Preserve
-        // that renderer fact as the next immediate display transaction rather
-        // than waiting for the generic background-work poll. This is also the
-        // single continuation rule for ordinary cold uploads and linked
-        // targets: if a request's fixed target still reports work, the next UI
-        // turn must observe it.
-        if requests
-            .iter()
-            .any(|request| self.coordinated_target_needs_execution(request.target))
-        {
-            self.render_coordination.request_refresh();
+        match observation {
+            ColorAttemptObservation::Current => self.render_attempt.settle(),
+            ColorAttemptObservation::Ready => {
+                // `begin` left this exact fingerprint admitted in `Ready`.
+                // The completed report is the sole authority that exactly one
+                // same-fingerprint successor can make immediate progress.
+                self.render_attempt.continue_ready(&attempt_fingerprint);
+            }
+            ColorAttemptObservation::Waiting(key) => {
+                self.render_attempt.wait(attempt_fingerprint.clone(), key);
+            }
+            ColorAttemptObservation::Failed(_) => {
+                unreachable!("a normalized local failure returned before report application")
+            }
         }
         self.observe_coordinated_display_milestones(false);
         self.record_current_layout_presentation_if_complete();
@@ -2486,7 +3601,10 @@ impl MiranteWorkbenchApp {
         transaction: Option<&PresentationTransaction>,
         logical_transaction_assembled: bool,
     ) {
-        let any_target_presented = report.targets().iter().any(|target| target.presented());
+        let any_target_applied = report
+            .targets()
+            .iter()
+            .any(|target| target.presented() || target.current());
         if let Some(timing) = report.cpu_timing() {
             real_interaction_trace::record_renderer_cpu_timing(timing);
         }
@@ -2506,13 +3624,13 @@ impl MiranteWorkbenchApp {
                     .and_then(|target| target.volume_refinement()),
             );
         }
-        let staged_presented = requests.iter().any(|request| {
+        let staged_satisfied = requests.iter().any(|request| {
             request.staged_3d_refinement
                 && report
                     .target(request.target)
-                    .is_some_and(|target| target.presented())
+                    .is_some_and(|target| target.presented() || target.current())
         });
-        if staged_presented {
+        if staged_satisfied {
             assert!(
                 requests
                     .iter()
@@ -2608,7 +3726,22 @@ impl MiranteWorkbenchApp {
                 self.render_coordination.frame_fidelity.refinement_pending =
                     !refinement.is_complete();
             }
-            if !target_report.presented() {
+            let facts = ColorAttemptTargetFacts {
+                target: target_report.target(),
+                current: target_report.current(),
+                presented: target_report.presented(),
+                deferred_by_backpressure: target_report.deferred_by_backpressure(),
+                actionable_work_remaining: target_report.actionable_work_remaining(),
+                hidden_waiting: matches!(
+                    target_report.hidden_refinement(),
+                    Some(
+                        HiddenRefinementState::Running(_)
+                            | HiddenRefinementState::WaitingForSubmission { .. }
+                    )
+                ),
+                hidden_refinement: target_report.hidden_refinement(),
+            };
+            if !report_member_should_apply(facts, target_report.disposition()) {
                 continue;
             }
             let progress = target_report
@@ -2671,6 +3804,7 @@ impl MiranteWorkbenchApp {
                 request.surface_generation,
                 &frame,
                 None,
+                target_report.presented(),
             );
             self.record_presented_volume_schedule(request);
             self.record_coordinated_layer_presentations_with_scales(
@@ -2678,18 +3812,23 @@ impl MiranteWorkbenchApp {
                 Some(request.layer_scales.as_ref()),
             );
         }
-        if any_target_presented && self.dataset.last_plan_error().is_none() {
+        if any_target_applied && self.dataset.last_plan_error().is_none() {
             self.render_coordination.frame_fidelity.last_failure_kind = None;
             self.render_coordination.frame_fidelity.last_capacity_error = None;
         }
+        let every_logical_member_current = logical_transaction_assembled
+            && requests.iter().all(|request| {
+                report
+                    .target(request.target)
+                    .is_some_and(|target| target.current())
+            });
         if let Some(transaction) = transaction
-            && any_target_presented
-            && logical_transaction_assembled
+            && every_logical_member_current
         {
-            // The renderer's atomic group is the publication proof: if any
-            // member was presented, every required member was exact or
-            // already exact in that same cutoff. Advance only the temporal
-            // cursor here; spatial mailboxes remain independently latest-only.
+            // The full renderer report is the proof: every member is either a
+            // newly executed Exact front or a front revalidated under the
+            // same coordinator observation. Advance only the temporal cursor
+            // here; spatial mailboxes remain independently latest-only.
             self.complete_presentation_transaction(snapshot, transaction);
         }
     }
@@ -2826,12 +3965,14 @@ impl MiranteWorkbenchApp {
         surface_generation: u64,
         frame: &PresentedFrame,
         cpu_timing: Option<CpuFrameTiming>,
+        record_presentation_interval: bool,
     ) {
-        if let Some(product) = self
-            .native_presentation
-            .product_gpu
-            .as_mut()
-            .filter(|product| product.presented_frame_interval_timing_enabled())
+        if record_presentation_interval
+            && let Some(product) = self
+                .native_presentation
+                .product_gpu
+                .as_mut()
+                .filter(|product| product.presented_frame_interval_timing_enabled())
         {
             product.record_presented_frame_interval(panel, frame.frame(), cpu_timing);
         }
@@ -3066,7 +4207,13 @@ impl MiranteWorkbenchApp {
             }
         }
         match first_error {
-            Some(error) => Err(error.into()),
+            Some(error) => {
+                if classify_color_runtime_error(error) == ColorRuntimeDisposition::RendererTerminal
+                {
+                    self.enter_product_renderer_terminal(error);
+                }
+                Err(error.into())
+            }
             None => Ok(()),
         }
     }
@@ -3088,24 +4235,20 @@ impl MiranteWorkbenchApp {
         });
     }
 
-    /// Executes one coordinated renderer observation and reports whether it
-    /// published new color content into a native presentation texture.
+    /// Executes one coordinated renderer observation and reports its complete
+    /// fixed-target composition mutation.
     ///
     /// The egui paint list for the current UI turn is built before this
-    /// method is called. A `true` result therefore requires one subsequent
-    /// composition wake; otherwise renderer currentness can advance while
-    /// the mapped window remains indefinitely on its previous pixels.
-    pub(crate) fn refresh_frame(&mut self) -> bool {
+    /// method is called. Every non-unchanged result therefore requires one
+    /// subsequent composition wake; otherwise either new texture pixels or a
+    /// newly cleared surface can remain absent from the mapped window.
+    pub(crate) fn refresh_frame(&mut self) -> DisplayCompositionChange {
         #[cfg(test)]
         {
             self.refresh_frame_calls = self.refresh_frame_calls.saturating_add(1);
         }
+        let composition_before = DisplayCompositionSnapshot::capture(self);
         self.poll_product_gpu_timings();
-        let color_submissions_before = self
-            .native_presentation
-            .product_gpu
-            .as_ref()
-            .map_or(0, |product| product.total_coordinated_color_submissions);
         let total_start = Instant::now();
         let completed_work = match self.rerender_coordinated_display_state() {
             Ok(work) => Some(work),
@@ -3122,15 +4265,10 @@ impl MiranteWorkbenchApp {
                 duration_ms(total_start.elapsed()),
             );
         }
-        self.native_presentation
-            .product_gpu
-            .as_ref()
-            .is_some_and(|product| {
-                product.total_coordinated_color_submissions > color_submissions_before
-            })
+        DisplayCompositionSnapshot::capture(self).change_from(&composition_before)
     }
 
-    fn poll_product_gpu_timings(&mut self) {
+    pub(crate) fn poll_product_gpu_timings(&mut self) {
         let Some(pending_count) = self
             .native_presentation
             .product_gpu
@@ -3176,13 +4314,20 @@ impl MiranteWorkbenchApp {
                         .pop_front()
                         .expect("the failed front timing remains pending");
                     self.volume_presentation.discard_timing(ticket);
+                    if classify_color_runtime_error(error)
+                        == ColorRuntimeDisposition::RendererTerminal
+                    {
+                        self.enter_product_renderer_terminal(error);
+                        tracing::error!(%error, "GPU timing observed the terminal renderer cause");
+                        break;
+                    }
                     tracing::warn!(%error, "adaptive GPU timing could not be collected");
                 }
             }
         }
     }
 
-    pub(crate) fn refresh_texture_only(&mut self) -> bool {
+    pub(crate) fn refresh_texture_only(&mut self) -> DisplayCompositionChange {
         self.invalidate_cross_section_panel_display_frames();
         self.refresh_frame()
     }
@@ -3192,42 +4337,6 @@ impl MiranteWorkbenchApp {
         self.render_coordination.frame_fidelity.last_failure_kind = Some(failure.kind());
         self.render_coordination.frame_fidelity.last_capacity_error =
             Some(failure.message().to_owned());
-        self.render_coordination.frame_fidelity.completeness = FrameCompleteness::Incomplete;
-    }
-
-    /// Projects one renderer-owned terminal startup failure through the same
-    /// product failure vocabulary used by ordinary display execution. Returns
-    /// true only for the first visible projection of that exact failure.
-    pub(crate) fn record_terminal_product_renderer_failure(
-        &mut self,
-        error: &anyhow::Error,
-    ) -> bool {
-        let failure = render_state::render_failure_status(error);
-        let changed = self.render_coordination.frame_fidelity.last_failure_kind
-            != Some(failure.kind())
-            || self
-                .render_coordination
-                .frame_fidelity
-                .last_capacity_error
-                .as_deref()
-                != Some(failure.message());
-        if !changed {
-            return false;
-        }
-        let retained_pixels = PresentationTarget::ALL.into_iter().any(|target| {
-            self.render_coordination
-                .surface(target)
-                .presented_frame()
-                .is_some()
-        });
-        self.record_product_render_failure(error);
-        self.render_coordination.frame_fidelity.display_freshness = if retained_pixels {
-            DisplayedFrameFreshness::Stale
-        } else {
-            DisplayedFrameFreshness::Unknown
-        };
-        self.render_coordination.invalidate_cross_sections();
-        true
     }
 }
 
@@ -3397,6 +4506,75 @@ pub(crate) fn render_backend_for_view(view: &ViewState) -> RenderBackend {
 #[cfg(test)]
 mod requirement_lease_update_tests {
     use super::*;
+
+    fn blank_composition_snapshot() -> DisplayCompositionSnapshot {
+        DisplayCompositionSnapshot {
+            targets: PresentationTarget::ALL.map(|target| DisplayTargetCompositionSnapshot {
+                active: true,
+                frame: None,
+                texture_binding: None,
+                background: if target == PresentationTarget::ThreeD {
+                    DisplayCompositionBackground::ThreeD(RenderBackend::Loading)
+                } else {
+                    DisplayCompositionBackground::CrossSection {
+                        active: true,
+                        schedule: Some(CrossSectionPanelScheduleState::missing_viewport(0)),
+                    }
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn composition_change_distinguishes_texture_surface_mixed_and_quiescent_states() {
+        let extent = RenderExtent::new(64, 64).unwrap();
+        let before = blank_composition_snapshot();
+
+        let mut texture = before.clone();
+        texture.targets[PresentationTarget::ThreeD.index()].frame = Some(
+            crate::tests::synthetic_presented_frame(PresentationTarget::ThreeD, extent),
+        );
+        texture.targets[PresentationTarget::ThreeD.index()].texture_binding = Some((1, 1));
+        assert_eq!(
+            texture.change_from(&before),
+            DisplayCompositionChange::TexturePublished
+        );
+
+        let mut cleared = texture.clone();
+        cleared.targets[PresentationTarget::ThreeD.index()].frame = None;
+        cleared.targets[PresentationTarget::ThreeD.index()].texture_binding = None;
+        cleared.targets[PresentationTarget::ThreeD.index()].background =
+            DisplayCompositionBackground::ThreeD(RenderBackend::Empty);
+        assert_eq!(
+            cleared.change_from(&texture),
+            DisplayCompositionChange::SurfaceCleared
+        );
+        assert_eq!(
+            cleared.change_from(&cleared),
+            DisplayCompositionChange::Unchanged
+        );
+
+        let mut mixed_before = blank_composition_snapshot();
+        mixed_before.targets[PresentationTarget::Xy.index()].frame = Some(
+            crate::tests::synthetic_presented_frame(PresentationTarget::Xy, extent),
+        );
+        mixed_before.targets[PresentationTarget::Xy.index()].texture_binding = Some((1, 1));
+        let mut mixed_after = mixed_before.clone();
+        mixed_after.targets[PresentationTarget::ThreeD.index()].frame = Some(
+            crate::tests::synthetic_presented_frame(PresentationTarget::ThreeD, extent),
+        );
+        mixed_after.targets[PresentationTarget::ThreeD.index()].texture_binding = Some((1, 2));
+        mixed_after.targets[PresentationTarget::Xy.index()].frame = None;
+        mixed_after.targets[PresentationTarget::Xy.index()].texture_binding = None;
+        assert_eq!(
+            mixed_after.change_from(&mixed_before),
+            DisplayCompositionChange::TexturePublishedAndSurfaceCleared
+        );
+
+        assert!(DisplayCompositionChange::TexturePublished.requires_composition_turn());
+        assert!(DisplayCompositionChange::SurfaceCleared.requires_composition_turn());
+        assert!(!DisplayCompositionChange::Unchanged.requires_composition_turn());
+    }
 
     fn backend_test_view(first_visible: bool, second_visible: bool) -> ViewState {
         let transfer = || {
@@ -3635,145 +4813,739 @@ mod requirement_lease_update_tests {
 
     fn render_failure_signature(
         frame: u64,
-        retained_lease_generation: u64,
         dataset_runtime_epoch: u64,
-    ) -> ProductRenderFailureSignature {
-        ProductRenderFailureSignature {
+    ) -> RenderAttemptFingerprint {
+        RenderAttemptFingerprint {
+            source_generation: SourceSessionGeneration::new(1),
+            layout: CanonicalViewerLayout::Single3d,
             frames: [Some(FrameIdentity::new(frame)), None, None, None],
+            timepoints: [Some(TimeIndex::new(0)), None, None, None],
             requirements: std::array::from_fn(|_| None),
-            retained_lease_generation,
+            surface_generations: [Some(1), None, None, None],
+            extents: [None; 4],
+            layer_scales: std::array::from_fn(|_| None),
+            schedules: [Some(VolumeColorSchedule::Direct), None, None, None],
             dataset_runtime_epoch,
+            cpu_capacity_epoch: 1,
+            renderer_device_generation: 1,
+        }
+    }
+
+    fn fingerprint_requirement_fixtures()
+    -> (RenderRequirements, RenderRequirements, RenderRequirements) {
+        use mirante4d_dataset::{
+            BrickKey, DatasetResourceIdentity, DatasetSourceId, ResourceRegion,
+        };
+        use mirante4d_domain::{
+            DisplayWindow, LayerTransfer, Opacity, RgbColor, SamplingPolicy, Shape3D,
+            TransferCurve, UnitQuaternion, WorldPoint3,
+        };
+        use mirante4d_render_api::{
+            LayerRenderIntent, PreparedResourceBody, PresentationViewport, RenderIntent,
+        };
+
+        let identity = DatasetResourceIdentity::SessionLocal(DatasetSourceId::new(97));
+        let layer = LogicalLayerKey::new(3);
+        let timepoint = TimeIndex::new(0);
+        let intent = RenderIntent::new(
+            FrameIdentity::new(7),
+            identity,
+            timepoint,
+            RenderViewIntent::cross_section(
+                CrossSectionView::new(WorldPoint3::origin(), UnitQuaternion::identity(), 1.0, 1.0)
+                    .unwrap(),
+            ),
+            PresentationViewport::new(64.0, 64.0).unwrap(),
+            RenderExtent::new(64, 64).unwrap(),
+            vec![LayerRenderIntent::new(
+                layer,
+                LayerTransfer::new(
+                    DisplayWindow::new(0.0, 1.0).unwrap(),
+                    RgbColor::new([1.0, 1.0, 1.0]).unwrap(),
+                    Opacity::new(1.0).unwrap(),
+                    TransferCurve::linear(),
+                    false,
+                ),
+                mirante4d_domain::RenderState::mip(SamplingPolicy::VoxelExact),
+            )],
+        )
+        .unwrap();
+        let key = |origin_x| {
+            BrickKey::new(
+                identity,
+                layer,
+                timepoint,
+                ScaleLevel::BASE,
+                ResourceRegion::new([0, 0, origin_x], Shape3D::new(1, 1, 1).unwrap()).unwrap(),
+            )
+        };
+        let prepared = |suffix_origin| {
+            let required = key(0);
+            let suffix = key(suffix_origin);
+            let mut canonical = vec![required, suffix];
+            canonical.sort_unstable();
+            let body =
+                PreparedResourceBody::new(canonical.into(), vec![required, suffix].into(), None)
+                    .unwrap();
+            PreparedRenderRequirements::new_with_required_prefix(
+                identity,
+                timepoint,
+                vec![layer],
+                body,
+                1,
+                1,
+            )
+            .unwrap()
+        };
+        let first = prepared(1);
+        let changed = prepared(2);
+        (
+            first.bind(&intent).unwrap(),
+            changed.bind(&intent).unwrap(),
+            first.promote_prefetch().bind(&intent).unwrap(),
+        )
+    }
+
+    fn complete_render_signature(requirements: RenderRequirements) -> RenderAttemptFingerprint {
+        let mut signature = render_failure_signature(7, 17);
+        signature.requirements[PresentationTarget::ThreeD.index()] = Some(requirements);
+        signature.extents[PresentationTarget::ThreeD.index()] =
+            Some(RenderExtent::new(64, 64).unwrap());
+        signature.layer_scales[PresentationTarget::ThreeD.index()] = Some(Arc::new(
+            BTreeMap::from([(LogicalLayerKey::new(3), ScaleLevel::BASE)]),
+        ));
+        signature
+    }
+
+    #[test]
+    fn composed_same_frame_successor_body_cannot_reuse_predecessor() {
+        let (predecessor_body, successor_body, _) = fingerprint_requirement_fixtures();
+        assert!(!predecessor_body.shares_resources_with(&successor_body));
+        let predecessor = complete_render_signature(predecessor_body);
+        let successor = complete_render_signature(successor_body);
+        assert!(!predecessor.matches_current(&successor));
+
+        let predecessor_fidelity = RenderFrameCompleteness::Exact;
+        let mut coordinator = RenderAttemptCoordinator::default();
+        coordinator.fail(
+            predecessor,
+            ResidentRenderFailureStatus::new(FrameFailureKind::BudgetExceeded, "old body"),
+        );
+        assert!(coordinator.begin(successor));
+        assert_eq!(predecessor_fidelity, RenderFrameCompleteness::Exact);
+        assert!(matches!(
+            coordinator.state(),
+            RenderAttemptState::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn composed_prefetch_role_change_cannot_reuse_predecessor() {
+        let (unpromoted, _, promoted) = fingerprint_requirement_fixtures();
+        assert!(unpromoted.shares_resources_with(&promoted));
+        assert_ne!(unpromoted.prefetch_promoted(), promoted.prefetch_promoted());
+        let predecessor = complete_render_signature(unpromoted);
+        let successor = complete_render_signature(promoted);
+        assert!(!predecessor.matches_current(&successor));
+
+        let mut coordinator = RenderAttemptCoordinator::default();
+        coordinator.fail(
+            predecessor,
+            ResidentRenderFailureStatus::new(FrameFailureKind::BudgetExceeded, "old role"),
+        );
+        assert!(coordinator.begin(successor));
+    }
+
+    #[test]
+    fn composed_source_time_scale_spatial_extent_or_surface_mismatch_never_reuses() {
+        let (requirements, changed_body, _) = fingerprint_requirement_fixtures();
+        let baseline = complete_render_signature(requirements);
+        let mut variants = Vec::new();
+
+        let mut source = baseline.clone();
+        source.source_generation = SourceSessionGeneration::new(2);
+        variants.push(source);
+        let mut time = baseline.clone();
+        time.timepoints[0] = Some(TimeIndex::new(1));
+        variants.push(time);
+        let mut spatial = baseline.clone();
+        spatial.frames[0] = Some(FrameIdentity::new(8));
+        variants.push(spatial);
+        let mut surface = baseline.clone();
+        surface.surface_generations[0] = Some(2);
+        variants.push(surface);
+        let mut extent = baseline.clone();
+        extent.extents[0] = Some(RenderExtent::new(65, 64).unwrap());
+        variants.push(extent);
+        let mut scale = baseline.clone();
+        scale.layer_scales[0] = Some(Arc::new(BTreeMap::from([(
+            LogicalLayerKey::new(3),
+            ScaleLevel::new(1),
+        )])));
+        variants.push(scale);
+        let mut body = baseline.clone();
+        body.requirements[0] = Some(changed_body);
+        variants.push(body);
+
+        for variant in variants {
+            assert!(!baseline.matches_current(&variant));
         }
     }
 
     #[test]
-    fn terminal_positive_lease_failure_executes_once_until_an_exact_input_changes() {
-        use mirante4d_render_api::GpuLedgerCategory;
-
-        let current = render_failure_signature(7, 13, 17);
-        let terminal_errors = [
-            WgpuRenderRuntimeError::BackendValidation,
-            WgpuRenderRuntimeError::CapacityExceeded {
-                category: GpuLedgerCategory::PayloadResidency,
-                requested_bytes: 2,
-                available_bytes: 1,
-            },
-            WgpuRenderRuntimeError::RequirementCapacityExceeded {
-                actual: 2,
-                maximum: 1,
-            },
-        ];
-        let mut final_latch = None;
-        for error in terminal_errors {
-            let mut latch = None;
-            let mut executions = 0_u64;
-            for _ in 0..128 {
-                let blocked = latch.as_ref().is_some_and(
-                    |latch: &DeterministicFailureLatch<ProductRenderFailureSignature>| {
-                        latch.blocks(|failure| failure.matches_current(&current))
-                    },
-                );
-                if blocked {
-                    continue;
-                }
-                executions = executions.saturating_add(1);
-                if product_render_failure_is_deterministic(error) {
-                    latch = Some(DeterministicFailureLatch::new(current.clone()));
-                }
-            }
-            assert_eq!(executions, 1, "unchanged UI polls must stay idle");
-            final_latch = latch;
+    fn latched_failure_is_quiescent_for_128_unchanged_ui_turns() {
+        let current = render_failure_signature(7, 17);
+        let mut coordinator = RenderAttemptCoordinator::default();
+        assert!(coordinator.begin(current.clone()));
+        coordinator.fail(
+            current.clone(),
+            ResidentRenderFailureStatus::new(FrameFailureKind::BudgetExceeded, "capacity"),
+        );
+        for _ in 0..128 {
+            assert!(!coordinator.begin(current.clone()));
+            assert_eq!(coordinator.wake(), RenderWake::None);
         }
 
         let changed = [
-            render_failure_signature(8, 13, 17),
-            render_failure_signature(7, 14, 17),
-            render_failure_signature(7, 13, 18),
+            render_failure_signature(8, 17),
+            render_failure_signature(7, 18),
         ];
         for signature in changed {
-            assert!(
-                !final_latch
-                    .as_ref()
-                    .expect("the first deterministic failure was latched")
-                    .blocks(|failure| failure.matches_current(&signature)),
-                "every exact input change must permit another execution"
+            assert!(coordinator.begin(signature));
+            coordinator.fail(
+                current.clone(),
+                ResidentRenderFailureStatus::new(FrameFailureKind::BudgetExceeded, "capacity"),
             );
         }
     }
 
     #[test]
-    fn render_capacity_is_latched_but_stale_and_async_backpressure_remain_retryable() {
+    fn published_texture_revision_requests_exactly_one_composition_turn() {
+        let mut coordinator = RenderAttemptCoordinator::default();
+        let target = PresentationTarget::ThreeD;
+
+        coordinator.note_published_texture(target, 3, 7);
+        assert_eq!(coordinator.wake(), RenderWake::Immediate);
+        coordinator.acknowledge_composition(target, Some((3, 7)));
+        assert_eq!(coordinator.wake(), RenderWake::None);
+
+        coordinator.note_published_texture(target, 3, 7);
+        coordinator.note_published_texture(target, 3, 6);
+        assert_eq!(
+            coordinator.wake(),
+            RenderWake::None,
+            "an acknowledged or stale texture cannot manufacture another composition turn"
+        );
+
+        coordinator.note_published_texture(target, 3, 8);
+        assert_eq!(coordinator.wake(), RenderWake::Immediate);
+        coordinator.acknowledge_composition(target, Some((3, 7)));
+        assert_eq!(coordinator.wake(), RenderWake::Immediate);
+        coordinator.acknowledge_composition(target, Some((3, 8)));
+        assert_eq!(coordinator.wake(), RenderWake::None);
+    }
+
+    #[test]
+    fn render_fingerprint_change_reopens_exactly_one_attempt() {
+        let (requirements, changed_body, promoted) = fingerprint_requirement_fixtures();
+        let current = complete_render_signature(requirements);
+        let mut changed = Vec::new();
+        let mut edit = current.clone();
+        edit.source_generation = SourceSessionGeneration::new(2);
+        changed.push(edit);
+        let mut edit = current.clone();
+        edit.layout = CanonicalViewerLayout::FourPanel;
+        changed.push(edit);
+        let mut edit = current.clone();
+        edit.frames[0] = Some(FrameIdentity::new(8));
+        changed.push(edit);
+        let mut edit = current.clone();
+        edit.timepoints[0] = Some(TimeIndex::new(1));
+        changed.push(edit);
+        for replacement in [changed_body, promoted] {
+            let mut edit = current.clone();
+            edit.requirements[0] = Some(replacement);
+            changed.push(edit);
+        }
+        let mut edit = current.clone();
+        edit.surface_generations[0] = Some(2);
+        changed.push(edit);
+        let mut edit = current.clone();
+        edit.extents[0] = Some(RenderExtent::new(65, 64).unwrap());
+        changed.push(edit);
+        let mut edit = current.clone();
+        edit.layer_scales[0] = Some(Arc::new(BTreeMap::from([(
+            LogicalLayerKey::new(3),
+            ScaleLevel::new(1),
+        )])));
+        changed.push(edit);
+        let mut edit = current.clone();
+        edit.schedules[0] = Some(VolumeColorSchedule::InteractivePreview);
+        changed.push(edit);
+        for (runtime, cpu, renderer) in [(18, 1, 1), (17, 2, 1), (17, 1, 2)] {
+            let mut edit = current.clone();
+            edit.dataset_runtime_epoch = runtime;
+            edit.cpu_capacity_epoch = cpu;
+            edit.renderer_device_generation = renderer;
+            changed.push(edit);
+        }
+
+        for changed in changed {
+            let mut coordinator = RenderAttemptCoordinator::default();
+            coordinator.fail(
+                current.clone(),
+                ResidentRenderFailureStatus::new(FrameFailureKind::BudgetExceeded, "capacity"),
+            );
+            assert!(coordinator.begin(changed.clone()));
+            coordinator.fail(
+                changed.clone(),
+                ResidentRenderFailureStatus::new(FrameFailureKind::BudgetExceeded, "capacity"),
+            );
+            assert!(!coordinator.begin(changed));
+            assert_eq!(coordinator.execution_decisions, 1);
+        }
+    }
+
+    #[test]
+    fn actionable_report_authorizes_exactly_one_same_fingerprint_retry() {
+        let current = render_failure_signature(7, 17);
+        let target = PresentationTarget::ThreeD;
+        let mut coordinator = RenderAttemptCoordinator::default();
+
+        assert!(coordinator.begin(current.clone()));
+        assert!(!coordinator.target_ready(target));
+        assert!(!coordinator.begin(current.clone()));
+
+        coordinator.continue_ready(&current);
+        assert!(coordinator.target_ready(target));
+        assert_eq!(coordinator.wake(), RenderWake::Immediate);
+        assert!(coordinator.begin(current.clone()));
+
+        assert!(!coordinator.target_ready(target));
+        assert_eq!(coordinator.wake(), RenderWake::None);
+        assert!(!coordinator.begin(current));
+        assert_eq!(coordinator.execution_decisions, 2);
+    }
+
+    fn renderer_event_batch(
+        bits: u8,
+        renderer_device_generation: u64,
+        completed_submission: u64,
+        hidden_worker_job: u64,
+    ) -> RendererEventBatch {
+        RendererEventBatch {
+            renderer_device_generation,
+            bits,
+            completed_submission,
+            hidden_worker_job,
+        }
+    }
+
+    #[test]
+    fn renderer_event_sink_coalesces_keys_and_ignores_late_callbacks_after_drop() {
+        let wake = Arc::new(RendererUiWake::new(egui::Context::default(), 1));
+        let weak = Arc::downgrade(&wake);
+        let sink = mirante4d_render_wgpu::RendererEventSink::new(move |event| {
+            if let Some(wake) = weak.upgrade() {
+                wake.wake_renderer_event(event);
+            }
+        });
+
+        sink.wake(RendererEvent::SubmissionCompleted { submission: 7 });
+        sink.wake(RendererEvent::SubmissionCompleted { submission: 5 });
+        sink.wake(RendererEvent::HiddenWorkerResult { job: 11 });
+        sink.wake(RendererEvent::HiddenWorkerResult { job: 9 });
+        assert!(wake.ui_turn_pending.load(Ordering::Acquire));
+        let batch = wake.begin_ui_turn();
+        assert_eq!(batch.submission_completed(), Some(7));
+        assert_eq!(batch.hidden_worker_result(), Some(11));
+        assert!(!wake.ui_turn_pending.load(Ordering::Acquire));
+
+        sink.wake(RendererEvent::PipelineCapabilityChanged(
+            PipelineCapability::InitialRender,
+        ));
+        sink.wake(RendererEvent::PipelineCapabilityChanged(
+            PipelineCapability::Pick,
+        ));
+        let initial = wake.begin_ui_turn();
+        assert!(initial.initial_pipeline_changed());
+        assert!(!initial.pick_pipeline_changed());
+        assert!(wake.ui_turn_pending.load(Ordering::Acquire));
+        let pick = wake.begin_ui_turn();
+        assert!(!pick.initial_pipeline_changed());
+        assert!(pick.pick_pipeline_changed());
+        assert!(!wake.ui_turn_pending.load(Ordering::Acquire));
+
+        let fingerprint = render_failure_signature(7, 17);
+        let mut coordinator = RenderAttemptCoordinator::default();
+        coordinator.wait(
+            fingerprint.clone(),
+            RenderWaitKey::SubmissionCleanup { submission: 8 },
+        );
+        coordinator.observe_renderer_events(batch);
+        assert!(!coordinator.begin(fingerprint.clone()));
+
+        // This commit occurs after the handler cleared the coalescing flag.
+        // It must therefore own exactly one successor UI turn.
+        sink.wake(RendererEvent::SubmissionCompleted { submission: 8 });
+        assert!(wake.ui_turn_pending.load(Ordering::Acquire));
+        let successor = wake.begin_ui_turn();
+        coordinator.observe_renderer_events(successor);
+        assert!(coordinator.begin(fingerprint));
+        assert!(!wake.ui_turn_pending.load(Ordering::Acquire));
+
+        wake.close();
+        let weak = Arc::downgrade(&wake);
+        drop(wake);
+        assert!(weak.upgrade().is_none());
+        sink.wake(RendererEvent::HiddenWorkerResult { job: 12 });
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn payload_recovery_completion_causes_one_retry_without_hot_polling() {
+        let current = render_failure_signature(7, 17);
+        let mut coordinator = RenderAttemptCoordinator::default();
+        coordinator.wait(
+            current.clone(),
+            RenderWaitKey::SubmissionCleanup { submission: 9 },
+        );
+        assert!(matches!(coordinator.wake(), RenderWake::Waiting(_)));
+
+        coordinator.observe_renderer_events(renderer_event_batch(
+            SUBMISSION_COMPLETED_EVENT,
+            1,
+            8,
+            0,
+        ));
+        assert!(matches!(coordinator.wake(), RenderWake::Waiting(_)));
+        assert!(!coordinator.begin(current.clone()));
+
+        coordinator.observe_renderer_events(renderer_event_batch(
+            SUBMISSION_COMPLETED_EVENT,
+            1,
+            9,
+            0,
+        ));
+        assert_eq!(coordinator.wake(), RenderWake::Immediate);
+        assert!(coordinator.begin(current));
+        assert_eq!(coordinator.execution_decisions, 1);
+    }
+
+    #[test]
+    fn eviction_acknowledgement_causes_one_retry_without_signature_change() {
+        let current = render_failure_signature(7, 17);
+        let mut coordinator = RenderAttemptCoordinator::default();
+        coordinator.wait(
+            current.clone(),
+            RenderWaitKey::EvictionAcknowledgement {
+                ledger_revision: 41,
+            },
+        );
+        coordinator.observe_eviction_acknowledgement(40);
+        assert!(matches!(coordinator.wake(), RenderWake::Waiting(_)));
+        assert!(!coordinator.begin(current.clone()));
+
+        coordinator.observe_eviction_acknowledgement(41);
+        assert_eq!(coordinator.wake(), RenderWake::Immediate);
+        assert!(coordinator.begin(current));
+        assert_eq!(coordinator.execution_decisions, 1);
+    }
+
+    #[test]
+    fn render_wait_priority_registers_one_keyed_causal_event() {
+        let current = render_failure_signature(7, 17);
+        let mut coordinator = RenderAttemptCoordinator::default();
+        coordinator.wait(
+            current.clone(),
+            RenderWaitKey::InitialPipeline {
+                device_generation: 3,
+            },
+        );
+        coordinator.observe_renderer_events(renderer_event_batch(PICK_PIPELINE_EVENT, 3, 0, 0));
+        assert!(matches!(coordinator.wake(), RenderWake::Waiting(_)));
+        coordinator.observe_renderer_events(renderer_event_batch(INITIAL_PIPELINE_EVENT, 2, 0, 0));
+        assert!(matches!(coordinator.wake(), RenderWake::Waiting(_)));
+        coordinator.observe_renderer_events(renderer_event_batch(INITIAL_PIPELINE_EVENT, 3, 0, 0));
+        assert_eq!(coordinator.wake(), RenderWake::Immediate);
+
+        coordinator.wait(
+            current,
+            RenderWaitKey::HiddenWorker {
+                target: PresentationTarget::ThreeD,
+                job: 17,
+            },
+        );
+        coordinator.observe_renderer_events(renderer_event_batch(HIDDEN_WORKER_EVENT, 3, 0, 16));
+        assert!(matches!(coordinator.wake(), RenderWake::Waiting(_)));
+        coordinator.observe_renderer_events(renderer_event_batch(HIDDEN_WORKER_EVENT, 3, 0, 17));
+        assert_eq!(coordinator.wake(), RenderWake::Immediate);
+        assert_eq!(coordinator.wait_decisions, 2);
+    }
+
+    #[test]
+    fn renderer_outcomes_have_exhaustive_attempt_dispositions() {
         use mirante4d_render_api::GpuLedgerCategory;
 
-        assert!(product_render_failure_is_deterministic(
-            WgpuRenderRuntimeError::BackendValidation
-        ));
-        assert!(!product_render_failure_is_deterministic(
-            WgpuRenderRuntimeError::StaleFrame {
+        assert_eq!(
+            classify_color_runtime_error(WgpuRenderRuntimeError::BackendValidation),
+            ColorRuntimeDisposition::RendererTerminal
+        );
+        assert_eq!(
+            classify_color_runtime_error(WgpuRenderRuntimeError::StaleFrame {
+                target: Some(PresentationTarget::ThreeD),
                 actual: FrameIdentity::new(1),
                 current: FrameIdentity::new(2),
-            }
-        ));
-        assert!(product_render_failure_is_deterministic(
-            WgpuRenderRuntimeError::CapacityExceeded {
+            }),
+            ColorRuntimeDisposition::Stale
+        );
+        assert_eq!(
+            classify_color_runtime_error(WgpuRenderRuntimeError::CapacityExceeded {
                 category: GpuLedgerCategory::PayloadResidency,
                 requested_bytes: 2,
                 available_bytes: 1,
-            }
-        ));
-        assert!(product_render_failure_is_deterministic(
-            WgpuRenderRuntimeError::RequirementCapacityExceeded {
+            }),
+            ColorRuntimeDisposition::DeterministicFailure
+        );
+        assert_eq!(
+            classify_color_runtime_error(WgpuRenderRuntimeError::RequirementCapacityExceeded {
                 actual: 2,
                 maximum: 1,
-            }
-        ));
-        assert!(product_render_failure_is_deterministic(
-            WgpuRenderRuntimeError::ControlCapacityExceeded
-        ));
-        assert!(!product_render_failure_is_deterministic(
-            WgpuRenderRuntimeError::PickBackpressure
-        ));
-        assert!(!product_render_failure_is_deterministic(
-            WgpuRenderRuntimeError::PayloadPlacementUnavailable {
+            }),
+            ColorRuntimeDisposition::DeterministicFailure
+        );
+        assert_eq!(
+            classify_color_runtime_error(WgpuRenderRuntimeError::PickBackpressure),
+            ColorRuntimeDisposition::AuxiliaryOnly
+        );
+        assert_eq!(
+            classify_color_runtime_error(WgpuRenderRuntimeError::PayloadPlacementUnavailable {
                 requested_bytes: 256,
                 total_free_bytes: 512,
                 largest_contiguous_bytes: 128,
-            }
+            }),
+            ColorRuntimeDisposition::PlacementRecovery
+        );
+        assert_eq!(
+            classify_color_runtime_error(WgpuRenderRuntimeError::PayloadRecoveryDeferred),
+            ColorRuntimeDisposition::Wait(RenderWaitReason::SubmissionCleanup)
+        );
+    }
+
+    #[test]
+    fn retryable_renderer_outcomes_preserve_presented_fidelity_and_use_neutral_status() {
+        let exact_pixels = RenderFrameCompleteness::Exact;
+        let current = render_failure_signature(7, 17);
+        let retryable = [
+            (
+                WgpuRenderRuntimeError::PipelineNotReady {
+                    capability: PipelineCapability::InitialRender,
+                },
+                RenderWaitKey::InitialPipeline {
+                    device_generation: 1,
+                },
+            ),
+            (
+                WgpuRenderRuntimeError::PayloadRecoveryDeferred,
+                RenderWaitKey::SubmissionCleanup { submission: 5 },
+            ),
+            (
+                WgpuRenderRuntimeError::ResidencyEvictionEventCapacityExceeded {
+                    actual: 2,
+                    maximum: 1,
+                },
+                RenderWaitKey::EvictionAcknowledgement { ledger_revision: 9 },
+            ),
+        ];
+        for (error, key) in retryable {
+            assert!(matches!(
+                classify_color_runtime_error(error),
+                ColorRuntimeDisposition::Wait(_)
+            ));
+            let mut coordinator = RenderAttemptCoordinator::default();
+            coordinator.wait(current.clone(), key);
+            assert!(matches!(
+                coordinator.state(),
+                RenderAttemptState::Waiting { .. }
+            ));
+            assert!(coordinator.failure().is_none());
+            assert_eq!(exact_pixels, RenderFrameCompleteness::Exact);
+        }
+    }
+
+    #[test]
+    fn non_error_backpressure_and_progress_are_normalized_before_report_application() {
+        let facts = |presented, deferred, actionable, hidden_waiting| ColorAttemptTargetFacts {
+            target: PresentationTarget::ThreeD,
+            current: false,
+            presented,
+            deferred_by_backpressure: deferred,
+            actionable_work_remaining: actionable,
+            hidden_waiting,
+            hidden_refinement: None,
+        };
+
+        let deferred = facts(false, true, false, false);
+        assert!(matches!(
+            classify_color_attempt_facts(&[deferred]),
+            ColorAttemptClass::SubmissionWait
         ));
-        assert!(!product_render_failure_is_deterministic(
-            WgpuRenderRuntimeError::PayloadRecoveryDeferred
+        assert!(!report_member_should_apply(
+            deferred,
+            CoordinatedMemberDisposition::Executed
+        ));
+
+        let missing_exact_residency = facts(false, false, false, false);
+        assert!(matches!(
+            classify_color_attempt_facts(&[missing_exact_residency]),
+            ColorAttemptClass::RelevantResidency(PresentationTarget::ThreeD)
+        ));
+        assert!(!report_member_should_apply(
+            missing_exact_residency,
+            CoordinatedMemberDisposition::Executed
+        ));
+
+        let running_hidden = facts(false, false, false, true);
+        assert!(matches!(
+            classify_color_attempt_facts(&[running_hidden]),
+            ColorAttemptClass::HiddenWait(PresentationTarget::ThreeD)
+        ));
+
+        let published_preview = facts(true, false, false, false);
+        assert!(matches!(
+            classify_color_attempt_facts(&[published_preview]),
+            ColorAttemptClass::RelevantResidency(PresentationTarget::ThreeD)
+        ));
+        assert!(report_member_should_apply(
+            published_preview,
+            CoordinatedMemberDisposition::Executed
+        ));
+
+        let retry_ready = facts(false, false, true, false);
+        assert!(matches!(
+            classify_color_attempt_facts(&[retry_ready]),
+            ColorAttemptClass::Ready
         ));
     }
 
     #[test]
-    fn eviction_event_backpressure_does_not_latch_an_unchanged_render_signature() {
-        let current = render_failure_signature(7, 13, 17);
-        let error = WgpuRenderRuntimeError::ResidencyEvictionEventCapacityExceeded {
-            actual: 2,
-            maximum: 1,
-        };
-        let mut latch = None;
-        let mut executions = 0_u64;
-        for _ in 0..2 {
-            let blocked = latch.as_ref().is_some_and(
-                |latch: &DeterministicFailureLatch<ProductRenderFailureSignature>| {
-                    latch.blocks(|failure| failure.matches_current(&current))
-                },
-            );
-            if blocked {
-                continue;
-            }
-            executions = executions.saturating_add(1);
-            if product_render_failure_is_deterministic(error) {
-                latch = Some(DeterministicFailureLatch::new(current.clone()));
-            }
+    fn stale_frame_waits_for_reported_mailbox_advance_without_resubmission() {
+        let target = PresentationTarget::Xy;
+        let mut stale = render_failure_signature(7, 17);
+        stale.frames[PresentationTarget::ThreeD.index()] = None;
+        stale.frames[target.index()] = Some(FrameIdentity::new(7));
+        let mut coordinator = RenderAttemptCoordinator::default();
+        coordinator.wait(
+            stale.clone(),
+            RenderWaitKey::MailboxAdvance {
+                target,
+                minimum_frame: 9,
+            },
+        );
+
+        let mut unrelated = stale.clone();
+        unrelated.dataset_runtime_epoch = 18;
+        assert!(!coordinator.begin(unrelated));
+        let mut still_stale = stale.clone();
+        still_stale.frames[target.index()] = Some(FrameIdentity::new(8));
+        assert!(!coordinator.begin(still_stale));
+        assert_eq!(coordinator.execution_decisions, 0);
+
+        let mut current = stale;
+        current.frames[target.index()] = Some(FrameIdentity::new(9));
+        assert!(coordinator.begin(current.clone()));
+        assert!(!coordinator.begin(current));
+        assert_eq!(coordinator.execution_decisions, 1);
+    }
+
+    #[test]
+    fn initial_render_failure_is_color_unavailable_across_fingerprint_changes() {
+        let initial_failure = ResidentRenderFailureStatus::new(
+            FrameFailureKind::BackendLimit,
+            "initial color pipeline validation failed",
+        );
+        let mut coordinator = RenderAttemptCoordinator::default();
+        coordinator.color_unavailable(initial_failure);
+        for changed in [
+            render_failure_signature(7, 17),
+            render_failure_signature(8, 18),
+        ] {
+            assert!(!coordinator.begin(changed));
+            assert_eq!(coordinator.wake(), RenderWake::None);
         }
+        assert!(matches!(
+            coordinator.state(),
+            RenderAttemptState::ColorUnavailable { .. }
+        ));
+        assert!(!coordinator.renderer_is_terminal());
+        assert_eq!(coordinator.execution_decisions, 0);
+    }
+
+    #[test]
+    fn viewer_render_failure_state_machine() {
+        let fingerprint = render_failure_signature(7, 17);
+
+        let mut retryable = RenderAttemptCoordinator::default();
+        retryable.wait(
+            fingerprint.clone(),
+            RenderWaitKey::SubmissionCleanup { submission: 5 },
+        );
+        assert!(matches!(retryable.wake(), RenderWake::Waiting(_)));
+        assert!(retryable.failure().is_none());
+
+        let mut deterministic = RenderAttemptCoordinator::default();
+        deterministic.fail(
+            fingerprint.clone(),
+            ResidentRenderFailureStatus::new(FrameFailureKind::BudgetExceeded, "capacity"),
+        );
+        assert!(!deterministic.begin(fingerprint.clone()));
+        assert_eq!(deterministic.wake(), RenderWake::None);
 
         assert_eq!(
-            executions, 2,
-            "eviction acknowledgement must permit retry without a render-signature change"
+            classify_color_runtime_error(WgpuRenderRuntimeError::VolumePickFailed),
+            ColorRuntimeDisposition::AuxiliaryOnly,
+            "a Pick-only failure cannot enter color attempt state"
         );
-        assert!(latch.is_none());
+
+        let hidden_timeout = ColorAttemptTargetFacts {
+            target: PresentationTarget::ThreeD,
+            current: false,
+            presented: false,
+            deferred_by_backpressure: false,
+            actionable_work_remaining: false,
+            hidden_waiting: false,
+            hidden_refinement: Some(HiddenRefinementState::Failed(
+                HiddenRefinementFailure::SubmissionTimedOutTwice,
+            )),
+        };
+        assert!(matches!(
+            classify_color_attempt_facts(&[hidden_timeout]),
+            ColorAttemptClass::Failed(_)
+        ));
+
+        let mut terminal = RenderAttemptCoordinator::default();
+        terminal.note_published_texture(PresentationTarget::ThreeD, 1, 9);
+        terminal.renderer_terminal(ResidentRenderFailureStatus::new(
+            FrameFailureKind::BackendLimit,
+            "first device cause",
+        ));
+        assert_eq!(terminal.wake(), RenderWake::None);
+        assert!(!terminal.begin(fingerprint));
+        assert!(terminal.renderer_is_terminal());
+    }
+
+    #[test]
+    fn eviction_event_backpressure_registers_one_causal_wait() {
+        let current = render_failure_signature(7, 17);
+        let key = RenderWaitKey::EvictionAcknowledgement {
+            ledger_revision: 41,
+        };
+        let mut coordinator = RenderAttemptCoordinator::default();
+        coordinator.wait(current, key.clone());
+        assert_eq!(
+            coordinator.wake(),
+            RenderWake::Waiting(WaitingWake::Event(key))
+        );
     }
 
     #[test]

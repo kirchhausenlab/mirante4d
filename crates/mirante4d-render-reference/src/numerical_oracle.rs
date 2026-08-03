@@ -1130,7 +1130,11 @@ fn prepare_ray(
     query: NumericalVolumeQuery,
 ) -> Result<Option<PreparedRay>, NumericalOracleError> {
     let grid_origin = volume.world_to_grid.point(query.ray.origin);
-    let grid_direction_per_world = volume.world_to_grid.vector(query.ray.direction);
+    let mut grid_direction_per_world = volume.world_to_grid.vector(query.ray.direction);
+    for component in &mut grid_direction_per_world {
+        *component =
+            portable_direction_component(*component).ok_or(NumericalOracleError::InvalidRay)?;
+    }
     let Some((entry_world, exit_world)) =
         intersect_grid(grid_origin, grid_direction_per_world, volume.shape_xyz)
     else {
@@ -1165,14 +1169,15 @@ fn intersect_grid(
     for axis in 0..3 {
         let lower = -0.5;
         let upper = f64::from(shape_xyz[axis]) - 0.5;
-        if direction[axis] == 0.0 {
+        let direction = portable_direction_component(direction[axis])?;
+        if direction == 0.0 {
             if origin[axis] < lower || origin[axis] >= upper {
                 return None;
             }
             continue;
         }
-        let first = (lower - origin[axis]) / direction[axis];
-        let second = (upper - origin[axis]) / direction[axis];
+        let first = (lower - origin[axis]) / direction;
+        let second = (upper - origin[axis]) / direction;
         entry = entry.max(first.min(second));
         exit = exit.min(first.max(second));
         if exit <= entry {
@@ -1180,6 +1185,19 @@ fn intersect_grid(
         }
     }
     (entry.is_finite() && exit.is_finite()).then_some((entry, exit))
+}
+
+fn portable_direction_component(value: f64) -> Option<f64> {
+    let value = value as f32;
+    if !value.is_finite() {
+        return None;
+    }
+    let magnitude_bits = value.to_bits() & 0x7fff_ffff;
+    Some(if magnitude_bits < 0x0080_0000 {
+        0.0
+    } else {
+        f64::from(value)
+    })
 }
 
 fn ray_sample(
@@ -1572,6 +1590,30 @@ fn finite_close(expected: f64, observed: f64, absolute: f64, relative: f64) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn traversal_direction_classification_keeps_every_normal_and_zeros_subnormals() {
+        assert_eq!(
+            portable_direction_component(5.0e-7),
+            Some(f64::from(5.0e-7_f32))
+        );
+        assert_eq!(
+            portable_direction_component(-5.0e-7),
+            Some(f64::from(-5.0e-7_f32))
+        );
+        assert_eq!(
+            portable_direction_component(f64::from(f32::MIN_POSITIVE)),
+            Some(f64::from(f32::MIN_POSITIVE))
+        );
+        assert_eq!(
+            portable_direction_component(f64::from(f32::from_bits(0x007f_ffff))),
+            Some(0.0)
+        );
+        assert_eq!(
+            portable_direction_component(f64::from(f32::from_bits(0x807f_ffff))),
+            Some(0.0)
+        );
+    }
 
     fn identity_volume(shape_xyz: [u32; 3], voxels: Vec<NumericalVoxel>) -> NumericalVolume {
         NumericalVolume::new(shape_xyz, GridToWorld::identity(), voxels).unwrap()

@@ -25,6 +25,8 @@ use thiserror::Error;
 pub const MAX_RENDER_LAYERS: usize = 64;
 pub const MAX_RENDER_REQUIREMENTS: usize = 65_536;
 pub const DEFAULT_LOGICAL_BRICK_SIDE: u64 = 64;
+pub const MAX_EXACT_SHADER_GRID_END_EXCLUSIVE: u64 = 1 << 23;
+pub const MAX_EXACT_SHADER_SAMPLE_COUNT: u64 = 1 << 23;
 pub const DEFAULT_PRESENTATION_VIEWPORT: PresentationViewport =
     PresentationViewport::new_unchecked(512.0, 512.0);
 
@@ -98,72 +100,2404 @@ pub enum ShaderControlAffineError {
     NotRepresentable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Axis3 {
+    X,
+    Y,
+    Z,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AffineColumn {
+    X,
+    Y,
+    Z,
+    Translation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AffineValidationStage {
+    Input,
+    Quantized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShaderControlField {
+    WorldToGrid { row: Axis3, column: AffineColumn },
+    PlaneCenter(Axis3),
+    PlaneRight(Axis3),
+    PlaneUp(Axis3),
+    PlaneWorldUnitsPerLogicalPoint,
+    PlaneScreenSpanX,
+    PlaneScreenSpanY,
+    VolumeRayOriginBase(Axis3),
+    VolumeRayOriginStepX(Axis3),
+    VolumeRayOriginStepY(Axis3),
+    VolumeRayDirectionBase(Axis3),
+    VolumeRayDirectionStepX(Axis3),
+    VolumeRayDirectionStepY(Axis3),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShaderEnvelopeStage {
+    PlanePixelCenter,
+    PlaneWorldPoint,
+    PlaneGridAddress,
+    VolumeRayConstruction,
+    VolumeDirectionNormalization,
+    VolumeWorldToGrid,
+    VolumeSlabIntersection,
+    VolumePageExit,
+    VolumeSamplePoint,
+    GeneralDvrInterval,
+    SubnormalDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShaderEnvelopeAxis {
+    Axis(Axis3),
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShaderEnvelopeFailure {
+    NonFiniteBound,
+    ZeroOrIndeterminateDirectionNorm,
+    DivisionDenominatorNotProvablyNormal,
+    ReachableQuotientNotProvablyFinite,
+    ErrorBudget { upper_voxels: f64 },
+    AllDirectionsStationary,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq)]
+pub enum ShaderAdmissionError {
+    #[error("grid-to-world affine is exactly singular")]
+    SingularAffine,
+    #[error("{stage:?} affine condition bound {condition_upper} exceeds the validator envelope")]
+    AffineConditionExceeded {
+        stage: AffineValidationStage,
+        condition_upper: f64,
+    },
+    #[error("shader control {field:?} is not finite in binary32")]
+    ShaderControlNotFinite { field: ShaderControlField },
+    #[error("the quantized world-to-grid affine is exactly singular")]
+    ShaderQuantizedAffineSingular,
+    #[error("shader coordinate precision exceeds half a voxel on {axis:?}: {error_voxels}")]
+    ShaderCoordinatePrecisionExceeded { axis: Axis3, error_voxels: f64 },
+    #[error("shader coordinate envelope failed at {stage:?} for {axis:?}: {reason:?}")]
+    ShaderCoordinateEnvelopeExceeded {
+        stage: ShaderEnvelopeStage,
+        axis: ShaderEnvelopeAxis,
+        reason: ShaderEnvelopeFailure,
+    },
+    #[error("shader sample count {bound} for layer {layer:?} exceeds {maximum}")]
+    ShaderSampleCountExceeded {
+        layer: LogicalLayerKey,
+        bound: u64,
+        maximum: u64,
+    },
+}
+
+/// The single validated affine representation consumed by shader planning and
+/// control construction. Its rows are the exact binary32 values uploaded to
+/// WGSL; inverse intervals and coordinate-error facts describe those rows over
+/// the complete declared half-voxel grid domain.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValidatedShaderAffine {
+    grid_to_world: GridToWorld,
+    grid_shape: Shape3D,
+    world_to_grid_rows: [[f32; 4]; 3],
+    grid_to_world_rows: [[f32; 4]; 3],
+    quantized_inverse_center: [[f64; 4]; 3],
+    quantized_inverse_radius: [[f64; 4]; 3],
+    condition_inf_upper: f64,
+    maximum_grid_error: [f64; 3],
+}
+
+impl ValidatedShaderAffine {
+    pub fn new(
+        grid_to_world: GridToWorld,
+        grid_shape: Shape3D,
+    ) -> Result<Self, ShaderAdmissionError> {
+        for (axis, end) in [Axis3::X, Axis3::Y, Axis3::Z].into_iter().zip([
+            grid_shape.x(),
+            grid_shape.y(),
+            grid_shape.z(),
+        ]) {
+            if end > MAX_EXACT_SHADER_GRID_END_EXCLUSIVE {
+                return Err(ShaderAdmissionError::ShaderCoordinateEnvelopeExceeded {
+                    stage: ShaderEnvelopeStage::VolumeWorldToGrid,
+                    axis: ShaderEnvelopeAxis::Axis(axis),
+                    reason: ShaderEnvelopeFailure::ErrorBudget { upper_voxels: 0.5 },
+                });
+            }
+        }
+
+        let matrix = grid_to_world.row_major();
+        let linear = [
+            [matrix[0], matrix[1], matrix[2]],
+            [matrix[4], matrix[5], matrix[6]],
+            [matrix[8], matrix[9], matrix[10]],
+        ];
+        if exact_determinant_is_zero(linear) {
+            return Err(ShaderAdmissionError::SingularAffine);
+        }
+        let input_inverse = verified_inverse(linear, AffineValidationStage::Input)?;
+        let translation = [matrix[3], matrix[7], matrix[11]];
+        let inverse_translation =
+            matrix_vector(input_inverse.center, translation).map(|value| -value);
+        let source_rows = [
+            [
+                input_inverse.center[0][0],
+                input_inverse.center[0][1],
+                input_inverse.center[0][2],
+                inverse_translation[0],
+            ],
+            [
+                input_inverse.center[1][0],
+                input_inverse.center[1][1],
+                input_inverse.center[1][2],
+                inverse_translation[1],
+            ],
+            [
+                input_inverse.center[2][0],
+                input_inverse.center[2][1],
+                input_inverse.center[2][2],
+                inverse_translation[2],
+            ],
+        ];
+        let mut world_to_grid_rows = [[0.0_f32; 4]; 3];
+        for row in 0..3 {
+            for column in 0..4 {
+                let converted = source_rows[row][column] as f32;
+                if !converted.is_finite() {
+                    return Err(ShaderAdmissionError::ShaderControlNotFinite {
+                        field: ShaderControlField::WorldToGrid {
+                            row: axis_for_index(row),
+                            column: affine_column_for_index(column),
+                        },
+                    });
+                }
+                world_to_grid_rows[row][column] = canonical_f32_zero(converted);
+            }
+        }
+
+        let quantized_linear =
+            world_to_grid_rows.map(|row| [f64::from(row[0]), f64::from(row[1]), f64::from(row[2])]);
+        if exact_determinant_is_zero(quantized_linear) {
+            return Err(ShaderAdmissionError::ShaderQuantizedAffineSingular);
+        }
+        let quantized_inverse =
+            verified_inverse(quantized_linear, AffineValidationStage::Quantized)?;
+        let quantized_translation = world_to_grid_rows.map(|row| f64::from(row[3]));
+        let inverse_translation_center =
+            matrix_vector(quantized_inverse.center, quantized_translation).map(|value| -value);
+        let translation_input_norm = quantized_translation
+            .into_iter()
+            .map(f64::abs)
+            .fold(0.0, f64::max);
+        let translation_radius: [f64; 3] = std::array::from_fn(|row| {
+            // The inverse-translation dot product may cancel almost
+            // completely. Bound its floating evaluation from the sum of the
+            // absolute products, never from the (possibly tiny) result.
+            let product_sum = (0..3)
+                .map(|column| {
+                    (quantized_inverse.center[row][column] * quantized_translation[column]).abs()
+                })
+                .sum::<f64>();
+            let operation_count = 5.0;
+            let gamma = operation_count * f64::EPSILON / (1.0 - operation_count * f64::EPSILON);
+            next_up(
+                3.0 * quantized_inverse.radius * translation_input_norm
+                    + gamma * product_sum
+                    + operation_count * f64::from_bits(1),
+            )
+        });
+        let mut quantized_inverse_center = [[0.0; 4]; 3];
+        let mut quantized_inverse_radius = [[0.0; 4]; 3];
+        let mut grid_to_world_rows = [[0.0_f32; 4]; 3];
+        for row in 0..3 {
+            let center = [
+                quantized_inverse.center[row][0],
+                quantized_inverse.center[row][1],
+                quantized_inverse.center[row][2],
+                inverse_translation_center[row],
+            ];
+            let mut radius = [
+                quantized_inverse.radius,
+                quantized_inverse.radius,
+                quantized_inverse.radius,
+                translation_radius[row],
+            ];
+            for column in 0..4 {
+                let quantized = canonical_f32_zero(center[column] as f32);
+                if !quantized.is_finite() {
+                    return Err(shader_envelope_error(
+                        ShaderEnvelopeStage::VolumeWorldToGrid,
+                        ShaderEnvelopeAxis::Axis(axis_for_index(row)),
+                        ShaderEnvelopeFailure::NonFiniteBound,
+                    ));
+                }
+                grid_to_world_rows[row][column] = quantized;
+                let quantized_center = f64::from(quantized);
+                radius[column] =
+                    next_up(radius[column] + (center[column] - quantized_center).abs());
+                quantized_inverse_center[row][column] = quantized_center;
+            }
+            quantized_inverse_radius[row] = radius;
+        }
+
+        let maximum_grid_error = maximum_shader_grid_error(matrix, grid_shape, world_to_grid_rows);
+        for (axis, error_voxels) in [Axis3::X, Axis3::Y, Axis3::Z]
+            .into_iter()
+            .zip(maximum_grid_error)
+        {
+            if !error_voxels.is_finite() {
+                return Err(ShaderAdmissionError::ShaderCoordinatePrecisionExceeded {
+                    axis,
+                    error_voxels: f64::INFINITY,
+                });
+            }
+            if error_voxels >= 0.5 {
+                return Err(ShaderAdmissionError::ShaderCoordinatePrecisionExceeded {
+                    axis,
+                    error_voxels,
+                });
+            }
+        }
+
+        Ok(Self {
+            grid_to_world,
+            grid_shape,
+            world_to_grid_rows,
+            grid_to_world_rows,
+            quantized_inverse_center,
+            quantized_inverse_radius,
+            condition_inf_upper: input_inverse.condition_inf_upper,
+            maximum_grid_error,
+        })
+    }
+
+    pub const fn grid_to_world(&self) -> GridToWorld {
+        self.grid_to_world
+    }
+
+    pub const fn grid_shape(&self) -> Shape3D {
+        self.grid_shape
+    }
+
+    pub const fn world_to_grid_rows(&self) -> [[f32; 4]; 3] {
+        self.world_to_grid_rows
+    }
+
+    pub const fn grid_to_world_rows(&self) -> [[f32; 4]; 3] {
+        self.grid_to_world_rows
+    }
+
+    pub const fn quantized_inverse_center(&self) -> [[f64; 4]; 3] {
+        self.quantized_inverse_center
+    }
+
+    pub const fn quantized_inverse_radius(&self) -> [[f64; 4]; 3] {
+        self.quantized_inverse_radius
+    }
+
+    pub const fn condition_inf_upper(&self) -> f64 {
+        self.condition_inf_upper
+    }
+
+    pub const fn maximum_grid_error(&self) -> [f64; 3] {
+        self.maximum_grid_error
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShaderRenderMode {
+    MaximumIntensity,
+    DirectVolume,
+    IsoSurface,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShaderLayerSchedule {
+    layer: LogicalLayerKey,
+    mode: ShaderRenderMode,
+    sampling: SamplingPolicy,
+}
+
+impl ShaderLayerSchedule {
+    pub const fn layer(self) -> LogicalLayerKey {
+        self.layer
+    }
+
+    pub const fn mode(self) -> ShaderRenderMode {
+        self.mode
+    }
+
+    pub const fn sampling(self) -> SamplingPolicy {
+        self.sampling
+    }
+}
+
+/// One catalog layer/scale affine captured by a target work proof.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShaderLayerAffine {
+    layer: LogicalLayerKey,
+    scale: ScaleLevel,
+    affine: ValidatedShaderAffine,
+}
+
+impl ShaderLayerAffine {
+    pub fn new(
+        layer: LogicalLayerKey,
+        scale: ScaleLevel,
+        grid_to_world: GridToWorld,
+        grid_shape: Shape3D,
+    ) -> Result<Self, ShaderAdmissionError> {
+        Ok(Self {
+            layer,
+            scale,
+            affine: ValidatedShaderAffine::new(grid_to_world, grid_shape)?,
+        })
+    }
+
+    pub const fn layer(self) -> LogicalLayerKey {
+        self.layer
+    }
+
+    pub const fn scale(self) -> ScaleLevel {
+        self.scale
+    }
+
+    pub const fn affine(self) -> ValidatedShaderAffine {
+        self.affine
+    }
+}
+
+/// Exact binary32 controls uploaded for a cross-section shader.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaneShaderControls {
+    center_world: [f32; 3],
+    right_world: [f32; 3],
+    up_world: [f32; 3],
+    world_units_per_logical_point: f32,
+    screen_span: [f32; 2],
+}
+
+impl PlaneShaderControls {
+    pub const fn center_world(self) -> [f32; 3] {
+        self.center_world
+    }
+
+    pub const fn right_world(self) -> [f32; 3] {
+        self.right_world
+    }
+
+    pub const fn up_world(self) -> [f32; 3] {
+        self.up_world
+    }
+
+    pub const fn world_units_per_logical_point(self) -> f32 {
+        self.world_units_per_logical_point
+    }
+
+    pub const fn screen_span(self) -> [f32; 2] {
+        self.screen_span
+    }
+}
+
+/// Exact affine binary32 controls uploaded for volume-ray construction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumeRayShaderControls {
+    origin_base: [f32; 3],
+    origin_step_x: [f32; 3],
+    origin_step_y: [f32; 3],
+    direction_base: [f32; 3],
+    direction_step_x: [f32; 3],
+    direction_step_y: [f32; 3],
+}
+
+impl VolumeRayShaderControls {
+    pub const fn origin_base(self) -> [f32; 3] {
+        self.origin_base
+    }
+
+    pub const fn origin_step_x(self) -> [f32; 3] {
+        self.origin_step_x
+    }
+
+    pub const fn origin_step_y(self) -> [f32; 3] {
+        self.origin_step_y
+    }
+
+    pub const fn direction_base(self) -> [f32; 3] {
+        self.direction_base
+    }
+
+    pub const fn direction_step_x(self) -> [f32; 3] {
+        self.direction_step_x
+    }
+
+    pub const fn direction_step_y(self) -> [f32; 3] {
+        self.direction_step_y
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShaderLayerWorkFacts {
+    layer: LogicalLayerKey,
+    scale: ScaleLevel,
+    grid_error_upper: [f64; 3],
+    address_range: [[f64; 2]; 3],
+    sample_count_upper: u64,
+}
+
+impl ShaderLayerWorkFacts {
+    pub const fn layer(self) -> LogicalLayerKey {
+        self.layer
+    }
+
+    pub const fn scale(self) -> ScaleLevel {
+        self.scale
+    }
+
+    pub const fn grid_error_upper(self) -> [f64; 3] {
+        self.grid_error_upper
+    }
+
+    pub const fn address_range(self) -> [[f64; 2]; 3] {
+        self.address_range
+    }
+
+    pub const fn sample_count_upper(self) -> u64 {
+        self.sample_count_upper
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedPlaneWorkEnvelope {
+    view: CrossSectionView,
+    presentation: PresentationViewport,
+    extent: RenderExtent,
+    controls: PlaneShaderControls,
+    schedules: Box<[ShaderLayerSchedule]>,
+    affines: Box<[ShaderLayerAffine]>,
+    facts: Box<[ShaderLayerWorkFacts]>,
+}
+
+/// Canonical finite physical-pixel footprint for one Plane affine. Semantic
+/// demand uses this exact result for coverage and guard containment; the
+/// target envelope and WGPU encoder use the same controls and affine object.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValidatedPlaneGridFootprint {
+    controls: PlaneShaderControls,
+    affine: ValidatedShaderAffine,
+    origin_grid: [f64; 3],
+    step_x_grid: [f64; 3],
+    step_y_grid: [f64; 3],
+    grid_error_upper: [f64; 3],
+    world_to_grid_rows: [[f64; 4]; 3],
+    width_pixels: u32,
+    height_pixels: u32,
+}
+
+impl ValidatedPlaneGridFootprint {
+    pub fn new(
+        view: CrossSectionView,
+        presentation: PresentationViewport,
+        extent: RenderExtent,
+        grid_to_world: GridToWorld,
+        grid_shape: Shape3D,
+    ) -> Result<Self, ShaderAdmissionError> {
+        validate_shader_extent(extent)?;
+        let controls = plane_shader_controls(view, presentation)?;
+        let affine = ValidatedShaderAffine::new(grid_to_world, grid_shape)?;
+        let geometry = plane_layer_geometry(affine, controls, extent)?;
+        Ok(Self {
+            controls,
+            affine,
+            origin_grid: geometry.origin_grid,
+            step_x_grid: geometry.step_x_grid,
+            step_y_grid: geometry.step_y_grid,
+            grid_error_upper: geometry.grid_error_upper,
+            world_to_grid_rows: affine.world_to_grid_rows().map(|row| row.map(f64::from)),
+            width_pixels: extent.width_pixels(),
+            height_pixels: extent.height_pixels(),
+        })
+    }
+
+    pub const fn controls(self) -> PlaneShaderControls {
+        self.controls
+    }
+
+    pub const fn affine(self) -> ValidatedShaderAffine {
+        self.affine
+    }
+
+    pub const fn origin_grid(self) -> [f64; 3] {
+        self.origin_grid
+    }
+
+    pub const fn step_x_grid(self) -> [f64; 3] {
+        self.step_x_grid
+    }
+
+    pub const fn step_y_grid(self) -> [f64; 3] {
+        self.step_y_grid
+    }
+
+    pub const fn grid_error_upper(self) -> [f64; 3] {
+        self.grid_error_upper
+    }
+
+    pub const fn world_to_grid_rows(self) -> [[f64; 4]; 3] {
+        self.world_to_grid_rows
+    }
+
+    pub const fn width_pixels(self) -> u32 {
+        self.width_pixels
+    }
+
+    pub const fn height_pixels(self) -> u32 {
+        self.height_pixels
+    }
+}
+
+impl ValidatedPlaneWorkEnvelope {
+    pub const fn controls(&self) -> PlaneShaderControls {
+        self.controls
+    }
+
+    pub fn affines(&self) -> &[ShaderLayerAffine] {
+        &self.affines
+    }
+
+    pub fn facts(&self) -> &[ShaderLayerWorkFacts] {
+        &self.facts
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VolumeRayWorkEnvelope {
+    camera: CameraView,
+    iso_light: IsoLightState,
+    presentation: PresentationViewport,
+    extent: RenderExtent,
+    controls: VolumeRayShaderControls,
+    schedules: Box<[ShaderLayerSchedule]>,
+    affines: Box<[ShaderLayerAffine]>,
+    facts: Box<[ShaderLayerWorkFacts]>,
+    general_dvr_sample_count_upper: Option<u64>,
+}
+
+impl VolumeRayWorkEnvelope {
+    pub const fn controls(&self) -> VolumeRayShaderControls {
+        self.controls
+    }
+
+    pub fn affines(&self) -> &[ShaderLayerAffine] {
+        &self.affines
+    }
+
+    pub fn facts(&self) -> &[ShaderLayerWorkFacts] {
+        &self.facts
+    }
+
+    pub const fn general_dvr_sample_count_upper(&self) -> Option<u64> {
+        self.general_dvr_sample_count_upper
+    }
+}
+
+/// Canonical target-specific proof consumed unchanged by semantic demand and
+/// the renderer control encoder.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShaderWorkEnvelope {
+    Plane(ValidatedPlaneWorkEnvelope),
+    Volume(VolumeRayWorkEnvelope),
+}
+
+/// One shareable shader proof whose CPU-ledger reservation has the same
+/// lifetime as every render-intent clone that can retain the allocation.
+pub struct SharedShaderWorkEnvelope {
+    envelope: ShaderWorkEnvelope,
+    _charge: Option<Arc<dyn CpuByteLease>>,
+}
+
+impl std::fmt::Debug for SharedShaderWorkEnvelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedShaderWorkEnvelope")
+            .field("envelope", &self.envelope)
+            .field("accounted", &self._charge.is_some())
+            .finish()
+    }
+}
+
+impl SharedShaderWorkEnvelope {
+    pub fn accounted(envelope: ShaderWorkEnvelope, charge: Arc<dyn CpuByteLease>) -> Self {
+        Self {
+            envelope,
+            _charge: Some(charge),
+        }
+    }
+
+    fn unaccounted(envelope: ShaderWorkEnvelope) -> Self {
+        Self {
+            envelope,
+            _charge: None,
+        }
+    }
+
+    pub const fn envelope(&self) -> &ShaderWorkEnvelope {
+        &self.envelope
+    }
+}
+
+impl ShaderWorkEnvelope {
+    pub fn for_intent(
+        catalog: &DatasetCatalog,
+        intent: &RenderIntent,
+        requirements: &RenderRequirements,
+    ) -> Result<Self, ShaderAdmissionError> {
+        let mut affines = Vec::new();
+        for layer in intent.layers() {
+            let chain = requirements.scale_chain(layer.layer()).ok_or_else(|| {
+                shader_envelope_error(
+                    ShaderEnvelopeStage::VolumeWorldToGrid,
+                    ShaderEnvelopeAxis::All,
+                    ShaderEnvelopeFailure::NonFiniteBound,
+                )
+            })?;
+            let catalog_layer = catalog.layer(layer.layer()).ok_or_else(|| {
+                shader_envelope_error(
+                    ShaderEnvelopeStage::VolumeWorldToGrid,
+                    ShaderEnvelopeAxis::All,
+                    ShaderEnvelopeFailure::NonFiniteBound,
+                )
+            })?;
+            for scale in chain.scales().iter().copied() {
+                let catalog_scale = catalog_layer.scale(scale).ok_or_else(|| {
+                    shader_envelope_error(
+                        ShaderEnvelopeStage::VolumeWorldToGrid,
+                        ShaderEnvelopeAxis::All,
+                        ShaderEnvelopeFailure::NonFiniteBound,
+                    )
+                })?;
+                affines.push(ShaderLayerAffine::new(
+                    layer.layer(),
+                    scale,
+                    catalog_scale.grid_to_world(),
+                    catalog_scale.shape(),
+                )?);
+            }
+        }
+        Self::for_intent_with_validated_affines(catalog, intent, requirements, affines)
+    }
+
+    /// Constructs one target envelope from dataset-generation cached affine
+    /// results. The supplied list must contain exactly the participating
+    /// layer/scale entries in intent/scale-chain order; every identity and
+    /// durable catalog transform is revalidated before a cached object can be
+    /// consumed.
+    pub fn for_intent_with_validated_affines(
+        catalog: &DatasetCatalog,
+        intent: &RenderIntent,
+        requirements: &RenderRequirements,
+        affines: Vec<ShaderLayerAffine>,
+    ) -> Result<Self, ShaderAdmissionError> {
+        validate_shader_extent(intent.extent())?;
+        let schedules = intent
+            .layers()
+            .iter()
+            .map(shader_layer_schedule)
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_cached_shader_affines(catalog, intent, requirements, &affines)?;
+        match intent.view() {
+            RenderViewIntent::CrossSection(view) => {
+                let controls = plane_shader_controls(view, intent.presentation())?;
+                let facts = affines
+                    .iter()
+                    .copied()
+                    .map(|layer| plane_layer_facts(layer, controls, intent.extent()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Self::Plane(ValidatedPlaneWorkEnvelope {
+                    view,
+                    presentation: intent.presentation(),
+                    extent: intent.extent(),
+                    controls,
+                    schedules: schedules.into_boxed_slice(),
+                    affines: affines.into_boxed_slice(),
+                    facts: facts.into_boxed_slice(),
+                }))
+            }
+            RenderViewIntent::Volume { camera, iso_light } => {
+                let controls =
+                    volume_ray_shader_controls(camera, intent.presentation(), intent.extent())?;
+                let facts = affines
+                    .iter()
+                    .copied()
+                    .map(|layer| volume_layer_facts(layer, controls, intent.extent()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let general_dvr_sample_count_upper = general_dvr_required(&schedules, &affines)
+                    .then(|| general_dvr_count_bound(&affines))
+                    .transpose()?;
+                Ok(Self::Volume(VolumeRayWorkEnvelope {
+                    camera,
+                    iso_light,
+                    presentation: intent.presentation(),
+                    extent: intent.extent(),
+                    controls,
+                    schedules: schedules.into_boxed_slice(),
+                    affines: affines.into_boxed_slice(),
+                    facts: facts.into_boxed_slice(),
+                    general_dvr_sample_count_upper,
+                }))
+            }
+        }
+    }
+
+    pub const fn pass_kind(&self) -> RenderPassKind {
+        match self {
+            Self::Plane(_) => RenderPassKind::Plane,
+            Self::Volume(_) => RenderPassKind::Volume,
+        }
+    }
+
+    /// Conservative owned-byte charge for a latest-only cached proof. This
+    /// excludes the `Arc` control block retained by its owner and includes all
+    /// boxed schedule, affine, and per-layer fact arrays.
+    pub fn owned_allocation_bytes(&self) -> u64 {
+        let (schedules, affines, facts) = match self {
+            Self::Plane(envelope) => (
+                envelope.schedules.len(),
+                envelope.affines.len(),
+                envelope.facts.len(),
+            ),
+            Self::Volume(envelope) => (
+                envelope.schedules.len(),
+                envelope.affines.len(),
+                envelope.facts.len(),
+            ),
+        };
+        (std::mem::size_of::<Self>() as u64)
+            .saturating_add(
+                (schedules as u64)
+                    .saturating_mul(std::mem::size_of::<ShaderLayerSchedule>() as u64),
+            )
+            .saturating_add(
+                (affines as u64).saturating_mul(std::mem::size_of::<ShaderLayerAffine>() as u64),
+            )
+            .saturating_add(
+                (facts as u64).saturating_mul(std::mem::size_of::<ShaderLayerWorkFacts>() as u64),
+            )
+            .max(1)
+    }
+
+    pub fn affine(
+        &self,
+        layer: LogicalLayerKey,
+        scale: ScaleLevel,
+    ) -> Option<ValidatedShaderAffine> {
+        let affines = match self {
+            Self::Plane(envelope) => envelope.affines(),
+            Self::Volume(envelope) => envelope.affines(),
+        };
+        affines
+            .iter()
+            .find(|candidate| candidate.layer == layer && candidate.scale == scale)
+            .map(|candidate| candidate.affine)
+    }
+
+    pub fn matches(
+        &self,
+        catalog: &DatasetCatalog,
+        intent: &RenderIntent,
+        requirements: &RenderRequirements,
+    ) -> bool {
+        let (view_matches, presentation, extent, schedules, affines) = match self {
+            Self::Plane(envelope) => (
+                intent.view() == RenderViewIntent::CrossSection(envelope.view),
+                envelope.presentation,
+                envelope.extent,
+                envelope.schedules.as_ref(),
+                envelope.affines.as_ref(),
+            ),
+            Self::Volume(envelope) => (
+                intent.view()
+                    == RenderViewIntent::Volume {
+                        camera: envelope.camera,
+                        iso_light: envelope.iso_light,
+                    },
+                envelope.presentation,
+                envelope.extent,
+                envelope.schedules.as_ref(),
+                envelope.affines.as_ref(),
+            ),
+        };
+        if !view_matches
+            || intent.view().pass_kind() != self.pass_kind()
+            || intent.presentation() != presentation
+            || intent.extent() != extent
+            || schedules.len() != intent.layers().len()
+            || schedules
+                .iter()
+                .zip(intent.layers())
+                .any(|(expected, actual)| shader_layer_schedule(actual).ok() != Some(*expected))
+        {
+            return false;
+        }
+        let mut index = 0;
+        for layer in intent.layers() {
+            let Some(chain) = requirements.scale_chain(layer.layer()) else {
+                return false;
+            };
+            let Some(catalog_layer) = catalog.layer(layer.layer()) else {
+                return false;
+            };
+            for scale in chain.scales().iter().copied() {
+                let Some(expected) = affines.get(index) else {
+                    return false;
+                };
+                let Some(catalog_scale) = catalog_layer.scale(scale) else {
+                    return false;
+                };
+                if expected.layer != layer.layer()
+                    || expected.scale != scale
+                    || expected.affine.grid_to_world() != catalog_scale.grid_to_world()
+                    || expected.affine.grid_shape() != catalog_scale.shape()
+                {
+                    return false;
+                }
+                index += 1;
+            }
+        }
+        index == affines.len()
+    }
+
+    pub const fn plane(&self) -> Option<&ValidatedPlaneWorkEnvelope> {
+        match self {
+            Self::Plane(envelope) => Some(envelope),
+            Self::Volume(_) => None,
+        }
+    }
+
+    pub const fn volume(&self) -> Option<&VolumeRayWorkEnvelope> {
+        match self {
+            Self::Volume(envelope) => Some(envelope),
+            Self::Plane(_) => None,
+        }
+    }
+}
+
+fn validate_cached_shader_affines(
+    catalog: &DatasetCatalog,
+    intent: &RenderIntent,
+    requirements: &RenderRequirements,
+    affines: &[ShaderLayerAffine],
+) -> Result<(), ShaderAdmissionError> {
+    let mismatch = || {
+        shader_envelope_error(
+            ShaderEnvelopeStage::VolumeWorldToGrid,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::NonFiniteBound,
+        )
+    };
+    let mut index = 0;
+    for layer in intent.layers() {
+        let chain = requirements
+            .scale_chain(layer.layer())
+            .ok_or_else(mismatch)?;
+        let catalog_layer = catalog.layer(layer.layer()).ok_or_else(mismatch)?;
+        for scale in chain.scales().iter().copied() {
+            let catalog_scale = catalog_layer.scale(scale).ok_or_else(mismatch)?;
+            let supplied = affines.get(index).ok_or_else(mismatch)?;
+            if supplied.layer != layer.layer()
+                || supplied.scale != scale
+                || supplied.affine.grid_to_world() != catalog_scale.grid_to_world()
+                || supplied.affine.grid_shape() != catalog_scale.shape()
+            {
+                return Err(mismatch());
+            }
+            index += 1;
+        }
+    }
+    if index != affines.len() {
+        return Err(mismatch());
+    }
+    Ok(())
+}
+
+fn shader_layer_schedule(
+    layer: &LayerRenderIntent,
+) -> Result<ShaderLayerSchedule, ShaderAdmissionError> {
+    let state = layer.render_state();
+    let mode = if state.mip_parameters().is_some() {
+        ShaderRenderMode::MaximumIntensity
+    } else if state.dvr_parameters().is_some() {
+        ShaderRenderMode::DirectVolume
+    } else if state.iso_parameters().is_some() {
+        ShaderRenderMode::IsoSurface
+    } else {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::VolumeSamplePoint,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::NonFiniteBound,
+        ));
+    };
+    Ok(ShaderLayerSchedule {
+        layer: layer.layer(),
+        mode,
+        sampling: state.sampling_policy(),
+    })
+}
+
+fn validate_shader_extent(extent: RenderExtent) -> Result<(), ShaderAdmissionError> {
+    for (axis, dimension) in [Axis3::X, Axis3::Y]
+        .into_iter()
+        .zip([extent.width_pixels(), extent.height_pixels()])
+    {
+        if u64::from(dimension) > MAX_EXACT_SHADER_GRID_END_EXCLUSIVE {
+            return Err(shader_envelope_error(
+                ShaderEnvelopeStage::PlanePixelCenter,
+                ShaderEnvelopeAxis::Axis(axis),
+                ShaderEnvelopeFailure::ErrorBudget { upper_voxels: 0.5 },
+            ));
+        }
+    }
+    Ok(())
+}
+
+const fn shader_envelope_error(
+    stage: ShaderEnvelopeStage,
+    axis: ShaderEnvelopeAxis,
+    reason: ShaderEnvelopeFailure,
+) -> ShaderAdmissionError {
+    ShaderAdmissionError::ShaderCoordinateEnvelopeExceeded {
+        stage,
+        axis,
+        reason,
+    }
+}
+
+fn quantized_shader_control(
+    value: f64,
+    field: ShaderControlField,
+) -> Result<f32, ShaderAdmissionError> {
+    let value = canonical_f32_zero(value as f32);
+    value
+        .is_finite()
+        .then_some(value)
+        .ok_or(ShaderAdmissionError::ShaderControlNotFinite { field })
+}
+
+fn quantized_shader_vec3(
+    values: [f64; 3],
+    field: impl Fn(Axis3) -> ShaderControlField,
+) -> Result<[f32; 3], ShaderAdmissionError> {
+    let mut result = [0.0; 3];
+    for axis in 0..3 {
+        result[axis] = quantized_shader_control(values[axis], field(axis_for_index(axis)))?;
+    }
+    Ok(result)
+}
+
+fn plane_shader_controls(
+    view: CrossSectionView,
+    presentation: PresentationViewport,
+) -> Result<PlaneShaderControls, ShaderAdmissionError> {
+    let axes = axes_from_orientation(view.orientation()).map_err(|_| {
+        shader_envelope_error(
+            ShaderEnvelopeStage::PlaneWorldPoint,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::NonFiniteBound,
+        )
+    })?;
+    Ok(PlaneShaderControls {
+        center_world: quantized_shader_vec3(view.center_world().components(), |axis| {
+            ShaderControlField::PlaneCenter(axis)
+        })?,
+        right_world: quantized_shader_vec3(axes.right(), |axis| {
+            ShaderControlField::PlaneRight(axis)
+        })?,
+        up_world: quantized_shader_vec3(axes.up(), ShaderControlField::PlaneUp)?,
+        world_units_per_logical_point: quantized_shader_control(
+            view.scale_world_per_screen_point(),
+            ShaderControlField::PlaneWorldUnitsPerLogicalPoint,
+        )?,
+        screen_span: [
+            quantized_shader_control(
+                presentation.width_points(),
+                ShaderControlField::PlaneScreenSpanX,
+            )?,
+            quantized_shader_control(
+                presentation.height_points(),
+                ShaderControlField::PlaneScreenSpanY,
+            )?,
+        ],
+    })
+}
+
+fn volume_ray_shader_controls(
+    camera: CameraView,
+    presentation: PresentationViewport,
+    extent: RenderExtent,
+) -> Result<VolumeRayShaderControls, ShaderAdmissionError> {
+    let frame = CameraFrame::new(camera, presentation).map_err(|_| {
+        shader_envelope_error(
+            ShaderEnvelopeStage::VolumeRayConstruction,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::NonFiniteBound,
+        )
+    })?;
+    let axes = frame.axes();
+    let width = f64::from(extent.width_pixels());
+    let height = f64::from(extent.height_pixels());
+    let screen_x = (0.5 / width - 0.5) * presentation.width_points();
+    let screen_y = (0.5 - 0.5 / height) * presentation.height_points();
+    let screen_dx = presentation.width_points() / width;
+    let screen_dy = -presentation.height_points() / height;
+    let forward = axes.forward();
+    let right = axes.right();
+    let up = axes.up();
+    let (origin, origin_step_x, origin_step_y, direction, direction_step_x, direction_step_y) =
+        match camera.projection() {
+            Projection::Orthographic => {
+                let scale = camera.orthographic_world_per_screen_point();
+                let eye = frame.eye().components();
+                (
+                    std::array::from_fn(|axis| {
+                        eye[axis] + right[axis] * screen_x * scale + up[axis] * screen_y * scale
+                    }),
+                    right.map(|value| value * screen_dx * scale),
+                    up.map(|value| value * screen_dy * scale),
+                    forward,
+                    [0.0; 3],
+                    [0.0; 3],
+                )
+            }
+            Projection::Perspective => {
+                let inverse_focal = camera.perspective_focal_length_screen_points().recip();
+                (
+                    frame.eye().components(),
+                    [0.0; 3],
+                    [0.0; 3],
+                    std::array::from_fn(|axis| {
+                        forward[axis]
+                            + right[axis] * screen_x * inverse_focal
+                            + up[axis] * screen_y * inverse_focal
+                    }),
+                    right.map(|value| value * screen_dx * inverse_focal),
+                    up.map(|value| value * screen_dy * inverse_focal),
+                )
+            }
+        };
+    Ok(VolumeRayShaderControls {
+        origin_base: quantized_shader_vec3(origin, ShaderControlField::VolumeRayOriginBase)?,
+        origin_step_x: quantized_shader_vec3(
+            origin_step_x,
+            ShaderControlField::VolumeRayOriginStepX,
+        )?,
+        origin_step_y: quantized_shader_vec3(
+            origin_step_y,
+            ShaderControlField::VolumeRayOriginStepY,
+        )?,
+        direction_base: quantized_shader_vec3(
+            direction,
+            ShaderControlField::VolumeRayDirectionBase,
+        )?,
+        direction_step_x: quantized_shader_vec3(
+            direction_step_x,
+            ShaderControlField::VolumeRayDirectionStepX,
+        )?,
+        direction_step_y: quantized_shader_vec3(
+            direction_step_y,
+            ShaderControlField::VolumeRayDirectionStepY,
+        )?,
+    })
+}
+
+fn plane_layer_facts(
+    layer: ShaderLayerAffine,
+    controls: PlaneShaderControls,
+    extent: RenderExtent,
+) -> Result<ShaderLayerWorkFacts, ShaderAdmissionError> {
+    let geometry = plane_layer_geometry(layer.affine, controls, extent)?;
+    Ok(ShaderLayerWorkFacts {
+        layer: layer.layer,
+        scale: layer.scale,
+        grid_error_upper: geometry.grid_error_upper,
+        address_range: geometry.address_range,
+        sample_count_upper: 1,
+    })
+}
+
+struct PlaneLayerGeometry {
+    origin_grid: [f64; 3],
+    step_x_grid: [f64; 3],
+    step_y_grid: [f64; 3],
+    grid_error_upper: [f64; 3],
+    address_range: [[f64; 2]; 3],
+}
+
+fn plane_layer_geometry(
+    affine: ValidatedShaderAffine,
+    controls: PlaneShaderControls,
+    extent: RenderExtent,
+) -> Result<PlaneLayerGeometry, ShaderAdmissionError> {
+    let width = f64::from(extent.width_pixels());
+    let height = f64::from(extent.height_pixels());
+    let pixel_corners = [
+        [0.5, 0.5],
+        [width - 0.5, 0.5],
+        [0.5, height - 0.5],
+        [width - 0.5, height - 0.5],
+    ];
+    let rows = affine.world_to_grid_rows().map(|row| row.map(f64::from));
+    let center = controls.center_world.map(f64::from);
+    let right = controls.right_world.map(f64::from);
+    let up = controls.up_world.map(f64::from);
+    let scale = f64::from(controls.world_units_per_logical_point);
+    let span = controls.screen_span.map(f64::from);
+    let first_screen_x = (0.5 / width - 0.5) * span[0];
+    let first_screen_y = (0.5 - 0.5 / height) * span[1];
+    let screen_step_x = span[0] / width;
+    let screen_step_y = -span[1] / height;
+    let origin_world = std::array::from_fn(|axis| {
+        center[axis] + (right[axis] * first_screen_x + up[axis] * first_screen_y) * scale
+    });
+    let step_x_world = right.map(|value| value * screen_step_x * scale);
+    let step_y_world = up.map(|value| value * screen_step_y * scale);
+    let transform_point = |point: [f64; 3]| {
+        rows.map(|row| row[0] * point[0] + row[1] * point[1] + row[2] * point[2] + row[3])
+    };
+    let transform_vector = |vector: [f64; 3]| {
+        rows.map(|row| row[0] * vector[0] + row[1] * vector[1] + row[2] * vector[2])
+    };
+    let origin_grid = transform_point(origin_world);
+    let step_x_grid = transform_vector(step_x_world);
+    let step_y_grid = transform_vector(step_y_world);
+    if !origin_grid.iter().all(|value| value.is_finite())
+        || !step_x_grid.iter().all(|value| value.is_finite())
+        || !step_y_grid.iter().all(|value| value.is_finite())
+    {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::PlaneGridAddress,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::NonFiniteBound,
+        ));
+    }
+    let mut address_range = [[f64::INFINITY, f64::NEG_INFINITY]; 3];
+    let mut maximum_world = [0.0_f64; 3];
+    for pixel in pixel_corners {
+        let screen_x = (pixel[0] / width - 0.5) * span[0];
+        let screen_y = (0.5 - pixel[1] / height) * span[1];
+        let world: [f64; 3] = std::array::from_fn(|axis| {
+            center[axis] + (right[axis] * screen_x + up[axis] * screen_y) * scale
+        });
+        for axis in 0..3 {
+            maximum_world[axis] = maximum_world[axis].max(world[axis].abs());
+            let grid = rows[axis][0] * world[0]
+                + rows[axis][1] * world[1]
+                + rows[axis][2] * world[2]
+                + rows[axis][3];
+            if !grid.is_finite() {
+                return Err(shader_envelope_error(
+                    ShaderEnvelopeStage::PlaneGridAddress,
+                    ShaderEnvelopeAxis::Axis(axis_for_index(axis)),
+                    ShaderEnvelopeFailure::NonFiniteBound,
+                ));
+            }
+            address_range[axis][0] = address_range[axis][0].min(grid);
+            address_range[axis][1] = address_range[axis][1].max(grid);
+        }
+    }
+    let screen_magnitude = [span[0].abs() * 0.5, span[1].abs() * 0.5];
+    let mut world_error = [0.0; 3];
+    for axis in 0..3 {
+        let magnitude = center[axis].abs()
+            + scale.abs()
+                * (right[axis].abs() * screen_magnitude[0] + up[axis].abs() * screen_magnitude[1]);
+        world_error[axis] = wgsl_f32_operation_error(8, magnitude)?;
+    }
+    let mut grid_error_upper = affine.maximum_grid_error();
+    for axis in 0..3 {
+        let propagated = rows[axis][0].abs() * world_error[0]
+            + rows[axis][1].abs() * world_error[1]
+            + rows[axis][2].abs() * world_error[2];
+        let magnitude = rows[axis][0].abs() * maximum_world[0]
+            + rows[axis][1].abs() * maximum_world[1]
+            + rows[axis][2].abs() * maximum_world[2]
+            + rows[axis][3].abs();
+        grid_error_upper[axis] = next_up(
+            grid_error_upper[axis]
+                + propagated
+                + wgsl_f32_operation_error(7, magnitude + propagated)?,
+        );
+        validate_grid_error(
+            ShaderEnvelopeStage::PlaneGridAddress,
+            axis,
+            grid_error_upper[axis],
+        )?;
+        address_range[axis][0] = next_down(address_range[axis][0] - grid_error_upper[axis]);
+        address_range[axis][1] = next_up(address_range[axis][1] + grid_error_upper[axis]);
+    }
+    Ok(PlaneLayerGeometry {
+        origin_grid,
+        step_x_grid,
+        step_y_grid,
+        grid_error_upper,
+        address_range,
+    })
+}
+
+fn volume_layer_facts(
+    layer: ShaderLayerAffine,
+    controls: VolumeRayShaderControls,
+    extent: RenderExtent,
+) -> Result<ShaderLayerWorkFacts, ShaderAdmissionError> {
+    let shape = layer.affine.grid_shape();
+    let dimensions = [shape.x(), shape.y(), shape.z()];
+    let sample_count_upper = dimensions.into_iter().max().unwrap_or(0);
+    if sample_count_upper > MAX_EXACT_SHADER_SAMPLE_COUNT {
+        return Err(ShaderAdmissionError::ShaderSampleCountExceeded {
+            layer: layer.layer,
+            bound: sample_count_upper,
+            maximum: MAX_EXACT_SHADER_SAMPLE_COUNT,
+        });
+    }
+    let rows = layer
+        .affine
+        .world_to_grid_rows()
+        .map(|row| row.map(f64::from));
+    let origin_bounds = affine_direction_bounds(
+        controls.origin_base.map(f64::from),
+        controls.origin_step_x.map(f64::from),
+        controls.origin_step_y.map(f64::from),
+        extent,
+    )?;
+    let grid_origin_bounds = transformed_point_bounds(rows, origin_bounds)?;
+    let direction_magnitude = volume_direction_component_magnitudes(controls, extent);
+    let direction_bounds = affine_direction_bounds(
+        controls.direction_base.map(f64::from),
+        controls.direction_step_x.map(f64::from),
+        controls.direction_step_y.map(f64::from),
+        extent,
+    )?;
+    let direction_norm_error =
+        wgsl_f32_operation_error(8, direction_magnitude.into_iter().fold(0.0, f64::max))?
+            * 3.0_f64.sqrt();
+    let direction_norm_lower = 1.0 - direction_norm_error;
+    if !direction_norm_lower.is_finite() || direction_norm_lower <= 0.0 {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::VolumeDirectionNormalization,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::ZeroOrIndeterminateDirectionNorm,
+        ));
+    }
+    let inverse = layer.affine.quantized_inverse_center();
+    let inverse_radius = layer.affine.quantized_inverse_radius();
+    let inverse_norm_upper = (0..3)
+        .map(|row| {
+            (0..3)
+                .map(|column| inverse[row][column].abs() + inverse_radius[row][column])
+                .sum::<f64>()
+        })
+        .fold(0.0, f64::max);
+    let grid_direction_bounds = transformed_direction_bounds(rows, direction_bounds)?;
+    let raw_grid_speed_lower = (grid_direction_bounds.norm_lower / 3.0_f64.sqrt()).max(
+        grid_direction_bounds
+            .components
+            .iter()
+            .map(|component| component.abs_lower)
+            .fold(0.0, f64::max),
+    );
+    let normalized_grid_speed_lower =
+        (direction_norm_lower / (3.0_f64.sqrt() * inverse_norm_upper)).max(
+            grid_direction_bounds
+                .components
+                .iter()
+                .filter_map(|component| {
+                    normalized_component_abs_lower(*component, direction_bounds.norm_upper, rows)
+                })
+                .fold(0.0, f64::max),
+        );
+    let grid_speed_lower = raw_grid_speed_lower.min(normalized_grid_speed_lower);
+    let minimum_normal = f64::from(f32::MIN_POSITIVE);
+    if !grid_speed_lower.is_finite() || grid_speed_lower < minimum_normal {
+        let all_raw_stationary = grid_direction_bounds
+            .components
+            .iter()
+            .all(|component| component.abs_upper < minimum_normal);
+        let all_normalized_stationary = grid_direction_bounds.components.iter().all(|component| {
+            normalized_component_abs_upper(*component, direction_bounds.norm_lower, rows)
+                .is_some_and(|upper| upper < minimum_normal)
+        });
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::SubnormalDirection,
+            ShaderEnvelopeAxis::All,
+            if all_raw_stationary && all_normalized_stationary {
+                ShaderEnvelopeFailure::AllDirectionsStationary
+            } else {
+                ShaderEnvelopeFailure::DivisionDenominatorNotProvablyNormal
+            },
+        ));
+    }
+    let ray_parameter_span_upper = next_up(sample_count_upper as f64 / grid_speed_lower);
+    let maximum_grid_distance = (0..3)
+        .map(|axis| {
+            let lower = -0.5;
+            let upper = dimensions[axis] as f64 - 0.5;
+            let origin = grid_origin_bounds.components[axis];
+            [
+                (lower - origin.low).abs(),
+                (lower - origin.high).abs(),
+                (upper - origin.low).abs(),
+                (upper - origin.high).abs(),
+            ]
+            .into_iter()
+            .fold(0.0, f64::max)
+        })
+        .fold(0.0, f64::max);
+    let ray_parameter_absolute_upper = next_up(maximum_grid_distance / grid_speed_lower);
+    if !ray_parameter_span_upper.is_finite()
+        || !ray_parameter_absolute_upper.is_finite()
+        || ray_parameter_span_upper > f64::from(f32::MAX)
+        || ray_parameter_absolute_upper > f64::from(f32::MAX)
+    {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::VolumeSlabIntersection,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::ReachableQuotientNotProvablyFinite,
+        ));
+    }
+    let maximum_grid_direction = grid_direction_bounds
+        .components
+        .iter()
+        .map(|component| component.abs_upper)
+        .fold(0.0, f64::max);
+    let page_comparison_product = next_up(ray_parameter_span_upper * maximum_grid_direction);
+    if !page_comparison_product.is_finite() || page_comparison_product > f64::from(f32::MAX) {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::VolumePageExit,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::ReachableQuotientNotProvablyFinite,
+        ));
+    }
+    let mut grid_error_upper = layer.affine.maximum_grid_error();
+    let mut all_raw_stationary = true;
+    let mut all_normalized_stationary = true;
+    for axis in 0..3 {
+        let raw = grid_direction_bounds.components[axis];
+        let normalized_abs_lower =
+            normalized_component_abs_lower(raw, direction_bounds.norm_upper, rows);
+        let normalized_abs_upper =
+            normalized_component_abs_upper(raw, direction_bounds.norm_lower, rows);
+        all_raw_stationary &= raw.abs_upper < minimum_normal;
+        all_normalized_stationary &=
+            normalized_abs_upper.is_some_and(|upper| upper < minimum_normal);
+
+        // Either the color path's native-scale direction or Pick's normalized
+        // direction can land in WGSL's portable-subnormal range. The shared
+        // shader canonicalizes that representation to zero, so charge the
+        // largest component that could be discarded anywhere in the finite
+        // viewport/ray interval. A component that is not proven normal for
+        // both paths must pay this bound even when it is normal at the four
+        // viewport corners.
+        if raw.abs_lower < minimum_normal
+            || normalized_abs_lower.is_none_or(|lower| lower < minimum_normal)
+        {
+            let discarded_component_upper = raw
+                .abs_upper
+                .max(normalized_abs_upper.unwrap_or(minimum_normal))
+                .min(minimum_normal);
+            let discarded = next_up(discarded_component_upper * ray_parameter_span_upper);
+            if !discarded.is_finite() {
+                return Err(shader_envelope_error(
+                    ShaderEnvelopeStage::SubnormalDirection,
+                    ShaderEnvelopeAxis::Axis(axis_for_index(axis)),
+                    ShaderEnvelopeFailure::NonFiniteBound,
+                ));
+            }
+            grid_error_upper[axis] = next_up(grid_error_upper[axis] + discarded);
+            validate_grid_error(
+                ShaderEnvelopeStage::SubnormalDirection,
+                axis,
+                grid_error_upper[axis],
+            )?;
+        }
+        let direction_error =
+            grid_direction_bounds.component_error[axis].max(normalized_component_error(rows));
+        let sample_construction_error = next_up(
+            grid_origin_bounds.component_error[axis]
+                + direction_error * ray_parameter_absolute_upper
+                + wgsl_f32_operation_error(
+                    4,
+                    dimensions[axis] as f64 + grid_origin_bounds.components[axis].abs_upper,
+                )?,
+        );
+        grid_error_upper[axis] = next_up(grid_error_upper[axis] + sample_construction_error);
+        let coordinate_magnitude = dimensions[axis] as f64 + 0.5;
+        grid_error_upper[axis] = next_up(
+            grid_error_upper[axis]
+                + wgsl_f32_operation_error(4, coordinate_magnitude.min(16_777_216.0))?,
+        );
+        validate_grid_error(
+            ShaderEnvelopeStage::VolumeSamplePoint,
+            axis,
+            grid_error_upper[axis],
+        )?;
+    }
+    if all_raw_stationary && all_normalized_stationary {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::SubnormalDirection,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::AllDirectionsStationary,
+        ));
+    }
+    Ok(ShaderLayerWorkFacts {
+        layer: layer.layer,
+        scale: layer.scale,
+        grid_error_upper,
+        address_range: [
+            [-0.5, shape.x() as f64 - 0.5],
+            [-0.5, shape.y() as f64 - 0.5],
+            [-0.5, shape.z() as f64 - 0.5],
+        ],
+        sample_count_upper,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AffineComponentBounds {
+    low: f64,
+    high: f64,
+    abs_lower: f64,
+    abs_upper: f64,
+}
+
+impl AffineComponentBounds {
+    fn from_interval(low: f64, high: f64) -> Result<Self, ShaderAdmissionError> {
+        if !low.is_finite() || !high.is_finite() || low > high {
+            return Err(shader_envelope_error(
+                ShaderEnvelopeStage::VolumeRayConstruction,
+                ShaderEnvelopeAxis::All,
+                ShaderEnvelopeFailure::NonFiniteBound,
+            ));
+        }
+        let abs_lower = if low <= 0.0 && high >= 0.0 {
+            0.0
+        } else {
+            low.abs().min(high.abs())
+        };
+        Ok(Self {
+            low,
+            high,
+            abs_lower,
+            abs_upper: low.abs().max(high.abs()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AffineDirectionBounds {
+    base: [f64; 3],
+    step_x: [f64; 3],
+    step_y: [f64; 3],
+    component_error: [f64; 3],
+    components: [AffineComponentBounds; 3],
+    norm_lower: f64,
+    norm_upper: f64,
+    maximum_x: f64,
+    maximum_y: f64,
+}
+
+fn affine_direction_bounds(
+    base: [f64; 3],
+    step_x: [f64; 3],
+    step_y: [f64; 3],
+    extent: RenderExtent,
+) -> Result<AffineDirectionBounds, ShaderAdmissionError> {
+    let maximum_x = f64::from(extent.width_pixels().saturating_sub(1));
+    let maximum_y = f64::from(extent.height_pixels().saturating_sub(1));
+    let component_error = std::array::from_fn(|axis| {
+        let magnitude =
+            base[axis].abs() + step_x[axis].abs() * maximum_x + step_y[axis].abs() * maximum_y;
+        wgsl_f32_operation_error(4, magnitude).unwrap_or(f64::INFINITY)
+    });
+    if component_error.iter().any(|error| !error.is_finite()) {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::VolumeRayConstruction,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::NonFiniteBound,
+        ));
+    }
+    let mut components = [AffineComponentBounds {
+        low: 0.0,
+        high: 0.0,
+        abs_lower: 0.0,
+        abs_upper: 0.0,
+    }; 3];
+    for axis in 0..3 {
+        components[axis] = affine_scalar_rectangle_interval(
+            base[axis],
+            step_x[axis],
+            step_y[axis],
+            maximum_x,
+            maximum_y,
+            component_error[axis],
+        )?;
+    }
+    let nominal_norm_lower =
+        affine_vector_rectangle_minimum_norm(base, step_x, step_y, maximum_x, maximum_y)?;
+    let nominal_norm_upper =
+        affine_vector_rectangle_maximum_norm(base, step_x, step_y, maximum_x, maximum_y)?;
+    let vector_error = component_error
+        .into_iter()
+        .map(|error| error * error)
+        .sum::<f64>()
+        .sqrt();
+    let norm_lower = (nominal_norm_lower - vector_error).max(0.0);
+    let norm_upper = next_up(nominal_norm_upper + vector_error);
+    if !norm_lower.is_finite() || !norm_upper.is_finite() || norm_upper <= 0.0 {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::VolumeDirectionNormalization,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::ZeroOrIndeterminateDirectionNorm,
+        ));
+    }
+    Ok(AffineDirectionBounds {
+        base,
+        step_x,
+        step_y,
+        component_error,
+        components,
+        norm_lower,
+        norm_upper,
+        maximum_x,
+        maximum_y,
+    })
+}
+
+fn transformed_direction_bounds(
+    rows: [[f64; 4]; 3],
+    direction: AffineDirectionBounds,
+) -> Result<AffineDirectionBounds, ShaderAdmissionError> {
+    transformed_affine_bounds(rows, direction, false)
+}
+
+fn transformed_point_bounds(
+    rows: [[f64; 4]; 3],
+    points: AffineDirectionBounds,
+) -> Result<AffineDirectionBounds, ShaderAdmissionError> {
+    transformed_affine_bounds(rows, points, true)
+}
+
+fn transformed_affine_bounds(
+    rows: [[f64; 4]; 3],
+    direction: AffineDirectionBounds,
+    include_translation: bool,
+) -> Result<AffineDirectionBounds, ShaderAdmissionError> {
+    let transform = |vector: [f64; 3]| {
+        rows.map(|row| {
+            row[0] * vector[0]
+                + row[1] * vector[1]
+                + row[2] * vector[2]
+                + if include_translation { row[3] } else { 0.0 }
+        })
+    };
+    let base = transform(direction.base);
+    let transform_vector = |vector: [f64; 3]| {
+        rows.map(|row| row[0] * vector[0] + row[1] * vector[1] + row[2] * vector[2])
+    };
+    let step_x = transform_vector(direction.step_x);
+    let step_y = transform_vector(direction.step_y);
+    let maximum_x = direction.maximum_x;
+    let maximum_y = direction.maximum_y;
+    let component_error = std::array::from_fn(|axis| {
+        let propagated = rows[axis][0].abs() * direction.component_error[0]
+            + rows[axis][1].abs() * direction.component_error[1]
+            + rows[axis][2].abs() * direction.component_error[2];
+        let magnitude = rows[axis][0].abs() * direction.components[0].abs_upper
+            + rows[axis][1].abs() * direction.components[1].abs_upper
+            + rows[axis][2].abs() * direction.components[2].abs_upper
+            + if include_translation {
+                rows[axis][3].abs()
+            } else {
+                0.0
+            };
+        next_up(
+            propagated
+                + wgsl_f32_operation_error(5, magnitude + propagated).unwrap_or(f64::INFINITY),
+        )
+    });
+    if component_error.iter().any(|error| !error.is_finite()) {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::VolumeWorldToGrid,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::NonFiniteBound,
+        ));
+    }
+    let mut components = [AffineComponentBounds {
+        low: 0.0,
+        high: 0.0,
+        abs_lower: 0.0,
+        abs_upper: 0.0,
+    }; 3];
+    for axis in 0..3 {
+        components[axis] = affine_scalar_rectangle_interval(
+            base[axis],
+            step_x[axis],
+            step_y[axis],
+            maximum_x,
+            maximum_y,
+            component_error[axis],
+        )?;
+    }
+    let nominal_norm_lower =
+        affine_vector_rectangle_minimum_norm(base, step_x, step_y, maximum_x, maximum_y)?;
+    let nominal_norm_upper =
+        affine_vector_rectangle_maximum_norm(base, step_x, step_y, maximum_x, maximum_y)?;
+    let vector_error = component_error
+        .into_iter()
+        .map(|error| error * error)
+        .sum::<f64>()
+        .sqrt();
+    Ok(AffineDirectionBounds {
+        base,
+        step_x,
+        step_y,
+        component_error,
+        components,
+        norm_lower: (nominal_norm_lower - vector_error).max(0.0),
+        norm_upper: next_up(nominal_norm_upper + vector_error),
+        maximum_x,
+        maximum_y,
+    })
+}
+
+fn affine_scalar_rectangle_interval(
+    base: f64,
+    step_x: f64,
+    step_y: f64,
+    maximum_x: f64,
+    maximum_y: f64,
+    error: f64,
+) -> Result<AffineComponentBounds, ShaderAdmissionError> {
+    let x = step_x * maximum_x;
+    let y = step_y * maximum_y;
+    let low = next_down(base + x.min(0.0) + y.min(0.0) - error);
+    let high = next_up(base + x.max(0.0) + y.max(0.0) + error);
+    AffineComponentBounds::from_interval(low, high)
+}
+
+fn affine_vector_rectangle_minimum_norm(
+    base: [f64; 3],
+    step_x: [f64; 3],
+    step_y: [f64; 3],
+    maximum_x: f64,
+    maximum_y: f64,
+) -> Result<f64, ShaderAdmissionError> {
+    let dot = |left: [f64; 3], right: [f64; 3]| {
+        left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+    };
+    let point = |x: f64, y: f64| {
+        std::array::from_fn::<_, 3, _>(|axis| base[axis] + step_x[axis] * x + step_y[axis] * y)
+    };
+    let mut candidates = Vec::with_capacity(9);
+    candidates.extend([
+        (0.0, 0.0),
+        (maximum_x, 0.0),
+        (0.0, maximum_y),
+        (maximum_x, maximum_y),
+    ]);
+    let step_x_squared = dot(step_x, step_x);
+    let step_y_squared = dot(step_y, step_y);
+    if step_y_squared > 0.0 {
+        for x in [0.0, maximum_x] {
+            let edge_base = point(x, 0.0);
+            candidates.push((
+                x,
+                (-dot(edge_base, step_y) / step_y_squared).clamp(0.0, maximum_y),
+            ));
+        }
+    }
+    if step_x_squared > 0.0 {
+        for y in [0.0, maximum_y] {
+            let edge_base = point(0.0, y);
+            candidates.push((
+                (-dot(edge_base, step_x) / step_x_squared).clamp(0.0, maximum_x),
+                y,
+            ));
+        }
+    }
+    let cross = dot(step_x, step_y);
+    let determinant = step_x_squared * step_y_squared - cross * cross;
+    if determinant > 0.0 {
+        let rhs_x = -dot(base, step_x);
+        let rhs_y = -dot(base, step_y);
+        let x = (rhs_x * step_y_squared - rhs_y * cross) / determinant;
+        let y = (rhs_y * step_x_squared - rhs_x * cross) / determinant;
+        if (0.0..=maximum_x).contains(&x) && (0.0..=maximum_y).contains(&y) {
+            candidates.push((x, y));
+        }
+    }
+    let squared = candidates
+        .into_iter()
+        .map(|(x, y)| dot(point(x, y), point(x, y)))
+        .fold(f64::INFINITY, f64::min);
+    if !squared.is_finite() || squared < 0.0 {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::VolumeDirectionNormalization,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::NonFiniteBound,
+        ));
+    }
+    Ok(next_down(squared.sqrt()).max(0.0))
+}
+
+fn affine_vector_rectangle_maximum_norm(
+    base: [f64; 3],
+    step_x: [f64; 3],
+    step_y: [f64; 3],
+    maximum_x: f64,
+    maximum_y: f64,
+) -> Result<f64, ShaderAdmissionError> {
+    let norm = |x: f64, y: f64| {
+        (0..3)
+            .map(|axis| (base[axis] + step_x[axis] * x + step_y[axis] * y).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    };
+    let maximum = [
+        norm(0.0, 0.0),
+        norm(maximum_x, 0.0),
+        norm(0.0, maximum_y),
+        norm(maximum_x, maximum_y),
+    ]
+    .into_iter()
+    .fold(0.0, f64::max);
+    if !maximum.is_finite() {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::VolumeDirectionNormalization,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::NonFiniteBound,
+        ));
+    }
+    Ok(next_up(maximum))
+}
+
+fn normalized_component_error(rows: [[f64; 4]; 3]) -> f64 {
+    let maximum_row_norm = rows
+        .into_iter()
+        .map(|row| (row[0].powi(2) + row[1].powi(2) + row[2].powi(2)).sqrt())
+        .fold(0.0, f64::max);
+    wgsl_f32_operation_error(16, maximum_row_norm).unwrap_or(f64::INFINITY)
+}
+
+fn normalized_component_abs_lower(
+    raw: AffineComponentBounds,
+    direction_norm_upper: f64,
+    rows: [[f64; 4]; 3],
+) -> Option<f64> {
+    (direction_norm_upper.is_finite() && direction_norm_upper > 0.0)
+        .then(|| (raw.abs_lower / direction_norm_upper - normalized_component_error(rows)).max(0.0))
+        .filter(|value| value.is_finite())
+}
+
+fn normalized_component_abs_upper(
+    raw: AffineComponentBounds,
+    direction_norm_lower: f64,
+    rows: [[f64; 4]; 3],
+) -> Option<f64> {
+    (direction_norm_lower.is_finite() && direction_norm_lower > 0.0)
+        .then(|| next_up(raw.abs_upper / direction_norm_lower + normalized_component_error(rows)))
+        .filter(|value| value.is_finite())
+}
+
+fn volume_direction_component_magnitudes(
+    controls: VolumeRayShaderControls,
+    extent: RenderExtent,
+) -> [f64; 3] {
+    let base = controls.direction_base.map(|value| f64::from(value).abs());
+    let step_x = controls
+        .direction_step_x
+        .map(|value| f64::from(value).abs());
+    let step_y = controls
+        .direction_step_y
+        .map(|value| f64::from(value).abs());
+    let maximum_x = f64::from(extent.width_pixels().saturating_sub(1));
+    let maximum_y = f64::from(extent.height_pixels().saturating_sub(1));
+    std::array::from_fn(|axis| base[axis] + step_x[axis] * maximum_x + step_y[axis] * maximum_y)
+}
+
+fn general_dvr_required(schedules: &[ShaderLayerSchedule], affines: &[ShaderLayerAffine]) -> bool {
+    schedules.len() > 1
+        && schedules
+            .iter()
+            .all(|schedule| schedule.mode == ShaderRenderMode::DirectVolume)
+        && !(schedules
+            .iter()
+            .all(|schedule| schedule.sampling == SamplingPolicy::VoxelExact)
+            && affines.windows(2).all(|pair| {
+                pair[0].scale == pair[1].scale
+                    && pair[0].affine.grid_shape() == pair[1].affine.grid_shape()
+                    && pair[0].affine.world_to_grid_rows() == pair[1].affine.world_to_grid_rows()
+            }))
+}
+
+fn general_dvr_count_bound(affines: &[ShaderLayerAffine]) -> Result<u64, ShaderAdmissionError> {
+    let mut world_min = [f64::INFINITY; 3];
+    let mut world_max = [f64::NEG_INFINITY; 3];
+    let mut maximum_grid_speed = 0.0_f64;
+    for layer in affines {
+        let inverse = layer.affine.quantized_inverse_center();
+        let radius = layer.affine.quantized_inverse_radius();
+        let shape = layer.affine.grid_shape();
+        let bounds = [
+            [-0.5, shape.x() as f64 - 0.5],
+            [-0.5, shape.y() as f64 - 0.5],
+            [-0.5, shape.z() as f64 - 0.5],
+        ];
+        for mask in 0_u8..8 {
+            let grid: [f64; 3] =
+                std::array::from_fn(|axis| bounds[axis][usize::from(mask & (1 << axis) != 0)]);
+            for axis in 0..3 {
+                let center = inverse[axis][0] * grid[0]
+                    + inverse[axis][1] * grid[1]
+                    + inverse[axis][2] * grid[2]
+                    + inverse[axis][3];
+                let error = radius[axis][0] * grid[0].abs()
+                    + radius[axis][1] * grid[1].abs()
+                    + radius[axis][2] * grid[2].abs()
+                    + radius[axis][3];
+                world_min[axis] = world_min[axis].min(next_down(center - error));
+                world_max[axis] = world_max[axis].max(next_up(center + error));
+            }
+        }
+        let rows = layer.affine.world_to_grid_rows();
+        maximum_grid_speed = maximum_grid_speed.max(
+            rows.into_iter()
+                .map(|row| {
+                    (f64::from(row[0]).powi(2)
+                        + f64::from(row[1]).powi(2)
+                        + f64::from(row[2]).powi(2))
+                    .sqrt()
+                })
+                .fold(0.0, f64::max),
+        );
+    }
+    let diagonal = (0..3)
+        .map(|axis| (world_max[axis] - world_min[axis]).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let count = next_up(diagonal * maximum_grid_speed).ceil();
+    if !count.is_finite() || count < 0.0 {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::GeneralDvrInterval,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::NonFiniteBound,
+        ));
+    }
+    let count = count.min(u64::MAX as f64) as u64;
+    if count > MAX_EXACT_SHADER_SAMPLE_COUNT {
+        return Err(ShaderAdmissionError::ShaderSampleCountExceeded {
+            layer: affines
+                .first()
+                .expect("general DVR has at least two layer affines")
+                .layer,
+            bound: count,
+            maximum: MAX_EXACT_SHADER_SAMPLE_COUNT,
+        });
+    }
+    Ok(count)
+}
+
+fn validate_grid_error(
+    stage: ShaderEnvelopeStage,
+    axis: usize,
+    upper: f64,
+) -> Result<(), ShaderAdmissionError> {
+    if !upper.is_finite() || upper < 0.0 {
+        return Err(shader_envelope_error(
+            stage,
+            ShaderEnvelopeAxis::Axis(axis_for_index(axis)),
+            ShaderEnvelopeFailure::NonFiniteBound,
+        ));
+    }
+    if upper >= 0.5 {
+        return Err(shader_envelope_error(
+            stage,
+            ShaderEnvelopeAxis::Axis(axis_for_index(axis)),
+            ShaderEnvelopeFailure::ErrorBudget {
+                upper_voxels: upper,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn wgsl_f32_operation_error(
+    operation_count: u32,
+    magnitude: f64,
+) -> Result<f64, ShaderAdmissionError> {
+    if !magnitude.is_finite() || magnitude < 0.0 || magnitude > f64::from(f32::MAX) {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::VolumeRayConstruction,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::NonFiniteBound,
+        ));
+    }
+    let operation_count = f64::from(operation_count);
+    let unit_roundoff = f64::from(f32::EPSILON);
+    let denominator = 1.0 - operation_count * unit_roundoff;
+    if denominator <= 0.0 {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::VolumeRayConstruction,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::NonFiniteBound,
+        ));
+    }
+    Ok(next_up(
+        operation_count * unit_roundoff / denominator * magnitude
+            + operation_count * f64::from(f32::from_bits(1)),
+    ))
+}
+
+fn next_down(value: f64) -> f64 {
+    if value.is_nan() || value == f64::NEG_INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return -f64::from_bits(1);
+    }
+    if value > 0.0 {
+        f64::from_bits(value.to_bits() - 1)
+    } else {
+        f64::from_bits(value.to_bits() + 1)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VerifiedInverse {
+    center: [[f64; 3]; 3],
+    radius: f64,
+    condition_inf_upper: f64,
+}
+
+fn verified_inverse(
+    matrix: [[f64; 3]; 3],
+    stage: AffineValidationStage,
+) -> Result<VerifiedInverse, ShaderAdmissionError> {
+    let scale = matrix
+        .iter()
+        .flatten()
+        .map(|value| value.abs())
+        .fold(0.0, f64::max);
+    if !scale.is_finite() || scale == 0.0 {
+        return Err(ShaderAdmissionError::AffineConditionExceeded {
+            stage,
+            condition_upper: f64::INFINITY,
+        });
+    }
+    let scaled = matrix.map(|row| row.map(|value| value / scale));
+    let mut augmented = [[0.0_f64; 6]; 3];
+    for row in 0..3 {
+        augmented[row][..3].copy_from_slice(&scaled[row]);
+        augmented[row][3 + row] = 1.0;
+    }
+    for column in 0..3 {
+        let mut pivot_row = column;
+        for row in column + 1..3 {
+            if augmented[row][column].abs() > augmented[pivot_row][column].abs() {
+                pivot_row = row;
+            }
+        }
+        let pivot = augmented[pivot_row][column];
+        if !pivot.is_finite() || pivot == 0.0 {
+            return Err(ShaderAdmissionError::AffineConditionExceeded {
+                stage,
+                condition_upper: f64::INFINITY,
+            });
+        }
+        augmented.swap(column, pivot_row);
+        for value in &mut augmented[column] {
+            *value /= pivot;
+        }
+        let pivot_values = augmented[column];
+        for (row_index, row_values) in augmented.iter_mut().enumerate() {
+            if row_index == column {
+                continue;
+            }
+            let factor = row_values[column];
+            for (entry, pivot_entry) in row_values.iter_mut().zip(pivot_values) {
+                *entry -= factor * pivot_entry;
+            }
+        }
+    }
+    let inverse_scaled = augmented.map(|row| [row[3], row[4], row[5]]);
+    if !inverse_scaled
+        .iter()
+        .flatten()
+        .all(|value| value.is_finite())
+    {
+        return Err(ShaderAdmissionError::AffineConditionExceeded {
+            stage,
+            condition_upper: f64::INFINITY,
+        });
+    }
+    let left = matrix_product(scaled, inverse_scaled);
+    let right = matrix_product(inverse_scaled, scaled);
+    let residual_bound = |product: [[f64; 3]; 3], lhs: [[f64; 3]; 3], rhs: [[f64; 3]; 3]| {
+        (0..3)
+            .map(|row| {
+                (0..3)
+                    .map(|column| {
+                        let expected = f64::from(row == column);
+                        let roundoff = (0..3)
+                            .map(|term| lhs[row][term].abs() * rhs[term][column].abs())
+                            .sum::<f64>()
+                            * 8.0
+                            * f64::EPSILON;
+                        next_up((expected - product[row][column]).abs() + roundoff)
+                    })
+                    .sum::<f64>()
+            })
+            .fold(0.0, f64::max)
+    };
+    let residual = residual_bound(left, scaled, inverse_scaled).max(residual_bound(
+        right,
+        inverse_scaled,
+        scaled,
+    ));
+    let inverse_scaled_norm = matrix_inf_norm(inverse_scaled);
+    let matrix_norm = matrix_inf_norm(scaled);
+    if !residual.is_finite() || residual >= 1.0 {
+        return Err(ShaderAdmissionError::AffineConditionExceeded {
+            stage,
+            condition_upper: f64::INFINITY,
+        });
+    }
+    let inverse_norm_upper = next_up(inverse_scaled_norm / (1.0 - residual));
+    let condition_inf_upper = next_up(matrix_norm * inverse_norm_upper);
+    if !condition_inf_upper.is_finite() || condition_inf_upper * f64::EPSILON > 1.0 / 64.0 {
+        return Err(ShaderAdmissionError::AffineConditionExceeded {
+            stage,
+            condition_upper: condition_inf_upper,
+        });
+    }
+    let center = inverse_scaled.map(|row| row.map(|value| value / scale));
+    let radius = next_up(inverse_scaled_norm * residual / (1.0 - residual) / scale.abs());
+    if !center.iter().flatten().all(|value| value.is_finite()) || !radius.is_finite() {
+        return Err(ShaderAdmissionError::AffineConditionExceeded {
+            stage,
+            condition_upper: condition_inf_upper,
+        });
+    }
+    Ok(VerifiedInverse {
+        center,
+        radius,
+        condition_inf_upper,
+    })
+}
+
+fn maximum_shader_grid_error(
+    grid_to_world: [f64; 16],
+    shape: Shape3D,
+    world_to_grid: [[f32; 4]; 3],
+) -> [f64; 3] {
+    let bounds = [
+        [-0.5, shape.x() as f64 - 0.5],
+        [-0.5, shape.y() as f64 - 0.5],
+        [-0.5, shape.z() as f64 - 0.5],
+    ];
+    let mut maximum = [0.0_f64; 3];
+    for bits in 0_u8..8 {
+        let grid = [
+            bounds[0][usize::from(bits & 1 != 0)],
+            bounds[1][usize::from(bits & 2 != 0)],
+            bounds[2][usize::from(bits & 4 != 0)],
+        ];
+        let world = [
+            grid_to_world[0] * grid[0]
+                + grid_to_world[1] * grid[1]
+                + grid_to_world[2] * grid[2]
+                + grid_to_world[3],
+            grid_to_world[4] * grid[0]
+                + grid_to_world[5] * grid[1]
+                + grid_to_world[6] * grid[2]
+                + grid_to_world[7],
+            grid_to_world[8] * grid[0]
+                + grid_to_world[9] * grid[1]
+                + grid_to_world[10] * grid[2]
+                + grid_to_world[11],
+        ];
+        let world = world.map(F32ErrorBound::from_f64);
+        for axis in 0..3 {
+            let row = world_to_grid[axis];
+            let reconstructed = F32ErrorBound::product(row[0], world[0])
+                .sum(F32ErrorBound::product(row[1], world[1]))
+                .sum(F32ErrorBound::product(row[2], world[2]))
+                .sum(F32ErrorBound::exact(row[3]));
+            maximum[axis] = maximum[axis].max(next_up(
+                (f64::from(reconstructed.center) - grid[axis]).abs() + reconstructed.radius,
+            ));
+        }
+    }
+    maximum
+}
+
+#[derive(Debug, Clone, Copy)]
+struct F32ErrorBound {
+    center: f32,
+    radius: f64,
+}
+
+impl F32ErrorBound {
+    const fn exact(center: f32) -> Self {
+        Self {
+            center: canonical_f32_zero(center),
+            radius: 0.0,
+        }
+    }
+
+    fn from_f64(value: f64) -> Self {
+        let center = canonical_f32_zero(value as f32);
+        if !center.is_finite() {
+            return Self {
+                center,
+                radius: f64::INFINITY,
+            };
+        }
+        let mut radius = (f64::from(center) - value).abs();
+        if center != 0.0 && center.abs() < f32::MIN_POSITIVE {
+            radius = radius.max(f64::from(center.abs()));
+        }
+        Self {
+            center,
+            radius: outward_nonnegative(radius),
+        }
+    }
+
+    fn product(coefficient: f32, input: Self) -> Self {
+        let exact_center = f64::from(coefficient) * f64::from(input.center);
+        let propagated = f64::from(coefficient.abs()) * input.radius;
+        Self::from_operation(exact_center, propagated)
+    }
+
+    fn sum(self, other: Self) -> Self {
+        let exact_center = f64::from(self.center) + f64::from(other.center);
+        Self::from_operation(
+            exact_center,
+            outward_nonnegative(self.radius + other.radius),
+        )
+    }
+
+    fn from_operation(exact_center: f64, propagated: f64) -> Self {
+        let center = canonical_f32_zero(exact_center as f32);
+        if !center.is_finite() || !propagated.is_finite() {
+            return Self {
+                center,
+                radius: f64::INFINITY,
+            };
+        }
+        let center_error = (f64::from(center) - exact_center).abs();
+        let rounding = if propagated == 0.0 {
+            center_error
+        } else {
+            next_up(center_error + f32_half_ulp(center))
+        };
+        let flush = if center != 0.0 && center.abs() < f32::MIN_POSITIVE {
+            f64::from(center.abs())
+        } else {
+            0.0
+        };
+        Self {
+            center,
+            radius: outward_nonnegative(propagated + rounding.max(flush)),
+        }
+    }
+}
+
+fn outward_nonnegative(value: f64) -> f64 {
+    if value == 0.0 { 0.0 } else { next_up(value) }
+}
+
+fn f32_half_ulp(value: f32) -> f64 {
+    if !value.is_finite() {
+        return f64::INFINITY;
+    }
+    let magnitude = value.abs();
+    if magnitude == 0.0 || magnitude < f32::MIN_POSITIVE {
+        return f64::from(f32::from_bits(1)) * 0.5;
+    }
+    let next = f32::from_bits(magnitude.to_bits() + 1);
+    f64::from(next - magnitude) * 0.5
+}
+
+fn matrix_product(left: [[f64; 3]; 3], right: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut result = [[0.0; 3]; 3];
+    for row in 0..3 {
+        for column in 0..3 {
+            result[row][column] = (0..3)
+                .map(|term| left[row][term] * right[term][column])
+                .sum();
+        }
+    }
+    result
+}
+
+fn matrix_vector(matrix: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
+    matrix.map(|row| (0..3).map(|column| row[column] * vector[column]).sum())
+}
+
+fn matrix_inf_norm(matrix: [[f64; 3]; 3]) -> f64 {
+    matrix
+        .into_iter()
+        .map(|row| row.into_iter().map(f64::abs).sum())
+        .fold(0.0, f64::max)
+}
+
+fn next_up(value: f64) -> f64 {
+    if value.is_nan() || value == f64::INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return f64::from_bits(1);
+    }
+    if value > 0.0 {
+        f64::from_bits(value.to_bits() + 1)
+    } else {
+        f64::from_bits(value.to_bits() - 1)
+    }
+}
+
+const EXACT_DETERMINANT_LIMBS: usize = 100;
+const MIN_TRIPLE_EXPONENT: i32 = -3222;
+
+fn exact_determinant_is_zero(matrix: [[f64; 3]; 3]) -> bool {
+    let terms = [
+        (false, [matrix[0][0], matrix[1][1], matrix[2][2]]),
+        (false, [matrix[0][1], matrix[1][2], matrix[2][0]]),
+        (false, [matrix[0][2], matrix[1][0], matrix[2][1]]),
+        (true, [matrix[0][2], matrix[1][1], matrix[2][0]]),
+        (true, [matrix[0][1], matrix[1][0], matrix[2][2]]),
+        (true, [matrix[0][0], matrix[1][2], matrix[2][1]]),
+    ];
+    let mut positive = [0_u64; EXACT_DETERMINANT_LIMBS];
+    let mut negative = [0_u64; EXACT_DETERMINANT_LIMBS];
+    for (subtract, values) in terms {
+        let decoded = values.map(decode_f64_integer_exponent);
+        if decoded.iter().any(|(_, significand, _)| *significand == 0) {
+            continue;
+        }
+        let sign = subtract ^ decoded.iter().fold(false, |sign, item| sign ^ item.0);
+        let exponent = decoded.iter().map(|item| item.2).sum::<i32>();
+        let product = multiply_three_significands(decoded[0].1, decoded[1].1, decoded[2].1);
+        let shift = usize::try_from(exponent - MIN_TRIPLE_EXPONENT)
+            .expect("the finite binary64 triple-product exponent is in range");
+        add_shifted_exact(
+            if sign { &mut negative } else { &mut positive },
+            product,
+            shift,
+        );
+    }
+    positive == negative
+}
+
+fn decode_f64_integer_exponent(value: f64) -> (bool, u64, i32) {
+    let bits = value.to_bits();
+    let sign = bits >> 63 != 0;
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    if exponent_bits == 0 {
+        (sign, fraction, -1074)
+    } else {
+        (sign, (1_u64 << 52) | fraction, exponent_bits - 1023 - 52)
+    }
+}
+
+fn multiply_three_significands(first: u64, second: u64, third: u64) -> [u64; 3] {
+    let pair = u128::from(first) * u128::from(second);
+    let pair_limbs = [pair as u64, (pair >> 64) as u64];
+    let mut result = [0_u64; 3];
+    let mut carry = 0_u128;
+    for (index, limb) in pair_limbs.into_iter().enumerate() {
+        let value = u128::from(limb) * u128::from(third) + carry;
+        result[index] = value as u64;
+        carry = value >> 64;
+    }
+    result[2] = carry as u64;
+    result
+}
+
+fn add_shifted_exact(
+    destination: &mut [u64; EXACT_DETERMINANT_LIMBS],
+    source: [u64; 3],
+    shift: usize,
+) {
+    let word_shift = shift / 64;
+    let bit_shift = shift % 64;
+    let mut shifted = [0_u64; EXACT_DETERMINANT_LIMBS];
+    for (index, limb) in source.into_iter().enumerate() {
+        let destination_index = word_shift + index;
+        shifted[destination_index] |= limb << bit_shift;
+        if bit_shift != 0 {
+            shifted[destination_index + 1] |= limb >> (64 - bit_shift);
+        }
+    }
+    let mut carry = 0_u128;
+    for (target, addend) in destination.iter_mut().zip(shifted) {
+        let sum = u128::from(*target) + u128::from(addend) + carry;
+        *target = sum as u64;
+        carry = sum >> 64;
+    }
+    debug_assert_eq!(carry, 0);
+}
+
+const fn axis_for_index(index: usize) -> Axis3 {
+    match index {
+        0 => Axis3::X,
+        1 => Axis3::Y,
+        2 => Axis3::Z,
+        _ => unreachable!(),
+    }
+}
+
+const fn affine_column_for_index(index: usize) -> AffineColumn {
+    match index {
+        0 => AffineColumn::X,
+        1 => AffineColumn::Y,
+        2 => AffineColumn::Z,
+        3 => AffineColumn::Translation,
+        _ => unreachable!(),
+    }
+}
+
+const fn canonical_f32_zero(value: f32) -> f32 {
+    if value == 0.0 { 0.0 } else { value }
+}
+
 /// Derives the canonical binary32 world-to-grid rows consumed by render
 /// shaders from one validated affine grid-to-world transform.
 pub fn shader_control_world_to_grid_rows(
     transform: GridToWorld,
 ) -> Result<[[f32; 4]; 3], ShaderControlAffineError> {
-    let matrix = transform.row_major();
-    let a = matrix[0];
-    let b = matrix[1];
-    let c = matrix[2];
-    let d = matrix[4];
-    let e = matrix[5];
-    let f = matrix[6];
-    let g = matrix[8];
-    let h = matrix[9];
-    let i = matrix[10];
-    let determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
-    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
-        return Err(ShaderControlAffineError::NonInvertible);
-    }
-    let inverse_determinant = determinant.recip();
-    let linear = [
-        (e * i - f * h) * inverse_determinant,
-        (c * h - b * i) * inverse_determinant,
-        (b * f - c * e) * inverse_determinant,
-        (f * g - d * i) * inverse_determinant,
-        (a * i - c * g) * inverse_determinant,
-        (c * d - a * f) * inverse_determinant,
-        (d * h - e * g) * inverse_determinant,
-        (b * g - a * h) * inverse_determinant,
-        (a * e - b * d) * inverse_determinant,
-    ];
-    if !linear.iter().all(|value| value.is_finite()) {
-        return Err(ShaderControlAffineError::NonInvertible);
-    }
-    let translation = [matrix[3], matrix[7], matrix[11]];
-    let rows = [
-        [
-            linear[0],
-            linear[1],
-            linear[2],
-            -(linear[0] * translation[0] + linear[1] * translation[1] + linear[2] * translation[2]),
-        ],
-        [
-            linear[3],
-            linear[4],
-            linear[5],
-            -(linear[3] * translation[0] + linear[4] * translation[1] + linear[5] * translation[2]),
-        ],
-        [
-            linear[6],
-            linear[7],
-            linear[8],
-            -(linear[6] * translation[0] + linear[7] * translation[1] + linear[8] * translation[2]),
-        ],
-    ];
-    let mut quantized = [[0.0; 4]; 3];
-    for row in 0..3 {
-        for column in 0..4 {
-            let converted = rows[row][column] as f32;
-            if !converted.is_finite() {
-                return Err(ShaderControlAffineError::NotRepresentable);
+    let shape = Shape3D::new(1, 1, 1).expect("the compatibility domain is valid");
+    ValidatedShaderAffine::new(transform, shape)
+        .map(|affine| affine.world_to_grid_rows())
+        .map_err(|error| match error {
+            ShaderAdmissionError::SingularAffine
+            | ShaderAdmissionError::AffineConditionExceeded { .. }
+            | ShaderAdmissionError::ShaderQuantizedAffineSingular => {
+                ShaderControlAffineError::NonInvertible
             }
-            quantized[row][column] = if converted == 0.0 { 0.0 } else { converted };
-        }
-    }
-    Ok(quantized)
+            ShaderAdmissionError::ShaderControlNotFinite { .. }
+            | ShaderAdmissionError::ShaderCoordinatePrecisionExceeded { .. }
+            | ShaderAdmissionError::ShaderCoordinateEnvelopeExceeded { .. }
+            | ShaderAdmissionError::ShaderSampleCountExceeded { .. } => {
+                ShaderControlAffineError::NotRepresentable
+            }
+        })
 }
 
 /// A monotonically assigned identity used to suppress stale render results.
@@ -341,7 +2675,7 @@ impl LayerRenderIntent {
 }
 
 /// One immutable, bounded request to produce a current frame.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct RenderIntent {
     frame: FrameIdentity,
     resource_identity: DatasetResourceIdentity,
@@ -350,9 +2684,39 @@ pub struct RenderIntent {
     presentation: PresentationViewport,
     extent: RenderExtent,
     layers: Vec<LayerRenderIntent>,
+    shader_work_envelope: Option<Arc<SharedShaderWorkEnvelope>>,
+}
+
+impl PartialEq for RenderIntent {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_semantic_request(other)
+            && match (
+                self.shader_work_envelope.as_ref(),
+                other.shader_work_envelope.as_ref(),
+            ) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
 }
 
 impl RenderIntent {
+    /// Compares the immutable scientific/display request while excluding its
+    /// derived shader-work proof allocation. A progressive quality handoff
+    /// may keep one semantic frame while changing requirement scales and
+    /// therefore its proof. Prepared-execution equality remains stricter via
+    /// [`PartialEq`], which also requires identical proof ownership.
+    pub fn same_semantic_request(&self, other: &Self) -> bool {
+        self.frame == other.frame
+            && self.resource_identity == other.resource_identity
+            && self.timepoint == other.timepoint
+            && self.view == other.view
+            && self.presentation == other.presentation
+            && self.extent == other.extent
+            && self.layers == other.layers
+    }
+
     pub fn new(
         frame: FrameIdentity,
         resource_identity: DatasetResourceIdentity,
@@ -387,6 +2751,7 @@ impl RenderIntent {
             presentation,
             extent,
             layers,
+            shader_work_envelope: None,
         })
     }
 
@@ -400,6 +2765,26 @@ impl RenderIntent {
     /// compare a candidate before allocating its final frame number.
     pub fn with_frame(mut self, frame: FrameIdentity) -> Self {
         self.frame = frame;
+        self
+    }
+
+    /// Finalizes a semantic intent with the exact shader-work proof prepared
+    /// for its viewport, layer order, scale chains, and camera controls.
+    pub fn with_shader_work_envelope(mut self, envelope: ShaderWorkEnvelope) -> Self {
+        debug_assert_eq!(self.view.pass_kind(), envelope.pass_kind());
+        self.shader_work_envelope = Some(Arc::new(SharedShaderWorkEnvelope::unaccounted(envelope)));
+        self
+    }
+
+    /// Finalizes an intent with one worker-cached proof allocation. Clones and
+    /// frame-coordinator reuse checks preserve this O(1) identity instead of
+    /// comparing the proof's layer/scale arrays on the UI or renderer path.
+    pub fn with_shared_shader_work_envelope(
+        mut self,
+        envelope: Arc<SharedShaderWorkEnvelope>,
+    ) -> Self {
+        debug_assert_eq!(self.view.pass_kind(), envelope.envelope().pass_kind());
+        self.shader_work_envelope = Some(envelope);
         self
     }
 
@@ -425,6 +2810,12 @@ impl RenderIntent {
 
     pub fn layers(&self) -> &[LayerRenderIntent] {
         &self.layers
+    }
+
+    pub fn shader_work_envelope(&self) -> Option<&ShaderWorkEnvelope> {
+        self.shader_work_envelope
+            .as_deref()
+            .map(SharedShaderWorkEnvelope::envelope)
     }
 }
 
@@ -2880,6 +5271,337 @@ mod tests {
             shader_control_world_to_grid_rows(unrepresentable),
             Err(ShaderControlAffineError::NotRepresentable)
         );
+    }
+
+    #[test]
+    fn uniform_affine_scale_is_not_rejected_by_determinant_magnitude() {
+        for scale in [1.0e-6, 2.0e6] {
+            let transform = GridToWorld::scale(scale, scale, scale).unwrap();
+            let rows = shader_control_world_to_grid_rows(transform).unwrap_or_else(|error| {
+                panic!(
+                    "a finite, uniformly scaled affine must not be rejected solely because of its determinant magnitude: scale={scale} error={error}"
+                )
+            });
+            let expected = (1.0 / scale) as f32;
+            assert_eq!(rows[0][0].to_bits(), expected.to_bits());
+            assert_eq!(rows[1][1].to_bits(), expected.to_bits());
+            assert_eq!(rows[2][2].to_bits(), expected.to_bits());
+        }
+    }
+
+    #[test]
+    fn validated_affine_has_exact_singularity_condition_and_grid_end_boundaries() {
+        let maximum_shape = Shape3D::new(1, 1, MAX_EXACT_SHADER_GRID_END_EXCLUSIVE).unwrap();
+        ValidatedShaderAffine::new(GridToWorld::identity(), maximum_shape)
+            .expect("the exact binary32 grid-end boundary is admitted");
+
+        let excessive_shape = Shape3D::new(1, 1, MAX_EXACT_SHADER_GRID_END_EXCLUSIVE + 1).unwrap();
+        assert!(matches!(
+            ValidatedShaderAffine::new(GridToWorld::identity(), excessive_shape),
+            Err(ShaderAdmissionError::ShaderCoordinateEnvelopeExceeded {
+                stage: ShaderEnvelopeStage::VolumeWorldToGrid,
+                axis: ShaderEnvelopeAxis::Axis(Axis3::X),
+                ..
+            })
+        ));
+
+        let singular = GridToWorld::scale(1.0, 0.0, 1.0).unwrap();
+        assert_eq!(
+            ValidatedShaderAffine::new(singular, Shape3D::new(8, 8, 8).unwrap()),
+            Err(ShaderAdmissionError::SingularAffine)
+        );
+
+        let ill_conditioned = GridToWorld::scale(1.0, 1.0, 1.0e-20).unwrap();
+        assert!(matches!(
+            ValidatedShaderAffine::new(ill_conditioned, Shape3D::new(8, 8, 8).unwrap()),
+            Err(ShaderAdmissionError::AffineConditionExceeded {
+                stage: AffineValidationStage::Input,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn precision_bound_translation_is_rejected_with_the_exact_axis() {
+        let translated = GridToWorld::from_row_major([
+            1.0, 0.0, 0.0, 1.0e12, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ])
+        .unwrap();
+        assert!(matches!(
+            ValidatedShaderAffine::new(translated, Shape3D::new(64, 64, 64).unwrap()),
+            Err(ShaderAdmissionError::ShaderCoordinatePrecisionExceeded { axis: Axis3::X, .. })
+        ));
+    }
+
+    #[test]
+    fn shader_half_step_coordinate_envelope_has_exact_boundary() {
+        let maximum = MAX_EXACT_SHADER_GRID_END_EXCLUSIVE;
+        let accepted = Shape3D::new(maximum, 1, 1).unwrap();
+        ValidatedShaderAffine::new(GridToWorld::identity(), accepted)
+            .expect("the exact half-step endpoint remains representable");
+
+        let rejected = Shape3D::new(maximum + 1, 1, 1).unwrap();
+        assert!(matches!(
+            ValidatedShaderAffine::new(GridToWorld::identity(), rejected),
+            Err(ShaderAdmissionError::ShaderCoordinateEnvelopeExceeded {
+                stage: ShaderEnvelopeStage::VolumeWorldToGrid,
+                axis: ShaderEnvelopeAxis::Axis(Axis3::Z),
+                reason: ShaderEnvelopeFailure::ErrorBudget { upper_voxels: 0.5 },
+            })
+        ));
+        validate_shader_extent(RenderExtent::new(maximum as u32, 1).unwrap())
+            .expect("the physical pixel-center endpoint uses the same exact boundary");
+        assert!(matches!(
+            validate_shader_extent(RenderExtent::new(maximum as u32 + 1, 1).unwrap()),
+            Err(ShaderAdmissionError::ShaderCoordinateEnvelopeExceeded {
+                stage: ShaderEnvelopeStage::PlanePixelCenter,
+                axis: ShaderEnvelopeAxis::Axis(Axis3::X),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn singular_condition_control_and_coordinate_failures_are_distinct() {
+        let shape = Shape3D::new(8, 8, 8).unwrap();
+        assert_eq!(
+            ValidatedShaderAffine::new(GridToWorld::scale(1.0, 0.0, 1.0).unwrap(), shape,),
+            Err(ShaderAdmissionError::SingularAffine)
+        );
+        assert!(matches!(
+            ValidatedShaderAffine::new(GridToWorld::scale(1.0, 1.0, 1.0e-20).unwrap(), shape,),
+            Err(ShaderAdmissionError::AffineConditionExceeded {
+                stage: AffineValidationStage::Input,
+                ..
+            })
+        ));
+        assert!(matches!(
+            ValidatedShaderAffine::new(
+                GridToWorld::scale(1.0e-39, 1.0e-39, 1.0e-39).unwrap(),
+                shape,
+            ),
+            Err(ShaderAdmissionError::ShaderControlNotFinite { .. })
+        ));
+
+        let epsilon = 1.0e-8;
+        let quantized_singular = GridToWorld::from_row_major([
+            (1.0 + epsilon) / epsilon,
+            -1.0 / epsilon,
+            0.0,
+            0.0,
+            -1.0 / epsilon,
+            1.0 / epsilon,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ])
+        .unwrap();
+        assert_eq!(
+            ValidatedShaderAffine::new(quantized_singular, shape),
+            Err(ShaderAdmissionError::ShaderQuantizedAffineSingular)
+        );
+
+        let translated = GridToWorld::from_row_major([
+            1.0, 0.0, 0.0, 1.0e12, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ])
+        .unwrap();
+        assert!(matches!(
+            ValidatedShaderAffine::new(translated, shape),
+            Err(ShaderAdmissionError::ShaderCoordinatePrecisionExceeded { axis: Axis3::X, .. })
+        ));
+
+        let far = ShaderLayerAffine::new(
+            LogicalLayerKey::new(0),
+            ScaleLevel::BASE,
+            GridToWorld::from_row_major([
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ])
+            .unwrap(),
+            Shape3D::new(maximum_shader_dimension_for_test(), 1, 1).unwrap(),
+        )
+        .unwrap();
+        let shifted = ShaderLayerAffine::new(
+            LogicalLayerKey::new(1),
+            ScaleLevel::BASE,
+            GridToWorld::scale(1_000_000.0, 1_000_000.0, 1_000_000.0).unwrap(),
+            Shape3D::new(maximum_shader_dimension_for_test(), 1, 1).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            general_dvr_count_bound(&[far, shifted]),
+            Err(ShaderAdmissionError::ShaderSampleCountExceeded { .. })
+        ));
+    }
+
+    const fn maximum_shader_dimension_for_test() -> u64 {
+        64
+    }
+
+    #[test]
+    fn plane_work_envelope_retains_viewport_wide_rounding_radius() {
+        let view =
+            CrossSectionView::new(WorldPoint3::origin(), UnitQuaternion::identity(), 0.01, 1.0)
+                .unwrap();
+        let presentation = PresentationViewport::new(8.0, 8.0).unwrap();
+        let extent = RenderExtent::new(64, 64).unwrap();
+        let footprint = ValidatedPlaneGridFootprint::new(
+            view,
+            presentation,
+            extent,
+            GridToWorld::identity(),
+            Shape3D::new(64, 64, 64).unwrap(),
+        )
+        .expect("a small identity Plane footprint is admitted");
+        assert!(
+            footprint
+                .grid_error_upper()
+                .into_iter()
+                .all(|upper| upper.is_finite() && upper < 0.5)
+        );
+
+        let ambiguous = CrossSectionView::new(
+            WorldPoint3::origin(),
+            UnitQuaternion::identity(),
+            100_000_000.0,
+            1.0,
+        )
+        .unwrap();
+        assert!(matches!(
+            ValidatedPlaneGridFootprint::new(
+                ambiguous,
+                presentation,
+                extent,
+                GridToWorld::identity(),
+                Shape3D::new(64, 64, 64).unwrap(),
+            ),
+            Err(ShaderAdmissionError::ShaderCoordinateEnvelopeExceeded {
+                stage: ShaderEnvelopeStage::PlaneGridAddress,
+                reason: ShaderEnvelopeFailure::ErrorBudget { .. },
+                ..
+            })
+        ));
+    }
+
+    fn volume_controls(direction: [f32; 3]) -> VolumeRayShaderControls {
+        VolumeRayShaderControls {
+            origin_base: [0.0; 3],
+            origin_step_x: [0.0; 3],
+            origin_step_y: [0.0; 3],
+            direction_base: direction,
+            direction_step_x: [0.0; 3],
+            direction_step_y: [0.0; 3],
+        }
+    }
+
+    #[test]
+    fn volume_ray_envelope_checks_interior_direction_minimum_and_count() {
+        let minimum = affine_vector_rectangle_minimum_norm(
+            [-1.0, -1.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0],
+            1.0,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(minimum, 0.0, "the interior stationary point is evaluated");
+
+        let layer = ShaderLayerAffine::new(
+            LogicalLayerKey::new(0),
+            ScaleLevel::BASE,
+            GridToWorld::identity(),
+            Shape3D::new(31, 23, 17).unwrap(),
+        )
+        .unwrap();
+        let facts = volume_layer_facts(
+            layer,
+            volume_controls([0.0, 0.0, 1.0]),
+            RenderExtent::new(32, 24).unwrap(),
+        )
+        .expect("finite axis-aligned rays have a bounded shader envelope");
+        assert_eq!(facts.sample_count_upper(), 31);
+        assert!(
+            facts
+                .grid_error_upper()
+                .into_iter()
+                .all(|upper| upper < 0.5)
+        );
+    }
+
+    #[test]
+    fn volume_page_traversal_subnormal_direction_is_portably_canonicalized_or_rejected() {
+        let minimum_normal = f64::from(f32::MIN_POSITIVE);
+        let world_scale = (2.0 * minimum_normal).recip();
+        let small = ShaderLayerAffine::new(
+            LogicalLayerKey::new(0),
+            ScaleLevel::BASE,
+            GridToWorld::scale(world_scale, world_scale, world_scale).unwrap(),
+            Shape3D::new(1, 1, 1).unwrap(),
+        )
+        .unwrap();
+        let accepted = volume_layer_facts(
+            small,
+            volume_controls([0.1, 0.0, 1.0]),
+            RenderExtent::new(1, 1).unwrap(),
+        )
+        .expect("a discarded subnormal component below the half-voxel budget is admitted");
+        assert!(accepted.grid_error_upper()[0] < 0.5);
+
+        let large = ShaderLayerAffine::new(
+            LogicalLayerKey::new(0),
+            ScaleLevel::BASE,
+            GridToWorld::scale(world_scale, world_scale, world_scale).unwrap(),
+            Shape3D::new(5, 5, 5).unwrap(),
+        )
+        .unwrap();
+        let rejection = volume_layer_facts(
+            large,
+            volume_controls([0.1, 0.0, 1.0]),
+            RenderExtent::new(1, 1).unwrap(),
+        );
+        assert!(
+            matches!(
+                rejection,
+                Err(ShaderAdmissionError::ShaderCoordinateEnvelopeExceeded {
+                    stage: ShaderEnvelopeStage::SubnormalDirection,
+                    axis: ShaderEnvelopeAxis::Axis(Axis3::X),
+                    reason: ShaderEnvelopeFailure::ErrorBudget { .. },
+                })
+            ),
+            "unexpected rejection: {rejection:?}"
+        );
+
+        let all_stationary_scale = (minimum_normal * 0.5).recip();
+        let all_stationary = ShaderLayerAffine::new(
+            LogicalLayerKey::new(0),
+            ScaleLevel::BASE,
+            GridToWorld::scale(
+                all_stationary_scale,
+                all_stationary_scale,
+                all_stationary_scale,
+            )
+            .unwrap(),
+            Shape3D::new(1, 1, 1).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            volume_layer_facts(
+                all_stationary,
+                volume_controls([1.0, 1.0, 1.0]),
+                RenderExtent::new(1, 1).unwrap(),
+            ),
+            Err(ShaderAdmissionError::ShaderCoordinateEnvelopeExceeded {
+                stage: ShaderEnvelopeStage::SubnormalDirection,
+                axis: ShaderEnvelopeAxis::All,
+                reason: ShaderEnvelopeFailure::AllDirectionsStationary,
+            })
+        ));
     }
 
     struct TestCharge(u64);

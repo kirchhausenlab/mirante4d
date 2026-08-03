@@ -28,8 +28,6 @@ pub(crate) fn frame_failure_kind_for_renderer_error(
         | Error::AdapterLimitsInsufficient
         | Error::DeviceLimitsInsufficient
         | Error::PipelineCompilerSpawnFailed
-        | Error::HiddenRefinementWorkerSpawnFailed
-        | Error::HiddenRefinementIdentityExhausted
         | Error::PipelineCompilationFailed { .. }
         | Error::DeviceLost
         | Error::DeviceOutOfMemory
@@ -41,16 +39,16 @@ pub(crate) fn frame_failure_kind_for_renderer_error(
         | Error::TextureRevisionExhausted
         | Error::RendererDeviceGenerationExhausted
         | Error::CoordinateLimitExceeded => FrameFailureKind::BackendLimit,
-        Error::UnsupportedView | Error::InvalidResourceGridCatalog => {
-            FrameFailureKind::InvalidTransform
-        }
+        Error::UnsupportedView
+        | Error::ShaderAdmission(_)
+        | Error::ShaderWorkEnvelopeMismatch
+        | Error::InvalidResourceGridCatalog => FrameFailureKind::InvalidTransform,
         Error::BackendValidation
         | Error::UnknownValidationCapture
         | Error::StaleValidationCapture
         | Error::ValidationCaptureFailed
         | Error::UnknownGpuTiming
         | Error::GpuTimingFailed
-        | Error::HiddenRefinementFailed
         | Error::PickCapacityExceeded
         | Error::PickTicketExhausted
         | Error::PickBackpressure

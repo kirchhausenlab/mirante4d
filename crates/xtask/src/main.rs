@@ -23,6 +23,7 @@ mod process;
 mod product_automation_progress;
 mod product_validate;
 mod reports;
+mod representative_static_rendering_recovery;
 mod t5_sentinel_oracle;
 mod target_fixture;
 mod verification;
@@ -94,6 +95,10 @@ fn main() -> anyhow::Result<()> {
             .map(|path| println!("{}", path.display())),
         "import-performance-t5-oracle-audit" => {
             import_performance_t5::run_oracle_audit(args.collect())
+        }
+        "representative-static-rendering-recovery" => {
+            representative_static_rendering_recovery::run(args.collect())
+                .map(|path| println!("{}", path.display()))
         }
         "__import-performance-t2-worker" => import_performance::run_worker(args.collect()),
         "docs-check" => documentation::docs_check(),
@@ -196,6 +201,8 @@ Mirante4D developer tasks
   cargo run --release -p xtask -- import-performance-t5 --config /absolute/private/config.json [--performance | --diagnostic]
   cargo run --release -p xtask -- import-performance-t5-publish --config /absolute/private/config.json --raw-report /absolute/private/raw-private-report.json
   cargo run --release -p xtask -- import-performance-t5-oracle-audit --config /absolute/private/config.json
+  cargo run --release -p xtask -- representative-static-rendering-recovery --config /absolute/private/config.json
+  cargo run --release -p xtask -- representative-static-rendering-recovery --raw-report /absolute/private/raw-report.json
   cargo xtask docs-check
   cargo xtask run-dev
 

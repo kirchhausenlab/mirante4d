@@ -91,6 +91,9 @@ cargo test -p mirante4d-render-wgpu \
 cargo test -p mirante4d-render-wgpu \
   coordinated_atomic_volume_strips_stay_hidden_and_match_the_direct_frame \
   -- --ignored --nocapture --test-threads=1
+cargo test -p mirante4d-render-wgpu \
+  volume_page_traversal_ \
+  -- --ignored --nocapture --test-threads=1
 cargo test --release -p mirante4d-render-wgpu \
   resident_coordinated_volume_gpu_timing -- --ignored --nocapture
 cargo test --release -p mirante4d-render-wgpu \
@@ -126,6 +129,13 @@ command uses the normal release application for independent pixel and mode
 facts. The former representative three-session and command-driven
 resident-navigation cadence scenarios were deleted because they did not
 establish visible continuity.
+
+The `volume_page_traversal_` filter runs the four registered trusted-GPU
+binary32 boundary cases. The full private A/B/C static-recovery campaign is
+documented in [Testing](TESTING.md); it requires three clean overlay commits,
+the designated workload and workstation, and
+`MIRANTE4D_XTASK_ALLOW_STATIC_RECOVERY=1`. Do not substitute an ordinary dirty
+working tree or a smaller public fixture for that evidence gate.
 
 `representative_temporal_playback` requires a multi-timepoint package. It
 uses 70 normal-product commands to exercise direct selection, fixed-scale

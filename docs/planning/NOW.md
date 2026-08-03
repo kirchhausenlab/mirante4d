@@ -5,6 +5,32 @@ Last updated: 2026-08-02
 ## Current Status
 
 The
+[viewer rendering correctness, recovery, and numerical cutover](../plans/active/VIEWER_RENDERING_CORRECTNESS_RECOVERY_AND_NUMERICAL_CUTOVER.md)
+is the owner-authorized corrective package after the 2026-08-02 read-only
+rendering audit. P1–P6 are implemented in the current working tree: complete
+logical-member reuse proof, one render-attempt/repaint authority, typed
+retryable and terminal outcomes, hidden-refinement and Pick terminality,
+capability-local pipeline/hidden failure, operation-scoped exhausted
+allocators, canonical binary32 affine/coordinate admissibility, and shared
+page traversal. The exact focused regressions and four trusted-GPU traversal
+cases pass. Direct trusted hidden-handoff and temporal pixel-replacement cases
+also pass. Current-tree real-display automation passes the 141-command render-
+mode matrix and 60-command native-navigation scenario. Existing rendering
+plans retain their valid architecture and historical evidence.
+
+The package is not closed. Its required pre-edit P0 baseline/overlay evidence
+was not captured before production implementation and is not being claimed
+retroactively. The private A/B/C orchestrator and evaluator are implemented,
+but the designated workload has not run, so P7/R11 performance recovery
+remains open. The local fixed-LOD matrix passes its separate `1.20` guard at a
+worst normalized ratio of `1.0181`; it does not close the cross-revision `1.05`
+gate. The attempted temporal normal-product run reached Exact/current t1 but
+its capture was inadmissible because the bundled fixture was clipped by the
+retained t0 transfer window. A suitable temporal workload, qualifying clean-
+revision trusted lane, and owner acceptance remain P8 work. No performance
+improvement or owner product-validated status is claimed.
+
+The
 [multichannel performance and visible-layer authority plan](../plans/active/VIEWER_MULTICHANNEL_PERFORMANCE_AND_VISIBLE_LAYER_AUTHORITY.md)
 closed on 2026-08-02 as a correctness-first package. Ordered visible layers
 and exact per-layer maps now own static rendering, empty visibility is
@@ -459,12 +485,22 @@ capture boundary exists.
 ## Next Package
 
 The
+[viewer rendering correctness, recovery, and numerical cutover](../plans/active/VIEWER_RENDERING_CORRECTNESS_RECOVERY_AND_NUMERICAL_CUTOVER.md)
+is the active owner-authorized viewer package. Its correctness cut is
+implemented, while P0 evidence ordering, P7 controlled performance evidence,
+and P8 integrated/product closeout remain open.
+The quarantined linked-S0 workflow, device recovery, GPU-budget changes,
+storage changes, reduced-resolution rendering, and speculative performance
+tuning remain outside it.
+
+The
 [multichannel performance and visible-layer authority plan](../plans/active/VIEWER_MULTICHANNEL_PERFORMANCE_AND_VISIBLE_LAYER_AUTHORITY.md)
 is closed. No new viewer implementation package is authorized by that
 closeout. Static multichannel performance recovery is an unresolved follow-up
-that must start with a controlled same-workload baseline/current comparison;
-the corrected static-to-playback isolation must remain green, and playback
-policy remains out of scope.
+now owned by the corrective plan above. It must use the
+plan's controlled matching-work baseline/current comparison; the corrected
+static-to-playback isolation must remain green, and playback policy remains
+out of scope.
 
 The
 [large-dataset preprocessing and storage cutover](../plans/active/LARGE_DATASET_PREPROCESSING_AND_STORAGE_CUTOVER.md),

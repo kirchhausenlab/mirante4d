@@ -200,6 +200,12 @@
       "listed_in": "docs/README.md"
     },
     {
+      "path": "docs/plans/active/VIEWER_RENDERING_CORRECTNESS_RECOVERY_AND_NUMERICAL_CUTOVER.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
       "path": "docs/plans/active/VIEWER_RESIDENT_3D_NAVIGATION_LADDER.md",
       "truth_scope": "target",
       "authorities": [],

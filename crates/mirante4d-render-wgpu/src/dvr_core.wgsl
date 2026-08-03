@@ -34,12 +34,22 @@ fn render_dvr_layer(
             continue;
         }
         let page = page_for_sample(layer_index, origin, direction, distance);
-        let next = segment_end_index(
+        let predicted_end = segment_end_index(
             entry,
             step,
             index,
             page_exit_distance(page, point, direction, distance, exit),
             count,
+        );
+        let next = page_segment_end_index(
+            layer_index,
+            page,
+            origin,
+            direction,
+            entry,
+            step,
+            index,
+            predicted_end,
         );
         if page.kind != PAGE_RESIDENT {
             result.covered = 0u;

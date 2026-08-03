@@ -5,14 +5,16 @@
 //! fixed-shape logical-target assembly used before an incremental physical
 //! demand delta is installed.
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use mirante4d_application::{
     ApplicationSnapshot, PresentationSlot, RenderCoordinationState, RenderIntentBase,
     RenderIntentMailbox, RenderIntentMailboxSnapshot, RenderIntentRevision,
     SourceSessionGeneration,
 };
-use mirante4d_domain::{CameraView, CrossSectionView, TimeIndex, ViewerLayout};
+use mirante4d_domain::{
+    CameraView, CrossSectionView, LogicalLayerKey, ScaleLevel, TimeIndex, ViewerLayout,
+};
 use mirante4d_render_api::{FrameCompleteness, PresentationTarget};
 use mirante4d_render_wgpu::CoordinatedPublicationGroup;
 
@@ -65,7 +67,6 @@ impl PresentationTransaction {
         self.cross_section
     }
 
-    #[cfg(test)]
     pub(crate) const fn publication_group(&self) -> CoordinatedPublicationGroup {
         match self.layout {
             ViewerLayout::Single3d => CoordinatedPublicationGroup::THREE_D,
@@ -326,65 +327,191 @@ impl ComposedPresentationScheduler {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TargetMaterialization {
-    Prepared,
-    Reused,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PresentationQuality {
+    layer_scales: Arc<BTreeMap<LogicalLayerKey, ScaleLevel>>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TargetAvailability {
-    prepared: u8,
-    reusable: u8,
+impl PresentationQuality {
+    pub(crate) fn exact(layer_scales: Arc<BTreeMap<LogicalLayerKey, ScaleLevel>>) -> Self {
+        Self { layer_scales }
+    }
+
+    pub(crate) fn layer_scales(&self) -> &Arc<BTreeMap<LogicalLayerKey, ScaleLevel>> {
+        &self.layer_scales
+    }
 }
 
-impl TargetAvailability {
-    pub(crate) const fn new() -> Self {
+/// Complete semantic member assembled before renderer-owned reuse
+/// classification. `prepared_request` is the immutable target request; no
+/// application-side prepared/reused bit exists after this boundary.
+#[derive(Debug)]
+pub(crate) struct PresentationTransactionMember<T> {
+    target: PresentationTarget,
+    source_generation: SourceSessionGeneration,
+    timepoint: TimeIndex,
+    spatial_frame: RenderIntentRevision,
+    surface_generation: u64,
+    quality: PresentationQuality,
+    prepared_request: T,
+}
+
+impl<T> PresentationTransactionMember<T> {
+    pub(crate) fn new(
+        target: PresentationTarget,
+        source_generation: SourceSessionGeneration,
+        timepoint: TimeIndex,
+        spatial_frame: RenderIntentRevision,
+        surface_generation: u64,
+        quality: PresentationQuality,
+        prepared_request: T,
+    ) -> Self {
         Self {
-            prepared: 0,
-            reusable: 0,
+            target,
+            source_generation,
+            timepoint,
+            spatial_frame,
+            surface_generation,
+            quality,
+            prepared_request,
         }
     }
 
-    pub(crate) fn mark_prepared(&mut self, target: PresentationTarget) {
-        self.prepared |= 1 << target.index();
+    pub(crate) const fn target(&self) -> PresentationTarget {
+        self.target
     }
 
-    pub(crate) fn mark_reusable(&mut self, target: PresentationTarget) {
-        self.reusable |= 1 << target.index();
+    pub(crate) const fn source_generation(&self) -> SourceSessionGeneration {
+        self.source_generation
+    }
+
+    pub(crate) const fn timepoint(&self) -> TimeIndex {
+        self.timepoint
+    }
+
+    pub(crate) const fn spatial_frame(&self) -> RenderIntentRevision {
+        self.spatial_frame
+    }
+
+    pub(crate) const fn surface_generation(&self) -> u64 {
+        self.surface_generation
+    }
+
+    pub(crate) const fn quality(&self) -> &PresentationQuality {
+        &self.quality
+    }
+
+    pub(crate) const fn prepared_request(&self) -> &T {
+        &self.prepared_request
+    }
+
+    pub(crate) const fn prepared_request_mut(&mut self) -> &mut T {
+        &mut self.prepared_request
+    }
+
+    pub(crate) fn into_prepared_request(self) -> T {
+        self.prepared_request
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LogicalTargetSet {
-    target_set: PlaybackTargetSet,
-    members: [Option<TargetMaterialization>; 4],
+#[derive(Debug)]
+pub(crate) enum PresentationTransactionTargets<T> {
+    ThreeD {
+        three_d: PresentationTransactionMember<T>,
+    },
+    FourPanel {
+        three_d: PresentationTransactionMember<T>,
+        xy: PresentationTransactionMember<T>,
+        xz: PresentationTransactionMember<T>,
+        yz: PresentationTransactionMember<T>,
+    },
 }
 
-impl LogicalTargetSet {
-    #[cfg(test)]
-    pub(crate) fn materialization(
-        &self,
-        target: PresentationTarget,
-    ) -> Option<TargetMaterialization> {
-        self.members[target.index()]
+impl<T> PresentationTransactionTargets<T> {
+    pub(crate) fn from_slots(
+        target_set: PlaybackTargetSet,
+        mut members: [Option<PresentationTransactionMember<T>>; 4],
+    ) -> Result<Self, MissingLogicalTarget> {
+        let mut take = |target: PresentationTarget| {
+            let Some(member) = members[target.index()].take() else {
+                return Err(MissingLogicalTarget(target));
+            };
+            if member.target != target {
+                return Err(MissingLogicalTarget(target));
+            }
+            Ok(member)
+        };
+        let targets = match target_set {
+            PlaybackTargetSet::ThreeD => Self::ThreeD {
+                three_d: take(PresentationTarget::ThreeD)?,
+            },
+            PlaybackTargetSet::FullLayout => Self::FourPanel {
+                three_d: take(PresentationTarget::ThreeD)?,
+                xy: take(PresentationTarget::Xy)?,
+                xz: take(PresentationTarget::Xz)?,
+                yz: take(PresentationTarget::Yz)?,
+            },
+        };
+        if let Some(member) = members.into_iter().flatten().next() {
+            return Err(MissingLogicalTarget(member.target));
+        }
+        Ok(targets)
     }
 
-    pub(crate) fn physical_targets(&self) -> Vec<PresentationTarget> {
-        PresentationTarget::ALL
-            .into_iter()
-            .filter(|target| {
-                let required = match self.target_set {
-                    PlaybackTargetSet::ThreeD => *target == PresentationTarget::ThreeD,
-                    PlaybackTargetSet::FullLayout => true,
-                };
-                required && self.members[target.index()] == Some(TargetMaterialization::Prepared)
-            })
-            .collect()
+    pub(crate) fn for_each_mut(
+        &mut self,
+        mut visit: impl FnMut(&mut PresentationTransactionMember<T>),
+    ) {
+        match self {
+            Self::ThreeD { three_d } => visit(three_d),
+            Self::FourPanel {
+                three_d,
+                xy,
+                xz,
+                yz,
+            } => {
+                visit(three_d);
+                visit(xy);
+                visit(xz);
+                visit(yz);
+            }
+        }
     }
 
-    pub(crate) fn physical_publication_group(&self) -> Option<CoordinatedPublicationGroup> {
-        CoordinatedPublicationGroup::exact_targets(self.physical_targets())
+    pub(crate) fn into_prepared_requests(self) -> FixedPresentationTargetRequests<T> {
+        match self {
+            Self::ThreeD { three_d } => {
+                FixedPresentationTargetRequests::ThreeD([three_d.into_prepared_request()])
+            }
+            Self::FourPanel {
+                three_d,
+                xy,
+                xz,
+                yz,
+            } => FixedPresentationTargetRequests::FourPanel([
+                three_d.into_prepared_request(),
+                xy.into_prepared_request(),
+                xz.into_prepared_request(),
+                yz.into_prepared_request(),
+            ]),
+        }
+    }
+}
+
+/// Fixed storage for the prepared requests of one complete logical
+/// transaction. The canonical array order is 3D, XY, XZ, YZ.
+#[derive(Debug)]
+pub(crate) enum FixedPresentationTargetRequests<T> {
+    ThreeD([T; 1]),
+    FourPanel([T; 4]),
+}
+
+impl<T> FixedPresentationTargetRequests<T> {
+    pub(crate) const fn as_slice(&self) -> &[T] {
+        match self {
+            Self::ThreeD(requests) => requests,
+            Self::FourPanel(requests) => requests,
+        }
     }
 }
 
@@ -395,44 +522,13 @@ impl fmt::Display for MissingLogicalTarget {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "temporal logical target {:?} is neither prepared nor compatibly reusable",
+            "temporal logical target {:?} has no prepared immutable request",
             self.0
         )
     }
 }
 
 impl std::error::Error for MissingLogicalTarget {}
-
-/// Assembles the fixed logical target set before physical scope mutation.
-/// Prepared wins when both facts are available; reuse is a real member, not a
-/// missing entry in a variable-length worker list.
-pub(crate) fn assemble_logical_targets(
-    target_set: PlaybackTargetSet,
-    availability: TargetAvailability,
-) -> Result<LogicalTargetSet, MissingLogicalTarget> {
-    let mut members = [None; 4];
-    for target in PresentationTarget::ALL {
-        let required = match target_set {
-            PlaybackTargetSet::ThreeD => target == PresentationTarget::ThreeD,
-            PlaybackTargetSet::FullLayout => true,
-        };
-        if !required {
-            continue;
-        }
-        let bit = 1 << target.index();
-        members[target.index()] = if availability.prepared & bit != 0 {
-            Some(TargetMaterialization::Prepared)
-        } else if availability.reusable & bit != 0 {
-            Some(TargetMaterialization::Reused)
-        } else {
-            return Err(MissingLogicalTarget(target));
-        };
-    }
-    Ok(LogicalTargetSet {
-        target_set,
-        members,
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -444,34 +540,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_four_panel_prepared_reused_partition_forms_one_complete_logical_frame() {
-        for prepared_bits in 0_u8..16 {
-            let mut availability = TargetAvailability::new();
-            let mut expected_physical = Vec::new();
-            for target in PresentationTarget::ALL {
-                let bit = 1 << target.index();
-                if prepared_bits & bit != 0 {
-                    availability.mark_prepared(target);
-                    expected_physical.push(target);
+    fn composed_physical_delta_matrix_keeps_complete_logical_members() {
+        let member = |target, renderer_will_reuse| {
+            PresentationTransactionMember::new(
+                target,
+                SourceSessionGeneration::new(7),
+                TimeIndex::new(3),
+                RenderIntentRevision::new(if target == PresentationTarget::ThreeD {
+                    11
                 } else {
-                    availability.mark_reusable(target);
-                }
-            }
-            let assembled =
-                assemble_logical_targets(PlaybackTargetSet::FullLayout, availability).unwrap();
-            assert_eq!(assembled.physical_targets(), expected_physical);
-            let physical_group = assembled.physical_publication_group();
-            assert_eq!(physical_group.is_some(), !expected_physical.is_empty());
-            if let Some(group) = physical_group {
-                assert!(group.exact_required());
-                for target in PresentationTarget::ALL {
-                    assert_eq!(group.contains(target), expected_physical.contains(&target));
-                }
-            }
-            assert!(
+                    13
+                }),
+                17 + target.index() as u64,
+                PresentationQuality::exact(Arc::new(BTreeMap::from([(
+                    LogicalLayerKey::new(0),
+                    ScaleLevel::new(1),
+                )]))),
+                renderer_will_reuse,
+            )
+        };
+        for reused_bits in 0_u8..16 {
+            let members = std::array::from_fn(|index| {
+                let target = PresentationTarget::ALL[index];
+                Some(member(target, reused_bits & (1 << target.index()) != 0))
+            });
+            let mut assembled =
+                PresentationTransactionTargets::from_slots(PlaybackTargetSet::FullLayout, members)
+                    .unwrap();
+            let mut observed = Vec::new();
+            assembled.for_each_mut(|member| {
+                observed.push((member.target(), *member.prepared_request()));
+            });
+            observed.sort_unstable_by_key(|(target, _)| target.index());
+            assert_eq!(
+                observed,
                 PresentationTarget::ALL
                     .into_iter()
-                    .all(|target| assembled.materialization(target).is_some())
+                    .map(|target| (target, reused_bits & (1 << target.index()) != 0))
+                    .collect::<Vec<_>>()
             );
         }
     }

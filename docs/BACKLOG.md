@@ -5,12 +5,15 @@ contains unresolved work only.
 
 ## Deferred
 
-- Recover static multichannel viewer performance after the correctness-first
-  visible-layer cut. Entry requires a controlled same-dataset, same-hardware
-  baseline/current comparison covering selected and displayed per-layer maps,
-  interaction latency, settlement time, I/O/decode/upload work, and GPU timing.
-  Preserve visible-layer authority, scientific semantics, native output, and
-  atomic presentation; playback requires separate explicit authorization.
+- Complete the owner-authorized
+  [viewer rendering correctness, recovery, and numerical cutover](plans/active/VIEWER_RENDERING_CORRECTNESS_RECOVERY_AND_NUMERICAL_CUTOVER.md)
+  after its implemented P1–P6 correctness cut. Its pre-edit P0 evidence was
+  not captured and remains unclaimed; the designated private A/B/C P7
+  matching-work campaign and any measurement-selected correction remain open.
+  The mapped render-mode and native-navigation scenarios pass, while a
+  suitable non-clipped temporal workload, qualifying clean-revision trusted
+  lane, and owner acceptance remain P8 work. No separate speculative
+  performance branch is active.
 - Add float16 TIFF/storage/rendering/analysis support only through a separate
   dtype capability plan.
 - Support mixed-dtype channel publication only through a separate physical

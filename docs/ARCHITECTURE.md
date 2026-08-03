@@ -1,6 +1,6 @@
 # Architecture
 
-Last updated: 2026-08-01
+Last updated: 2026-08-02
 
 Mirante4D is a native Rust desktop viewer and analysis workbench. It opens
 strict `.m4d` packages; source microscopy data enters through explicit
@@ -416,12 +416,29 @@ discard the playback session's prepared body.
 
 The scheduler assembles a fixed logical target set before deriving physical
 work: standalone 3D contains exactly 3D, while four-panel contains exactly 3D,
-XY, XZ, and YZ. Each member is either newly prepared or reused after proving
-its exact source, timepoint, scale map, spatial revision, extent, immutable
-body, and renderer lineage. Validation sees the complete logical set. A
-separate projection then yields an empty, partial, or complete physical delta;
-an empty delta completes without GPU work, and a partial delta receives an
-exact atomic publication group for only its changed targets.
+XY, XZ, and YZ. The intended member contract is exact source, timepoint, scale
+map, spatial revision, extent, immutable body, prefetch role, and renderer
+lineage. It sends that complete typed set to the renderer before physical work
+is known. The renderer compares each member with its private current front,
+including the exact immutable requirement body and promoted-prefetch role,
+and returns both every logical disposition and the physical recorded-target
+list. A mixed transaction can therefore rebuild any subset without losing
+the complete transaction identity. The all-reused case is also validated
+inside the renderer against current target allocation, surface generation,
+front, texture, and device lineage and performs no transfer, pipeline, color,
+or submission work.
+
+One application `RenderAttemptCoordinator` owns color execution admission,
+fingerprint-scoped deterministic failure, causal waiting, displayed-fidelity
+projection, and repaint eligibility. Its fingerprint contains the complete
+logical member contracts plus dataset/runtime/capacity/device epochs. A wait
+names one exact key: logical member, mailbox revision, candidate plan,
+InitialRender capability, submission completion, eviction acknowledgement,
+relevant residency, or hidden job. The backend-neutral renderer event sink is
+weak and coalescing; it makes one matching wait ready for one admission, while
+an already-consumed `Ready` fingerprint cannot execute again. Retryable
+pressure never rewrites the retained front as incomplete, and stable failed,
+color-unavailable, or renderer-terminal state owns no polling repaint.
 
 Pause or Stop creates a retained-quality transaction after application
 reconciliation has established the final render-intent revisions. The current
@@ -513,6 +530,26 @@ so channel ordering cannot change the optical result. ISO hits are depth
 ordered, and gradients are transformed to world space by the inverse-
 transpose affine.
 
+All volume and Pick paths now import one representation-level traversal
+contract. Each grid-direction component is first quantized to binary32;
+subnormal components are canonical stationary only when the host work
+envelope proves their discarded displacement stays strictly below the shared
+half-voxel error budget. Remaining normal components use exact sign/zero
+classification for both intersection and page exit. An outward page quotient
+is evaluated only when its boundary is provably before the finite ray exit,
+so an irrelevant positive overflow clamps to that exit rather than becoming a
+NaN or stationary axis.
+
+`segment_end_index` is the sole monotone-progress authority. Because a
+continuous quotient can still disagree with an actual binary32 sample at a
+page or general-DVR layer-entry boundary, the shared helper validates the
+predicted exclusive sample against the represented page/state and, only on a
+mismatch, finds the first transition with a bounded binary search. MIP, fused
+and general DVR, ISO, authored Mixed, SmoothLinear, and Pick consume these
+mechanics. Trusted Vulkan fixtures compare both directions around the former
+epsilon, exact zero, admitted/rejected subnormal cases, and far-boundary
+overflow with independent color, coverage, validity, and Pick facts.
+
 One renderer-global first-seen queue owns pending decoded lease handles.
 Admitting an offer appends its key to the derived relevant-order index of each
 live opaque frame lease whose immutable body contains that key. Acquiring or
@@ -560,6 +597,25 @@ waits behind at most that batch rather than an old full-panel fine ray pass.
 A request-body, frame, or extent mismatch cancels the old job and suppresses
 its result. Partial rows cannot capture, publish, become pick authority, or
 change texture revision.
+
+Hidden refinement has its own permanent capability state and cause-preserving
+outcomes. Worker spawn failure, hidden-job identity exhaustion, and a worker
+panic disable only future hidden work; an independently admissible direct or
+Plane color pass remains usable. A timeout retains the exact in-flight
+submission lease, discards its private candidate only after known completion,
+and permits at most one fresh fingerprint-scoped retry. A second timeout is
+quiescent. Result publication and terminal cleanup share one acceptance gate,
+so a late worker cannot repopulate a cleared queue or wake the application.
+Observed device loss, out-of-memory, or backend-internal failure still enters
+the renderer-global first-cause latch.
+
+InitialRender and Pick pipeline compilation likewise have independent
+capability states. A Pick validation/compiler-worker failure terminates every
+pending Pick ticket with a typed result but cannot poison already-ready color.
+An InitialRender-local failure projects color unavailable across later
+fingerprints. Device-level compilation causes promote through the same global
+terminal latch and invalidate both capabilities; no local capability state
+can continue after an unsafe device cause.
 
 Completion places one bounded result and requests one application wake. It
 does not request a repaint per row or use the visible vsynced presentation
@@ -654,6 +710,20 @@ This is the sole renderer construction path. Focused GPU tests also request
 their Vulkan device externally and poll this background readiness protocol;
 there is no blocking or renderer-owned-instance test constructor.
 
+`PipelineState` publishes InitialRender and Pick capability independently.
+Validation or worker-lifecycle failure is retained by the capability whose
+stage failed; only an OOM/backend-internal/device cause enters the global
+first-cause latch. Pick failure drains pending tickets to a typed terminal
+result, while an already-ready InitialRender capability remains usable.
+
+Renderer construction no longer depends on the dedicated hidden-refinement
+worker. Spawn failure installs a permanent hidden-only capability cause.
+Hidden-job, private-presentation, and texture-revision allocators each record
+their own one-way exhaustion fact and preflight only operations that need that
+identity. Existing allocations and unrelated direct, Plane, Pick, capture, or
+timing work remain eligible; no exhausted checked allocator is re-entered on a
+later fingerprint.
+
 One exhaustive private color-kernel selector maps every cross-section to the
 dedicated Plane pipeline, homogeneous volume stacks to their MIP/DVR/ISO
 family, and heterogeneous stacks to Mixed. Plane is composed only from shared
@@ -741,7 +811,7 @@ submission. Readmission cancels its pending event before a new victim is
 recorded, so even a full net-neutral transaction never exceeds the bound.
 
 The same renderer path supports MIP, DVR, ISO, orthographic and perspective
-projection, full finite affine transforms, voxel-exact and SmoothLinear
+projection, render-admitted finite affine transforms, voxel-exact and SmoothLinear
 sampling, flat and gradient-lit ISO, and attached or detached light. It also
 owns latest-only asynchronous compute picks against an exact presented
 page/arena snapshot. MIP argmax, first ISO threshold, and maximum DVR opacity
@@ -761,7 +831,14 @@ may be empty. Ideal, capacity-selected, frozen-navigation, and displayed
 quality remain exact per-layer maps; a scalar exists only as an explicitly
 uniform nonempty summary. Empty visibility commits empty demand and publishes
 the intentional empty surface instead of retaining an old front or entering a
-planning retry.
+planning retry. The canonical zero-visible-layer cutoff precedes asynchronous
+demand-result consumption: it removes every fixed-target renderer front and
+its frame lease before the zero-body aggregate union is preflighted. Native
+binding identity is retired in that same cutoff, while the underlying egui
+registration is freed at the next UI-turn boundary so a paint list already
+resolved in the current turn remains valid. Repeated empty observation is
+quiescent, and restoring any channel re-enters the ordinary demand and
+publication path.
 
 The UI evaluates bounded demand signatures. The affine cell footprint in the
 physical pixels of the actual 3D or cross-section view produces an independent
@@ -933,6 +1010,27 @@ candidate may retain the fifth opaque lease only while staging an atomic exact
 3D replacement; there is no public presentation-token allocator. The old 256-record,
 128-lease, and 16,384-global-dimension ceilings are deleted.
 
+Rendering metadata is admitted through one `ValidatedShaderAffine` and one
+target work envelope before demand or renderer submission. The affine
+authority quantizes the exact controls the shader consumes, rejects true
+singularity and excessive normalized condition separately, and returns
+outward-rounded inverse/control error intervals rather than using an absolute
+determinant magnitude. Plane and volume envelopes add the complete viewport,
+camera/ray, interpolation/gradient, general-DVR span, and sample-construction
+error. Grid ends and sample counts are accepted through `2^23` and rejected at
+`2^23 + 1` before u32-to-f32 aliasing can occur. Dataset layer/scale affine
+results are bounded and semantically cached; per-target work-envelope results
+are latest-only and verify the exact viewport, layer order, schedule, and
+affine identities carried into the renderer.
+
+Orthographic planning consumes the validated camera quaternion axes and
+stable relative near-plane arithmetic. It does not reconstruct a basis from
+`target - eye`, so a tiny positive camera distance or a large translated
+target cannot create an unrelated false camera-math failure. Scale-dependent
+precision refusal returns a typed candidate rejection to the existing
+monotone LOD selector; no caller bypasses the envelope or silently clamps a
+coordinate.
+
 The WGPU runtime shares one `OnceLock`-backed terminal-failure latch with the
 device-loss and uncaptured-error callbacks. The first observed device loss,
 out-of-memory, backend-internal, or validation cause wins. Frame, poll,
@@ -940,6 +1038,13 @@ submission, and mapped-buffer boundaries return that typed cause before
 continuing unsafe work. Cleanup remains usable, but there is deliberately no
 device-recovery epoch, CPU renderer, silent backend fallback, or second
 application-wide GPU latch.
+
+On terminal entry the renderer disables hidden-result acceptance and retires
+non-executable hidden, residency, capture, timing, and Pick background
+ownership without issuing unsafe device work. Application background
+scheduling consults the terminal attempt projection before renderer queues;
+raw pending bookkeeping cannot retain an immediate or 50 ms wake. This is
+cleanup and quiescence only—there remains no device-recovery epoch.
 
 ## Persistence And Settings
 

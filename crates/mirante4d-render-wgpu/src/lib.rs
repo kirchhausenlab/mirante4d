@@ -16,7 +16,7 @@ use mirante4d_render_api::RenderResourceGridCatalog;
 use mirante4d_render_api::{
     FrameIdentity, FrameProgress, GpuLedgerCategory, PreparedRenderRequirements,
     PresentationTarget, RenderExtent, RenderExtentEnvelope, RenderIntent, RenderPassKind,
-    RenderRequirements, VolumePickQuery, VolumePickResult, VolumePickTicket,
+    RenderRequirements, ShaderAdmissionError, VolumePickQuery, VolumePickResult, VolumePickTicket,
 };
 use thiserror::Error;
 
@@ -122,6 +122,17 @@ pub enum VolumeColorSchedule {
     Direct,
     InteractivePreview,
     AtomicRefinement { strip_height_pixels: u32 },
+}
+
+/// Renderer-owned classification of one complete logical-frame member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinatedMemberDisposition {
+    /// The current front was revalidated against the complete request without
+    /// recording or submitting color work.
+    Reused,
+    /// The member required renderer execution during this cutoff, whether or
+    /// not backpressure allowed it to publish yet.
+    Executed,
 }
 
 /// Hidden exact-volume construction progress for one coordinated cutoff.
@@ -373,6 +384,59 @@ impl<'a> CoordinatedTargetRequest<'a> {
     }
 }
 
+/// Fixed-shape renderer boundary for a complete logical presentation
+/// transaction. Physical reuse/execution is intentionally absent from this
+/// type and is classified only after the renderer observes every member.
+#[derive(Debug, Clone, Copy)]
+pub enum CoordinatedLogicalTargetSet<'a> {
+    ThreeD {
+        three_d: CoordinatedTargetRequest<'a>,
+    },
+    FourPanel {
+        three_d: CoordinatedTargetRequest<'a>,
+        xy: CoordinatedTargetRequest<'a>,
+        xz: CoordinatedTargetRequest<'a>,
+        yz: CoordinatedTargetRequest<'a>,
+    },
+}
+
+impl<'a> CoordinatedLogicalTargetSet<'a> {
+    pub fn three_d(three_d: CoordinatedTargetRequest<'a>) -> Result<Self, WgpuRenderRuntimeError> {
+        if three_d.target() != PresentationTarget::ThreeD {
+            return Err(WgpuRenderRuntimeError::CoordinatedTargetViewMismatch {
+                target: three_d.target(),
+            });
+        }
+        Ok(Self::ThreeD { three_d })
+    }
+
+    pub fn four_panel(
+        three_d: CoordinatedTargetRequest<'a>,
+        xy: CoordinatedTargetRequest<'a>,
+        xz: CoordinatedTargetRequest<'a>,
+        yz: CoordinatedTargetRequest<'a>,
+    ) -> Result<Self, WgpuRenderRuntimeError> {
+        for (request, expected) in [
+            (three_d, PresentationTarget::ThreeD),
+            (xy, PresentationTarget::Xy),
+            (xz, PresentationTarget::Xz),
+            (yz, PresentationTarget::Yz),
+        ] {
+            if request.target() != expected {
+                return Err(WgpuRenderRuntimeError::CoordinatedTargetViewMismatch {
+                    target: request.target(),
+                });
+            }
+        }
+        Ok(Self::FourPanel {
+            three_d,
+            xy,
+            xz,
+            yz,
+        })
+    }
+}
+
 /// Consequences for one logical target in a coordinated cutoff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatedTargetExecutionReport {
@@ -382,6 +446,8 @@ pub struct CoordinatedTargetExecutionReport {
     frame: FrameIdentity,
     progress: Option<FrameProgress>,
     presented: bool,
+    current: bool,
+    disposition: CoordinatedMemberDisposition,
     visited_resources: usize,
     uploaded_resources: usize,
     payload_upload_bytes: u64,
@@ -389,7 +455,9 @@ pub struct CoordinatedTargetExecutionReport {
     residency_command_buffers: u32,
     residency_queue_submissions: u32,
     deferred_by_backpressure: bool,
-    volume_refinement: Option<VolumeRefinementProgress>,
+    actionable_work_remaining: bool,
+    hidden_refinement: Option<HiddenRefinementState>,
+    hidden_refinement_job: Option<u64>,
     validation_capture: Option<CoordinatedValidationCaptureTicket>,
     newly_resident_keys: Box<[BrickKey]>,
     evicted_keys: Box<[BrickKey]>,
@@ -420,6 +488,16 @@ impl CoordinatedTargetExecutionReport {
         self.presented
     }
 
+    /// True only when the renderer's current front satisfies this complete
+    /// logical request at the report's locked observation.
+    pub const fn current(&self) -> bool {
+        self.current
+    }
+
+    pub const fn disposition(&self) -> CoordinatedMemberDisposition {
+        self.disposition
+    }
+
     pub const fn visited_resources(&self) -> usize {
         self.visited_resources
     }
@@ -448,8 +526,45 @@ impl CoordinatedTargetExecutionReport {
         self.deferred_by_backpressure
     }
 
+    /// True when another coordinated execution can consume renderer-owned
+    /// work immediately without waiting for a new application-side input.
+    ///
+    /// This fact is captured with the complete cutoff report so callers never
+    /// need a second, target-by-target renderer query that could observe a
+    /// different front/candidate state.
+    pub const fn actionable_work_remaining(&self) -> bool {
+        self.actionable_work_remaining
+    }
+
     pub const fn volume_refinement(&self) -> Option<VolumeRefinementProgress> {
-        self.volume_refinement
+        match self.hidden_refinement {
+            Some(
+                HiddenRefinementState::Running(progress)
+                | HiddenRefinementState::WaitingForSubmission { progress, .. }
+                | HiddenRefinementState::Complete(progress),
+            ) => Some(progress),
+            Some(
+                HiddenRefinementState::RetryReady
+                | HiddenRefinementState::Failed(_)
+                | HiddenRefinementState::CapabilityFailed(_),
+            )
+            | None => None,
+        }
+    }
+
+    /// Renderer-owned lifecycle of an exact volume built behind the safe
+    /// visible predecessor. Local timeout and worker-capability failures are
+    /// report state, not renderer-global errors.
+    pub const fn hidden_refinement(&self) -> Option<HiddenRefinementState> {
+        self.hidden_refinement
+    }
+
+    /// Exact worker identity whose completion can advance a reported hidden
+    /// wait. This is populated only while `hidden_refinement` is `Running` or
+    /// `WaitingForSubmission`, so a caller never has to perform a second
+    /// target query against a later renderer observation.
+    pub const fn hidden_refinement_job(&self) -> Option<u64> {
+        self.hidden_refinement_job
     }
 
     pub const fn validation_capture(&self) -> Option<CoordinatedValidationCaptureTicket> {
@@ -721,6 +836,111 @@ pub enum PipelineCompilationFailureCause {
     BackendInternal,
     WorkerPanicked,
     WorkerStopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineCapabilityStatus {
+    Compiling,
+    Ready,
+    Failed(PipelineCompilationFailureCause),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineCapabilityStatuses {
+    initial_render: PipelineCapabilityStatus,
+    pick: PipelineCapabilityStatus,
+}
+
+impl PipelineCapabilityStatuses {
+    pub const fn initial_render(self) -> PipelineCapabilityStatus {
+        self.initial_render
+    }
+
+    pub const fn pick(self) -> PipelineCapabilityStatus {
+        self.pick
+    }
+}
+
+/// Backend-neutral, coalescible notification into the native event loop.
+///
+/// Producers commit their authoritative result before invoking this sink. A
+/// notification therefore asks the application to reread renderer state; it
+/// is never itself permission to submit or repaint color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RendererEvent {
+    /// One compiler capability published its next ordered state.
+    PipelineCapabilityChanged(PipelineCapability),
+    /// The queue completed this runtime-owned submission and every earlier
+    /// runtime-owned submission. Identities are monotone within one renderer
+    /// device generation.
+    SubmissionCompleted { submission: u64 },
+    /// The hidden-refinement worker published a result, or an already timed-
+    /// out submission for this exact job reached queue completion.
+    HiddenWorkerResult { job: u64 },
+    /// A bounded Pick map completed. This can wake auxiliary polling but never
+    /// authorizes a color attempt.
+    PickMapCompleted,
+}
+
+#[derive(Clone)]
+pub struct RendererEventSink {
+    wake: Arc<dyn Fn(RendererEvent) + Send + Sync + 'static>,
+}
+
+impl RendererEventSink {
+    pub fn new(wake: impl Fn(RendererEvent) + Send + Sync + 'static) -> Self {
+        Self {
+            wake: Arc::new(wake),
+        }
+    }
+
+    pub fn wake(&self, event: RendererEvent) {
+        (self.wake)(event);
+    }
+}
+
+impl std::fmt::Debug for RendererEventSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RendererEventSink(..)")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiddenRefinementCapabilityFailure {
+    WorkerSpawnFailed,
+    WorkerPanicked,
+    JobIdentityExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiddenRefinementFailure {
+    SubmissionTimedOutTwice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiddenRefinementAfterCompletion {
+    RetryOnce,
+    FailRequest(HiddenRefinementFailure),
+    FailCapability(HiddenRefinementCapabilityFailure),
+}
+
+/// Public, operation-local state of exact hidden volume refinement.
+///
+/// A timed-out submission remains owned until its exact queue-completion
+/// callback fires. `WaitingForSubmission` therefore names the transition that
+/// is permitted after completion; observing this state never authorizes a
+/// duplicate submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiddenRefinementState {
+    Running(VolumeRefinementProgress),
+    WaitingForSubmission {
+        progress: VolumeRefinementProgress,
+        after_completion: HiddenRefinementAfterCompletion,
+    },
+    RetryReady,
+    Failed(HiddenRefinementFailure),
+    CapabilityFailed(HiddenRefinementCapabilityFailure),
+    Complete(VolumeRefinementProgress),
 }
 
 /// Stable counters and sanitized adapter facts for the product runtime.
@@ -1428,7 +1648,7 @@ impl ValidationCapture {
 }
 
 /// Typed, backend-neutral failures from the product GPU runtime.
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, Copy, PartialEq)]
 pub enum WgpuRenderRuntimeError {
     #[error("the WGPU runtime configuration is invalid")]
     InvalidConfiguration,
@@ -1442,12 +1662,6 @@ pub enum WgpuRenderRuntimeError {
     DeviceLimitsInsufficient,
     #[error("the bounded GPU pipeline compiler worker could not be started")]
     PipelineCompilerSpawnFailed,
-    #[error("the bounded hidden-refinement worker could not be started")]
-    HiddenRefinementWorkerSpawnFailed,
-    #[error("the renderer exhausted its hidden-refinement job identity space")]
-    HiddenRefinementIdentityExhausted,
-    #[error("hidden exact refinement failed before atomic promotion")]
-    HiddenRefinementFailed,
     #[error("{capability:?} GPU pipeline compilation failed with first cause {cause:?}")]
     PipelineCompilationFailed {
         capability: PipelineCapability,
@@ -1465,8 +1679,9 @@ pub enum WgpuRenderRuntimeError {
     FrameContractMismatch,
     #[error("the requested render extent exceeds 1920x1080")]
     ExtentExceeded,
-    #[error("render frame {actual:?} is stale relative to {current:?}")]
+    #[error("render frame {actual:?} for {target:?} is stale relative to {current:?}")]
     StaleFrame {
+        target: Option<PresentationTarget>,
         actual: FrameIdentity,
         current: FrameIdentity,
     },
@@ -1522,6 +1737,10 @@ pub enum WgpuRenderRuntimeError {
     PayloadContractMismatch,
     #[error("the product renderer does not support this view transform")]
     UnsupportedView,
+    #[error("the requested view is outside the validated shader envelope: {0}")]
+    ShaderAdmission(ShaderAdmissionError),
+    #[error("the supplied shader-work envelope does not match the target request")]
+    ShaderWorkEnvelopeMismatch,
     #[error("semantic coordinates exceed the bounded GPU metadata representation")]
     CoordinateLimitExceeded,
     #[error("frame control metadata exceeds its 8-MiB ceiling")]
@@ -1687,11 +1906,31 @@ impl WgpuRenderRuntime {
         self.inner.diagnostics()
     }
 
-    /// Installs the native event-loop wake used only when hidden exact work
-    /// reaches a terminal handoff. Hidden batches never use this callback as
-    /// their scheduling clock.
-    pub fn set_hidden_refinement_wake(&mut self, wake: Arc<dyn Fn() + Send + Sync + 'static>) {
-        self.inner.set_hidden_refinement_wake(wake);
+    /// Opaque identity of the WGPU device generation owned by this runtime.
+    pub const fn device_generation(&self) -> RendererDeviceGeneration {
+        self.inner.device_generation()
+    }
+
+    /// Returns the exact next queue-completion event capable of changing a
+    /// bounded submission-cleanup/backpressure result.
+    pub fn next_submission_completion_event(&self) -> u64 {
+        self.inner.next_submission_completion_event()
+    }
+
+    /// Returns the current hidden-refinement job for a fixed logical target.
+    /// The identity is used only to key the worker-result wake; it exposes no
+    /// renderer-owned allocation or submission handle.
+    /// Installs the single event-loop sink used by asynchronous renderer
+    /// capabilities and hidden refinement.
+    pub fn set_renderer_event_sink(&mut self, sink: RendererEventSink) {
+        self.inner.set_renderer_event_sink(sink);
+    }
+
+    /// Retires CPU-side retry, readback, lease-offer, and event-wake
+    /// ownership after the global GPU latch becomes terminal. This performs
+    /// no device or queue operation and does not attempt recovery.
+    pub fn retire_terminal_work(&mut self) {
+        self.inner.retire_terminal_work();
     }
 
     /// Returns the last readiness state observed by the runtime, or the first
@@ -1716,6 +1955,22 @@ impl WgpuRenderRuntime {
         capability: PipelineCapability,
     ) -> Result<bool, WgpuRenderRuntimeError> {
         self.inner.pipeline_capability_is_ready(capability)
+    }
+
+    /// Truthful independent state for color and Pick pipeline capabilities.
+    pub fn pipeline_capability_statuses(
+        &self,
+    ) -> Result<PipelineCapabilityStatuses, WgpuRenderRuntimeError> {
+        self.inner.pipeline_capability_statuses()
+    }
+
+    /// Consumes at most one compiler event and returns independent capability
+    /// state. Capability-local failure is represented in the value; only a
+    /// device-global first cause is returned as an error.
+    pub fn poll_pipeline_capability_statuses(
+        &mut self,
+    ) -> Result<PipelineCapabilityStatuses, WgpuRenderRuntimeError> {
+        self.inner.poll_pipeline_capability_statuses()
     }
 
     /// Applies the complete desired subset of the fixed four-target layout.
@@ -1803,6 +2058,31 @@ impl WgpuRenderRuntime {
     ///
     /// Eligible resident color passes are recorded active-first into one
     /// command encoder and use exactly one uninstrumented color submission.
+    pub fn execute_coordinated_logical_frame(
+        &mut self,
+        catalog: &DatasetCatalog,
+        active_target: PresentationTarget,
+        targets: CoordinatedLogicalTargetSet<'_>,
+    ) -> Result<CoordinatedFrameExecutionReport, WgpuRenderRuntimeError> {
+        match targets {
+            CoordinatedLogicalTargetSet::ThreeD { three_d } => self
+                .inner
+                .execute_coordinated_frame(catalog, active_target, std::slice::from_ref(&three_d)),
+            CoordinatedLogicalTargetSet::FourPanel {
+                three_d,
+                xy,
+                xz,
+                yz,
+            } => {
+                let targets = [three_d, xy, xz, yz];
+                self.inner
+                    .execute_coordinated_frame(catalog, active_target, &targets)
+            }
+        }
+    }
+
+    /// Executes a nontransactional physical request cohort. Composed Exact
+    /// transactions must use [`Self::execute_coordinated_logical_frame`].
     pub fn execute_coordinated_frame(
         &mut self,
         catalog: &DatasetCatalog,

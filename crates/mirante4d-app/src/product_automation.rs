@@ -512,13 +512,87 @@ fn coordinated_visible_layout_current_complete_with_snapshot(
             surface.display_current()
                 && demand_currentness.cross_section(panel)
                 && surface.cross_section_schedule().is_some_and(|schedule| {
-                    schedule.status == crate::CrossSectionPanelScheduleStatus::Current
+                    matches!(
+                        schedule.status,
+                        crate::CrossSectionPanelScheduleStatus::Current
+                            | crate::CrossSectionPanelScheduleStatus::Empty
+                    )
                 })
                 && surface.layer_presentations().iter().all(|layer| {
                     layer.current && layer.available_requirements == layer.total_requirements
                 })
         }),
     }
+}
+
+fn assert_empty_visible_presentation(
+    app: &MiranteWorkbenchApp,
+    snapshot: &ApplicationSnapshot,
+) -> Result<(), String> {
+    let view = application_view(snapshot);
+    if view.layers().iter().any(|layer| layer.visible()) {
+        return Err("empty presentation assertion still has a visible layer".to_owned());
+    }
+    if !app
+        .dataset
+        .current_target_layer_scales()
+        .is_some_and(|scales| scales.is_empty())
+    {
+        return Err("empty presentation has no current explicit-empty target scale map".to_owned());
+    }
+    let fidelity = &app.render_coordination.frame_fidelity;
+    if fidelity.backend != crate::RenderBackend::Empty
+        || fidelity.completeness != FrameCompleteness::Complete
+        || fidelity.display_freshness != DisplayedFrameFreshness::Current
+        || fidelity.reason != crate::LodDecisionReason::NoVisibleData
+        || fidelity.displayed_scale_level.is_some()
+        || fidelity.last_failure_kind.is_some()
+        || fidelity.last_capacity_error.is_some()
+    {
+        return Err(format!(
+            "3D empty fidelity mismatch: backend={:?}, completeness={:?}, freshness={:?}, reason={:?}, scale={:?}, failure={:?}, error={:?}",
+            fidelity.backend,
+            fidelity.completeness,
+            fidelity.display_freshness,
+            fidelity.reason,
+            fidelity.displayed_scale_level,
+            fidelity.last_failure_kind,
+            fidelity.last_capacity_error,
+        ));
+    }
+    let targets: &[PresentationSlot] = match view.layout() {
+        ViewerLayout::Single3d => &PresentationSlot::ALL[..1],
+        ViewerLayout::FourPanel => &PresentationSlot::ALL,
+    };
+    for target in targets.iter().copied() {
+        let surface = app.render_coordination.surface(target);
+        if surface.presented_frame().is_some()
+            || !surface.layer_presentations().is_empty()
+            || app
+                .native_presentation
+                .texture_binding_identity(target)
+                .is_some()
+        {
+            return Err(format!(
+                "{target:?} retained frame, layer, or native texture authority after empty publication"
+            ));
+        }
+        if target.is_cross_section()
+            && (!surface.display_current()
+                || !surface.cross_section_schedule().is_some_and(|schedule| {
+                    schedule.status == crate::CrossSectionPanelScheduleStatus::Empty
+                        && schedule.reason == crate::CrossSectionPanelScheduleReason::NoSelectedData
+                }))
+        {
+            return Err(format!(
+                "{target:?} is not a current explicit-empty linked surface"
+            ));
+        }
+    }
+    if app.render_attempt.wake() != crate::display_refresh::RenderWake::None {
+        return Err("empty presentation retained immediate renderer/composition work".to_owned());
+    }
+    Ok(())
 }
 
 fn visible_product_panels(snapshot: &ApplicationSnapshot) -> Vec<PanelId> {
@@ -4300,6 +4374,14 @@ impl ProductAutomationController {
                 request, &hit, x_fraction, y_fraction,
             )));
         }
+        if let Some((_request, terminal)) =
+            app.viewer_pick_queue.take_automation_terminal_for(purpose)
+        {
+            return Err(format!(
+                "{} ended without a scientific result: {terminal:?}",
+                automation_pick_purpose_name(purpose)
+            ));
+        }
         match app.native_presentation.pick_pipeline_is_ready() {
             Ok(true) => {}
             Ok(false) => return Ok(CommandProgress::Waiting),
@@ -4352,7 +4434,7 @@ impl ProductAutomationController {
             ProductAutomationWaitCondition::RuntimeIdle => {
                 let progressive_render_work =
                     crate::workbench_playback_runtime::progressive_render_submission_work(
-                        &app.native_presentation,
+                        &app.render_attempt,
                     );
                 let demand_currentness = app.visible_demand_plan_currentness();
                 let exact_visible_demand = demand_currentness.current_3d
@@ -4368,11 +4450,13 @@ impl ProductAutomationController {
                         &app.dataset,
                         &app.render_coordination,
                         &app.native_presentation,
+                        &app.render_attempt,
                         progressive_render_work.any_required,
                     ),
                     app.dataset.visible_demand_plan_outstanding(),
                     app.pending_visible_demand_plan.is_some(),
                 ) && app.render_intent_mailbox.active_target(base).is_none()
+                    && !app.shader_work_envelopes.has_pending_work()
                     && app.resident_cross_section_coverage.is_none()
                     && exact_visible_demand
             }
@@ -4521,6 +4605,9 @@ impl ProductAutomationController {
                 } else {
                     Ok(())
                 }
+            }
+            ProductAutomationAssertCondition::EmptyPresentation => {
+                assert_empty_visible_presentation(app, &snapshot)
             }
             ProductAutomationAssertCondition::FrameFidelity {
                 scale_level,

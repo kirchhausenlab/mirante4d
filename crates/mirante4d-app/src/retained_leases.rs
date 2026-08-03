@@ -173,13 +173,6 @@ impl RetainedLeases {
         Self::default()
     }
 
-    /// Monotonic identity for the exact CPU lease cohort visible to the
-    /// renderer. Deterministic render failures may be suppressed only while
-    /// this input generation remains unchanged.
-    pub(crate) const fn generation(&self) -> u64 {
-        self.generation
-    }
-
     /// Atomically replaces the union of current semantic requirements.
     /// Atomically replaces the requirement set and returns the number of
     /// previously retained lease handles retired by that replacement.

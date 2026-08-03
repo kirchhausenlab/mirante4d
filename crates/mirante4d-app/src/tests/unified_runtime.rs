@@ -1558,8 +1558,7 @@ fn incremental_linked_zoom_pixels_match_direct_fine_cpu_oracle_after_one_settlem
     renderer
         .activate_dataset_generation(app.application.snapshot().catalog())
         .expect("the headless renderer activates the same product dataset");
-    app.native_presentation =
-        native_presentation::NativePresentationBridge::with_headless_product_renderer(renderer);
+    install_test_product_renderer(&mut app, renderer);
 
     let initial = app.application.snapshot();
     app.apply_application_command(
@@ -2099,8 +2098,7 @@ fn unsafe_3d_profile_keeps_native_preview_visible_until_atomic_exact_strips_fini
     renderer
         .activate_dataset_generation(app.application.snapshot().catalog())
         .expect("the headless renderer activates the same product dataset");
-    app.native_presentation =
-        native_presentation::NativePresentationBridge::with_headless_product_renderer(renderer);
+    install_test_product_renderer(&mut app, renderer);
     app.volume_presentation
         .set_work_limits_for_test(1_000_000, 100_000);
 
@@ -2124,7 +2122,7 @@ fn unsafe_3d_profile_keeps_native_preview_visible_until_atomic_exact_strips_fini
             "the bootstrap navigation frame did not become visible"
         );
         app.drain_brick_results(&context);
-        app.rerender_coordinated_display_state().unwrap();
+        drive_test_product_render(&mut app).unwrap();
         std::thread::yield_now();
     }
 
@@ -2197,7 +2195,7 @@ fn unsafe_3d_profile_keeps_native_preview_visible_until_atomic_exact_strips_fini
             "the unsafe current-camera preview did not publish"
         );
         app.drain_brick_results(&context);
-        app.rerender_coordinated_display_state().unwrap();
+        drive_test_product_render(&mut app).unwrap();
         std::thread::yield_now();
     }
     let preview_frame = app
@@ -2237,7 +2235,7 @@ fn unsafe_3d_profile_keeps_native_preview_visible_until_atomic_exact_strips_fini
         "a provisional preview must not enter exact validation capture"
     );
 
-    let mut observed_hidden_strip = false;
+    let mut observed_hidden_job = false;
     let mut linked_input_checked = false;
     while app.render_coordination.frame_fidelity.three_d_preview {
         assert!(
@@ -2246,22 +2244,31 @@ fn unsafe_3d_profile_keeps_native_preview_visible_until_atomic_exact_strips_fini
         );
         while app.render_coordination.take_refresh_request() {}
         app.drain_brick_results(&context);
-        app.rerender_coordinated_display_state().unwrap();
+        drive_test_product_render(&mut app).unwrap();
         if app.render_coordination.frame_fidelity.three_d_preview {
             assert!(
-                app.render_coordination.take_refresh_request(),
-                "an unfinished hidden candidate, including a backpressure deferral, must enqueue its next immediate display transaction"
+                app.render_coordination.take_refresh_request()
+                    || !matches!(
+                        app.render_attempt.wake(),
+                        display_refresh::RenderWake::None
+                    ),
+                "an unfinished hidden candidate must retain an immediate continuation or one exact causal wait"
             );
-            let completed = app
-                .render_coordination
-                .frame_fidelity
-                .three_d_refinement_strips_completed;
-            let total = app
-                .render_coordination
-                .frame_fidelity
-                .three_d_refinement_strips_total;
-            observed_hidden_strip |= completed > 0 && completed < total;
-            if !linked_input_checked && completed > 0 && completed < total {
+            let (hidden_started, hidden_completed) = {
+                let diagnostics = app
+                    .native_presentation
+                    .product_gpu
+                    .as_ref()
+                    .expect("the hidden-refinement renderer remains installed")
+                    .renderer
+                    .diagnostics();
+                (
+                    diagnostics.hidden_refinement_jobs_started(),
+                    diagnostics.hidden_refinement_jobs_completed(),
+                )
+            };
+            observed_hidden_job |= hidden_started > 0;
+            if !linked_input_checked && hidden_started > hidden_completed {
                 let before_revision = app.render_intent_mailbox.snapshot().three_d_revision;
                 let cross_section = *application_view(&app.application.snapshot()).cross_section();
                 app.apply_render_intent_interaction(
@@ -2280,20 +2287,17 @@ fn unsafe_3d_profile_keeps_native_preview_visible_until_atomic_exact_strips_fini
                     before_revision,
                     "linked-only input must not advance 3D frame identity"
                 );
-                app.rerender_coordinated_display_state().unwrap();
+                drive_test_product_render(&mut app).unwrap();
                 assert_eq!(
-                    app.render_coordination
-                        .frame_fidelity
-                        .three_d_refinement_strips_total,
-                    total,
-                    "linked-only input must not replace the hidden 3D candidate"
-                );
-                assert!(
-                    app.render_coordination
-                        .frame_fidelity
-                        .three_d_refinement_strips_completed
-                        >= completed,
-                    "linked-only input must not reset hidden 3D strip progress"
+                    app.native_presentation
+                        .product_gpu
+                        .as_ref()
+                        .expect("the hidden-refinement renderer remains installed")
+                        .renderer
+                        .diagnostics()
+                        .hidden_refinement_jobs_cancelled(),
+                    0,
+                    "linked-only input must not cancel the hidden 3D candidate"
                 );
                 linked_input_checked = true;
             }
@@ -2314,13 +2318,24 @@ fn unsafe_3d_profile_keeps_native_preview_visible_until_atomic_exact_strips_fini
         std::thread::yield_now();
     }
     assert!(
-        observed_hidden_strip,
-        "the forced unsafe exact body must make hidden strip progress"
+        observed_hidden_job,
+        "the forced unsafe exact body must enter the hidden worker"
     );
     assert!(
         linked_input_checked,
         "the hidden candidate must survive a real linked-only input sample"
     );
+    let hidden_diagnostics = app
+        .native_presentation
+        .product_gpu
+        .as_ref()
+        .expect("the hidden-refinement renderer remains installed")
+        .renderer
+        .diagnostics();
+    assert!(hidden_diagnostics.hidden_refinement_jobs_completed() > 0);
+    assert!(hidden_diagnostics.hidden_refinement_batches() > 0);
+    assert_eq!(hidden_diagnostics.hidden_refinement_jobs_cancelled(), 0);
+    assert_eq!(hidden_diagnostics.hidden_refinement_jobs_failed(), 0);
 
     let exact = app
         .render_coordination
@@ -2380,7 +2395,7 @@ fn unsafe_3d_profile_keeps_native_preview_visible_until_atomic_exact_strips_fini
         .as_ref()
         .unwrap()
         .total_coordinated_color_submissions;
-    app.rerender_coordinated_display_state().unwrap();
+    drive_test_product_render(&mut app).unwrap();
     assert_eq!(
         app.native_presentation
             .product_gpu
@@ -2407,8 +2422,7 @@ fn exact_transient_cross_section_updates_all_linked_panels_before_finish_and_emp
     renderer
         .activate_dataset_generation(app.application.snapshot().catalog())
         .expect("the headless renderer activates the same product dataset");
-    app.native_presentation =
-        native_presentation::NativePresentationBridge::with_headless_product_renderer(renderer);
+    install_test_product_renderer(&mut app, renderer);
     let initial = app.application.snapshot();
     app.apply_application_command(
         ApplicationCommand::SetLayout {
@@ -2744,7 +2758,7 @@ fn exact_transient_cross_section_updates_all_linked_panels_before_finish_and_emp
         )
     };
     let settled_work =
-        workbench_playback_runtime::progressive_render_submission_work(&app.native_presentation);
+        workbench_playback_runtime::progressive_render_submission_work(&app.render_attempt);
     assert!(
         !settled_work.any_required,
         "an omitted Empty target must not leave renderer-owned progress to poll"
@@ -2758,6 +2772,7 @@ fn exact_transient_cross_section_updates_all_linked_panels_before_finish_and_emp
                 &app.dataset,
                 &app.render_coordination,
                 &app.native_presentation,
+                &app.render_attempt,
                 settled_work.any_required,
             ),
             "a settled Empty presentation must not keep the UI background-work loop alive"
@@ -2767,7 +2782,7 @@ fn exact_transient_cross_section_updates_all_linked_panels_before_finish_and_emp
     app.rerender_coordinated_display_state()
         .expect("a repeated settled Empty refresh must remain a no-op");
     let repeated_work =
-        workbench_playback_runtime::progressive_render_submission_work(&app.native_presentation);
+        workbench_playback_runtime::progressive_render_submission_work(&app.render_attempt);
     assert!(
         !repeated_work.any_required,
         "a repeated Empty refresh must not recreate renderer-owned progress"
@@ -3648,10 +3663,14 @@ fn hiding_all_visible_layers_publishes_explicit_empty_3d_state() {
     let mut app = test_workbench_app_without_background_runtime(opened);
     await_visible_demand_plan(&mut app);
     let context = egui::Context::default();
-    let hidden_layers = application_view(&app.application.snapshot())
+    let visible_layers = application_view(&app.application.snapshot())
         .layers()
         .iter()
         .filter(|layer| layer.visible())
+        .cloned()
+        .collect::<Vec<_>>();
+    let hidden_layers = visible_layers
+        .iter()
         .map(|layer| {
             mirante4d_project_model::LayerViewState::new(
                 layer.layer_key(),
@@ -3662,6 +3681,20 @@ fn hiding_all_visible_layers_publishes_explicit_empty_3d_state() {
         })
         .collect::<Vec<_>>();
     assert!(!hidden_layers.is_empty());
+    let generation = app
+        .render_coordination
+        .surface(PresentationSlot::ThreeD)
+        .generation();
+    assert!(app.render_coordination.record_presented_frame(
+        PresentationSlot::ThreeD,
+        generation,
+        synthetic_presented_frame(
+            PresentationSlot::ThreeD,
+            app.render_coordination.render_viewport,
+        ),
+    ));
+    app.render_attempt
+        .note_published_texture(PresentationSlot::ThreeD, 1, 1);
     for hidden in hidden_layers {
         app.apply_application_command(ApplicationCommand::SetLayerView(hidden), &context)
             .unwrap();
@@ -3672,6 +3705,18 @@ fn hiding_all_visible_layers_publishes_explicit_empty_3d_state() {
             .iter()
             .all(|layer| !layer.visible()),
         "the fixture command must establish an all-hidden canonical view"
+    );
+    assert!(
+        app.render_coordination
+            .surface(PresentationSlot::ThreeD)
+            .presented_frame()
+            .is_none(),
+        "the canonical last-hide command must clear the old frame before worker settlement"
+    );
+    assert_eq!(
+        app.render_coordination.frame_fidelity.backend,
+        mirante4d_application::RenderBackend::Empty,
+        "worker settlement cannot be the authority for clearing canonical empty visibility"
     );
     assert!(await_visible_demand_plan(&mut app).current_plan_installed);
     assert!(
@@ -3695,7 +3740,11 @@ fn hiding_all_visible_layers_publishes_explicit_empty_3d_state() {
     assert!(app.navigation_render_plans.is_empty());
     assert_eq!(app.dataset.last_plan_error(), None);
 
-    app.rerender_coordinated_display_state().unwrap();
+    assert_eq!(
+        app.refresh_frame(),
+        crate::display_refresh::DisplayCompositionChange::Unchanged,
+        "an already-published empty surface must not schedule another composition turn"
+    );
 
     assert_eq!(
         app.render_coordination.frame_fidelity.backend,
@@ -3715,6 +3764,144 @@ fn hiding_all_visible_layers_publishes_explicit_empty_3d_state() {
             .layer_presentations()
             .is_empty()
     );
+    assert_eq!(
+        app.render_attempt.wake(),
+        crate::display_refresh::RenderWake::None,
+        "the retired texture identity cannot keep an empty surface repainting"
+    );
+    assert_eq!(
+        app.refresh_frame(),
+        crate::display_refresh::DisplayCompositionChange::Unchanged,
+        "re-observing the same current empty surface must be quiescent"
+    );
+
+    for visible in visible_layers {
+        app.apply_application_command(ApplicationCommand::SetLayerView(visible), &context)
+            .unwrap();
+    }
+    assert!(await_visible_demand_plan(&mut app).current_plan_installed);
+    assert!(!app
+        .dataset
+        .scope_is_empty(dataset_requests::SCOPE_CURRENT_3D));
+    assert!(app
+        .prepared_scope_render_plans
+        .contains_key(&dataset_requests::SCOPE_CURRENT_3D));
+    assert!(matches!(
+        app.render_attempt.state(),
+        crate::display_refresh::RenderAttemptState::Idle
+    ));
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn hiding_all_visible_layers_clears_every_linked_surface_once_and_unhides_normally() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let context = egui::Context::default();
+    let initial = app.application.snapshot();
+    app.apply_application_command(
+        ApplicationCommand::SetLayout {
+            layout: CanonicalViewerLayout::FourPanel,
+            cross_section: *application_view(&initial).cross_section(),
+        },
+        &context,
+    )
+    .unwrap();
+    let presentation = PresentationViewport::new(64.0, 64.0).unwrap();
+    let extent = mirante4d_render_api::RenderExtent::new(64, 64).unwrap();
+    for slot in PresentationSlot::ALL {
+        app.render_coordination
+            .record_viewports(slot, presentation, extent);
+    }
+    await_visible_demand_plan(&mut app);
+    for slot in PresentationSlot::ALL {
+        let generation = app.render_coordination.surface(slot).generation();
+        assert!(app.render_coordination.record_presented_frame(
+            slot,
+            generation,
+            synthetic_presented_frame(slot, extent),
+        ));
+        app.render_attempt.note_published_texture(slot, 1, 1);
+    }
+
+    let visible_layers = application_view(&app.application.snapshot())
+        .layers()
+        .iter()
+        .filter(|layer| layer.visible())
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(!visible_layers.is_empty());
+    for layer in &visible_layers {
+        app.apply_application_command(
+            ApplicationCommand::SetLayerView(
+                mirante4d_project_model::LayerViewState::new(
+                    layer.layer_key(),
+                    false,
+                    layer.transfer().clone(),
+                    *layer.render_state(),
+                ),
+            ),
+            &context,
+        )
+        .unwrap();
+    }
+    for slot in PresentationSlot::ALL {
+        assert!(
+            app.render_coordination
+                .surface(slot)
+                .presented_frame()
+                .is_none(),
+            "{slot:?} retained an old frame until worker settlement"
+        );
+    }
+    let installed = await_visible_demand_plan(&mut app);
+    assert!(installed.current_plan_installed);
+    assert!(installed.cross_section_plan_installed);
+
+    assert_eq!(
+        app.refresh_frame(),
+        crate::display_refresh::DisplayCompositionChange::SurfaceCleared
+    );
+    for slot in PresentationSlot::ALL {
+        let surface = app.render_coordination.surface(slot);
+        assert!(surface.presented_frame().is_none(), "{slot:?} retained an old frame");
+        assert!(surface.layer_presentations().is_empty());
+        if slot.is_cross_section() {
+            assert!(surface.display_current());
+            assert_eq!(
+                surface.cross_section_schedule().unwrap().status,
+                CrossSectionPanelScheduleStatus::Empty
+            );
+        }
+    }
+    assert_eq!(app.render_attempt.wake(), crate::display_refresh::RenderWake::None);
+    assert_eq!(
+        app.refresh_frame(),
+        crate::display_refresh::DisplayCompositionChange::Unchanged
+    );
+
+    for layer in visible_layers {
+        app.apply_application_command(ApplicationCommand::SetLayerView(layer), &context)
+            .unwrap();
+    }
+    let restored = await_visible_demand_plan(&mut app);
+    assert!(restored.current_plan_installed);
+    assert!(restored.cross_section_plan_installed);
+    for scope in [
+        dataset_requests::SCOPE_CURRENT_3D,
+        dataset_requests::SCOPE_CROSS_SECTION_XY,
+        dataset_requests::SCOPE_CROSS_SECTION_XZ,
+        dataset_requests::SCOPE_CROSS_SECTION_YZ,
+    ] {
+        assert!(!app.dataset.scope_is_empty(scope));
+        assert!(app.prepared_scope_render_plans.contains_key(&scope));
+    }
+    assert!(matches!(
+        app.render_attempt.state(),
+        crate::display_refresh::RenderAttemptState::Idle
+    ));
     app.dataset.request_shutdown().unwrap();
 }
 
@@ -4988,7 +5175,7 @@ fn await_exact_three_d_timepoint_capture(
                 dataset_requests::SCOPE_CURRENT_3D
             };
             if app.dataset.scope_resources_complete(target_scope) {
-                app.rerender_coordinated_display_state()
+                drive_test_product_render(app)
                     .expect("the temporal successor renders through the product coordinator");
             }
         }
@@ -5026,8 +5213,7 @@ fn direct_timepoint_selection_replaces_retained_gpu_pixels_with_the_successor_bo
     renderer
         .activate_dataset_generation(app.application.snapshot().catalog())
         .expect("the temporal fixture activates on the product renderer");
-    app.native_presentation =
-        native_presentation::NativePresentationBridge::with_headless_product_renderer(renderer);
+    install_test_product_renderer(&mut app, renderer);
     app.render_coordination.record_viewports(
         PresentationSlot::ThreeD,
         PresentationViewport::new(64.0, 64.0).unwrap(),

@@ -185,12 +185,22 @@ fn pick_main() {
             continue;
         }
         let page = page_for_sample(layer_index, origin, direction, distance);
-        let next = segment_end_index(
+        let predicted_end = segment_end_index(
             ray.entry,
             step,
             index,
             page_exit_distance(page, point, direction, distance, ray.exit),
             count,
+        );
+        let next = page_segment_end_index(
+            layer_index,
+            page,
+            origin,
+            direction,
+            ray.entry,
+            step,
+            index,
+            predicted_end,
         );
         if page.kind != PAGE_RESIDENT {
             incomplete = true;

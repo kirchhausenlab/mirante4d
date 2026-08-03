@@ -510,12 +510,19 @@ pub(crate) fn test_workbench_app_without_background_runtime(
     )
     .expect("the test resource policy has a valid CPU budget");
 
+    let shader_work_envelope_ledger = dataset.cpu_ledger_arc();
     MiranteWorkbenchApp {
         application,
         startup_diagnostics,
         dataset,
         render_coordination,
         native_presentation: native_presentation::NativePresentationBridge::unavailable(),
+        renderer_ui_wake: Arc::new(RendererUiWake::new(egui::Context::default(), 1)),
+        shader_work_envelopes: shader_work_envelope_cache::ShaderWorkEnvelopeCache::new(
+            shader_work_envelope_ledger,
+            || {},
+        )
+        .expect("the test shader-envelope worker starts"),
         viewer_pick_queue: viewer_pick_runtime::ViewerPickQueue::default(),
         volume_presentation: volume_presentation::VolumePresentationController::default(),
         progressive_display_pacer: workbench_brick_runtime::ProgressiveDisplayRefreshPacer::default(
@@ -525,7 +532,7 @@ pub(crate) fn test_workbench_app_without_background_runtime(
         pending_visible_demand_plan: None,
         visible_demand_failure_latch: None,
         visible_demand_placeability_limit: None,
-        viewer_render_failure_latch: None,
+        render_attempt: display_refresh::RenderAttemptCoordinator::default(),
         dataset_runtime_epoch: 0,
         prepared_scope_render_plans: std::collections::BTreeMap::new(),
         navigation_render_plans: Vec::new(),
@@ -659,6 +666,67 @@ fn test_wgpu_renderer(
             }
         }
     }
+}
+
+fn install_test_product_renderer(
+    app: &mut MiranteWorkbenchApp,
+    mut renderer: mirante4d_render_wgpu::WgpuRenderRuntime,
+) {
+    let weak_wake = Arc::downgrade(&app.renderer_ui_wake);
+    renderer.set_renderer_event_sink(mirante4d_render_wgpu::RendererEventSink::new(
+        move |event| {
+            if let Some(wake) = weak_wake.upgrade() {
+                wake.wake_renderer_event(event);
+            }
+        },
+    ));
+    app.native_presentation =
+        native_presentation::NativePresentationBridge::with_headless_product_renderer(renderer);
+}
+
+fn drive_test_product_render(app: &mut MiranteWorkbenchApp) -> anyhow::Result<()> {
+    let events = app.renderer_ui_wake.begin_ui_turn();
+    app.render_attempt.observe_renderer_events(events);
+    app.rerender_coordinated_display_state().map(|_| ())
+}
+
+#[test]
+fn terminal_renderer_with_pending_internal_work_has_no_background_wake() {
+    let wake = RendererUiWake::new(egui::Context::default(), 7);
+
+    wake.wake();
+    assert!(wake.ui_turn_pending.load(Ordering::Acquire));
+    let generic_batch = wake.begin_ui_turn();
+    assert_eq!(generic_batch.renderer_device_generation, 7);
+    assert_eq!(generic_batch.bits, 0);
+    assert!(!wake.ui_turn_pending.load(Ordering::Acquire));
+
+    wake.wake_renderer_event(RendererEvent::PipelineCapabilityChanged(
+        mirante4d_render_wgpu::PipelineCapability::Pick,
+    ));
+    wake.wake_renderer_event(RendererEvent::SubmissionCompleted { submission: 11 });
+    wake.wake_renderer_event(RendererEvent::SubmissionCompleted { submission: 9 });
+    wake.wake_renderer_event(RendererEvent::HiddenWorkerResult { job: 13 });
+    assert!(wake.ui_turn_pending.load(Ordering::Acquire));
+    let batch = wake.begin_ui_turn();
+    assert_eq!(batch.renderer_device_generation, 7);
+    assert!(!batch.initial_pipeline_changed());
+    assert_eq!(batch.submission_completed(), Some(11));
+    assert_eq!(batch.hidden_worker_result(), Some(13));
+    assert!(!wake.ui_turn_pending.load(Ordering::Acquire));
+
+    wake.enter_renderer_terminal();
+    wake.wake();
+    wake.wake_renderer_event(RendererEvent::SubmissionCompleted { submission: 12 });
+    assert!(!wake.ui_turn_pending.load(Ordering::Acquire));
+    assert_eq!(wake.begin_ui_turn().bits, 0);
+
+    wake.close();
+    wake.wake_renderer_event(RendererEvent::PipelineCapabilityChanged(
+        mirante4d_render_wgpu::PipelineCapability::InitialRender,
+    ));
+    assert!(!wake.ui_turn_pending.load(Ordering::Acquire));
+    assert_eq!(wake.begin_ui_turn().bits, 0);
 }
 
 include!("tests/fidelity_shell.rs");

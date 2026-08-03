@@ -1,6 +1,6 @@
 # Current State
 
-Last reviewed: 2026-08-01
+Last reviewed: 2026-08-02
 
 Mirante4D is public, pre-alpha academic research software. Persisted formats
 and APIs can change through explicit hard cutovers; there is no supported
@@ -599,6 +599,93 @@ nonmutation, process, and artifact evidence.
 
 See [testing](TESTING.md) for commands and claim language.
 
+## Rendering Correctness Audit Status
+
+A 2026-08-02 read-only audit found rendering cases not covered by the closed
+viewer evidence, and the owner authorized the complete corrective package.
+The correctness cut is implemented in the current working tree. Composed
+Exact transactions now enter the renderer as a complete fixed logical target
+set. Every member binds source/time/frame, exact per-layer map, spatial and
+surface facts, immutable requirement body, promoted-prefetch role, output
+extent, schedule, and renderer lineage. The renderer alone classifies reused
+versus rebuilt members, returns the complete logical dispositions plus the
+physical delta, validates an all-reused transaction against its current
+private fronts, and performs no pipeline/allocation/submission work for a
+genuine zero delta.
+
+One application render-attempt coordinator now owns fingerprint-scoped
+execution, deterministic failure, displayed-fidelity projection, causal
+waiting, texture-composition acknowledgement, and repaint eligibility.
+Retryable pipeline, submission, placement, eviction, residency, candidate,
+mailbox, logical-member, and hidden-worker waits preserve the predecessor and
+name the exact event that can make progress. A coalescing weak renderer event
+sink makes a satisfied wait eligible for exactly one new admission; consumed
+`Ready`, stable deterministic failure, color-unavailable, and terminal state
+are quiescent. A completed `Ready` report authorizes exactly one same-
+fingerprint continuation, and asynchronous shader-envelope completion restores
+the consumed render refresh before waking the UI. Progressive preview and
+exact refinement compare the same semantic request while retaining stricter
+proof identity for actual reuse, so a valid same-frame refinement is not
+misreported as a frame-contract mismatch. Ordinary UI service also retires
+pending GPU timing tickets without requiring a render refresh. Terminal
+projection retires non-executable renderer background ownership, so raw
+residency/capture state cannot retain an immediate or 50 ms wake.
+
+Hidden refinement now preserves cancellation, first/second timeout, worker
+spawn, worker panic, identity exhaustion, and device causes separately. It
+retains an in-flight completion lease before retry or cleanup, never publishes
+partial rows, permits at most one fresh timeout retry, and permanently disables
+only hidden work after a hidden-local worker/identity cause. InitialRender and
+Pick pipeline capabilities are also independent: a local Pick failure drains
+pending tickets to a typed terminal result without disabling ready color,
+while device-level compilation causes still promote through the one global
+first-cause latch. Hidden-job, private-presentation, and texture-revision
+identity exhaustion is operation-scoped and never re-enters the exhausted
+allocator.
+
+The render API is the sole binary32 affine and work-envelope authority.
+Normalized condition and outward-rounded control/inverse error replace
+absolute determinant magnitude; exact singular, condition, nonfinite-control,
+quantized-singular, coordinate, envelope, and sample-count failures remain
+distinct. Grid ends and counts are accepted through `2^23` and rejected at
+`2^23 + 1`. Bounded layer/scale affine results and latest-only target envelope
+results feed semantic demand and renderer controls. Orthographic planning uses
+the validated quaternion axes and relative near-plane arithmetic instead of
+reconstructing a basis from `target - eye`.
+
+All volume and Pick WGSL paths share binary32 normal/subnormal direction
+classification, finite page-exit logic, and represented-sample segment
+correction. Continuous page and general-DVR entry predictions are checked
+against the actual binary32 sample and shortened by bounded search when they
+would assign a sample to the wrong page/state. Positive and negative `5e-7`,
+zero, admitted/rejected subnormal, and far-boundary-overflow cases now compare
+MIP, fused/general DVR, ISO, Mixed, both sampling modes, coverage, validity,
+and Pick with independent facts on the trusted Vulkan adapter.
+
+Current-tree real-display automation passes all 141 mapped
+`target_fixture_render_modes` commands and all 60
+`representative_native_navigation` commands on the NVIDIA RTX/Vulkan product
+path, with exact/current settlement and no renderer validation error. These
+are internal normal-application automation results, not owner observation.
+The attempted temporal scenario reached an Exact/current timepoint-1 frame but
+its independent capture gate rejected that fixture because the retained
+timepoint-0 transfer window left no intermediate RGB pixels. The direct
+trusted temporal replacement regression passes, but a suitable normal-product
+temporal workload is still required.
+
+The active
+[viewer rendering correctness, recovery, and numerical cutover](plans/active/VIEWER_RENDERING_CORRECTNESS_RECOVERY_AND_NUMERICAL_CUTOVER.md)
+retains three open closeout boundaries. Its required pre-edit P0 A/B overlay
+campaign was not captured before these production edits, so that milestone is
+not retroactively claimed. The immutable A/B/C campaign orchestrator and
+sanitizing evaluator now exist, but the designated private workload has not
+run and R11 performance recovery remains open. The full trusted-GPU lane
+requires a clean revision and correctly refuses this dirty implementation
+tree. The temporal normal-product exercise and owner mapped acceptance remain
+required before the correctness cut is product-validated. Earlier product-
+validation claims remain valid only for their named revisions and do not
+cover these new edge cases.
+
 ## Viewer Performance And Development Recovery Status
 
 The 2026-08-02 static multichannel visible-layer correction is implemented and
@@ -607,15 +694,25 @@ matrix pass. After normal product use, the owner explicitly accepted the
 correctness-first closeout while reporting materially worse static viewer
 performance. No controlled before/after product measurement exists, so this
 is qualitative negative evidence rather than a quantified regression, and no
-performance improvement is claimed. Static performance recovery is deferred
-to separately approved follow-up work. Durable active-layer selection is now analysis
+performance improvement is claimed. Static performance recovery is owned by
+the authorized corrective plan linked above. Its private A/B/C orchestrator
+now enforces matching scientific work, three balanced order blocks, complete
+raw metrics, nearest-rank/median aggregation, the 5% fixed-GPU and 10%/1 ms
+product thresholds, deterministic first-boundary attribution, and sanitized
+output. No qualifying campaign has run, so R11 remains open and no tuning or
+recovery claim follows from that implementation alone. Durable active-layer selection is now analysis
 focus only and may be hidden. Ordered visible layers own render membership,
 and ideal, capacity-selected, navigation, and displayed fidelity are exact
 per-layer maps. Active-only changes preserve planning, residency, render
 revision, and presentation authority. Hiding the active channel leaves the
 remaining channels renderable; hiding all channels installs and publishes the
-explicit empty state. Uniform scalar LODs survive only as optional diagnostic
-summaries and cannot decide currentness or reuse.
+explicit empty state before asynchronous zero-body planning can retain or
+repaint a predecessor. The empty cutoff retires renderer-front, frame-lease,
+pick, capture, and native-binding authority; the already-resolved egui
+registration survives only to the next UI-turn boundary. Empty idle is
+quiescent, and unhiding a channel uses the normal planner and renderer path.
+Uniform scalar LODs survive only as optional diagnostic summaries and cannot
+decide currentness or reuse.
 
 Static capacity refinement and navigation construction now use deterministic
 max-min normalized per-layer progress with authored-order ties. Playback keeps

@@ -9,6 +9,7 @@ use mirante4d_render_api::PresentationTarget;
 use crate::{
     BACKGROUND_WORK_REPAINT_INTERVAL, RenderCoordinationState,
     dataset_requests::{DatasetDemandState, SCOPE_PLAYBACK},
+    display_refresh::{RenderAttemptCoordinator, RenderAttemptState},
     import_worker_service::ImportWorkerService,
     native_presentation::NativePresentationBridge,
     playback::{playback_frame_interval, playback_tick_for_ui_time},
@@ -23,21 +24,20 @@ pub(crate) fn background_work_active(
     dataset: &DatasetDemandState,
     render: &RenderCoordinationState,
     presentation: &NativePresentationBridge,
+    render_attempt: &RenderAttemptCoordinator,
     progressive_render_required: bool,
 ) -> bool {
     application_service_work_active(snapshot)
         || import.status().is_active()
         || snapshot.transient().playback_active()
         || dataset.dispatcher().has_pending_work()
-        || presentation.product_gpu.as_ref().is_some_and(|product| {
-            product
-                .renderer
-                .pipeline_readiness()
-                .is_ok_and(|readiness| readiness != mirante4d_render_wgpu::PipelineReadiness::Ready)
-                || product.renderer.has_pending_residency_work()
-                || product.renderer.has_pending_residency_evictions()
-                || !product.pending_validation_captures.is_empty()
-        })
+        || (!matches!(
+            render_attempt.state(),
+            RenderAttemptState::RendererTerminal { .. }
+        ) && presentation.product_gpu.as_ref().is_some_and(|product| {
+            !product.pending_validation_captures.is_empty()
+                || !product.pending_gpu_timings.is_empty()
+        }))
         || progressive_render_required
         || (crate::application_view(snapshot).layout() == ViewerLayout::FourPanel
             && render.iter().any(|(_, panel)| {
@@ -102,41 +102,14 @@ const fn cross_section_schedule_requires_polling(status: CrossSectionPanelSchedu
 /// already CPU-resident. Dataset I/O completion owns refreshes while resources
 /// are still pending, so slow I/O cannot cause identical full-frame renders.
 pub(crate) fn progressive_render_submission_work(
-    presentation: &NativePresentationBridge,
+    attempt: &RenderAttemptCoordinator,
 ) -> ProgressiveRenderSubmissionWork {
-    let Some(product) = presentation.product_gpu.as_ref() else {
-        return ProgressiveRenderSubmissionWork::default();
-    };
-    if !product
-        .renderer
-        .pipeline_capability_is_ready(mirante4d_render_wgpu::PipelineCapability::InitialRender)
-        .unwrap_or(false)
-    {
-        return ProgressiveRenderSubmissionWork::default();
+    ProgressiveRenderSubmissionWork {
+        three_d_required: attempt.target_ready(PresentationTarget::ThreeD),
+        any_required: PresentationTarget::ALL
+            .into_iter()
+            .any(|target| attempt.target_ready(target)),
     }
-    let mut work = ProgressiveRenderSubmissionWork::default();
-    for target in PresentationTarget::ALL {
-        let required = match product
-            .renderer
-            .coordinated_target_requires_execution(target)
-        {
-            Ok(required) => required,
-            Err(
-                mirante4d_render_wgpu::WgpuRenderRuntimeError::CoordinatedTargetNotConfigured {
-                    ..
-                },
-            ) => false,
-            Err(error) => {
-                tracing::error!(%error, ?target, "renderer target refresh query failed");
-                true
-            }
-        };
-        work.any_required |= required;
-        if target == PresentationTarget::ThreeD {
-            work.three_d_required = required;
-        }
-    }
-    work
 }
 
 fn application_service_work_active(snapshot: &ApplicationSnapshot) -> bool {
