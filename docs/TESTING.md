@@ -1,6 +1,6 @@
 # Testing And Validation
 
-Last updated: 2026-08-02
+Last updated: 2026-08-03
 
 Testing exists to expose meaningful failures quickly. It is not a measure of
 project seriousness, and a large passing suite is not a substitute for using
@@ -99,14 +99,121 @@ Vulkan lane on the designated workstation:
 
 ```bash
 MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
-  cargo xtask verify-local trusted-gpu
+  cargo xtask verify-local trusted-gpu-correctness
 ```
 
-That lane is a bounded wrapper around the focused ignored Vulkan tests. It
-retains the clean-revision, hardware/adapter, timeout, independent-oracle, and
-normal verification-report checks. Ordinary GPU test source is not registered
-as a hash-bound fixture, and passing tests are not reinterpreted by a separate
-qualification-receipt parser.
+That lane reconciles and executes the exact registered ignored correctness
+inventory, serially and with zero retries. It retains the clean-revision,
+Vulkan adapter, timeout, independent-oracle, and native-process authority
+checks. It does not run or claim performance.
+
+The first complete clean execution at commit
+`a6ef07aea1ea04bddeb77efd7ad9cbd0f97a236d` selected all 25 registered cases.
+The native Nextest summary reported 19 passes and six failures, so that run
+established no trusted correctness pass. The implemented
+[GPU correctness campaign follow-up](plans/active/VIEWER_GPU_CORRECTNESS_CAMPAIGN_FOLLOW_UP.md)
+records and repairs the six diagnosed boundaries, adds the flexible active-
+panel policy, and preserves exact case attribution after a nonzero test exit.
+
+The subsequent clean execution at commit
+`efb745221ba3a78d00a20fe14b843d07f5272d06`, tree
+`acbcce58fe91ac7e1dd7c1623998a3ab2b22bf11`, reconciled the exact inventory and
+passed all 25 selected cases serially with zero retries, skips, not-started
+cases, or unattributed outcomes. Its structured status is
+`complete_native_success`. The runner consumes Nextest's structured
+`libtest-json-plus` stream after either a zero or nonzero exit; native process
+status, complete inventory reconciliation, and the per-case stream must all
+agree before the lane can pass.
+
+The separate release campaign is:
+
+```bash
+MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
+MIRANTE4D_GPU_ENVIRONMENT_QUIESCENT=1 \
+MIRANTE4D_GPU_DISPLAY_PROFILE_ID=<configured-id> \
+MIRANTE4D_GPU_COMPOSITOR_SESSION_ID=<configured-id> \
+MIRANTE4D_GPU_POWER_POLICY_ID=<configured-id> \
+MIRANTE4D_GPU_QUIESCENCE_POLICY_ID=<configured-id> \
+  cargo xtask gpu-performance --config /absolute/private/config.json
+```
+
+The private file follows
+`verification/gpu-performance-config.schema.json`, is mode 0600, and pins
+clean baseline/candidate checkouts, external target directories, the Cell
+package's `m4d/manifest/root.json` digest, the opaque workload profile,
+kernel, Cargo lock, exact RTX 3070 Ti/Vulkan driver, X11 output/refresh,
+power/thermal evidence, and private reports. The command rejects GitHub
+Actions, Wayland, changed environment facts, suspend/clock discontinuity,
+automatic retries, and dirty revisions.
+
+Before timing, the campaign runs or verifies the controlled mapped Vulkan
+first-pixel-out probe. The opt-in final WGPU swapchain hook supplies the same
+strict nonzero ID to `VK_KHR_present_id` and `VK_KHR_present_id2`; a bounded
+off-thread worker waits with `VK_KHR_present_wait` and drains revision-3
+`VK_EXT_present_timing` first-pixel-out records. Independent X11 readback
+correlates each completed present to its product marker and separately proves
+resize, map, focus, visibility, post-remap recovery, and extent lifecycle.
+The observer excludes unchanged, superseded, out-of-date, window-unavailable,
+failed, timed-out, or ambiguous samples. It then runs 39 component
+measurements and the normal `representative_gpu_interaction` product sequence.
+
+The report authority is
+`vulkan_ext_present_timing_first_pixel_out_marker_v2`; the campaign and
+baseline measurement version is `gpu-performance-v3`. Present-wait host times
+qualify mapped visibility, maximum active visible gap, coarse settlement, and
+the conservative resident input-response upper bound. First-pixel-out deltas
+inside one swapchain generation and time-domain ID qualify exact scanout
+cadence. The campaign blocks on eight product summaries: standalone and four-
+panel interval p95 ≤ 33.3 ms, resident input-response p99 ≤ 50 ms, maximum
+active visible gap ≤ 100 ms, resident exact settlement ≤ 250 ms, prepared
+nonresident exact replacement ≤ one second, startup coarse visibility ≤ 250
+ms, and startup exact settlement ≤ two seconds. It makes no physical-photon,
+input-to-photon, or universal all-hardware claim.
+The owner-approved
+[GPU testing refactor](plans/active/VIEWER_GPU_TESTING_REFACTOR.md) defines the
+full trigger, metric, baseline, and claim contract.
+
+The first calibration activation used the qualified workstation, a clean
+candidate revision, and an owner-selected package that passed the production
+multi-layer catalog preflight. Its controlled presentation probe originally
+reported a stale heartbeat after the 1920x1080-to-1600x900 transition. Live
+replay showed that the one-second sidecar had hidden later commands and that
+the probe could both lose an in-pass repaint after native geometry changes and
+deadlock after asking its own soon-dormant UI loop to minimize and later
+restore the window.
+
+The repaired probe publishes each command transition immediately. A wake
+thread exists only for this non-measured probe. The app requests minimization;
+the parent runner owns the forced X11 unmap and restore/focus. The minimize
+command does not complete until the observer has seen a map after the unmap
+and eframe reports the viewport restored and focused. The final 1920x1080
+state is settled and captured through GPU readback. A current-tree real-
+display run completed all 29 commands without owner intervention; product
+validation passed, the app exited zero, and its requested, observed, and
+captured extents were all 1920x1080.
+
+That run established why X11 Present completion could not be the authority on
+the NVIDIA/Vulkan path: it emitted zero completion events. The owner-approved
+Vulkan replacement was then completed with first-pixel-out timing on NVIDIA
+595.84. The current-tree real-window boundary proof observed 212 submitted
+and completed presents across nine configured swapchains, accepted 11 changed
+marker-correlated images including one after remap, classified three out-of-
+date recreation presents separately, drained one timing result for such a
+rejected ID, and recorded zero fatal rejection, unknown/duplicate ID, queue,
+clock, wait, timing, timeout, ambiguity, or closeout failure. The controlled
+proof covers unchanged repeats, distinct queued images, resize/surface
+recreation, focus/occlusion, and unmap/remap without counting unavailable-
+window time as a visible stall.
+
+A current-tree representative interaction smoke run also passed all eight
+absolute gates: standalone/four-panel scanout p95 16.96/17.01 ms, resident
+input-response p99 49.65 ms, maximum active visible gap 88.69 ms, resident
+exact settlement 45.36 ms, prepared nonresident replacement 97.50 ms, startup
+coarse 5.88 ms, and startup exact 1.008 seconds. The campaign still has zero
+accepted calibration runs and `pending_initial_calibration` is unchanged.
+Do not substitute application publication, GPU completion alone, client-
+surface change, or egui paint queuing for the correlated present-wait, marker,
+and first-pixel-out authority.
 
 The rendering-correctness cut adds four trusted page-traversal cases under
 `volume_page_traversal_`. They cover positive/negative `5e-7` crossings,
@@ -227,7 +334,8 @@ cargo test -p mirante4d-render-wgpu \
 ```
 
 Those direct invocations are supporting diagnostics only. They do not bypass
-the `trusted-gpu` clean-revision guard and cannot close P7. On the designated
+the `trusted-gpu-correctness` clean-revision guard or the performance campaign
+and cannot close P7. On the designated
 RTX 3070 Ti Laptop GPU/Vulkan adapter, the current matrix's worst homogeneous
 linear normalized ratio is `1.0181` with `gate_met=true`, zero sample uploads,
 and zero validation errors. The separate private A/B/C threshold remains
@@ -269,6 +377,14 @@ MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
 ```
 
 The project-store lifecycle lane is intentionally not a routine PR check.
+
+The owner-approved
+[project state and persistence testing refactor](plans/active/PROJECT_STATE_AND_PERSISTENCE_TESTING_REFACTOR.md)
+is now being implemented. Its target separates routine, host-process,
+qualified-filesystem, and VM-guest ownership; requires post-failure and
+production corruption oracles; and forbids green success-path returns when
+the writable filesystem capability is absent. Current commands remain
+authoritative until the plan's hard cutover is complete.
 
 Import and preprocessing work can use:
 
@@ -328,6 +444,16 @@ growth and is not compared with that one-unit headroom as though it were a
 whole-package reservation. These checks do not prove that the
 welcome screen, file choosers, wizard, or a long local import behave correctly
 on the owner's workstation.
+
+The implemented
+[import, preprocessing, and storage testing refactor](plans/active/IMPORT_PREPROCESSING_STORAGE_TESTING_REFACTOR.md)
+closes the audited independent-source, compression, case-diagnostics,
+behavioral-oracle, stage-fault, parser-hostility, and application/UI gaps
+without replacing the current product architecture or building a large new
+verification system. Its independent fixture validators, production source
+and target conformance, cancellation/fault/recovery cases, and typed app/UI
+handoff tests are portable evidence. The named local performance and mapped
+product commands remain separate changed-boundary evidence.
 
 Private datasets and configuration stay outside the repository. Source
 nonmutation, bounded work, cancellation, and atomic create-only publication
@@ -555,10 +681,12 @@ front.
 The terminal fast-path fixture compares one complete 64³ resource with the
 ordinary eight-page sparse path for voxel-exact and smooth-linear MIP, DVR,
 and ISO. Dedicated MIP/DVR/ISO tests retain independent numerical-oracle
-coverage. The timing fixture names adapter, shape, physical extent, mode,
-sampling, trials, median, and p95; each 1920×1080 terminal case must remain
-below the 16.667 ms product guideline. This is a practical workstation target,
-not a universal adapter contract.
+coverage. The timing fixture names adapter, driver, shape, physical extent,
+mode, sampling, 30 warm-ups, 120 raw samples, median, and nearest-rank p95.
+The former 16.667 ms number is a preferred 60 Hz component observation. The
+blocking component feasibility limit is 33.3 ms, and only the mapped product
+observer can establish the representative 30 Hz cadence contract. Neither is
+a universal adapter claim.
 
 The product gate is the normal mapped application in four-panel and standalone
 3D. Exercise rotation, translation, and zoom at an already-smooth

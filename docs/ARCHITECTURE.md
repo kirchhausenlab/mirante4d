@@ -1,6 +1,6 @@
 # Architecture
 
-Last updated: 2026-08-02
+Last updated: 2026-08-03
 
 Mirante4D is a native Rust desktop viewer and analysis workbench. It opens
 strict `.m4d` packages; source microscopy data enters through explicit
@@ -398,8 +398,10 @@ ceilings until Pause or Stop. Total timepoint count therefore does not change
 steady-state playback memory.
 
 Each successor is one immutable temporal frame contract and one prepared
-visible-target resource body. Standalone 3D owns only a 3D body; four-panel
-owns fixed-scale 3D/XY/XZ/YZ bodies. Lateness retains the same-scale
+active-target resource body. The current UI projects standalone 3D to the 3D
+target and four-panel to 3D/XY/XZ/YZ, but playback and presentation carry the
+bounded target set rather than a one-versus-four enum. Hidden targets own no
+required body. Lateness retains the same-scale
 predecessor rather than substituting a coarser playback LOD, skipping time, or
 exposing `Loading...`. The temporal body contains no camera geometry. During
 four-panel playback, the linked-panel wrappers bind geometry-independent
@@ -414,19 +416,27 @@ with the latest spatial mailbox snapshots; newest whole-layout spatial
 settlement is not a temporal clock gate, and spatial samples cannot rebuild or
 discard the playback session's prepared body.
 
-The scheduler assembles a fixed logical target set before deriving physical
-work: standalone 3D contains exactly 3D, while four-panel contains exactly 3D,
-XY, XZ, and YZ. The intended member contract is exact source, timepoint, scale
-map, spatial revision, extent, immutable body, prefetch role, and renderer
-lineage. It sends that complete typed set to the renderer before physical work
-is known. The renderer compares each member with its private current front,
-including the exact immutable requirement body and promoted-prefetch role,
-and returns both every logical disposition and the physical recorded-target
-list. A mixed transaction can therefore rebuild any subset without losing
-the complete transaction identity. The all-reused case is also validated
-inside the renderer against current target allocation, surface generation,
-front, texture, and device lineage and performs no transfer, pipeline, color,
-or submission work.
+The scheduler snapshots one immutable `ActivePresentationLayout`: a monotone
+layout generation, a unique bounded subset of 3D/XY/XZ/YZ, and the exact
+extent and surface generation of each member. For one state change, the
+semantic publication set is the active set intersected with the targets whose
+pixels depend on that change. Unaffected 3D is therefore excluded from a
+linked-only update, and hidden panels impose no planning, texture, pin, color,
+or submission obligation. Layout, extent, or surface-generation drift retires
+the old attempt instead of shrinking it or publishing stale work.
+
+Every member of the semantic set is classified as already current, terminal
+no-work, or physically executable. A terminal empty cross-section can complete
+its semantic membership without fabricating a prepared GPU body. All
+nonterminal members cross the renderer boundary with exact source, timepoint,
+scale map, spatial revision, extent, immutable body, prefetch role, and
+renderer lineage. The renderer validates the complete nonterminal publication
+group before deriving its smaller physical delta, compares each member with
+its private current front, and returns every disposition plus the actually
+recorded targets. The application exposes the successor only after the whole
+semantic set, including terminal members, is current. An all-reused group is
+validated against current allocation, surface generation, front, texture, and
+device lineage and performs no transfer, pipeline, color, or submission work.
 
 One application `RenderAttemptCoordinator` owns color execution admission,
 fingerprint-scoped deterministic failure, causal waiting, displayed-fidelity
@@ -695,6 +705,14 @@ run the arena allocator, mutate the directory, upload payloads, or submit a
 transfer. Completion leases are still acquired before a replaced front is
 released, and retained-navigation accounting advances only after its color
 work is submitted.
+
+Replacement planning ranks a resource by its effective age: the greater of
+its materialized resource age and the newest age of every owning pin cohort.
+A same-body rebind therefore protects recently revisited resources even before
+cohort retirement materializes that age. Simulation, commit, partial cohort
+retirement, and rollback use the same rule, so overlapping cohorts preserve
+the newest survivor rather than evicting a just-used payload under an older
+resource timestamp.
 
 The native existing-device constructor creates fixed buffers and layouts, then
 hands shader/pipeline creation to one capacity-two worker. Its current ordered
@@ -994,6 +1012,34 @@ counters, renderer CPU planning/submission, linked-pass GPU timestamps, and
 egui texture-image command queuing. The latter is a UI-construction boundary,
 not a surface-present event. No trace event claims compositor or monitor
 visibility.
+
+The trusted local GPU campaign has one separate opt-in final-present observer.
+Only when `MIRANTE4D_PRESENTATION_OBSERVER_REPORT` is set before WGPU device
+creation, the locally patched `wgpu-hal` Vulkan path requires and enables
+`VK_KHR_present_id`, `VK_KHR_present_wait`, `VK_KHR_present_id2`,
+`VK_KHR_calibrated_timestamps`, and revision-3 `VK_EXT_present_timing`; the
+instance also requires `VK_KHR_get_surface_capabilities2`. Each observed
+swapchain proves the ID2/timing surface capabilities, enables the two timing
+create flags, allocates a bounded 256-result queue, and selects one driver-
+reported time-domain ID. The existing final `vkQueuePresentKHR` receives the
+same strict ID through both present-ID structures and requests only
+`VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT` with no target time.
+
+A bounded worker owns both `vkWaitForPresentKHR` and timing-result drainage.
+After completion, an independent X11 connection reads the product marker while
+another tracks map, focus, visibility, resize, and extent. Marker and first-
+pixel-out halves may arrive in either order but form a record only after ID,
+swapchain generation, time-domain, and product identity agree. Swapchain
+teardown waits for bounded admitted work so recreation cannot race the
+observer; out-of-date presents and recovery-window reads are explicitly
+excluded. This path qualifies correlated product visibility, first-pixel-out
+scanout cadence, maximum active visible gap, conservative resident input-
+response, and coarse exact settlement. First-pixel-out means that the first
+pixel left the presentation engine for display hardware; it does not claim
+physical photons or input-to-photon latency. Without the environment variable
+the extensions and observer are absent and ordinary device, renderer, queue,
+and presentation behavior are unchanged.
+
 Automation-only validation capture remains asynchronous. The independent CPU
 oracle owns expected RGBA, coverage, and validity facts; it is not a product
 renderer. The current generic product capture and image-stat boundary
@@ -1017,11 +1063,15 @@ singularity and excessive normalized condition separately, and returns
 outward-rounded inverse/control error intervals rather than using an absolute
 determinant magnitude. Plane and volume envelopes add the complete viewport,
 camera/ray, interpolation/gradient, general-DVR span, and sample-construction
-error. Grid ends and sample counts are accepted through `2^23` and rejected at
-`2^23 + 1` before u32-to-f32 aliasing can occur. Dataset layer/scale affine
-results are bounded and semantically cached; per-target work-envelope results
-are latest-only and verify the exact viewport, layer order, schedule, and
-affine identities carried into the renderer.
+error. Volume distance bounds use an outward-rounded forward-reachable ray
+interval, so a direction with a proven sign is charged only for boundaries it
+can reach before ray exit; zero and uncertain sign/order remain conservative
+and fail closed. Mirrored positive/negative paths share the same bound. Grid
+ends and sample counts are accepted through `2^23` and rejected at `2^23 + 1`
+before u32-to-f32 aliasing can occur. Dataset layer/scale affine results are
+bounded and semantically cached; per-target work-envelope results are
+latest-only and verify the exact viewport, layer order, schedule, and affine
+identities carried into the renderer.
 
 Orthographic planning consumes the validated camera quaternion axes and
 stable relative near-plane arithmetic. It does not reconstruct a basis from

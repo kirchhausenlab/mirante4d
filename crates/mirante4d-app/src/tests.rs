@@ -16,7 +16,7 @@ const TARGET_FIXTURE_ARCHIVE: &[u8] = include_bytes!(concat!(
 ));
 const SOURCE_FIXTURE_ARCHIVE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../fixtures/source/mirante4d-source-tiff-fixtures-v1.tar"
+    "/../../fixtures/source/mirante4d-source-tiff-fixtures-v2.tar"
 ));
 const TARGET_FIXTURE_NAME: &str = "m4d-t1-u16-3d-multiscale";
 const USTAR_BLOCK_BYTES: usize = 512;
@@ -685,8 +685,12 @@ fn install_test_product_renderer(
 }
 
 fn drive_test_product_render(app: &mut MiranteWorkbenchApp) -> anyhow::Result<()> {
+    if app.shader_work_envelopes.take_completed_result_wake() {
+        app.render_coordination.request_refresh();
+    }
     let events = app.renderer_ui_wake.begin_ui_turn();
     app.render_attempt.observe_renderer_events(events);
+    app.poll_product_gpu_timings();
     app.rerender_coordinated_display_state().map(|_| ())
 }
 

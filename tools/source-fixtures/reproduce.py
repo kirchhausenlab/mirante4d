@@ -25,8 +25,8 @@ PYTHON = Path("/usr/bin/python3.12")
 PYTHON_SHA256 = "1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118"
 RUSTC_SHA256 = "4a84e05991ad6f2a84c1361c29b52b38c390365bd1fc269b1936c88d482a8928"
 RUSTC_RELEASE_SHA256 = "3545a0efad2355ecb0a3b9ac02efee96e27f1f9d24b7ce2fc3f279b2efb0d923"
-SPEC_IDS = [f"SRC-TIFF-SPEC-{number:03d}" for number in range(1, 5)]
-ARCHIVE_NAME = "mirante4d-source-tiff-fixtures-v1.tar"
+SPEC_IDS = [f"SRC-TIFF-SPEC-{number:03d}" for number in range(1, 6)]
+ARCHIVE_NAME = "mirante4d-source-tiff-fixtures-v2.tar"
 
 
 def canonical_json(value: Any) -> bytes:
@@ -138,8 +138,8 @@ def parse_spec_paths(spec: Path) -> list[str]:
     with spec.open(newline="", encoding="utf-8") as source:
         rows = list(csv.DictReader(source, delimiter="|"))
     paths = sorted(row["path"] for row in rows if row["kind"] == "file")
-    if len(paths) != 16 or len(paths) != len(set(paths)):
-        raise RuntimeError("approved specification must name exactly 16 unique files")
+    if len(paths) != 21 or len(paths) != len(set(paths)):
+        raise RuntimeError("approved specification must name exactly 21 unique files")
     return paths
 
 
@@ -230,7 +230,18 @@ def compare_facts(facts_path: Path, reader_path: Path) -> None:
     observed = {item["path"]: item for item in reader["files"]}
     if set(expected) != set(observed):
         raise RuntimeError("fact oracle and reader path sets differ")
-    fields = ("dtype", "ifd_count", "width", "height", "logical_bytes", "logical_value_sha256")
+    fields = (
+        "dtype",
+        "ifd_count",
+        "width",
+        "height",
+        "byte_order",
+        "tiff_version",
+        "compression",
+        "storage_layout",
+        "logical_bytes",
+        "logical_value_sha256",
+    )
     for path in sorted(expected):
         for field in fields:
             if expected[path][field] != observed[path][field]:
@@ -252,8 +263,8 @@ def compare_facts(facts_path: Path, reader_path: Path) -> None:
 def member_inventory(root: Path) -> tuple[list[str], list[str]]:
     files = sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file())
     directories = sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_dir())
-    if len(files) != 20 or len(directories) != 7:
-        raise RuntimeError(f"approved archive must have 20 files and 7 directories, got {len(files)}/{len(directories)}")
+    if len(files) != 25 or len(directories) != 8:
+        raise RuntimeError(f"approved archive must have 25 files and 8 directories, got {len(files)}/{len(directories)}")
     return files, directories
 
 
@@ -431,7 +442,7 @@ def build_manifest(
         "schema": "mirante4d-foundation-source-fixture-manifest",
         "schema_version": 1,
         "specification_ids": SPEC_IDS,
-        "specification_version": 1,
+        "specification_version": 2,
         "status": "independently_validated",
         "publication_class": "public_safe",
         "license": "MIT",
@@ -515,15 +526,15 @@ def build_manifest(
                 "state": "approved",
                 "role": "repository owner",
                 "approved_by": "Mirante4D repository owner",
-                "approved_on": "2026-07-10",
-                "reference": "OA-001",
+                "approved_on": "2026-08-03",
+                "reference": "IMPORT_PREPROCESSING_STORAGE_TESTING_REFACTOR",
             },
             "scientific_and_layout_facts": {
                 "state": "approved",
                 "role": "repository owner",
                 "approved_by": "Mirante4D repository owner",
-                "approved_on": "2026-07-10",
-                "reference": "OA-001",
+                "approved_on": "2026-08-03",
+                "reference": "IMPORT_PREPROCESSING_STORAGE_TESTING_REFACTOR",
             },
         },
     }
@@ -540,7 +551,7 @@ def reproduce_once(
 ) -> dict[str, Any]:
     root = work / "root"
     root.mkdir(parents=True)
-    spec = repo / "tools/source-fixtures/specification/v1.tsv"
+    spec = repo / "tools/source-fixtures/specification/v2.tsv"
     ome = repo / "tools/source-fixtures/specification/ome-2016-06.xml"
     run(
         [str(PYTHON), "-S", str(repo / "tools/source-fixtures/producer/produce.py"), "--spec", str(spec), "--ome-xml", str(ome), "--output", str(root)],
@@ -550,9 +561,9 @@ def reproduce_once(
     records.mkdir()
     facts = records / "expected-facts.json"
     run([str(oracle), str(spec), str(facts)])
-    shutil.copyfile(repo / "tools/source-fixtures/specification/grouping-v1.json", records / "grouping.json")
-    shutil.copyfile(repo / "tools/source-fixtures/specification/provenance-license-v1.json", records / "provenance-license.json")
-    mutations = bind_mutations(root, repo / "tools/source-fixtures/specification/mutation-recipes-v1.json")
+    shutil.copyfile(repo / "tools/source-fixtures/specification/grouping-v2.json", records / "grouping.json")
+    shutil.copyfile(repo / "tools/source-fixtures/specification/provenance-license-v2.json", records / "provenance-license.json")
+    mutations = bind_mutations(root, repo / "tools/source-fixtures/specification/mutation-recipes-v2.json")
     (records / "mutations.json").write_bytes(canonical_json(mutations))
     reader_report = work / "reader-report.json"
     run(
@@ -661,6 +672,7 @@ def main() -> None:
         destination.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(first["archive"], destination / first["archive"].name)
         shutil.copyfile(output, destination / "manifest.json")
+        shutil.copyfile(first["reader_report"], destination / "independent-reader-report.json")
     print(f"archive sha256: {fixture_manifest['archive']['sha256']}")
     print(f"generated tree sha256: {first['tree_sha']}")
     print(f"manifest: {output}")

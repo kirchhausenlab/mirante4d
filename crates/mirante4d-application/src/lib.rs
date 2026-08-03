@@ -31,13 +31,13 @@ pub use project_store_service::{
     ProjectStoreServiceStatus, SystemMonotonicClock,
 };
 pub use render_coordination::{
-    CoordinatedPresentationGroup, CoordinatedPublicationDiagnostics,
-    CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
-    CrossSectionPanelScheduleStatus, DISPLAY_TIMING_SAMPLE_CAPACITY, DisplayGenerationStatus,
-    DisplayRefreshPath, DisplayRefreshTiming, DisplayTimingSamples, DisplayedFrameFreshness,
-    FrameCompleteness, FrameFailureKind, FrameFidelityStatus, LayerPresentationOverflow,
-    LayerPresentationStatus, LodDecisionReason, RenderBackend, RenderCoordinationState,
-    RenderSurfaceState, ResidentRenderFailureStatus,
+    CoordinatedPublicationDiagnostics, CrossSectionPanelScheduleReason,
+    CrossSectionPanelScheduleState, CrossSectionPanelScheduleStatus,
+    DISPLAY_TIMING_SAMPLE_CAPACITY, DisplayGenerationStatus, DisplayRefreshPath,
+    DisplayRefreshTiming, DisplayTimingSamples, DisplayedFrameFreshness, FrameCompleteness,
+    FrameFailureKind, FrameFidelityStatus, LayerPresentationOverflow, LayerPresentationStatus,
+    LodDecisionReason, RenderBackend, RenderCoordinationState, RenderSurfaceState,
+    ResidentRenderFailureStatus,
 };
 pub use render_intent_mailbox::{
     CompletedRenderIntent, RenderGestureId, RenderGestureKind, RenderIntentBase,

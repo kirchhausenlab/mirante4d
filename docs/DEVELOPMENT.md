@@ -75,8 +75,31 @@ workstation:
 
 ```bash
 MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
-  cargo xtask verify-local trusted-gpu
+  cargo xtask verify-local trusted-gpu-correctness
 ```
+
+That command runs only the exact 25-case correctness inventory. Performance
+uses the separate release campaign and its mode-0600 private configuration:
+
+```bash
+MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
+MIRANTE4D_GPU_ENVIRONMENT_QUIESCENT=1 \
+MIRANTE4D_GPU_DISPLAY_PROFILE_ID=<configured-id> \
+MIRANTE4D_GPU_COMPOSITOR_SESSION_ID=<configured-id> \
+MIRANTE4D_GPU_POWER_POLICY_ID=<configured-id> \
+MIRANTE4D_GPU_QUIESCENCE_POLICY_ID=<configured-id> \
+  cargo xtask gpu-performance --config /absolute/private/config.json
+```
+
+The configuration contract is
+`verification/gpu-performance-config.schema.json`. The campaign checks the
+clean pinned revision(s), Cargo lock, kernel, X11 output mode, adapter,
+driver, AC/power/thermal evidence, and explicit quiescence attestation. It
+builds outside the clean checkouts, performs the controlled Vulkan
+first-pixel-out activation probe, then runs the three component benchmark
+functions and the normal mapped product. Calibration writes a private
+baseline proposal requiring explicit owner acceptance; it never edits the
+accepted repository baseline.
 
 For viewer/rendering work, the focused release diagnostics and normal-product
 scenarios are:
@@ -94,11 +117,6 @@ cargo test -p mirante4d-render-wgpu \
 cargo test -p mirante4d-render-wgpu \
   volume_page_traversal_ \
   -- --ignored --nocapture --test-threads=1
-cargo test --release -p mirante4d-render-wgpu \
-  resident_coordinated_volume_gpu_timing -- --ignored --nocapture
-cargo test --release -p mirante4d-render-wgpu \
-  native_1080p_terminal_navigation_gpu_timing \
-  -- --ignored --nocapture --test-threads=1
 MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
   cargo xtask product-validate target_fixture_render_modes
 MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
@@ -107,6 +125,10 @@ MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
 MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
   cargo xtask product-validate \
     /absolute/path/to/time-series.m4d representative_temporal_playback
+MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display \
+MIRANTE4D_PRESENTATION_OBSERVER_REPORT=/absolute/private/presentation.json \
+  cargo xtask product-validate \
+    /absolute/path/to/cell-package.m4d representative_gpu_interaction
 cargo xtask viewer-oblique-continuity \
   --workflow linked-lod-diagnostic \
   --dataset /absolute/path/to/dataset.m4d \
@@ -122,13 +144,20 @@ cargo xtask viewer-oblique-continuity \
   --duration-secs 300 --runs 1 --skip-build
 ```
 
-The ignored timing tests are component diagnostics of resident sparse and
-single-resource terminal rendering. The terminal fixture measures
-voxel-exact and smooth-linear MIP/DVR/ISO at 1920×1080. The render-modes
-command uses the normal release application for independent pixel and mode
-facts. The former representative three-session and command-driven
-resident-navigation cadence scenarios were deleted because they did not
-establish visible continuity.
+The ignored timing functions are owned only by the `gpu-performance` lane.
+They emit 39 release measurements after 30 warm-ups and 120 measured frames;
+direct invocations are diagnostics, not a baseline comparison or product
+cadence result. The terminal fixture measures voxel-exact and smooth-linear
+MIP/DVR/ISO at 1920×1080. The mapped GPU scenario accepts correct changed
+frames only after final-swapchain `VK_KHR_present_wait` completion, marker
+readback, and matching `VK_EXT_present_timing` first-pixel-out feedback. X11
+proves window lifecycle and reads the marker. The campaign gates standalone
+and four-panel first-pixel-out interval p95 at 33.3 ms, resident coarse input-
+response p99 at 50 ms, maximum active visible gap at 100 ms, resident exact
+settlement at 250 ms, prepared nonresident replacement at one second, startup
+coarse at 250 ms, and startup exact at two seconds. It makes no photon,
+input-to-photon, or all-hardware cadence claim; application publication clocks
+remain diagnostics.
 
 The `volume_page_traversal_` filter runs the four registered trusted-GPU
 binary32 boundary cases. The full private A/B/C static-recovery campaign is

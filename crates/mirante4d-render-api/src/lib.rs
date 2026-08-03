@@ -833,13 +833,14 @@ impl ShaderWorkEnvelope {
             RenderViewIntent::Volume { camera, iso_light } => {
                 let controls =
                     volume_ray_shader_controls(camera, intent.presentation(), intent.extent())?;
-                let facts = affines
+                let analyses = affines
                     .iter()
                     .copied()
-                    .map(|layer| volume_layer_facts(layer, controls, intent.extent()))
+                    .map(|layer| volume_layer_analysis(layer, controls, intent.extent()))
                     .collect::<Result<Vec<_>, _>>()?;
+                let (facts, reachability): (Vec<_>, Vec<_>) = analyses.into_iter().unzip();
                 let general_dvr_sample_count_upper = general_dvr_required(&schedules, &affines)
-                    .then(|| general_dvr_count_bound(&affines))
+                    .then(|| general_dvr_count_bound(&affines, &reachability))
                     .transpose()?;
                 Ok(Self::Volume(VolumeRayWorkEnvelope {
                     camera,
@@ -1350,11 +1351,20 @@ fn plane_layer_geometry(
     })
 }
 
+#[cfg(test)]
 fn volume_layer_facts(
     layer: ShaderLayerAffine,
     controls: VolumeRayShaderControls,
     extent: RenderExtent,
 ) -> Result<ShaderLayerWorkFacts, ShaderAdmissionError> {
+    volume_layer_analysis(layer, controls, extent).map(|(facts, _)| facts)
+}
+
+fn volume_layer_analysis(
+    layer: ShaderLayerAffine,
+    controls: VolumeRayShaderControls,
+    extent: RenderExtent,
+) -> Result<(ShaderLayerWorkFacts, VolumeLayerReachability), ShaderAdmissionError> {
     let shape = layer.affine.grid_shape();
     let dimensions = [shape.x(), shape.y(), shape.z()];
     let sample_count_upper = dimensions.into_iter().max().unwrap_or(0);
@@ -1443,22 +1453,16 @@ fn volume_layer_facts(
         ));
     }
     let ray_parameter_span_upper = next_up(sample_count_upper as f64 / grid_speed_lower);
-    let maximum_grid_distance = (0..3)
-        .map(|axis| {
-            let lower = -0.5;
-            let upper = dimensions[axis] as f64 - 0.5;
-            let origin = grid_origin_bounds.components[axis];
-            [
-                (lower - origin.low).abs(),
-                (lower - origin.high).abs(),
-                (upper - origin.low).abs(),
-                (upper - origin.high).abs(),
-            ]
-            .into_iter()
-            .fold(0.0, f64::max)
-        })
-        .fold(0.0, f64::max);
-    let ray_parameter_absolute_upper = next_up(maximum_grid_distance / grid_speed_lower);
+    let reachability = volume_layer_reachability(
+        dimensions,
+        grid_origin_bounds,
+        grid_direction_bounds,
+        direction_bounds,
+        rows,
+        raw_grid_speed_lower,
+        normalized_grid_speed_lower,
+    )?;
+    let ray_parameter_absolute_upper = reachability.maximum_parameter_upper();
     if !ray_parameter_span_upper.is_finite()
         || !ray_parameter_absolute_upper.is_finite()
         || ray_parameter_span_upper > f64::from(f32::MAX)
@@ -1486,8 +1490,7 @@ fn volume_layer_facts(
     let mut grid_error_upper = layer.affine.maximum_grid_error();
     let mut all_raw_stationary = true;
     let mut all_normalized_stationary = true;
-    for axis in 0..3 {
-        let raw = grid_direction_bounds.components[axis];
+    for (axis, raw) in grid_direction_bounds.components.iter().copied().enumerate() {
         let normalized_abs_lower =
             normalized_component_abs_lower(raw, direction_bounds.norm_upper, rows);
         let normalized_abs_upper =
@@ -1527,19 +1530,38 @@ fn volume_layer_facts(
         }
         let direction_error =
             grid_direction_bounds.component_error[axis].max(normalized_component_error(rows));
+        let normalized_direction_upper =
+            normalized_component_abs_upper(raw, direction_bounds.norm_lower, rows).ok_or_else(
+                || {
+                    shader_envelope_error(
+                        ShaderEnvelopeStage::VolumeDirectionNormalization,
+                        ShaderEnvelopeAxis::Axis(axis_for_index(axis)),
+                        ShaderEnvelopeFailure::NonFiniteBound,
+                    )
+                },
+            )?;
+        let native_product =
+            grid_direction_bounds.components[axis].abs_upper * reachability.native.exit_upper;
+        let normalized_product = normalized_direction_upper * reachability.normalized.exit_upper;
+        let reachable_operation_magnitude = next_up(
+            grid_origin_bounds.components[axis].abs_upper + native_product.max(normalized_product),
+        );
+        if !reachable_operation_magnitude.is_finite() {
+            return Err(shader_envelope_error(
+                ShaderEnvelopeStage::VolumeSamplePoint,
+                ShaderEnvelopeAxis::Axis(axis_for_index(axis)),
+                ShaderEnvelopeFailure::NonFiniteBound,
+            ));
+        }
         let sample_construction_error = next_up(
             grid_origin_bounds.component_error[axis]
                 + direction_error * ray_parameter_absolute_upper
-                + wgsl_f32_operation_error(
-                    4,
-                    dimensions[axis] as f64 + grid_origin_bounds.components[axis].abs_upper,
-                )?,
+                + wgsl_f32_operation_error(4, reachable_operation_magnitude)?,
         );
         grid_error_upper[axis] = next_up(grid_error_upper[axis] + sample_construction_error);
-        let coordinate_magnitude = dimensions[axis] as f64 + 0.5;
         grid_error_upper[axis] = next_up(
             grid_error_upper[axis]
-                + wgsl_f32_operation_error(4, coordinate_magnitude.min(16_777_216.0))?,
+                + wgsl_f32_operation_error(4, reachable_operation_magnitude.min(16_777_216.0))?,
         );
         validate_grid_error(
             ShaderEnvelopeStage::VolumeSamplePoint,
@@ -1554,17 +1576,287 @@ fn volume_layer_facts(
             ShaderEnvelopeFailure::AllDirectionsStationary,
         ));
     }
-    Ok(ShaderLayerWorkFacts {
-        layer: layer.layer,
-        scale: layer.scale,
-        grid_error_upper,
-        address_range: [
-            [-0.5, shape.x() as f64 - 0.5],
-            [-0.5, shape.y() as f64 - 0.5],
-            [-0.5, shape.z() as f64 - 0.5],
-        ],
-        sample_count_upper,
+    Ok((
+        ShaderLayerWorkFacts {
+            layer: layer.layer,
+            scale: layer.scale,
+            grid_error_upper,
+            address_range: [
+                [-0.5, shape.x() as f64 - 0.5],
+                [-0.5, shape.y() as f64 - 0.5],
+                [-0.5, shape.z() as f64 - 0.5],
+            ],
+            sample_count_upper,
+        },
+        reachability,
+    ))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RayParameterBounds {
+    possible_intersection: bool,
+    entry_lower: f64,
+    exit_upper: f64,
+}
+
+impl RayParameterBounds {
+    const fn no_intersection() -> Self {
+        Self {
+            possible_intersection: false,
+            entry_lower: 0.0,
+            exit_upper: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VolumeLayerReachability {
+    native: RayParameterBounds,
+    normalized: RayParameterBounds,
+    native_grid_speed_upper: f64,
+}
+
+impl VolumeLayerReachability {
+    fn maximum_parameter_upper(self) -> f64 {
+        self.native.exit_upper.max(self.normalized.exit_upper)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PortableDirectionBounds {
+    Positive { lower: f64, upper: f64 },
+    Negative { lower: f64, upper: f64 },
+    Stationary,
+    Uncertain,
+}
+
+/// Bounds the nonnegative ray interval that the color path's native-scale ray
+/// and Pick's normalized ray can reach. Definite direction signs select only
+/// the forward slab boundary; a genuinely uncertain axis contributes no
+/// optimistic constraint and the max-norm fallback retains both branches.
+fn volume_layer_reachability(
+    dimensions: [u64; 3],
+    grid_origin_bounds: AffineDirectionBounds,
+    grid_direction_bounds: AffineDirectionBounds,
+    world_direction_bounds: AffineDirectionBounds,
+    rows: [[f64; 4]; 3],
+    raw_grid_speed_lower: f64,
+    normalized_grid_speed_lower: f64,
+) -> Result<VolumeLayerReachability, ShaderAdmissionError> {
+    let minimum_normal = f64::from(f32::MIN_POSITIVE);
+    let raw = grid_direction_bounds.components.map(|component| {
+        classify_portable_direction(component, component.abs_lower, component.abs_upper)
+    });
+    let normalized = std::array::from_fn(|axis| {
+        let component = grid_direction_bounds.components[axis];
+        let lower =
+            normalized_component_abs_lower(component, world_direction_bounds.norm_upper, rows);
+        let upper =
+            normalized_component_abs_upper(component, world_direction_bounds.norm_lower, rows);
+        match (lower, upper) {
+            (Some(lower), Some(upper)) => classify_portable_direction(component, lower, upper),
+            _ => PortableDirectionBounds::Uncertain,
+        }
+    });
+    let maximum_grid_distance = maximum_grid_distance(dimensions, grid_origin_bounds);
+    let native = reachable_ray_interval(
+        dimensions,
+        grid_origin_bounds,
+        raw,
+        raw_grid_speed_lower,
+        maximum_grid_distance,
+    )?;
+    let normalized = reachable_ray_interval(
+        dimensions,
+        grid_origin_bounds,
+        normalized,
+        normalized_grid_speed_lower,
+        maximum_grid_distance,
+    )?;
+    let native_grid_speed_upper = raw
+        .into_iter()
+        .map(|direction| match direction {
+            PortableDirectionBounds::Positive { upper, .. }
+            | PortableDirectionBounds::Negative { upper, .. } => upper,
+            PortableDirectionBounds::Stationary => 0.0,
+            PortableDirectionBounds::Uncertain => minimum_normal.max(
+                grid_direction_bounds
+                    .components
+                    .iter()
+                    .map(|component| component.abs_upper)
+                    .fold(0.0, f64::max),
+            ),
+        })
+        .fold(0.0, f64::max);
+    Ok(VolumeLayerReachability {
+        native,
+        normalized,
+        native_grid_speed_upper,
     })
+}
+
+fn classify_portable_direction(
+    signed: AffineComponentBounds,
+    abs_lower: f64,
+    abs_upper: f64,
+) -> PortableDirectionBounds {
+    let minimum_normal = f64::from(f32::MIN_POSITIVE);
+    if abs_upper < minimum_normal {
+        PortableDirectionBounds::Stationary
+    } else if signed.low > 0.0 && abs_lower >= minimum_normal {
+        PortableDirectionBounds::Positive {
+            lower: abs_lower,
+            upper: abs_upper,
+        }
+    } else if signed.high < 0.0 && abs_lower >= minimum_normal {
+        PortableDirectionBounds::Negative {
+            lower: abs_lower,
+            upper: abs_upper,
+        }
+    } else {
+        PortableDirectionBounds::Uncertain
+    }
+}
+
+fn reachable_ray_interval(
+    dimensions: [u64; 3],
+    origins: AffineDirectionBounds,
+    directions: [PortableDirectionBounds; 3],
+    fallback_speed_lower: f64,
+    maximum_grid_distance: f64,
+) -> Result<RayParameterBounds, ShaderAdmissionError> {
+    let mut entry_lower = 0.0_f64;
+    let mut exit_upper = f64::INFINITY;
+    for axis in 0..3 {
+        let lower = -0.5;
+        let upper = dimensions[axis] as f64 - 0.5;
+        let origin = origins.components[axis];
+        let (near, far) = match directions[axis] {
+            PortableDirectionBounds::Positive {
+                lower: speed_lower,
+                upper: speed_upper,
+            } => (
+                quotient_interval(
+                    lower - origin.high,
+                    lower - origin.low,
+                    speed_lower,
+                    speed_upper,
+                ),
+                quotient_interval(
+                    upper - origin.high,
+                    upper - origin.low,
+                    speed_lower,
+                    speed_upper,
+                ),
+            ),
+            PortableDirectionBounds::Negative {
+                lower: speed_lower,
+                upper: speed_upper,
+            } => (
+                quotient_interval(
+                    upper - origin.high,
+                    upper - origin.low,
+                    -speed_upper,
+                    -speed_lower,
+                ),
+                quotient_interval(
+                    lower - origin.high,
+                    lower - origin.low,
+                    -speed_upper,
+                    -speed_lower,
+                ),
+            ),
+            PortableDirectionBounds::Stationary => {
+                if origin.high < lower || origin.low >= upper {
+                    return Ok(RayParameterBounds::no_intersection());
+                }
+                continue;
+            }
+            PortableDirectionBounds::Uncertain => continue,
+        };
+        let (near_low, _) = near?;
+        let (_, far_high) = far?;
+        entry_lower = entry_lower.max(near_low);
+        exit_upper = exit_upper.min(far_high);
+    }
+
+    if !exit_upper.is_finite() {
+        exit_upper = next_up(maximum_grid_distance / fallback_speed_lower);
+    }
+    entry_lower = next_down(entry_lower.max(0.0)).max(0.0);
+    exit_upper = next_up(exit_upper);
+    if !entry_lower.is_finite() || !exit_upper.is_finite() {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::VolumeSlabIntersection,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::ReachableQuotientNotProvablyFinite,
+        ));
+    }
+    if exit_upper <= entry_lower {
+        return Ok(RayParameterBounds::no_intersection());
+    }
+    Ok(RayParameterBounds {
+        possible_intersection: true,
+        entry_lower,
+        exit_upper,
+    })
+}
+
+fn quotient_interval(
+    numerator_low: f64,
+    numerator_high: f64,
+    denominator_low: f64,
+    denominator_high: f64,
+) -> Result<(f64, f64), ShaderAdmissionError> {
+    if !numerator_low.is_finite()
+        || !numerator_high.is_finite()
+        || !denominator_low.is_finite()
+        || !denominator_high.is_finite()
+        || numerator_low > numerator_high
+        || denominator_low > denominator_high
+        || (denominator_low <= 0.0 && denominator_high >= 0.0)
+    {
+        return Err(shader_envelope_error(
+            ShaderEnvelopeStage::VolumeSlabIntersection,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::ReachableQuotientNotProvablyFinite,
+        ));
+    }
+    let quotients = [
+        numerator_low / denominator_low,
+        numerator_low / denominator_high,
+        numerator_high / denominator_low,
+        numerator_high / denominator_high,
+    ];
+    let low = quotients.into_iter().fold(f64::INFINITY, f64::min);
+    let high = quotients.into_iter().fold(f64::NEG_INFINITY, f64::max);
+    if low.is_finite() && high.is_finite() {
+        Ok((next_down(low), next_up(high)))
+    } else {
+        Err(shader_envelope_error(
+            ShaderEnvelopeStage::VolumeSlabIntersection,
+            ShaderEnvelopeAxis::All,
+            ShaderEnvelopeFailure::ReachableQuotientNotProvablyFinite,
+        ))
+    }
+}
+
+fn maximum_grid_distance(dimensions: [u64; 3], grid_origin_bounds: AffineDirectionBounds) -> f64 {
+    (0..3)
+        .map(|axis| {
+            let lower = -0.5;
+            let upper = dimensions[axis] as f64 - 0.5;
+            let origin = grid_origin_bounds.components[axis];
+            [
+                (lower - origin.low).abs(),
+                (lower - origin.high).abs(),
+                (upper - origin.low).abs(),
+                (upper - origin.high).abs(),
+            ]
+            .into_iter()
+            .fold(0.0, f64::max)
+        })
+        .fold(0.0, f64::max)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1945,52 +2237,28 @@ fn general_dvr_required(schedules: &[ShaderLayerSchedule], affines: &[ShaderLaye
             }))
 }
 
-fn general_dvr_count_bound(affines: &[ShaderLayerAffine]) -> Result<u64, ShaderAdmissionError> {
-    let mut world_min = [f64::INFINITY; 3];
-    let mut world_max = [f64::NEG_INFINITY; 3];
+fn general_dvr_count_bound(
+    affines: &[ShaderLayerAffine],
+    reachability: &[VolumeLayerReachability],
+) -> Result<u64, ShaderAdmissionError> {
+    debug_assert_eq!(affines.len(), reachability.len());
+    let mut entry_lower = f64::INFINITY;
+    let mut exit_upper = 0.0_f64;
     let mut maximum_grid_speed = 0.0_f64;
-    for layer in affines {
-        let inverse = layer.affine.quantized_inverse_center();
-        let radius = layer.affine.quantized_inverse_radius();
-        let shape = layer.affine.grid_shape();
-        let bounds = [
-            [-0.5, shape.x() as f64 - 0.5],
-            [-0.5, shape.y() as f64 - 0.5],
-            [-0.5, shape.z() as f64 - 0.5],
-        ];
-        for mask in 0_u8..8 {
-            let grid: [f64; 3] =
-                std::array::from_fn(|axis| bounds[axis][usize::from(mask & (1 << axis) != 0)]);
-            for axis in 0..3 {
-                let center = inverse[axis][0] * grid[0]
-                    + inverse[axis][1] * grid[1]
-                    + inverse[axis][2] * grid[2]
-                    + inverse[axis][3];
-                let error = radius[axis][0] * grid[0].abs()
-                    + radius[axis][1] * grid[1].abs()
-                    + radius[axis][2] * grid[2].abs()
-                    + radius[axis][3];
-                world_min[axis] = world_min[axis].min(next_down(center - error));
-                world_max[axis] = world_max[axis].max(next_up(center + error));
-            }
-        }
-        let rows = layer.affine.world_to_grid_rows();
-        maximum_grid_speed = maximum_grid_speed.max(
-            rows.into_iter()
-                .map(|row| {
-                    (f64::from(row[0]).powi(2)
-                        + f64::from(row[1]).powi(2)
-                        + f64::from(row[2]).powi(2))
-                    .sqrt()
-                })
-                .fold(0.0, f64::max),
-        );
+    for facts in reachability
+        .iter()
+        .copied()
+        .filter(|facts| facts.native.possible_intersection)
+    {
+        entry_lower = entry_lower.min(facts.native.entry_lower);
+        exit_upper = exit_upper.max(facts.native.exit_upper);
+        maximum_grid_speed = maximum_grid_speed.max(facts.native_grid_speed_upper);
     }
-    let diagonal = (0..3)
-        .map(|axis| (world_max[axis] - world_min[axis]).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    let count = next_up(diagonal * maximum_grid_speed).ceil();
+    let count = if entry_lower.is_finite() {
+        next_up(next_up(exit_upper - entry_lower).max(0.0) * maximum_grid_speed).ceil()
+    } else {
+        0.0
+    };
     if !count.is_finite() || count < 0.0 {
         return Err(shader_envelope_error(
             ShaderEnvelopeStage::GeneralDvrInterval,
@@ -2550,6 +2818,120 @@ impl PresentationTarget {
         }
     }
 }
+
+/// Fixed-capacity set over the viewer's closed presentation-target universe.
+///
+/// Membership, scheduling order, and publication policy remain separate
+/// decisions. Iteration is always canonical (`3D`, `XY`, `XZ`, `YZ`) and the
+/// representation cannot contain duplicates or allocate dynamically.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PresentationTargetSet(u8);
+
+impl PresentationTargetSet {
+    const ALL_BITS: u8 = (1 << PresentationTarget::ALL.len()) - 1;
+
+    pub const EMPTY: Self = Self(0);
+    pub const THREE_D: Self = Self::from_target(PresentationTarget::ThreeD);
+    pub const LINKED_CROSS_SECTIONS: Self = Self(
+        (1 << PresentationTarget::Xy.index())
+            | (1 << PresentationTarget::Xz.index())
+            | (1 << PresentationTarget::Yz.index()),
+    );
+    pub const ALL: Self = Self(Self::ALL_BITS);
+
+    pub const fn from_target(target: PresentationTarget) -> Self {
+        Self(1 << target.index())
+    }
+
+    pub fn from_targets(targets: impl IntoIterator<Item = PresentationTarget>) -> Self {
+        targets
+            .into_iter()
+            .fold(Self::EMPTY, |set, target| set.with(target))
+    }
+
+    pub const fn with(self, target: PresentationTarget) -> Self {
+        Self(self.0 | (1 << target.index()))
+    }
+
+    pub const fn without(self, target: PresentationTarget) -> Self {
+        Self(self.0 & !(1 << target.index()))
+    }
+
+    pub const fn contains(self, target: PresentationTarget) -> bool {
+        self.0 & (1 << target.index()) != 0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub const fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn len(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    pub const fn is_subset(self, other: Self) -> bool {
+        self.difference(other).is_empty()
+    }
+
+    pub const fn iter(self) -> PresentationTargetSetIter {
+        PresentationTargetSetIter {
+            set: self,
+            next_index: 0,
+        }
+    }
+}
+
+impl IntoIterator for PresentationTargetSet {
+    type Item = PresentationTarget;
+    type IntoIter = PresentationTargetSetIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PresentationTargetSetIter {
+    set: PresentationTargetSet,
+    next_index: usize,
+}
+
+impl Iterator for PresentationTargetSetIter {
+    type Item = PresentationTarget;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.next_index < PresentationTarget::ALL.len() {
+            let target = PresentationTarget::ALL[self.next_index];
+            self.next_index += 1;
+            if self.set.contains(target) {
+                return Some(target);
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = PresentationTarget::ALL[self.next_index..]
+            .iter()
+            .filter(|target| self.set.contains(**target))
+            .count();
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for PresentationTargetSetIter {}
 
 /// A backend-neutral target size in physical render pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -5434,8 +5816,17 @@ mod tests {
             Shape3D::new(maximum_shader_dimension_for_test(), 1, 1).unwrap(),
         )
         .unwrap();
+        let reachable = VolumeLayerReachability {
+            native: RayParameterBounds {
+                possible_intersection: true,
+                entry_lower: 0.0,
+                exit_upper: MAX_EXACT_SHADER_SAMPLE_COUNT as f64 + 1.0,
+            },
+            normalized: RayParameterBounds::no_intersection(),
+            native_grid_speed_upper: 1.0,
+        };
         assert!(matches!(
-            general_dvr_count_bound(&[far, shifted]),
+            general_dvr_count_bound(&[far, shifted], &[reachable, reachable]),
             Err(ShaderAdmissionError::ShaderSampleCountExceeded { .. })
         ));
     }
@@ -5500,6 +5891,20 @@ mod tests {
         }
     }
 
+    fn translated_volume_controls(
+        origin: [f32; 3],
+        direction: [f32; 3],
+    ) -> VolumeRayShaderControls {
+        VolumeRayShaderControls {
+            origin_base: origin,
+            origin_step_x: [0.0; 3],
+            origin_step_y: [0.0; 3],
+            direction_base: direction,
+            direction_step_x: [0.0; 3],
+            direction_step_y: [0.0; 3],
+        }
+    }
+
     #[test]
     fn volume_ray_envelope_checks_interior_direction_minimum_and_count() {
         let minimum = affine_vector_rectangle_minimum_norm(
@@ -5532,6 +5937,169 @@ mod tests {
                 .into_iter()
                 .all(|upper| upper < 0.5)
         );
+    }
+
+    #[test]
+    fn volume_envelope_excludes_proven_unreachable_opposite_boundary() {
+        let layer = ShaderLayerAffine::new(
+            LogicalLayerKey::new(0),
+            ScaleLevel::BASE,
+            GridToWorld::identity(),
+            Shape3D::new(1, 1, 1_000_000).unwrap(),
+        )
+        .unwrap();
+
+        let toward_lower = volume_layer_facts(
+            layer,
+            translated_volume_controls([16_383.5, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+            RenderExtent::new(1, 1).unwrap(),
+        )
+        .expect("the distant upper boundary is behind the ray and cannot affect its samples");
+        assert!(
+            toward_lower.grid_error_upper()[0] < 0.5,
+            "the reachable lower-bound path retains a strict half-voxel budget"
+        );
+
+        let mirrored_layer = ShaderLayerAffine::new(
+            LogicalLayerKey::new(0),
+            ScaleLevel::BASE,
+            GridToWorld::identity(),
+            Shape3D::new(1, 1, 100_000).unwrap(),
+        )
+        .unwrap();
+        let toward_upper = volume_layer_facts(
+            mirrored_layer,
+            translated_volume_controls([83_615.5, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            RenderExtent::new(1, 1).unwrap(),
+        )
+        .expect("the distant lower boundary is behind the mirrored ray");
+        assert!(
+            toward_upper.grid_error_upper()[0] < 0.5,
+            "the mirrored reachable path retains the same strict budget"
+        );
+
+        let exact_limit = ShaderLayerAffine::new(
+            LogicalLayerKey::new(0),
+            ScaleLevel::BASE,
+            GridToWorld::identity(),
+            Shape3D::new(1, 1, MAX_EXACT_SHADER_SAMPLE_COUNT).unwrap(),
+        )
+        .unwrap();
+        let exact_limit = volume_layer_facts(
+            exact_limit,
+            translated_volume_controls([0.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+            RenderExtent::new(1, 1).unwrap(),
+        )
+        .expect("the exact 2^23 sample-count boundary remains admitted");
+        assert_eq!(
+            exact_limit.sample_count_upper(),
+            MAX_EXACT_SHADER_SAMPLE_COUNT
+        );
+    }
+
+    fn constant_affine_bounds(components: [f64; 3]) -> AffineDirectionBounds {
+        let components = components.map(|value| AffineComponentBounds {
+            low: value,
+            high: value,
+            abs_lower: value.abs(),
+            abs_upper: value.abs(),
+        });
+        let norm = components
+            .iter()
+            .map(|component| component.low * component.low)
+            .sum::<f64>()
+            .sqrt();
+        AffineDirectionBounds {
+            base: components.map(|component| component.low),
+            step_x: [0.0; 3],
+            step_y: [0.0; 3],
+            component_error: [0.0; 3],
+            components,
+            norm_lower: norm,
+            norm_upper: norm,
+            maximum_x: 0.0,
+            maximum_y: 0.0,
+        }
+    }
+
+    #[test]
+    fn volume_envelope_reachability_is_symmetric_and_fails_closed_when_uncertain() {
+        let dimensions = [1_000_000, 1, 1];
+        let toward_lower = reachable_ray_interval(
+            dimensions,
+            constant_affine_bounds([16_383.5, 0.0, 0.0]),
+            [
+                PortableDirectionBounds::Negative {
+                    lower: 1.0,
+                    upper: 1.0,
+                },
+                PortableDirectionBounds::Stationary,
+                PortableDirectionBounds::Stationary,
+            ],
+            1.0,
+            983_616.0,
+        )
+        .unwrap();
+        let toward_upper = reachable_ray_interval(
+            dimensions,
+            constant_affine_bounds([983_615.5, 0.0, 0.0]),
+            [
+                PortableDirectionBounds::Positive {
+                    lower: 1.0,
+                    upper: 1.0,
+                },
+                PortableDirectionBounds::Stationary,
+                PortableDirectionBounds::Stationary,
+            ],
+            1.0,
+            983_616.0,
+        )
+        .unwrap();
+        assert!(toward_lower.possible_intersection);
+        assert!(toward_upper.possible_intersection);
+        assert_eq!(
+            toward_lower.exit_upper.to_bits(),
+            toward_upper.exit_upper.to_bits(),
+            "mirroring the origin and direction selects the other forward boundary without changing the reachable interval"
+        );
+
+        let uncertain_sign = reachable_ray_interval(
+            [8, 1, 128],
+            constant_affine_bounds([3.5, 0.0, 0.0]),
+            [
+                PortableDirectionBounds::Uncertain,
+                PortableDirectionBounds::Stationary,
+                PortableDirectionBounds::Positive {
+                    lower: 1.0,
+                    upper: 1.0,
+                },
+            ],
+            1.0,
+            128.0,
+        )
+        .unwrap();
+        assert!(
+            uncertain_sign.exit_upper > 127.0,
+            "an uncertain X sign cannot contribute the optimistic nearby X boundary"
+        );
+
+        let stationary_miss = reachable_ray_interval(
+            [8, 8, 8],
+            constant_affine_bounds([3.5, 9.0, 3.5]),
+            [
+                PortableDirectionBounds::Positive {
+                    lower: 1.0,
+                    upper: 1.0,
+                },
+                PortableDirectionBounds::Stationary,
+                PortableDirectionBounds::Stationary,
+            ],
+            1.0,
+            9.5,
+        )
+        .unwrap();
+        assert!(!stationary_miss.possible_intersection);
+        assert_eq!(stationary_miss.exit_upper, 0.0);
     }
 
     #[test]

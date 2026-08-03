@@ -15,8 +15,9 @@ use mirante4d_dataset::{BrickKey, DatasetCatalog, ResourceLease, ResourcePayload
 use mirante4d_render_api::RenderResourceGridCatalog;
 use mirante4d_render_api::{
     FrameIdentity, FrameProgress, GpuLedgerCategory, PreparedRenderRequirements,
-    PresentationTarget, RenderExtent, RenderExtentEnvelope, RenderIntent, RenderPassKind,
-    RenderRequirements, ShaderAdmissionError, VolumePickQuery, VolumePickResult, VolumePickTicket,
+    PresentationTarget, PresentationTargetSet, RenderExtent, RenderExtentEnvelope, RenderIntent,
+    RenderPassKind, RenderRequirements, ShaderAdmissionError, VolumePickQuery, VolumePickResult,
+    VolumePickTicket,
 };
 use thiserror::Error;
 
@@ -42,7 +43,7 @@ pub enum RetainedFrameRenderPolicy {
     ExactFrameOnly,
 }
 
-/// Fixed targets that must publish one coherent semantic successor together.
+/// Bounded targets that must publish one coherent semantic successor together.
 ///
 /// The set is carried by every request participating in the transaction. The
 /// renderer may continue residency preparation and private 3D refinement while
@@ -51,55 +52,39 @@ pub enum RetainedFrameRenderPolicy {
 /// first-useful or exact publication threshold in the same coordinated cutoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordinatedPublicationGroup {
-    targets: u8,
+    targets: PresentationTargetSet,
     exact_required: bool,
 }
 
 impl CoordinatedPublicationGroup {
-    const THREE_D_TARGETS: u8 = 1 << PresentationTarget::ThreeD.index();
-    const FULL_LAYOUT_TARGETS: u8 = Self::THREE_D_TARGETS
-        | (1 << PresentationTarget::Xy.index())
-        | (1 << PresentationTarget::Xz.index())
-        | (1 << PresentationTarget::Yz.index());
-
-    pub const THREE_D: Self = Self {
-        targets: Self::THREE_D_TARGETS,
-        exact_required: true,
-    };
-    pub const FULL_LAYOUT: Self = Self {
-        targets: Self::FULL_LAYOUT_TARGETS,
-        exact_required: true,
-    };
-    pub const THREE_D_FIRST_USEFUL: Self = Self {
-        targets: Self::THREE_D_TARGETS,
-        exact_required: false,
-    };
-    pub const FULL_LAYOUT_FIRST_USEFUL: Self = Self {
-        targets: Self::FULL_LAYOUT_TARGETS,
-        exact_required: false,
-    };
-
-    /// Builds the exact atomic group for a nonempty physical render delta.
-    ///
-    /// Logical frame assembly may prove that some targets are already
-    /// compatible immutable fronts. Those reused targets remain members of
-    /// the logical transaction, but only changed targets participate in the
-    /// renderer cutoff. Returning `None` for an empty delta lets the caller
-    /// complete an all-reused transaction without submitting artificial GPU
-    /// work.
-    pub fn exact_targets(targets: impl IntoIterator<Item = PresentationTarget>) -> Option<Self> {
-        let mut target_mask = 0_u8;
-        for target in targets {
-            target_mask |= 1 << target.index();
+    pub const fn exact_target_set(targets: PresentationTargetSet) -> Option<Self> {
+        if targets.is_empty() {
+            None
+        } else {
+            Some(Self {
+                targets,
+                exact_required: true,
+            })
         }
-        (target_mask != 0).then_some(Self {
-            targets: target_mask,
-            exact_required: true,
-        })
+    }
+
+    pub const fn first_useful_target_set(targets: PresentationTargetSet) -> Option<Self> {
+        if targets.is_empty() {
+            None
+        } else {
+            Some(Self {
+                targets,
+                exact_required: false,
+            })
+        }
     }
 
     pub const fn contains(self, target: PresentationTarget) -> bool {
-        self.targets & (1 << target.index()) != 0
+        self.targets.contains(target)
+    }
+
+    pub const fn targets(self) -> PresentationTargetSet {
+        self.targets
     }
 
     pub const fn exact_required(self) -> bool {
@@ -107,7 +92,7 @@ impl CoordinatedPublicationGroup {
     }
 
     const fn is_empty(self) -> bool {
-        self.targets == 0
+        self.targets.is_empty()
     }
 }
 
@@ -384,59 +369,6 @@ impl<'a> CoordinatedTargetRequest<'a> {
     }
 }
 
-/// Fixed-shape renderer boundary for a complete logical presentation
-/// transaction. Physical reuse/execution is intentionally absent from this
-/// type and is classified only after the renderer observes every member.
-#[derive(Debug, Clone, Copy)]
-pub enum CoordinatedLogicalTargetSet<'a> {
-    ThreeD {
-        three_d: CoordinatedTargetRequest<'a>,
-    },
-    FourPanel {
-        three_d: CoordinatedTargetRequest<'a>,
-        xy: CoordinatedTargetRequest<'a>,
-        xz: CoordinatedTargetRequest<'a>,
-        yz: CoordinatedTargetRequest<'a>,
-    },
-}
-
-impl<'a> CoordinatedLogicalTargetSet<'a> {
-    pub fn three_d(three_d: CoordinatedTargetRequest<'a>) -> Result<Self, WgpuRenderRuntimeError> {
-        if three_d.target() != PresentationTarget::ThreeD {
-            return Err(WgpuRenderRuntimeError::CoordinatedTargetViewMismatch {
-                target: three_d.target(),
-            });
-        }
-        Ok(Self::ThreeD { three_d })
-    }
-
-    pub fn four_panel(
-        three_d: CoordinatedTargetRequest<'a>,
-        xy: CoordinatedTargetRequest<'a>,
-        xz: CoordinatedTargetRequest<'a>,
-        yz: CoordinatedTargetRequest<'a>,
-    ) -> Result<Self, WgpuRenderRuntimeError> {
-        for (request, expected) in [
-            (three_d, PresentationTarget::ThreeD),
-            (xy, PresentationTarget::Xy),
-            (xz, PresentationTarget::Xz),
-            (yz, PresentationTarget::Yz),
-        ] {
-            if request.target() != expected {
-                return Err(WgpuRenderRuntimeError::CoordinatedTargetViewMismatch {
-                    target: request.target(),
-                });
-            }
-        }
-        Ok(Self::FourPanel {
-            three_d,
-            xy,
-            xz,
-            yz,
-        })
-    }
-}
-
 /// Consequences for one logical target in a coordinated cutoff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatedTargetExecutionReport {
@@ -455,6 +387,7 @@ pub struct CoordinatedTargetExecutionReport {
     residency_command_buffers: u32,
     residency_queue_submissions: u32,
     deferred_by_backpressure: bool,
+    retry_after_submission: Option<u64>,
     actionable_work_remaining: bool,
     hidden_refinement: Option<HiddenRefinementState>,
     hidden_refinement_job: Option<u64>,
@@ -524,6 +457,14 @@ impl CoordinatedTargetExecutionReport {
 
     pub const fn deferred_by_backpressure(&self) -> bool {
         self.deferred_by_backpressure
+    }
+
+    /// Exact runtime-owned completion that can make this deferred cutoff
+    /// eligible again. The identity is captured at the capacity decision so
+    /// a completion racing with report delivery cannot move the wait to an
+    /// unrelated later submission.
+    pub const fn retry_after_submission(&self) -> Option<u64> {
+        self.retry_after_submission
     }
 
     /// True when another coordinated execution can consume renderer-owned
@@ -626,6 +567,7 @@ pub struct CoordinatedFrameExecutionReport {
     recorded_targets: Box<[PresentationTarget]>,
     residency_queue_submissions: u32,
     color_queue_submissions: u32,
+    submitted_through_event: Option<u64>,
     cpu_timing: Option<CpuFrameTiming>,
     gpu_timing: Option<GpuTimingTicket>,
 }
@@ -649,6 +591,13 @@ impl CoordinatedFrameExecutionReport {
 
     pub const fn color_queue_submissions(&self) -> u32 {
         self.color_queue_submissions
+    }
+
+    /// Highest runtime-owned queue submission created by this cutoff. Waiting
+    /// for this exact event establishes completion of every submission the
+    /// report accounts for, including an earlier residency transfer.
+    pub const fn submitted_through_event(&self) -> Option<u64> {
+        self.submitted_through_event
     }
 
     pub const fn cpu_timing(&self) -> Option<CpuFrameTiming> {
@@ -1917,6 +1866,14 @@ impl WgpuRenderRuntime {
         self.inner.next_submission_completion_event()
     }
 
+    /// Advances WGPU's nonblocking completion boundary and returns the
+    /// highest runtime-owned submission event known complete. Tests and the
+    /// native event service use this to wait for one exact causal completion;
+    /// it never waits, sleeps, or authorizes an unrelated retry.
+    pub fn poll_submission_completions(&mut self) -> Result<u64, WgpuRenderRuntimeError> {
+        self.inner.poll_submission_completions()
+    }
+
     /// Returns the current hidden-refinement job for a fixed logical target.
     /// The identity is used only to key the worker-result wake; it exposes no
     /// renderer-owned allocation or submission handle.
@@ -2054,35 +2011,9 @@ impl WgpuRenderRuntime {
         )
     }
 
-    /// Executes one ordered cutoff over the desired fixed-target layout.
-    ///
-    /// Eligible resident color passes are recorded active-first into one
-    /// command encoder and use exactly one uninstrumented color submission.
-    pub fn execute_coordinated_logical_frame(
-        &mut self,
-        catalog: &DatasetCatalog,
-        active_target: PresentationTarget,
-        targets: CoordinatedLogicalTargetSet<'_>,
-    ) -> Result<CoordinatedFrameExecutionReport, WgpuRenderRuntimeError> {
-        match targets {
-            CoordinatedLogicalTargetSet::ThreeD { three_d } => self
-                .inner
-                .execute_coordinated_frame(catalog, active_target, std::slice::from_ref(&three_d)),
-            CoordinatedLogicalTargetSet::FourPanel {
-                three_d,
-                xy,
-                xz,
-                yz,
-            } => {
-                let targets = [three_d, xy, xz, yz];
-                self.inner
-                    .execute_coordinated_frame(catalog, active_target, &targets)
-            }
-        }
-    }
-
-    /// Executes a nontransactional physical request cohort. Composed Exact
-    /// transactions must use [`Self::execute_coordinated_logical_frame`].
+    /// Executes one complete bounded semantic cohort. The renderer validates
+    /// any declared publication group before deriving the physical color
+    /// delta; callers never submit a shortened delta as the logical frame.
     pub fn execute_coordinated_frame(
         &mut self,
         catalog: &DatasetCatalog,
@@ -2300,14 +2231,19 @@ mod tests {
     }
 
     #[test]
-    fn exact_publication_group_represents_only_the_physical_delta() {
-        assert_eq!(CoordinatedPublicationGroup::exact_targets([]), None);
-        let group = CoordinatedPublicationGroup::exact_targets([
+    fn dynamic_publication_group_preserves_the_complete_semantic_membership() {
+        assert_eq!(
+            CoordinatedPublicationGroup::exact_target_set(PresentationTargetSet::EMPTY),
+            None
+        );
+        let targets = PresentationTargetSet::from_targets([
             PresentationTarget::ThreeD,
             PresentationTarget::Xz,
-        ])
-        .expect("a nonempty physical delta forms one exact group");
+        ]);
+        let group = CoordinatedPublicationGroup::exact_target_set(targets)
+            .expect("a nonempty semantic target set forms one exact group");
         assert!(group.exact_required());
+        assert_eq!(group.targets(), targets);
         assert!(group.contains(PresentationTarget::ThreeD));
         assert!(group.contains(PresentationTarget::Xz));
         assert!(!group.contains(PresentationTarget::Xy));

@@ -780,7 +780,7 @@ fn automation_alone_does_not_enable_validation_capture() {
     let navigation: ProductAutomationScript = serde_json::from_str(
         r#"{
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 10,
+          "schema_version": 11,
           "hard_safety_limits": {},
           "scenario": "performance_navigation",
           "commands": [
@@ -807,7 +807,7 @@ fn automation_alone_does_not_enable_validation_capture() {
         let raw = format!(
             r#"{{
               "schema": "mirante4d-product-automation-script",
-              "schema_version": 10,
+              "schema_version": 11,
               "hard_safety_limits": {{}},
               "scenario": "render_correctness",
               "commands": [{pixel_command}]
@@ -962,7 +962,7 @@ fn automation_script_parses_the_b4_project_store_contract() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 10,
+          "schema_version": 11,
           "hard_safety_limits": {},
           "scenario": "b4_project_store",
           "commands": [
@@ -1038,7 +1038,7 @@ fn automation_script_parses_exposed_provisional_autosave_recovery() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 10,
+          "schema_version": 11,
           "hard_safety_limits": {},
           "scenario": "pre_alpha_recovery",
           "commands": [
@@ -1147,7 +1147,7 @@ fn automation_script_parses_semantic_camera_commands() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 10,
+          "schema_version": 11,
           "hard_safety_limits": {
             "max_cpu_total_bytes": 1024,
             "max_runtime_queued_requests": 128
@@ -1275,7 +1275,7 @@ fn automation_script_parses_package_integrity_audit_evidence_workflow() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 10,
+          "schema_version": 11,
           "hard_safety_limits": {},
           "scenario": "b3_package_integrity_audit",
           "commands": [
@@ -1331,7 +1331,7 @@ fn automation_script_parses_normal_import_cancel_resume_workflow() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 10,
+          "schema_version": 11,
           "hard_safety_limits": {},
           "scenario": "import_preprocessing",
           "commands": [
@@ -1374,7 +1374,7 @@ fn automation_script_parses_retained_four_panel_assertions() {
     let raw = r#"
         {
           "schema": "mirante4d-product-automation-script",
-          "schema_version": 10,
+          "schema_version": 11,
           "hard_safety_limits": {},
           "scenario": "unit_four_panel",
           "commands": [
@@ -1492,6 +1492,46 @@ fn automation_script_rejects_wrong_schema_version() {
     let err = script.validate().unwrap_err().to_string();
 
     assert!(err.contains("unsupported automation script schema version"));
+}
+
+#[test]
+fn only_the_monitored_presentation_probe_uses_an_out_of_pass_ui_wake() {
+    assert!(presentation_probe_ui_wake_required(
+        GPU_PRESENTATION_PROBE_SCENARIO,
+        true,
+    ));
+    assert!(!presentation_probe_ui_wake_required(
+        GPU_PRESENTATION_PROBE_SCENARIO,
+        false,
+    ));
+    assert!(!presentation_probe_ui_wake_required(
+        "representative_gpu_performance",
+        true,
+    ));
+}
+
+#[test]
+fn presentation_probe_only_continues_after_observed_restored_and_focused_window() {
+    assert!(!presentation_probe_window_restored(
+        false,
+        Some(false),
+        Some(true),
+    ));
+    assert!(!presentation_probe_window_restored(
+        true,
+        Some(true),
+        Some(true),
+    ));
+    assert!(!presentation_probe_window_restored(
+        true,
+        Some(false),
+        Some(false),
+    ));
+    assert!(presentation_probe_window_restored(
+        true,
+        Some(false),
+        Some(true),
+    ));
 }
 
 #[test]

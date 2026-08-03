@@ -12,6 +12,18 @@ contract = { max-threads = 2 }
 ui = { max-threads = 1 }
 
 [[profile.default.overrides]]
+filter = 'package(mirante4d-app) & test(=tests::typed_import_commands_cancel_resume_publish_and_open_without_a_display)'
+slow-timeout = { period = "5s", terminate-after = 6 }
+
+[[profile.default.overrides]]
+filter = 'package(mirante4d-import-pipeline) & test(=promoted_source_facts_drive_production_inspection_decode_and_publication)'
+slow-timeout = { period = "10s", terminate-after = 6 }
+
+[[profile.default.overrides]]
+filter = 'package(mirante4d-import-pipeline) & test(=cancellation_matrix_resumes_to_one_identity_across_every_prepublication_stage)'
+slow-timeout = { period = "20s", terminate-after = 6 }
+
+[[profile.default.overrides]]
 filter = 'package(mirante4d-app) & (test(=tests::import_analyze_save_and_reopen_without_a_global_integrity_audit) | test(=tests::imported_publication_waits_for_project_close_then_installs_without_an_integrity_audit) | test(=tests::failed_project_close_retains_imported_authority_without_an_audit_fallback) | test(=tests::imported_transfer_drift_fails_closed_without_external_open_fallback))'
 slow-timeout = { period = "5s", terminate-after = 6 }
 
@@ -23,6 +35,10 @@ slow-timeout = { period = "20s", terminate-after = 9 }
 [[profile.default.overrides]]
 filter = 'package(mirante4d-project-store) & test(=actor::tests::purge_fresh_process_kill_and_retry_matrix)'
 slow-timeout = { period = "5s", terminate-after = 8 }
+
+[[profile.default.overrides]]
+filter = 'package(mirante4d-import-pipeline) & test(=process_checkpoint_recovery_survives_forced_worker_termination)'
+slow-timeout = { period = "10s", terminate-after = 6 }
 
 [[profile.default.overrides]]
 filter = 'package(mirante4d-analysis-core) | package(mirante4d-analysis-runtime) | package(mirante4d-application) | package(mirante4d-dataset) | package(mirante4d-dataset-runtime) | package(mirante4d-domain) | package(mirante4d-identity) | package(mirante4d-project-model) | package(mirante4d-render-api) | package(mirante4d-render-reference) | package(mirante4d-render-wgpu) | package(mirante4d-settings) | package(xtask)'
@@ -59,11 +75,20 @@ report-name = "mirante4d-pr-rust"
 store-success-output = false
 store-failure-output = true
 
-[profile.trusted-gpu]
+[profile.trusted-gpu-correctness]
 inherits = "default"
 test-threads = 1
 global-timeout = "15m"
 
-[[profile.trusted-gpu.overrides]]
-filter = '((package(mirante4d-app) & test(/^gpu_memory::tests::selected_vulkan_adapter_reports_typed_device_local_memory/)) | (package(mirante4d-app) & test(/^tests::unsafe_3d_profile_keeps_native_preview_visible_until_atomic_exact_strips_finish/)) | (package(mirante4d-app) & test(/^tests::exact_transient_cross_section_updates_all_linked_panels_before_finish_and_empty_clears_them/)) | (package(mirante4d-app) & test(/^tests::incremental_linked_zoom_pixels_match_direct_fine_cpu_oracle_after_one_settlement_plan/)) | (package(mirante4d-app) & test(/^tests::direct_timepoint_selection_replaces_retained_gpu_pixels_with_the_successor_body/))) | ((package(mirante4d-render-wgpu) & test(/^gpu_tests::existing_device_constructor_publishes_color_before_pick_readiness/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::dedicated_/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::resident_body_changes_reuse_global_gpu_residency_across_targets/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::resident_coordinated_volume_gpu_timing/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::coordinated_four_target_resident_cutoff_has_real_pixels_one_submit_and_idle_zero/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::coordinated_atomic_volume_strips_stay_hidden_and_match_the_direct_frame/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::cross_target_upload_after_progress_snapshot_remains_dirty_until_consumed/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::coordinated_target_pins_are_union_scoped_and_layout_retirement_releases_them/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::segmented_payload_upload_and_sampling_cross_the_first_binding/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::rays_beyond_the_removed_16384_sample_cap_reach_the_far_voxel/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::multichannel_semantics_are_order_independent/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::progressive_plane_falls_back_by_whole_footprint_and_invalid_never_falls_through/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::terminal_full_volume_fast_path_matches_reference_for_all_volume_modes_and_sampling/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::native_1080p_terminal_navigation_gpu_timing/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::fixed_lod_multichannel_gpu_timing_matrix/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::volume_page_traversal_/)))'
+[[profile.trusted-gpu-correctness.overrides]]
+filter = '((package(mirante4d-app) & test(/^gpu_memory::tests::selected_vulkan_adapter_reports_typed_device_local_memory$/)) | (package(mirante4d-app) & test(/^tests::unsafe_3d_profile_keeps_native_preview_visible_until_atomic_exact_strips_finish$/)) | (package(mirante4d-app) & test(/^tests::exact_transient_cross_section_updates_all_linked_panels_before_finish_and_empty_clears_them$/)) | (package(mirante4d-app) & test(/^tests::incremental_linked_zoom_pixels_match_direct_fine_cpu_oracle_after_one_settlement_plan$/)) | (package(mirante4d-app) & test(/^tests::direct_timepoint_selection_replaces_retained_gpu_pixels_with_the_successor_body$/))) | ((package(mirante4d-render-wgpu) & test(/^gpu_tests::volume_page_traversal_crosses_sub_epsilon_direction_for_all_kernels_and_pick$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::volume_page_traversal_zero_direction_stays_in_one_page$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::volume_page_traversal_subnormal_direction_is_portably_canonicalized_or_rejected$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::volume_page_traversal_far_boundary_overflow_clamps_only_to_ray_exit$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::existing_device_constructor_publishes_color_before_pick_readiness$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::progressive_plane_falls_back_by_whole_footprint_and_invalid_never_falls_through$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::dedicated_mip_off_axis_color_matches_independent_numerical_oracle$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::dedicated_iso_affine_lighting_and_six_tap_halo_match_independent_reference$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::dedicated_mixed_mip_iso_authored_over_matches_independent_hand_facts$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::dedicated_dvr_off_axis_perspective_uses_physical_world_distance$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::resident_body_changes_reuse_global_gpu_residency_across_targets$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::coordinated_atomic_volume_strips_stay_hidden_and_match_the_direct_frame$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::coordinated_active_target_set_has_real_pixels_one_submit_and_idle_zero$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::cross_target_upload_after_progress_snapshot_remains_dirty_until_consumed$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::coordinated_target_pins_are_union_scoped_and_layout_retirement_releases_them$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::segmented_payload_upload_and_sampling_cross_the_first_binding$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::rays_beyond_the_removed_16384_sample_cap_reach_the_far_voxel$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::multichannel_semantics_are_order_independent$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::terminal_full_volume_fast_path_matches_reference_for_all_volume_modes_and_sampling$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::resident_coordinated_volume_is_exact_zero_work_and_idle_when_resident$/)))'
 slow-timeout = { period = "20s", terminate-after = 3 }
+
+[profile.gpu-performance]
+inherits = "default"
+test-threads = 1
+global-timeout = "30m"
+
+[[profile.gpu-performance.overrides]]
+filter = '((package(mirante4d-render-wgpu) & test(/^gpu_tests::native_1080p_terminal_navigation_gpu_timing$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::fixed_lod_multichannel_gpu_timing_matrix$/)) | (package(mirante4d-render-wgpu) & test(/^gpu_tests::resident_coordinated_volume_gpu_timing$/)))'
+slow-timeout = { period = "60s", terminate-after = 20 }

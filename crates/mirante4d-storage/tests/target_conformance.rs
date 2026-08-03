@@ -181,14 +181,40 @@ fn production_reader_consumes_all_positive_target_packages() {
 
     assert_eq!(manifest.archives.len(), 3);
     assert_eq!(expected.cases.len(), 3);
+    let mut failures = Vec::new();
     for archive in &manifest.archives {
-        let facts = expected
-            .cases
-            .iter()
-            .find(|case| case.case_id == archive.case_id)
-            .expect("every promoted archive has independent facts");
-        exercise_case(repository, archive, facts);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let facts = expected
+                .cases
+                .iter()
+                .find(|case| case.case_id == archive.case_id)
+                .expect("every promoted archive has independent facts");
+            exercise_case(repository, archive, facts);
+        }));
+        match outcome {
+            Ok(()) => eprintln!("M4D_TARGET_POSITIVE_PASS {}", archive.case_id),
+            Err(payload) => {
+                failures.push(format!("{}: {}", archive.case_id, panic_message(payload)))
+            }
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "promoted target package failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+        })
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
 fn exercise_case(repository: &Path, archive: &ArchiveAuthority, facts: &CaseFacts) {

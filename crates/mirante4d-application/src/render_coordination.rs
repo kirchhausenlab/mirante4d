@@ -1,6 +1,8 @@
 //! Framework-neutral status for coordinating progressive product presentation.
 
-use mirante4d_render_api::{MAX_RENDER_LAYERS, PresentationViewport, PresentedFrame, RenderExtent};
+use mirante4d_render_api::{
+    MAX_RENDER_LAYERS, PresentationTargetSet, PresentationViewport, PresentedFrame, RenderExtent,
+};
 
 use crate::PresentationSlot;
 
@@ -330,25 +332,6 @@ pub struct LayerPresentationOverflow {
     pub maximum: usize,
 }
 
-/// Targets that must all be semantically complete/current before one admitted
-/// display generation can be counted as a coordinated publication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CoordinatedPresentationGroup {
-    ThreeD,
-    Linked2d,
-    FullLayout,
-}
-
-impl CoordinatedPresentationGroup {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::ThreeD => "three_d",
-            Self::Linked2d => "linked_2d",
-            Self::FullLayout => "full_layout",
-        }
-    }
-}
-
 /// Monotonic, framework-neutral counters needed to identify a display freeze.
 /// No wall-clock or serializable `Instant` is retained here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -452,12 +435,12 @@ impl DisplayTimingSamples {
 /// another input never resets the gap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatedPublicationDiagnostics {
-    required_group: CoordinatedPresentationGroup,
+    required_targets: PresentationTargetSet,
     current_presentation_generation: Option<u64>,
     current_presentation_at_ns: Option<u64>,
     total_current_publications: u64,
     total_superseded_before_current_publication: u64,
-    window_group: Option<CoordinatedPresentationGroup>,
+    window_targets: Option<PresentationTargetSet>,
     window_started_at_ns: Option<u64>,
     window_ended_at_ns: Option<u64>,
     final_input_generation: Option<u64>,
@@ -473,12 +456,12 @@ pub struct CoordinatedPublicationDiagnostics {
 impl Default for CoordinatedPublicationDiagnostics {
     fn default() -> Self {
         Self {
-            required_group: CoordinatedPresentationGroup::FullLayout,
+            required_targets: PresentationTargetSet::ALL,
             current_presentation_generation: None,
             current_presentation_at_ns: None,
             total_current_publications: 0,
             total_superseded_before_current_publication: 0,
-            window_group: None,
+            window_targets: None,
             window_started_at_ns: None,
             window_ended_at_ns: None,
             final_input_generation: None,
@@ -494,8 +477,8 @@ impl Default for CoordinatedPublicationDiagnostics {
 }
 
 impl CoordinatedPublicationDiagnostics {
-    pub const fn required_group(&self) -> CoordinatedPresentationGroup {
-        self.required_group
+    pub const fn required_targets(&self) -> PresentationTargetSet {
+        self.required_targets
     }
 
     pub const fn current_presentation_generation(&self) -> Option<u64> {
@@ -514,8 +497,8 @@ impl CoordinatedPublicationDiagnostics {
         self.total_superseded_before_current_publication
     }
 
-    pub const fn window_group(&self) -> Option<CoordinatedPresentationGroup> {
-        self.window_group
+    pub const fn window_targets(&self) -> Option<PresentationTargetSet> {
+        self.window_targets
     }
 
     pub const fn window_started_at_ns(&self) -> Option<u64> {
@@ -567,9 +550,9 @@ impl CoordinatedPublicationDiagnostics {
         self.window_transition_errors == 0 && self.window_group_mismatches == 0
     }
 
-    fn begin_window(&mut self, now_ns: u64, group: CoordinatedPresentationGroup) {
+    fn begin_window(&mut self, now_ns: u64, targets: PresentationTargetSet) {
         let replaced_active_window = u64::from(self.window_active());
-        self.window_group = Some(group);
+        self.window_targets = Some(targets);
         self.window_started_at_ns = Some(now_ns);
         self.window_ended_at_ns = None;
         self.final_input_generation = None;
@@ -602,7 +585,7 @@ impl CoordinatedPublicationDiagnostics {
         &mut self,
         previous_generation: u64,
         generation: u64,
-        group: CoordinatedPresentationGroup,
+        targets: PresentationTargetSet,
     ) {
         if previous_generation > 0
             && self.current_presentation_generation != Some(previous_generation)
@@ -611,8 +594,8 @@ impl CoordinatedPublicationDiagnostics {
                 .total_superseded_before_current_publication
                 .saturating_add(1);
         }
-        self.required_group = group;
-        if self.window_active() && self.window_group != Some(group) {
+        self.required_targets = targets;
+        if self.window_active() && self.window_targets != Some(targets) {
             self.window_group_mismatches = self.window_group_mismatches.saturating_add(1);
         }
         debug_assert!(generation >= previous_generation);
@@ -631,7 +614,7 @@ impl CoordinatedPublicationDiagnostics {
         self.current_presentation_at_ns = Some(now_ns);
         self.total_current_publications = self.total_current_publications.saturating_add(1);
 
-        let publication_matches_window = self.window_group == Some(self.required_group);
+        let publication_matches_window = self.window_targets == Some(self.required_targets);
         let final_publication_after_window =
             self.window_ended_at_ns.is_some() && self.final_input_generation == Some(generation);
         if publication_matches_window && (self.window_active() || final_publication_after_window) {
@@ -848,8 +831,8 @@ impl RenderCoordinationState {
         &self.coordinated_publication
     }
 
-    pub const fn required_coordinated_presentation_group(&self) -> CoordinatedPresentationGroup {
-        self.coordinated_publication.required_group()
+    pub const fn required_coordinated_presentation_targets(&self) -> PresentationTargetSet {
+        self.coordinated_publication.required_targets()
     }
 
     pub fn record_interaction_task_duration(&mut self, duration_ns: u64) {
@@ -860,11 +843,11 @@ impl RenderCoordinationState {
         self.active_ui_update_duration_samples.record(duration_ns);
     }
 
-    /// Records one admitted effective display input and its currentness group.
+    /// Records one admitted effective display input and its affected targets.
     pub fn begin_display_input_generation(
         &mut self,
         now_ns: u64,
-        group: CoordinatedPresentationGroup,
+        targets: PresentationTargetSet,
     ) -> u64 {
         let previous = self.display_generation.input_generation;
         self.display_generation.input_generation = previous.saturating_add(1);
@@ -872,17 +855,13 @@ impl RenderCoordinationState {
         self.coordinated_publication.note_admitted_generation(
             previous,
             self.display_generation.input_generation,
-            group,
+            targets,
         );
         self.display_generation.input_generation
     }
 
-    pub fn begin_active_publication_window(
-        &mut self,
-        now_ns: u64,
-        group: CoordinatedPresentationGroup,
-    ) {
-        self.coordinated_publication.begin_window(now_ns, group);
+    pub fn begin_active_publication_window(&mut self, now_ns: u64, targets: PresentationTargetSet) {
+        self.coordinated_publication.begin_window(now_ns, targets);
     }
 
     pub fn end_active_publication_window(&mut self, now_ns: u64) {
@@ -1457,7 +1436,7 @@ mod tests {
     fn full_layout_publication_clock_is_independent_of_main_loop_heartbeats() {
         let mut state = coordination_state();
         assert_eq!(
-            state.begin_display_input_generation(100, CoordinatedPresentationGroup::FullLayout),
+            state.begin_display_input_generation(100, PresentationTargetSet::ALL),
             1
         );
         state.record_main_loop_heartbeat(120);
@@ -1467,8 +1446,8 @@ mod tests {
         assert_eq!(waiting.raw_current_main_loop_heartbeat_gap_ns, 30);
         assert_eq!(waiting.raw_maximum_main_loop_heartbeat_gap_ns, 30);
         assert_eq!(
-            state.required_coordinated_presentation_group(),
-            CoordinatedPresentationGroup::FullLayout
+            state.required_coordinated_presentation_targets(),
+            PresentationTargetSet::ALL
         );
         assert_eq!(
             state
@@ -1495,14 +1474,14 @@ mod tests {
     #[test]
     fn coordinated_publication_window_tracks_direct_gaps_and_final_latency() {
         let mut state = coordination_state();
-        state.begin_active_publication_window(100, CoordinatedPresentationGroup::Linked2d);
+        state.begin_active_publication_window(100, PresentationTargetSet::LINKED_CROSS_SECTIONS);
 
         assert_eq!(
-            state.begin_display_input_generation(105, CoordinatedPresentationGroup::Linked2d),
+            state.begin_display_input_generation(105, PresentationTargetSet::LINKED_CROSS_SECTIONS),
             1
         );
         assert_eq!(
-            state.begin_display_input_generation(115, CoordinatedPresentationGroup::Linked2d),
+            state.begin_display_input_generation(115, PresentationTargetSet::LINKED_CROSS_SECTIONS),
             2
         );
         state.record_main_loop_heartbeat(120);
@@ -1510,16 +1489,16 @@ mod tests {
         state.record_current_group_presentation(130);
 
         assert_eq!(
-            state.begin_display_input_generation(135, CoordinatedPresentationGroup::Linked2d),
+            state.begin_display_input_generation(135, PresentationTargetSet::LINKED_CROSS_SECTIONS),
             3
         );
         state.record_current_group_presentation(150);
         assert_eq!(
-            state.begin_display_input_generation(160, CoordinatedPresentationGroup::Linked2d),
+            state.begin_display_input_generation(160, PresentationTargetSet::LINKED_CROSS_SECTIONS),
             4
         );
         assert_eq!(
-            state.begin_display_input_generation(170, CoordinatedPresentationGroup::Linked2d),
+            state.begin_display_input_generation(170, PresentationTargetSet::LINKED_CROSS_SECTIONS),
             5
         );
         state.record_main_loop_heartbeat(190);
@@ -1557,9 +1536,9 @@ mod tests {
     #[test]
     fn final_only_publication_remains_insufficient_for_a_fixed_gesture() {
         let mut state = coordination_state();
-        state.begin_active_publication_window(100, CoordinatedPresentationGroup::Linked2d);
-        state.begin_display_input_generation(105, CoordinatedPresentationGroup::Linked2d);
-        state.begin_display_input_generation(150, CoordinatedPresentationGroup::Linked2d);
+        state.begin_active_publication_window(100, PresentationTargetSet::LINKED_CROSS_SECTIONS);
+        state.begin_display_input_generation(105, PresentationTargetSet::LINKED_CROSS_SECTIONS);
+        state.begin_display_input_generation(150, PresentationTargetSet::LINKED_CROSS_SECTIONS);
         state.end_active_publication_window(200);
         state.record_current_group_presentation(225);
 
@@ -1575,11 +1554,11 @@ mod tests {
     #[test]
     fn admitting_input_never_resets_the_active_publication_gap() {
         let mut state = coordination_state();
-        state.begin_active_publication_window(1_000, CoordinatedPresentationGroup::ThreeD);
-        state.begin_display_input_generation(1_010, CoordinatedPresentationGroup::ThreeD);
+        state.begin_active_publication_window(1_000, PresentationTargetSet::THREE_D);
+        state.begin_display_input_generation(1_010, PresentationTargetSet::THREE_D);
         state.record_current_group_presentation(1_020);
         for now_ns in [1_030, 1_040, 1_050, 1_060] {
-            state.begin_display_input_generation(now_ns, CoordinatedPresentationGroup::ThreeD);
+            state.begin_display_input_generation(now_ns, PresentationTargetSet::THREE_D);
         }
         state.end_active_publication_window(1_100);
 
@@ -1630,7 +1609,10 @@ mod tests {
         let idle = state.display_generation();
         assert_eq!(idle.raw_maximum_main_loop_heartbeat_gap_ns, 999_990);
 
-        state.begin_display_input_generation(1_000_010, CoordinatedPresentationGroup::Linked2d);
+        state.begin_display_input_generation(
+            1_000_010,
+            PresentationTargetSet::LINKED_CROSS_SECTIONS,
+        );
         state.record_main_loop_heartbeat(1_000_030);
         let active = state.display_generation();
         assert_eq!(active.raw_maximum_main_loop_heartbeat_gap_ns, 999_990);
@@ -1672,10 +1654,10 @@ mod tests {
     #[test]
     fn coordinated_publication_sample_overflow_invalidates_the_window() {
         let mut state = coordination_state();
-        state.begin_active_publication_window(1, CoordinatedPresentationGroup::ThreeD);
+        state.begin_active_publication_window(1, PresentationTargetSet::THREE_D);
         for index in 0..=DISPLAY_TIMING_SAMPLE_CAPACITY as u64 {
             let admitted_at = index.saturating_mul(10).saturating_add(2);
-            state.begin_display_input_generation(admitted_at, CoordinatedPresentationGroup::ThreeD);
+            state.begin_display_input_generation(admitted_at, PresentationTargetSet::THREE_D);
             state.record_current_group_presentation(admitted_at.saturating_add(1));
         }
         state.end_active_publication_window(

@@ -301,6 +301,9 @@ pub(super) enum ProductAutomationCommand {
         width: u32,
         height: u32,
     },
+    SetWindowMinimized {
+        minimized: bool,
+    },
     SetRenderTargetSize {
         width: u32,
         height: u32,
@@ -327,6 +330,9 @@ pub(super) enum ProductAutomationCommand {
     },
     ObservePlaybackCadence {
         duration_ms: u64,
+    },
+    SetGpuPerformancePhase {
+        phase: ProductAutomationGpuPerformancePhase,
     },
     SetLayerVisibility {
         layer_index: usize,
@@ -449,7 +455,10 @@ pub(super) enum ProductAutomationCommand {
         x_fraction: f32,
         y_fraction: f32,
     },
-    CopyDiagnostics,
+    CopyDiagnostics {
+        #[serde(default)]
+        checkpoint: Option<String>,
+    },
     CaptureScreenshot {
         target: ProductAutomationPresentationTarget,
         name: Option<String>,
@@ -511,6 +520,7 @@ impl ProductAutomationCommand {
             Self::WaitFor { .. } => "wait_for",
             Self::SetViewportSize { .. } => "set_viewport_size",
             Self::SetMappedClientPixels { .. } => "set_mapped_client_pixels",
+            Self::SetWindowMinimized { .. } => "set_window_minimized",
             Self::SetRenderTargetSize { .. } => "set_render_target_size",
             Self::SetViewerLayout { .. } => "set_viewer_layout",
             Self::SetTimeIndex { .. } => "set_time_index",
@@ -519,6 +529,7 @@ impl ProductAutomationCommand {
             Self::WaitForPresentedTimeIndex { .. } => "wait_for_presented_time_index",
             Self::WaitForTemporalTransitions { .. } => "wait_for_temporal_transitions",
             Self::ObservePlaybackCadence { .. } => "observe_playback_cadence",
+            Self::SetGpuPerformancePhase { .. } => "set_gpu_performance_phase",
             Self::SetLayerVisibility { .. } => "set_layer_visibility",
             Self::SetLayerOrder { .. } => "set_layer_order",
             Self::SetRenderMode { .. } => "set_render_mode",
@@ -547,7 +558,7 @@ impl ProductAutomationCommand {
             Self::SetActiveTool { .. } => "set_active_tool",
             Self::ProbeHover { .. } => "probe_hover",
             Self::PrimaryClick { .. } => "primary_click",
-            Self::CopyDiagnostics => "copy_diagnostics",
+            Self::CopyDiagnostics { .. } => "copy_diagnostics",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
             Self::CaptureTemporalFrame { .. } => "capture_temporal_frame",
             Self::Assert { .. } => "assert",
@@ -561,6 +572,22 @@ impl ProductAutomationCommand {
             && path.as_os_str().is_empty()
         {
             anyhow::bail!("switch_dataset requires a nonempty package path");
+        }
+        if let Self::CopyDiagnostics {
+            checkpoint: Some(checkpoint),
+        } = self
+            && (checkpoint.is_empty()
+                || checkpoint.len() > 128
+                || !checkpoint.as_bytes()[0].is_ascii_lowercase()
+                || !checkpoint.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'_' | b'.')
+                }))
+        {
+            anyhow::bail!(
+                "copy_diagnostics checkpoint must be one lowercase safe token of at most 128 bytes"
+            );
         }
         if let Self::SetCrossSectionView {
             center_world,
@@ -744,6 +771,34 @@ impl ProductAutomationCommand {
             anyhow::bail!("playback/input assertion requires a nonzero transition count");
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProductAutomationGpuPerformancePhase {
+    Startup,
+    StandaloneInteraction,
+    FourPanelInteraction,
+    ResidentSettlement,
+    PreparedNonresidentReplacement,
+    ModeSamplingMatrix,
+    InterruptedRefinement,
+    SettledIdle,
+}
+
+impl ProductAutomationGpuPerformancePhase {
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::StandaloneInteraction => "standalone_interaction",
+            Self::FourPanelInteraction => "four_panel_interaction",
+            Self::ResidentSettlement => "resident_settlement",
+            Self::PreparedNonresidentReplacement => "prepared_nonresident_replacement",
+            Self::ModeSamplingMatrix => "mode_sampling_matrix",
+            Self::InterruptedRefinement => "interrupted_refinement",
+            Self::SettledIdle => "settled_idle",
+        }
     }
 }
 

@@ -1390,6 +1390,24 @@ fn linked_reference_frames(
     })
 }
 
+fn drive_test_product_until(
+    app: &mut MiranteWorkbenchApp,
+    phase: &str,
+    deadline: std::time::Instant,
+    reached: impl Fn(&MiranteWorkbenchApp) -> bool,
+) {
+    while !reached(app) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the product test did not reach phase {phase}; render state={:?}",
+            app.render_attempt.state()
+        );
+        drive_test_product_render(app)
+            .unwrap_or_else(|error| panic!("phase {phase} failed: {error}"));
+        std::thread::yield_now();
+    }
+}
+
 fn await_linked_validation_captures(
     app: &mut MiranteWorkbenchApp,
     expected_frame: mirante4d_render_api::FrameIdentity,
@@ -1444,8 +1462,7 @@ fn await_linked_validation_captures(
                 );
             }
         } else {
-            app.rerender_coordinated_display_state()
-                .expect("the linked product frame renders");
+            drive_test_product_render(app).expect("the linked product frame renders");
         }
         let captures =
             [PanelId::Xy, PanelId::Xz, PanelId::Yz].map(|panel| {
@@ -1537,6 +1554,41 @@ fn assert_linked_captures_match_reference(
         assert!(
             max_delta <= 1,
             "{} GPU/reference RGBA8 delta was {max_delta}",
+            panel.label()
+        );
+    }
+}
+
+fn assert_linked_captures_equivalent(
+    actual: &[TrustedLinkedCapture; 3],
+    expected: &[TrustedLinkedCapture; 3],
+) {
+    for (panel, (actual, expected)) in [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+        .into_iter()
+        .zip(actual.iter().zip(expected))
+    {
+        assert_eq!(
+            actual.coverage,
+            expected.coverage,
+            "{} repeat-render coverage changed",
+            panel.label()
+        );
+        assert_eq!(
+            actual.validity,
+            expected.validity,
+            "{} repeat-render validity changed",
+            panel.label()
+        );
+        let max_delta = actual
+            .rgba8
+            .iter()
+            .zip(&expected.rgba8)
+            .map(|(left, right)| left.abs_diff(*right))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_delta <= 1,
+            "{} repeat-render RGBA8 delta was {max_delta}",
             panel.label()
         );
     }
@@ -1725,8 +1777,27 @@ fn incremental_linked_zoom_pixels_match_direct_fine_cpu_oracle_after_one_settlem
         .as_ref()
         .unwrap()
         .total_coordinated_color_submissions;
-    app.rerender_coordinated_display_state()
-        .expect("the installed same-frame successor renders");
+    drive_test_product_until(
+        &mut app,
+        "linked successor publication",
+        std::time::Instant::now() + Duration::from_secs(5),
+        |app| {
+            app.native_presentation
+                .product_gpu
+                .as_ref()
+                .is_some_and(|product| {
+                    product.total_coordinated_color_submissions
+                        > color_submissions_before_cutover
+                        && product.last_coordinated_recorded_targets.as_ref()
+                            == [
+                                PresentationSlot::Xy,
+                                PresentationSlot::Xz,
+                                PresentationSlot::Yz,
+                            ]
+                        && product.pending_validation_captures.len() == 3
+                })
+        },
+    );
     let product = app.native_presentation.product_gpu.as_ref().unwrap();
     assert!(
         product.total_coordinated_color_submissions > color_submissions_before_cutover,
@@ -1815,8 +1886,25 @@ fn incremental_linked_zoom_pixels_match_direct_fine_cpu_oracle_after_one_settlem
         .as_ref()
         .unwrap()
         .total_coordinated_color_submissions;
-    app.rerender_coordinated_display_state()
-        .expect("the complete same-frame successor renders");
+    drive_test_product_until(
+        &mut app,
+        "exact linked successor publication",
+        std::time::Instant::now() + Duration::from_secs(5),
+        |app| {
+            [PanelId::Xy, PanelId::Xz, PanelId::Yz]
+                .into_iter()
+                .all(|panel| {
+                    app.render_coordination
+                        .surface(panel.presentation_slot())
+                        .presented_frame()
+                        .is_some_and(|frame| {
+                            frame.frame() == cutover_frame
+                                && frame.progress().completeness()
+                                    == mirante4d_render_api::FrameCompleteness::Exact
+                        })
+                })
+        },
+    );
     let product = app.native_presentation.product_gpu.as_ref().unwrap();
     if !first_successor_all_exact {
         assert!(
@@ -1929,7 +2017,7 @@ fn incremental_linked_zoom_pixels_match_direct_fine_cpu_oracle_after_one_settlem
     let settled_frame = app.render_intent_mailbox.snapshot().latest_revision;
     let incremental_capture = await_linked_validation_captures(&mut app, settled_frame);
     assert_linked_captures_match_reference(&incremental_capture, &fine_reference);
-    assert_eq!(incremental_capture, direct_fine_capture);
+    assert_linked_captures_equivalent(&incremental_capture, &direct_fine_capture);
     assert!(app.visible_demand_plan_currentness().cross_sections);
     assert!(Arc::ptr_eq(
         &three_d_body_before,
@@ -2146,7 +2234,7 @@ fn unsafe_3d_profile_keeps_native_preview_visible_until_atomic_exact_strips_fini
             }),
         )
         .unwrap(),
-        Some(CoordinatedPresentationGroup::FullLayout)
+        Some(PresentationTargetSet::ALL)
     );
     await_visible_demand_plan(&mut app);
     assert_eq!(
@@ -2601,9 +2689,9 @@ fn exact_transient_cross_section_updates_all_linked_panels_before_finish_and_emp
     )
     .unwrap();
     let durable_revision = app.render_intent_mailbox.snapshot().latest_revision;
-    assert!(
-        durable_revision > transient_revision,
-        "the durable linked state must own a newer global mailbox revision"
+    assert_eq!(
+        durable_revision, transient_revision,
+        "Finish commits the final exact transient identity instead of manufacturing a second render intent"
     );
     assert_eq!(
         *application_view(&app.application.snapshot()).cross_section(),
@@ -3342,7 +3430,7 @@ fn resident_extent_only_plan_install_wakes_exactly_one_new_frame() {
             )],
         )
         .unwrap(),
-        Some(CoordinatedPresentationGroup::ThreeD)
+        Some(PresentationTargetSet::THREE_D)
     );
     let resize_revision = app.render_intent_mailbox.snapshot().latest_revision;
     assert_eq!(resize_revision.get(), revision_before_resize.get() + 1);
@@ -4229,6 +4317,192 @@ fn import_cancellation_waits_for_the_worker_terminal_result() {
 }
 
 #[test]
+fn typed_import_commands_cancel_resume_publish_and_open_without_a_display() {
+    let temp = tempfile::tempdir().unwrap();
+    let current_package = write_target_fixture(temp.path()).unwrap();
+    let source = write_source_time_series_fixture(temp.path()).unwrap();
+    let destination = temp.path().join("typed-command-import.m4d");
+    let checkpoint = temp
+        .path()
+        .join(".typed-command-import.m4d.import-checkpoint");
+    let mut source_before = fs::read_dir(&source)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+    source_before.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let opened = open_dataset_and_render_first_frame(&current_package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    app.source_open_service = Some(current_source_open_service::CurrentSourceOpenService::new(
+        app.cpu_broker.clone(),
+    ));
+    let context = egui::Context::default();
+
+    app.apply_import_command(ImportCommand::BeginSetup, &context);
+    app.apply_import_command(ImportCommand::SetChannelCount { count: 1 }, &context);
+    app.apply_import_command(
+        ImportCommand::SetChannelLabel {
+            channel: 0,
+            label: "nuclei".to_owned(),
+        },
+        &context,
+    );
+    app.apply_import_command(
+        ImportCommand::SetChannelSourceKind {
+            channel: 0,
+            kind: mirante4d_application::import_workflow::ImportChannelSourceKind::FolderOf3dTiffs,
+        },
+        &context,
+    );
+    app.import.install_channel_selection(0, source.clone());
+    let manifest = TiffSource::new(vec![
+        TiffChannelSource::folder_of_3d("nuclei", &source).unwrap(),
+    ])
+    .unwrap();
+    app.import
+        .workers
+        .start_inspection(manifest.clone(), PathBuf::new())
+        .unwrap();
+    app.import.mark_channel_inspection_active(0);
+    let inspection_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        app.drain_tiff_import_setup_results(&context);
+        if app
+            .import
+            .setup
+            .as_ref()
+            .and_then(|setup| setup.channels[0].inspection.as_ref())
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < inspection_deadline,
+            "typed setup inspection did not complete"
+        );
+        std::thread::yield_now();
+    }
+    let inspection = app.import.validated_setup_inspection().unwrap();
+    app.import.setup = None;
+    let first_review = app
+        .import
+        .install_review(manifest.clone(), inspection.clone(), destination.clone())
+        .unwrap();
+    let ImportWorkflowSnapshot::Review(review) = app.import.snapshot() else {
+        panic!("validated setup did not produce a review");
+    };
+    assert_eq!(review.review_id, first_review);
+    let mut draft = review.initial_draft;
+    draft.calibration_confirmed = true;
+    draft.time_step_seconds = Some(1.0);
+
+    let gate = import_worker_service::pause_test_import_after_progress(
+        destination.clone(),
+        mirante4d_import_pipeline::ImportStage::BaseProduction,
+        1,
+    );
+    app.apply_import_command(
+        ImportCommand::Start {
+            review_id: first_review,
+            draft,
+        },
+        &context,
+    );
+    assert!(gate.wait_until_reached(Duration::from_secs(10)));
+    app.apply_import_command(ImportCommand::CancelImport, &context);
+    assert!(matches!(
+        app.import.workers.status(),
+        ImportWorkerStatus::Importing {
+            cancellation_requested: true,
+            ..
+        }
+    ));
+    gate.release();
+    let cancellation_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while app.import.workers.status().is_importing() {
+        app.drain_import_results(&context);
+        assert!(
+            std::time::Instant::now() < cancellation_deadline,
+            "typed import cancellation did not reach its terminal result"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(app.import.workers.diagnostics().cancelled_runs, 1);
+    assert!(!destination.exists());
+    assert!(checkpoint.exists());
+
+    let retry_review = app
+        .import
+        .install_review(manifest, inspection, destination.clone())
+        .unwrap();
+    app.apply_import_command(
+        ImportCommand::Start {
+            review_id: retry_review,
+            draft,
+        },
+        &context,
+    );
+    let publication_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while app.import.workers.status().is_importing() {
+        app.drain_import_results(&context);
+        assert!(
+            std::time::Instant::now() < publication_deadline,
+            "resumed typed import did not publish"
+        );
+        std::thread::yield_now();
+    }
+    let diagnostics = app.import.workers.diagnostics();
+    assert_eq!(diagnostics.successful_runs, 1);
+    assert!(diagnostics.maximum_resumed_work_units > 0);
+    let receipt = diagnostics.last_successful_import.unwrap().receipt;
+    assert!(destination.exists());
+    assert!(!checkpoint.exists());
+
+    wait_for_test_app(&mut app, |app| {
+        app.dataset.selected_path() == destination
+            && app
+                .source_open_service
+                .as_ref()
+                .is_some_and(|service| service.active_token().is_none())
+    });
+    assert_eq!(
+        app.application
+            .snapshot()
+            .catalog()
+            .content_address_status()
+            .content_address()
+            .copied(),
+        Some(receipt.scientific_content_id)
+    );
+    assert!(matches!(
+        app.application.snapshot().source().content_address_origin(),
+        mirante4d_application::ContentAddressOrigin::ComputedDuringImport
+    ));
+    let mut source_after = fs::read_dir(&source)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+    source_after.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(source_after, source_before);
+
+    app.source_open_service.take().unwrap().shutdown().unwrap();
+    app.package_integrity_audit_service
+        .take()
+        .unwrap()
+        .shutdown()
+        .unwrap();
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
 fn imported_dataset_uses_the_existing_dirty_project_open_handoff() {
     let temp = tempfile::tempdir().unwrap();
     let package = write_target_fixture(temp.path()).unwrap();
@@ -4723,19 +4997,11 @@ fn import_analyze_save_and_reopen_without_a_global_integrity_audit() {
     app.project_store_noninteractive_paths.initial_save = Some(project_path.clone());
     app.apply_application_command(ApplicationCommand::RequestProjectSave, &context)
         .unwrap();
-    if wait_for_initial_project_save(&mut app) == InitialProjectSave::UnsupportedFilesystem {
-        assert!(!project_path.exists());
-        assert!(app.project_dirty());
-        assert!(app.analysis_start_unavailable_reason().is_some());
-        close_test_project_store(&mut app);
-        app.dataset.request_shutdown().unwrap();
-        app.package_integrity_audit_service
-            .take()
-            .unwrap()
-            .shutdown()
-            .unwrap();
-        return;
-    }
+    assert_eq!(
+        wait_for_initial_project_save(&mut app),
+        InitialProjectSave::Established,
+        "the named import/analyse/save/reopen workflow requires a qualified writable filesystem"
+    );
 
     assert_eq!(app.analysis_start_unavailable_reason(), None);
     app.start_product_analysis(analysis_product::ProductAnalysisScope::FullTimeTrace)
@@ -4889,7 +5155,42 @@ fn import_analyze_save_and_reopen_without_a_global_integrity_audit() {
         .unwrap();
 }
 
- fn install_test_project_store(app: &mut MiranteWorkbenchApp) {
+#[test]
+fn unsupported_project_filesystem_blocks_analysis_without_publishing_a_destination() {
+    let unsupported = tempfile::tempdir_in("/dev/shm")
+        .expect("the Linux test environment provides the deliberately unsupported tmpfs");
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let project_path = unsupported.path().join("unsupported.m4dproj");
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    install_test_project_store(&mut app);
+    let context = egui::Context::default();
+
+    app.apply_application_command(ApplicationCommand::AttachDataset, &context)
+        .unwrap();
+    assert!(app.project_dirty());
+    app.project_store_noninteractive_paths.initial_save = Some(project_path.clone());
+    app.apply_application_command(ApplicationCommand::RequestProjectSave, &context)
+        .unwrap();
+    assert_eq!(
+        wait_for_initial_project_save(&mut app),
+        InitialProjectSave::UnsupportedFilesystem
+    );
+    assert!(!project_path.exists());
+    assert!(app.project_dirty());
+    assert!(app.analysis_start_unavailable_reason().is_some());
+
+    close_test_project_store(&mut app);
+    app.dataset.request_shutdown().unwrap();
+    app.package_integrity_audit_service
+        .take()
+        .unwrap()
+        .shutdown()
+        .unwrap();
+}
+
+fn install_test_project_store(app: &mut MiranteWorkbenchApp) {
     let snapshot = app.application.snapshot();
     let WorkspaceSnapshot::Unbound { workspace } = snapshot.workspace() else {
         panic!("test project store must start before the workspace is bound");

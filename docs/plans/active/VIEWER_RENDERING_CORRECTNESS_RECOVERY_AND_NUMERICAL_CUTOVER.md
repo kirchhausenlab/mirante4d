@@ -2083,7 +2083,7 @@ cargo test -p mirante4d-application
 cargo test -p mirante4d-app --lib
 cargo test -p mirante4d-ui-egui
 MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 \
-  cargo xtask verify-local trusted-gpu
+  cargo xtask verify-local trusted-gpu-correctness
 cargo xtask verify-pr
 cargo xtask docs-check
 ```

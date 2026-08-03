@@ -239,7 +239,10 @@ mod tests {
     use crate::{
         ProjectOpenMode,
         generation::GenerationDocument,
-        lease::{GcTransitionInjector, GcTransitionTarget, TransitionEdge},
+        lease::{
+            GcTransitionInjector, GcTransitionTarget, TransitionEdge,
+            acquire_writer_eventually_for_test,
+        },
     };
 
     const MANUAL: &str = concat!(
@@ -588,8 +591,7 @@ mod tests {
             }
 
             drop(leases);
-            let mut retry =
-                ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+            let mut retry = acquire_writer_eventually_for_test(&root);
             let retry_trace = GcTransitionInjector::recorder();
             retry.set_gc_transition_injector(retry_trace.clone());
             publish_pin(&root, &retry, "checkpoint-a", target, limits, || false).unwrap();
@@ -666,8 +668,7 @@ mod tests {
             }
 
             drop(leases);
-            let mut retry =
-                ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+            let mut retry = acquire_writer_eventually_for_test(&root);
             let retry_trace = GcTransitionInjector::recorder();
             retry.set_gc_transition_injector(retry_trace.clone());
             remove_pin(&root, &retry, "checkpoint-a", limits, || false).unwrap();

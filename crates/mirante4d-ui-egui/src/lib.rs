@@ -1628,7 +1628,8 @@ mod tests {
 
     use egui_kittest::{Harness, kittest::Queryable};
     use mirante4d_application::import_workflow::{
-        ImportFailureSnapshot, ImportRecoverySnapshot, ImportShapeSnapshot,
+        ImportChannelSetupSnapshot, ImportFailureSnapshot, ImportRecoverySnapshot,
+        ImportSetupSnapshot, ImportShapeSnapshot,
     };
 
     use super::*;
@@ -1704,6 +1705,22 @@ mod tests {
             },
             ome_spacing_zyx_um: Some([0.5, 0.2, 0.2]),
             initial_draft,
+        })
+    }
+
+    fn import_setup() -> ImportWorkflowSnapshot {
+        ImportWorkflowSnapshot::Configure(ImportSetupSnapshot {
+            setup_id: 41,
+            channels: vec![ImportChannelSetupSnapshot {
+                label: "channel 1".to_owned(),
+                source_kind: ImportChannelSourceKind::Single3dTiff,
+                selected_path: Some("/source/cells.ome.tiff".to_owned()),
+                inspection: None,
+                error: None,
+            }],
+            active_inspection: None,
+            active_inspection_progress: None,
+            validation_error: None,
         })
     }
 
@@ -1814,6 +1831,60 @@ mod tests {
 
         state.synchronize_import_snapshot(&import_review(8, import_draft(4.0)));
         assert_eq!(state.import_review.unwrap().draft.spacing_zyx_um, [4.0; 3]);
+    }
+
+    #[test]
+    fn import_setup_row_emits_typed_label_source_kind_and_path_commands() {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 500.0))
+            .build_ui_state(
+                |ui, state: &mut ImportWindowHarnessState| {
+                    state.commands =
+                        show_import_workflow_window(ui.ctx(), &mut state.ui, &state.snapshot);
+                },
+                ImportWindowHarnessState {
+                    ui: EguiUiState::new(256, 128),
+                    snapshot: import_setup(),
+                    commands: Vec::new(),
+                },
+            );
+
+        harness.get_by_label("/source/cells.ome.tiff");
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .focus();
+        harness.step();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text("nuclei");
+        harness.step();
+        assert_eq!(
+            harness.state().commands,
+            vec![ImportCommand::SetChannelLabel {
+                channel: 0,
+                label: "nuclei".to_owned(),
+            }]
+        );
+
+        harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+        harness.step();
+        harness.get_by_label("Folder of 2D TIFFs").click_accesskit();
+        harness.step();
+        assert_eq!(
+            harness.state().commands,
+            vec![ImportCommand::SetChannelSourceKind {
+                channel: 0,
+                kind: ImportChannelSourceKind::FolderOf2dTiffs,
+            }]
+        );
+
+        harness.get_by_label("Choose…").click_accesskit();
+        harness.step();
+        assert_eq!(
+            harness.state().commands,
+            vec![ImportCommand::ChooseChannelSource { channel: 0 }]
+        );
     }
 
     #[test]

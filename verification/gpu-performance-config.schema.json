@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mirante4d.org/schemas/gpu-performance-config-v2.schema.json",
+  "title": "Mirante4D private GPU performance campaign configuration v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "measurement_version",
+    "operation",
+    "baseline",
+    "candidate",
+    "private_output_directory",
+    "raw_report",
+    "representative_package",
+    "representative_package_manifest_sha256",
+    "workload_profile_id",
+    "presentation_probe_receipt",
+    "supersedes_baseline_id",
+    "environment"
+  ],
+  "properties": {
+    "schema": { "const": "mirante4d-gpu-performance-config" },
+    "schema_version": { "const": 2 },
+    "measurement_version": { "const": "gpu-performance-v3" },
+    "operation": { "enum": ["calibrate", "compare"] },
+    "baseline": { "$ref": "#/$defs/revision" },
+    "candidate": {
+      "anyOf": [{ "$ref": "#/$defs/revision" }, { "type": "null" }]
+    },
+    "private_output_directory": { "$ref": "#/$defs/absolutePath" },
+    "raw_report": { "$ref": "#/$defs/absolutePath" },
+    "representative_package": { "$ref": "#/$defs/absolutePath" },
+    "representative_package_manifest_sha256": { "$ref": "#/$defs/sha256" },
+    "workload_profile_id": { "$ref": "#/$defs/token" },
+    "presentation_probe_receipt": { "$ref": "#/$defs/absolutePath" },
+    "supersedes_baseline_id": {
+      "anyOf": [{ "$ref": "#/$defs/token" }, { "type": "null" }]
+    },
+    "environment": { "$ref": "#/$defs/environment" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "operation": { "const": "calibrate" } } },
+      "then": { "properties": { "candidate": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "operation": { "const": "compare" } } },
+      "then": { "properties": { "candidate": { "$ref": "#/$defs/revision" } } }
+    }
+  ],
+  "$defs": {
+    "absolutePath": { "type": "string", "pattern": "^/" },
+    "token": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "revisionId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkout", "target_directory", "revision"],
+      "properties": {
+        "checkout": { "$ref": "#/$defs/absolutePath" },
+        "target_directory": { "$ref": "#/$defs/absolutePath" },
+        "revision": { "$ref": "#/$defs/revisionId" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "platform",
+        "kernel_release",
+        "release_profile",
+        "adapter",
+        "backend",
+        "driver",
+        "display_output",
+        "display_profile_id",
+        "compositor_session_id",
+        "display_refresh_millihz",
+        "target_width_pixels",
+        "target_height_pixels",
+        "power_policy_id",
+        "ac_online_path",
+        "ac_online_expected",
+        "power_policy_path",
+        "power_policy_expected",
+        "thermal_status_path",
+        "thermal_status_expected",
+        "quiescence_policy_id",
+        "cargo_lock_sha256",
+        "presentation_authority"
+      ],
+      "properties": {
+        "platform": { "const": "linux-x86_64" },
+        "kernel_release": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "release_profile": { "const": "release" },
+        "adapter": { "const": "NVIDIA GeForce RTX 3070 Ti Laptop GPU" },
+        "backend": { "const": "Vulkan" },
+        "driver": { "type": "string", "minLength": 1 },
+        "display_output": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "display_profile_id": { "$ref": "#/$defs/token" },
+        "compositor_session_id": { "$ref": "#/$defs/token" },
+        "display_refresh_millihz": { "type": "integer", "minimum": 30000 },
+        "target_width_pixels": { "const": 1920 },
+        "target_height_pixels": { "const": 1080 },
+        "power_policy_id": { "$ref": "#/$defs/token" },
+        "ac_online_path": { "$ref": "#/$defs/absolutePath" },
+        "ac_online_expected": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "power_policy_path": { "$ref": "#/$defs/absolutePath" },
+        "power_policy_expected": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "thermal_status_path": { "$ref": "#/$defs/absolutePath" },
+        "thermal_status_expected": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "quiescence_policy_id": { "$ref": "#/$defs/token" },
+        "cargo_lock_sha256": { "$ref": "#/$defs/sha256" },
+        "presentation_authority": {
+          "const": "vulkan_ext_present_timing_first_pixel_out_marker_v2"
+        }
+      }
+    }
+  }
+}

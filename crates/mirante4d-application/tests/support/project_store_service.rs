@@ -568,12 +568,10 @@ fn foreground_completion_at_autosave_deadline_does_not_capture_the_stale_snapsho
 }
 
 #[test]
-fn real_open_recovery_inspection_failure_enters_recovery_only() {
+fn qualified_filesystem_open_recovery_inspection_failure_enters_recovery_only() {
     let directory = TestDirectory::new();
     let path = ProjectStorePath::new(directory.path().join("recovery.m4dproj")).unwrap();
-    if !create_established_store(&path) {
-        return;
-    }
+    create_established_store(&path);
 
     let mut opener = admitted_unbound_application();
     opener.drain_events(MAX_PENDING_EVENTS);
@@ -626,13 +624,12 @@ fn real_open_recovery_inspection_failure_enters_recovery_only() {
 }
 
 #[test]
-fn automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit() {
+fn qualified_filesystem_automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit()
+{
     let directory = TestDirectory::new();
 
     let newer_path = ProjectStorePath::new(directory.path().join("newer.m4dproj")).unwrap();
-    let Some((newer_generation, _)) = create_established_recovery_store(&newer_path, false) else {
-        return;
-    };
+    let (newer_generation, _) = create_established_recovery_store(&newer_path, false);
     let mut newer_opener = admitted_unbound_application();
     newer_opener.drain_events(MAX_PENDING_EVENTS);
     let newer_token = project_open_request(&mut newer_opener);
@@ -670,11 +667,8 @@ fn automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit() {
     newer_service.join().unwrap();
 
     let branch_path = ProjectStorePath::new(directory.path().join("branches.m4dproj")).unwrap();
-    let Some((divergent_generation, current_manual)) =
-        create_established_recovery_store(&branch_path, true)
-    else {
-        return;
-    };
+    let (divergent_generation, current_manual) =
+        create_established_recovery_store(&branch_path, true);
     corrupt_generation(
         branch_path.as_path(),
         current_manual.expect("branch fixture advances the manual head"),
@@ -715,13 +709,11 @@ fn automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit() {
 }
 
 #[test]
-fn real_recovery_selected_save_as_establishes_the_new_project() {
+fn qualified_filesystem_recovery_selected_save_as_establishes_the_new_project() {
     let directory = TestDirectory::new();
     let source = ProjectStorePath::new(directory.path().join("recovery.m4dproj")).unwrap();
     let destination = ProjectStorePath::new(directory.path().join("recovered.m4dproj")).unwrap();
-    let Some((selected_generation, _)) = create_established_recovery_store(&source, false) else {
-        return;
-    };
+    let (selected_generation, _) = create_established_recovery_store(&source, false);
 
     let mut opener = admitted_unbound_application();
     opener.drain_events(MAX_PENDING_EVENTS);
@@ -1522,7 +1514,7 @@ fn close_service(
     panic!("project-store service did not close");
 }
 
-fn create_established_store(path: &ProjectStorePath) -> bool {
+fn create_established_store(path: &ProjectStorePath) {
     let mut application = admitted_bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     let (token, projection) = project_save_request(&mut application);
@@ -1546,19 +1538,18 @@ fn create_established_store(path: &ProjectStorePath) -> bool {
         } if completed == token => {
             assert!(!path.as_path().exists());
             service.join().unwrap();
-            return false;
+            panic!("qualified-filesystem persistence test requires a writable accepted filesystem");
         }
         event => panic!("unexpected fixture Create completion: {event:?}"),
     }
     close_service(&mut service, &snapshot);
     service.join().unwrap();
-    true
 }
 
 fn create_established_recovery_store(
     path: &ProjectStorePath,
     advance_manual: bool,
-) -> Option<(ProjectGenerationId, Option<ProjectGenerationId>)> {
+) -> (ProjectGenerationId, Option<ProjectGenerationId>) {
     let mut application = admitted_bound_application();
     application.drain_events(MAX_PENDING_EVENTS);
     let (create_token, create_projection) = project_save_request(&mut application);
@@ -1586,7 +1577,7 @@ fn create_established_recovery_store(
         } if token == create_token => {
             assert!(!path.as_path().exists());
             service.join().unwrap();
-            return None;
+            panic!("qualified-filesystem recovery test requires a writable accepted filesystem");
         }
         event => panic!("unexpected fixture Create completion: {event:?}"),
     };
@@ -1640,7 +1631,7 @@ fn create_established_recovery_store(
     let final_snapshot = application.snapshot();
     close_service(&mut service, &final_snapshot);
     service.join().unwrap();
-    Some((autosave_generation, current_manual))
+    (autosave_generation, current_manual)
 }
 
 fn wait_for_manual_save(

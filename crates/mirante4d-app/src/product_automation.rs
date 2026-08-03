@@ -3,6 +3,11 @@ use std::{
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -40,9 +45,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{
-    CoordinatedPresentationGroup, DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN,
-    DisplayedFrameFreshness, FrameCompleteness, MiranteWorkbenchApp, application_view,
-    import_worker_service::ImportWorkerTimingOrigin, viewer_layout::PanelId,
+    DVR_DENSITY_SCALE_MAX, DVR_DENSITY_SCALE_MIN, DisplayedFrameFreshness, FrameCompleteness,
+    MiranteWorkbenchApp, application_view, import_worker_service::ImportWorkerTimingOrigin,
+    viewer_layout::PanelId,
 };
 
 mod capture;
@@ -68,7 +73,20 @@ const AUTOMATION_REPORT_ENV: &str = "MIRANTE4D_AUTOMATION_REPORT";
 const AUTOMATION_PICK_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTOMATION_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTOMATION_DATASET_SWITCH_TIMEOUT: Duration = Duration::from_secs(120);
+const PRESENTATION_PROBE_UI_WAKE_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_TEMPORAL_OBSERVATIONS: usize = 4_096;
+
+fn presentation_probe_ui_wake_required(scenario: &str, progress_enabled: bool) -> bool {
+    progress_enabled && scenario == GPU_PRESENTATION_PROBE_SCENARIO
+}
+
+fn presentation_probe_window_restored(
+    map_after_unmap_observed: bool,
+    minimized: Option<bool>,
+    focused: Option<bool>,
+) -> bool {
+    map_after_unmap_observed && minimized == Some(false) && focused == Some(true)
+}
 
 fn sequence_sample_target_ns(sample: u32, samples: u32, duration_ms: u64) -> u64 {
     if samples == 0 {
@@ -181,7 +199,8 @@ fn assertion_capture_panels(condition: &ProductAutomationAssertCondition) -> Vec
 }
 const AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 const AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-const AUTOMATION_SCHEMA_VERSION: u32 = 10;
+const GPU_PRESENTATION_PROBE_SCENARIO: &str = "representative_gpu_presentation_probe";
+const AUTOMATION_SCHEMA_VERSION: u32 = 11;
 const AUTOMATION_REPORT_SCHEMA_VERSION: u32 = 9;
 
 fn dispatch_application_command(
@@ -525,6 +544,131 @@ fn coordinated_visible_layout_current_complete_with_snapshot(
     }
 }
 
+pub(crate) fn presentation_observer_observation(
+    app: &MiranteWorkbenchApp,
+) -> Option<crate::presentation_observer::PresentationObservation> {
+    let automation = app.product_automation.as_ref()?;
+    let (phase, active_input, command_index, scenario) =
+        automation.gpu_performance_observation_state()?;
+    let snapshot = app.application.snapshot();
+    let view = application_view(&snapshot);
+    let generation = app.render_coordination.display_generation();
+    let now_ns = app.display_instrumentation_now_ns();
+    let visible_panels = visible_product_panels(&snapshot);
+    let panel_identity = visible_panels
+        .iter()
+        .map(|panel| {
+            let surface = app.render_coordination.surface(panel.presentation_slot());
+            let presented = surface.presented_frame();
+            json!({
+                "panel": panel.label(),
+                "surface_generation": surface.generation(),
+                "frame": presented.map(|frame| frame.frame().get()),
+                "time_index": presented.map(|frame| frame.timepoint().get()),
+                "extent": presented.map(|frame| [frame.extent().width_pixels(), frame.extent().height_pixels()]),
+                "completeness": presented.map(|frame| format!("{:?}", frame.progress().completeness())),
+            })
+        })
+        .collect::<Vec<_>>();
+    let surface_generation = visible_panels
+        .iter()
+        .map(|panel| {
+            app.render_coordination
+                .surface(panel.presentation_slot())
+                .generation()
+        })
+        .max()
+        .unwrap_or_default();
+    let layers = view
+        .layers()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, layer)| {
+            json!({
+                "ordinal": ordinal,
+                "layer_key": layer.layer_key().ordinal(),
+                "visible": layer.visible(),
+                "mode": format!("{:?}", layer.render_state().mode()),
+                "sampling": format!("{:?}", layer.render_state().sampling_policy()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let environment_identity = app
+        .native_presentation
+        .product_gpu
+        .as_ref()
+        .map(|product| {
+            let diagnostics = product.renderer.diagnostics();
+            json!({
+                "adapter": diagnostics.adapter_name(),
+                "backend": diagnostics.backend(),
+                "driver": diagnostics.driver(),
+                "repository_revision": option_env!("MIRANTE4D_T5_BUILD_REVISION"),
+                "build_profile": option_env!("MIRANTE4D_T5_BUILD_PROFILE"),
+                "target_mode": option_env!("MIRANTE4D_T5_BUILD_TARGET_MODE"),
+            })
+        })
+        .unwrap_or(Value::Null);
+    let eligible = app
+        .native_presentation
+        .initial_render_pipeline_is_ready()
+        .unwrap_or(false)
+        && !visible_panels.is_empty()
+        && visible_panels.iter().all(|panel| {
+            let surface = app.render_coordination.surface(panel.presentation_slot());
+            surface.display_current()
+                && surface.presented_frame().is_some()
+                && surface.render_failure().is_none()
+        })
+        && app
+            .render_coordination
+            .frame_fidelity
+            .last_failure_kind
+            .is_none()
+        && app
+            .render_coordination
+            .frame_fidelity
+            .last_capacity_error
+            .is_none();
+    let exact = eligible
+        && coordinated_visible_layout_current_complete_with_snapshot(app, &snapshot)
+        && visible_panels.iter().all(|panel| {
+            app.render_coordination
+                .surface(panel.presentation_slot())
+                .presented_frame()
+                .is_some_and(|frame| {
+                    frame.progress().completeness()
+                        == mirante4d_render_api::FrameCompleteness::Exact
+                })
+        });
+    Some(crate::presentation_observer::PresentationObservation {
+        scenario: scenario.to_owned(),
+        phase: phase.to_owned(),
+        command_index,
+        active_input,
+        eligible,
+        exact,
+        identity: json!({
+            "panels": panel_identity,
+            "exact": exact,
+        }),
+        input_generation: generation.input_generation,
+        input_age_ns: now_ns.saturating_sub(generation.input_generation_at_ns),
+        surface_generation,
+        work_identity: json!({
+            "scenario": scenario,
+            "mapped_client_extent": [1920, 1080],
+            "layout": format!("{:?}", view.layout()),
+            "time_index": view.timepoint().get(),
+            "layer_count": layers.len(),
+            "layers": layers,
+            "presentation_targets": visible_panels.iter().map(|panel| panel.label()).collect::<Vec<_>>(),
+            "quality_changes_for_performance_forbidden": true,
+        }),
+        environment_identity,
+    })
+}
+
 fn assert_empty_visible_presentation(
     app: &MiranteWorkbenchApp,
     snapshot: &ApplicationSnapshot,
@@ -787,6 +931,7 @@ pub(crate) struct ProductAutomationController {
     last_stationary_playback_cadence: Option<CompletedInputTemporalDistribution>,
     last_input_sequence_cadence_comparison: Option<PlaybackCadenceComparison>,
     active_playback_stop_trace: Option<ActivePlaybackStopTrace>,
+    gpu_performance_phase: Option<ProductAutomationGpuPerformancePhase>,
     temporal_capture_baselines: Vec<TemporalCaptureBaseline>,
     limit_observations: ProductAutomationLimitObservations,
     render_target_override: Option<RenderExtent>,
@@ -801,6 +946,44 @@ pub(crate) struct ProductAutomationController {
     completed_import_primary_measurement: Option<ImportPrimaryMeasurement>,
     imported_open_ready_outcome: Option<ImportedOpenReadyOutcome>,
     report_written: bool,
+    presentation_probe_ui_wake: Option<ProductAutomationUiWake>,
+    presentation_probe_window_cycle_observed: bool,
+    presentation_probe_minimize_requested: bool,
+}
+
+struct ProductAutomationUiWake {
+    stop: Arc<AtomicBool>,
+}
+
+impl ProductAutomationUiWake {
+    fn start(ctx: &egui::Context) -> Result<Self, String> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let wake_context = ctx.clone();
+        thread::Builder::new()
+            .name("mirante4d-presentation-probe-ui-wake".to_owned())
+            .spawn(move || {
+                loop {
+                    thread::sleep(PRESENTATION_PROBE_UI_WAKE_INTERVAL);
+                    if worker_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // An out-of-pass request always reaches eframe's event
+                    // proxy. In-pass delayed repaint requests can be consumed
+                    // by a native fullscreen/resize transition before the
+                    // next UI turn is scheduled.
+                    wake_context.request_repaint();
+                }
+            })
+            .map_err(|error| format!("failed to start presentation-probe UI wake: {error}"))?;
+        Ok(Self { stop })
+    }
+}
+
+impl Drop for ProductAutomationUiWake {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -939,7 +1122,7 @@ struct ActiveInputSequence {
     next_sample: u32,
     samples: u32,
     duration_ms: u64,
-    required_group: CoordinatedPresentationGroup,
+    required_group: mirante4d_render_api::PresentationTargetSet,
     origin_generation: u64,
     origin_durable_commits: u64,
     origin_render_intent_revision: u64,
@@ -1422,8 +1605,11 @@ impl ProductAutomationController {
         // This remains stable across egui multipass re-entry and advances
         // exactly once per Context::run.
         automation.automation_frame_nr = ctx.cumulative_frame_nr();
-        let status = match automation.publish_progress_if_due() {
-            Ok(()) => automation.step(app, ctx),
+        let status = match automation.ensure_presentation_probe_ui_wake(ctx) {
+            Ok(()) => match automation.publish_progress_if_due() {
+                Ok(()) => automation.step(app, ctx),
+                Err(reason) => AutomationStatus::Failed(reason),
+            },
             Err(reason) => AutomationStatus::Failed(reason),
         };
         // Automation submits through the same one-pending/one-latest native
@@ -1513,6 +1699,7 @@ impl ProductAutomationController {
             last_stationary_playback_cadence: None,
             last_input_sequence_cadence_comparison: None,
             active_playback_stop_trace: None,
+            gpu_performance_phase: None,
             temporal_capture_baselines: Vec::new(),
             limit_observations: ProductAutomationLimitObservations::default(),
             render_target_override: None,
@@ -1526,6 +1713,9 @@ impl ProductAutomationController {
             completed_import_primary_measurement: None,
             imported_open_ready_outcome: None,
             report_written: false,
+            presentation_probe_ui_wake: None,
+            presentation_probe_window_cycle_observed: false,
+            presentation_probe_minimize_requested: false,
         }
     }
 
@@ -1563,6 +1753,27 @@ impl ProductAutomationController {
         self.progress.as_ref().map_or(requested, |progress| {
             progress.clamp_repaint_after(requested, Instant::now())
         })
+    }
+
+    fn requires_active_presentation_probe_poll(&self) -> bool {
+        presentation_probe_ui_wake_required(&self.script.scenario, self.progress.is_some())
+    }
+
+    fn ensure_presentation_probe_ui_wake(&mut self, ctx: &egui::Context) -> Result<(), String> {
+        if self.requires_active_presentation_probe_poll()
+            && self.presentation_probe_ui_wake.is_none()
+        {
+            self.presentation_probe_ui_wake = Some(ProductAutomationUiWake::start(ctx)?);
+        }
+        Ok(())
+    }
+
+    fn stop_presentation_probe_ui_wake(&mut self) {
+        self.presentation_probe_ui_wake = None;
+    }
+
+    pub(crate) fn observe_presentation_probe_window_cycle(&mut self, observed: bool) {
+        self.presentation_probe_window_cycle_observed |= observed;
     }
 
     pub(crate) const fn render_target_override(&self) -> Option<RenderExtent> {
@@ -1621,7 +1832,7 @@ impl ProductAutomationController {
         app: &mut MiranteWorkbenchApp,
         samples: u32,
         duration_ms: u64,
-        required_group: CoordinatedPresentationGroup,
+        required_group: mirante4d_render_api::PresentationTargetSet,
     ) -> InputSequenceStep {
         if self.active_input_sequence.is_none() {
             self.last_input_sequence_temporal_transitions = None;
@@ -2011,7 +2222,7 @@ impl ProductAutomationController {
                     return;
                 };
                 if contract.target_set()
-                    != crate::playback_session::PlaybackTargetSet::from(
+                    != crate::playback_session::playback_targets_for_layout(
                         application_view(&snapshot).layout(),
                     )
                     && self.temporal_violation.is_none()
@@ -3085,6 +3296,46 @@ impl ProductAutomationController {
                     "external_geometry_observation_required": true,
                 })))
             }
+            ProductAutomationCommand::SetWindowMinimized { minimized } => {
+                if !minimized {
+                    self.presentation_probe_minimize_requested = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    return Ok(CommandProgress::Done(json!({
+                        "minimized": false,
+                        "presentation_probe_only": true,
+                    })));
+                }
+                if self.script.scenario != GPU_PRESENTATION_PROBE_SCENARIO {
+                    return Err(
+                        "window minimization is reserved for the controlled presentation probe"
+                            .to_owned(),
+                    );
+                }
+                if !self.presentation_probe_minimize_requested {
+                    self.presentation_probe_minimize_requested = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    return Ok(CommandProgress::Waiting);
+                }
+                let (observed_minimized, observed_focused) = ctx.input(|input| {
+                    let viewport = input.viewport();
+                    (viewport.minimized, viewport.focused)
+                });
+                if !presentation_probe_window_restored(
+                    self.presentation_probe_window_cycle_observed,
+                    observed_minimized,
+                    observed_focused,
+                ) {
+                    return Ok(CommandProgress::Waiting);
+                }
+                self.presentation_probe_minimize_requested = false;
+                Ok(CommandProgress::Done(json!({
+                    "minimized": true,
+                    "externally_restored": true,
+                    "observer_saw_map_after_unmap": true,
+                    "presentation_probe_only": true,
+                })))
+            }
             ProductAutomationCommand::SetRenderTargetSize { width, height } => {
                 let viewport = RenderExtent::new(*width, *height)
                     .map_err(|error| format!("invalid automation render target: {error}"))?;
@@ -3350,6 +3601,13 @@ impl ProductAutomationController {
                         "second_half_transitions": distribution.second_half_transitions,
                         "maximum_gap_ns": distribution.maximum_gap_ns,
                     },
+                })))
+            }
+            ProductAutomationCommand::SetGpuPerformancePhase { phase } => {
+                self.gpu_performance_phase = Some(*phase);
+                Ok(CommandProgress::Done(json!({
+                    "phase": phase.name(),
+                    "presentation_observer_required": true,
                 })))
             }
             ProductAutomationCommand::SetLayerVisibility {
@@ -3696,7 +3954,7 @@ impl ProductAutomationController {
                 app,
                 *samples,
                 *duration_ms,
-                CoordinatedPresentationGroup::ThreeD,
+                mirante4d_render_api::PresentationTargetSet::THREE_D,
             ) {
                 InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
                 InputSequenceStep::Dispatch(_) => {
@@ -3741,7 +3999,7 @@ impl ProductAutomationController {
                 app,
                 *samples,
                 *duration_ms,
-                CoordinatedPresentationGroup::ThreeD,
+                mirante4d_render_api::PresentationTargetSet::THREE_D,
             ) {
                 InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
                 InputSequenceStep::Dispatch(_) => {
@@ -3777,7 +4035,7 @@ impl ProductAutomationController {
                 app,
                 *samples,
                 *duration_ms,
-                CoordinatedPresentationGroup::ThreeD,
+                mirante4d_render_api::PresentationTargetSet::THREE_D,
             ) {
                 InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
                 InputSequenceStep::Dispatch(_) => {
@@ -3861,7 +4119,7 @@ impl ProductAutomationController {
                 app,
                 *samples,
                 *duration_ms,
-                CoordinatedPresentationGroup::Linked2d,
+                mirante4d_render_api::PresentationTargetSet::LINKED_CROSS_SECTIONS,
             ) {
                 InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
                 InputSequenceStep::Dispatch(_) => {
@@ -3920,7 +4178,7 @@ impl ProductAutomationController {
                 app,
                 *samples,
                 *duration_ms,
-                CoordinatedPresentationGroup::Linked2d,
+                mirante4d_render_api::PresentationTargetSet::LINKED_CROSS_SECTIONS,
             ) {
                 InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
                 InputSequenceStep::Dispatch(_) => {
@@ -3979,7 +4237,7 @@ impl ProductAutomationController {
                 app,
                 *samples,
                 *duration_ms,
-                CoordinatedPresentationGroup::Linked2d,
+                mirante4d_render_api::PresentationTargetSet::LINKED_CROSS_SECTIONS,
             ) {
                 InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
                 InputSequenceStep::Dispatch(_) => {
@@ -4046,7 +4304,7 @@ impl ProductAutomationController {
                 app,
                 *samples,
                 *duration_ms,
-                CoordinatedPresentationGroup::Linked2d,
+                mirante4d_render_api::PresentationTargetSet::LINKED_CROSS_SECTIONS,
             ) {
                 InputSequenceStep::Wait(delay) => Ok(CommandProgress::PassiveWaiting(Some(delay))),
                 InputSequenceStep::Dispatch(_) => {
@@ -4118,8 +4376,14 @@ impl ProductAutomationController {
                 *y_fraction,
                 ViewerPickPurpose::PrimaryClick,
             ),
-            ProductAutomationCommand::CopyDiagnostics => {
-                let diagnostics = self.diagnostics_json(app);
+            ProductAutomationCommand::CopyDiagnostics { checkpoint } => {
+                let mut diagnostics = self.diagnostics_json(app);
+                if let Some(object) = diagnostics.as_object_mut() {
+                    object.insert(
+                        "checkpoint".to_owned(),
+                        checkpoint.clone().map_or(Value::Null, Value::String),
+                    );
+                }
                 self.diagnostics.push(diagnostics.clone());
                 Ok(CommandProgress::Done(diagnostics))
             }
@@ -4300,6 +4564,19 @@ impl ProductAutomationController {
                 Ok(CommandProgress::Done(json!({})))
             }
         }
+    }
+
+    pub(crate) fn gpu_performance_observation_state(
+        &self,
+    ) -> Option<(&'static str, bool, usize, &str)> {
+        self.gpu_performance_phase.map(|phase| {
+            (
+                phase.name(),
+                self.active_input_sequence.is_some(),
+                self.command_index,
+                self.script.scenario.as_str(),
+            )
+        })
     }
 
     fn capture_viewport_artifact(
@@ -5419,6 +5696,7 @@ impl ProductAutomationController {
         if self.report_written {
             return;
         }
+        self.stop_presentation_probe_ui_wake();
         self.observe_import_projection(app);
         self.report_written = true;
         if status != "passed"
@@ -6317,6 +6595,26 @@ fn package_integrity_audit_diagnostics_json(app: &MiranteWorkbenchApp) -> Value 
     })
 }
 
+fn presentation_targets_label(targets: mirante4d_render_api::PresentationTargetSet) -> String {
+    use mirante4d_render_api::{PresentationTarget, PresentationTargetSet};
+    match targets {
+        PresentationTargetSet::THREE_D => "three_d".to_owned(),
+        PresentationTargetSet::LINKED_CROSS_SECTIONS => "linked_2d".to_owned(),
+        PresentationTargetSet::ALL => "full_layout".to_owned(),
+        PresentationTargetSet::EMPTY => "empty".to_owned(),
+        _ => targets
+            .iter()
+            .map(|target| match target {
+                PresentationTarget::ThreeD => "three_d",
+                PresentationTarget::Xy => "xy",
+                PresentationTarget::Xz => "xz",
+                PresentationTarget::Yz => "yz",
+            })
+            .collect::<Vec<_>>()
+            .join("+"),
+    }
+}
+
 fn display_coordination_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
     let generation = app.render_coordination.display_generation();
     let coordinated = app
@@ -6336,7 +6634,7 @@ fn display_coordination_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
         "input_generation_at_ns": generation.input_generation_at_ns,
         "full_layout_current_presentation_at_ns": generation.current_presentation_at_ns,
         "coordinated_publication": {
-            "required_group": coordinated.required_group().name(),
+            "required_group": presentation_targets_label(coordinated.required_targets()),
             "current_presentation_generation": coordinated.current_presentation_generation(),
             "current_presentation_at_ns": coordinated.current_presentation_at_ns(),
             "presentation_generation_gap": generation.input_generation.saturating_sub(
@@ -6345,7 +6643,7 @@ fn display_coordination_diagnostics_json(app: &MiranteWorkbenchApp) -> Value {
             "total_current_publications": coordinated.total_current_publications(),
             "total_superseded_before_current_publication":
                 coordinated.total_superseded_before_current_publication(),
-            "window_group": coordinated.window_group().map(CoordinatedPresentationGroup::name),
+            "window_group": coordinated.window_targets().map(presentation_targets_label),
             "window_started_at_ns": coordinated.window_started_at_ns(),
             "window_ended_at_ns": coordinated.window_ended_at_ns(),
             "window_active": coordinated.window_active(),

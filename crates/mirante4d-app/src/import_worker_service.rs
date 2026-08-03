@@ -20,6 +20,139 @@ use mirante4d_import_pipeline::{
 };
 use rustix::time::{ClockId, clock_gettime};
 
+#[cfg(test)]
+#[derive(Clone)]
+struct RegisteredTestImportEventGate {
+    stage: ImportStage,
+    minimum_completed_work_units: u64,
+    state: Arc<(std::sync::Condvar, Mutex<TestImportEventGateState>)>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestImportEventGateState {
+    reached: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+pub(crate) struct TestImportEventGate {
+    state: Arc<(std::sync::Condvar, Mutex<TestImportEventGateState>)>,
+}
+
+#[cfg(test)]
+impl TestImportEventGate {
+    pub(crate) fn wait_until_reached(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let (condition, state) = self.state.as_ref();
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !state.reached {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, wait) = condition
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if wait.timed_out() && !state.reached {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(crate) fn release(&self) {
+        let (condition, state) = self.state.as_ref();
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.released = true;
+        condition.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestImportEventGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(test)]
+fn test_import_event_gates() -> &'static Mutex<BTreeMap<PathBuf, RegisteredTestImportEventGate>> {
+    static GATES: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, RegisteredTestImportEventGate>>> =
+        std::sync::OnceLock::new();
+    GATES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn pause_test_import_after_progress(
+    destination: PathBuf,
+    stage: ImportStage,
+    minimum_completed_work_units: u64,
+) -> TestImportEventGate {
+    let state = Arc::new((
+        std::sync::Condvar::new(),
+        Mutex::new(TestImportEventGateState::default()),
+    ));
+    let previous = test_import_event_gates()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            destination,
+            RegisteredTestImportEventGate {
+                stage,
+                minimum_completed_work_units,
+                state: Arc::clone(&state),
+            },
+        );
+    assert!(
+        previous.is_none(),
+        "test import destination already has an event gate"
+    );
+    TestImportEventGate { state }
+}
+
+#[cfg(test)]
+fn pause_for_test_import_event(destination: &std::path::Path, event: &ImportEvent) {
+    let (stage, completed_work_units) = match event {
+        ImportEvent::StageProgress {
+            stage,
+            completed_work_units,
+            ..
+        } => (*stage, *completed_work_units),
+        _ => return,
+    };
+    let gate = {
+        let mut gates = test_import_event_gates()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(gate) = gates.get(destination) else {
+            return;
+        };
+        if stage != gate.stage || completed_work_units < gate.minimum_completed_work_units {
+            return;
+        }
+        gates
+            .remove(destination)
+            .expect("observed test gate remains registered")
+    };
+    let (condition, state) = gate.state.as_ref();
+    let mut state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.reached = true;
+    condition.notify_all();
+    while !state.released {
+        state = condition
+            .wait(state)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ImportWorkerBusy;
 
@@ -494,12 +627,16 @@ impl ImportWorkerService {
         };
         let completion_wake = self.completion_wake.clone();
         let ledger = progress_reservation.ledger();
+        #[cfg(test)]
+        let worker_destination = destination.clone();
         let worker = spawn_tiff_import_worker(
             options.clone(),
             ledger,
             cancellation.clone(),
             move |event| {
                 worker_diagnostics.record_event(&event);
+                #[cfg(test)]
+                pause_for_test_import_event(&worker_destination, &event);
                 worker_events.record(event);
             },
             move |outcome| {

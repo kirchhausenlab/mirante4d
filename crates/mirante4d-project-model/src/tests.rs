@@ -103,6 +103,229 @@ fn dataset_locator_is_explicitly_not_scientific_identity() {
 }
 
 #[test]
+fn channel_preset_ids_enforce_exact_ascii_and_byte_boundaries() {
+    for invalid in ["", "has space", "has.dot", "café", "slash/value"] {
+        assert_eq!(
+            ChannelPresetId::new(invalid).unwrap_err(),
+            ProjectModelError::InvalidChannelPresetId,
+            "accepted invalid channel-preset id {invalid:?}"
+        );
+    }
+
+    let exact = "a".repeat(MAX_CHANNEL_PRESET_ID_BYTES);
+    assert_eq!(ChannelPresetId::new(&exact).unwrap().as_str(), exact);
+    assert_eq!(
+        ChannelPresetId::new("a".repeat(MAX_CHANNEL_PRESET_ID_BYTES + 1)).unwrap_err(),
+        ProjectModelError::ChannelPresetIdTooLong {
+            maximum: MAX_CHANNEL_PRESET_ID_BYTES,
+        }
+    );
+}
+
+#[test]
+fn project_labels_enforce_exact_content_and_utf8_byte_boundaries() {
+    for (value, expected) in [
+        (
+            "",
+            ProjectModelError::EmptyLabel {
+                kind: "channel preset label",
+            },
+        ),
+        (
+            " \t ",
+            ProjectModelError::EmptyLabel {
+                kind: "channel preset label",
+            },
+        ),
+        (
+            "label\nvalue",
+            ProjectModelError::LabelContainsControl {
+                kind: "channel preset label",
+            },
+        ),
+    ] {
+        assert_eq!(
+            ChannelPreset::new(
+                ChannelPresetId::new("label-case").unwrap(),
+                value,
+                Vec::new()
+            )
+            .unwrap_err(),
+            expected
+        );
+    }
+
+    let exact_ascii = "a".repeat(MAX_PROJECT_LABEL_BYTES);
+    assert_eq!(
+        ChannelPreset::new(
+            ChannelPresetId::new("ascii-limit").unwrap(),
+            &exact_ascii,
+            Vec::new(),
+        )
+        .unwrap()
+        .label(),
+        exact_ascii
+    );
+
+    let exact_unicode = "é".repeat(MAX_PROJECT_LABEL_BYTES / 2);
+    assert_eq!(exact_unicode.len(), MAX_PROJECT_LABEL_BYTES);
+    assert_eq!(
+        artifact_with(
+            ArtifactHandleId::from_bytes([31; 16]),
+            Vec::new(),
+            &exact_unicode,
+            None,
+            None,
+            ArtifactRecoverability::NonRegenerable,
+        )
+        .unwrap()
+        .label(),
+        exact_unicode
+    );
+    assert_eq!(
+        artifact_with(
+            ArtifactHandleId::from_bytes([32; 16]),
+            Vec::new(),
+            format!("{exact_unicode}é"),
+            None,
+            None,
+            ArtifactRecoverability::NonRegenerable,
+        )
+        .unwrap_err(),
+        ProjectModelError::LabelTooLong {
+            kind: "artifact label",
+            maximum: MAX_PROJECT_LABEL_BYTES,
+        }
+    );
+}
+
+#[test]
+fn view_validation_reports_exact_empty_duplicate_and_active_layer_errors() {
+    let construct = |layers, active_layer| {
+        ViewState::new(
+            layers,
+            active_layer,
+            TimeIndex::new(0),
+            camera(),
+            ViewerLayout::Single3d,
+            cross_section(),
+            IsoLightState::attached_camera(),
+        )
+    };
+
+    assert_eq!(
+        construct(Vec::new(), LogicalLayerKey::new(0)).unwrap_err(),
+        ProjectModelError::EmptyView
+    );
+    assert_eq!(
+        construct(vec![layer(3), layer(3)], LogicalLayerKey::new(3)).unwrap_err(),
+        ProjectModelError::DuplicateLayer { ordinal: 3 }
+    );
+    assert_eq!(
+        construct(vec![layer(3)], LogicalLayerKey::new(4)).unwrap_err(),
+        ProjectModelError::ActiveLayerMissing { ordinal: 4 }
+    );
+}
+
+#[test]
+fn duplicate_project_keys_and_artifact_provenance_fail_exactly() {
+    let preset_id = ChannelPresetId::new("duplicate").unwrap();
+    assert_eq!(
+        ChannelPreset::new(
+            preset_id.clone(),
+            "Duplicate entries",
+            vec![preset_entry(0), preset_entry(0)],
+        )
+        .unwrap_err(),
+        ProjectModelError::DuplicatePresetLayer {
+            preset_id: "duplicate".to_owned(),
+            ordinal: 0,
+        }
+    );
+
+    let preset = ChannelPreset::new(preset_id, "Duplicate preset", vec![preset_entry(0)]).unwrap();
+    assert_eq!(
+        ProjectState::new(
+            project_id(),
+            dataset_reference("dataset.m4d"),
+            view(vec![layer(0)], 0),
+            vec![preset.clone(), preset],
+            Vec::new(),
+        )
+        .unwrap_err(),
+        ProjectModelError::DuplicateChannelPreset {
+            preset_id: "duplicate".to_owned(),
+        }
+    );
+
+    let duplicate_layer_handle = ArtifactHandleId::from_bytes([41; 16]);
+    assert_eq!(
+        artifact_with(
+            duplicate_layer_handle.clone(),
+            vec![LogicalLayerKey::new(2), LogicalLayerKey::new(2)],
+            "Duplicate layer",
+            None,
+            None,
+            ArtifactRecoverability::NonRegenerable,
+        )
+        .unwrap_err(),
+        ProjectModelError::DuplicateArtifactLayer {
+            handle_id: duplicate_layer_handle,
+            ordinal: 2,
+        }
+    );
+
+    let duplicate_handle = ArtifactHandleId::from_bytes([42; 16]);
+    let artifact = artifact(duplicate_handle.clone(), vec![LogicalLayerKey::new(0)]);
+    assert_eq!(
+        ProjectState::new(
+            project_id(),
+            dataset_reference("dataset.m4d"),
+            view(vec![layer(0)], 0),
+            Vec::new(),
+            vec![artifact.clone(), artifact],
+        )
+        .unwrap_err(),
+        ProjectModelError::DuplicateArtifactHandle {
+            handle_id: duplicate_handle,
+        }
+    );
+
+    let derivation =
+        DerivationRecordId::parse(&format!("{}{}", DerivationRecordId::PREFIX, zero_hex()))
+            .unwrap();
+    let recipe = RecipeId::parse(&format!("{}{}", RecipeId::PREFIX, zero_hex())).unwrap();
+    for (index, derivation_id, recipe_id) in [
+        (0_u8, None, None),
+        (1, Some(derivation.clone()), None),
+        (2, None, Some(recipe.clone())),
+    ] {
+        let handle_id = ArtifactHandleId::from_bytes([50 + index; 16]);
+        assert_eq!(
+            artifact_with(
+                handle_id.clone(),
+                Vec::new(),
+                "Regenerable",
+                derivation_id,
+                recipe_id,
+                ArtifactRecoverability::Regenerable,
+            )
+            .unwrap_err(),
+            ProjectModelError::RegenerableArtifactMissingProvenance { handle_id }
+        );
+    }
+    artifact_with(
+        ArtifactHandleId::from_bytes([53; 16]),
+        Vec::new(),
+        "Regenerable",
+        Some(derivation),
+        Some(recipe),
+        ArtifactRecoverability::Regenerable,
+    )
+    .unwrap();
+}
+
+#[test]
 fn view_reorder_keeps_active_selection_by_logical_layer_key() {
     let view = view(vec![layer(0), layer(1), layer(2)], 1);
     let reordered = view
@@ -452,6 +675,131 @@ fn collection_limits_reject_oversized_inputs_before_duplicate_checks() {
 }
 
 #[test]
+fn exact_collection_and_aggregate_limits_are_accepted() {
+    let all_layers = (0..MAX_VIEW_LAYERS as u32).map(layer).collect::<Vec<_>>();
+    let max_view = ViewState::new(
+        all_layers,
+        LogicalLayerKey::new(MAX_VIEW_LAYERS as u32 - 1),
+        TimeIndex::new(0),
+        camera(),
+        ViewerLayout::Single3d,
+        cross_section(),
+        IsoLightState::attached_camera(),
+    )
+    .unwrap();
+    assert_eq!(max_view.layers().len(), MAX_VIEW_LAYERS);
+
+    let max_entries = (0..MAX_CHANNEL_PRESET_ENTRIES as u32)
+        .map(preset_entry)
+        .collect::<Vec<_>>();
+    let max_preset = ChannelPreset::new(
+        ChannelPresetId::new("max-entries").unwrap(),
+        "Maximum",
+        max_entries,
+    )
+    .unwrap();
+    assert_eq!(max_preset.entries().len(), MAX_CHANNEL_PRESET_ENTRIES);
+
+    let max_sources = (0..MAX_ARTIFACT_SOURCE_LAYERS as u32)
+        .map(LogicalLayerKey::new)
+        .collect::<Vec<_>>();
+    let max_source_artifact = artifact(ArtifactHandleId::from_bytes([61; 16]), max_sources);
+    assert_eq!(
+        max_source_artifact.source_layers().len(),
+        MAX_ARTIFACT_SOURCE_LAYERS
+    );
+
+    let one_layer_view = view(vec![layer(0)], 0);
+    let max_presets = (0..MAX_CHANNEL_PRESETS)
+        .map(|index| {
+            ChannelPreset::new(
+                ChannelPresetId::new(format!("preset-{index}")).unwrap(),
+                "Preset",
+                vec![preset_entry(0)],
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let max_preset_project = ProjectState::new(
+        project_id(),
+        dataset_reference("dataset.m4d"),
+        one_layer_view.clone(),
+        max_presets,
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        max_preset_project.channel_presets().len(),
+        MAX_CHANNEL_PRESETS
+    );
+
+    let max_artifacts = (0..MAX_ARTIFACTS)
+        .map(|index| artifact(unique_artifact_handle(index), Vec::new()))
+        .collect::<Vec<_>>();
+    let max_artifact_project = ProjectState::new(
+        project_id(),
+        dataset_reference("dataset.m4d"),
+        one_layer_view,
+        Vec::new(),
+        max_artifacts,
+    )
+    .unwrap();
+    assert_eq!(max_artifact_project.artifacts().len(), MAX_ARTIFACTS);
+
+    let aggregate_presets = (0..(MAX_TOTAL_CHANNEL_PRESET_ENTRIES / MAX_VIEW_LAYERS))
+        .map(|index| {
+            ChannelPreset::new(
+                ChannelPresetId::new(format!("aggregate-{index}")).unwrap(),
+                "Aggregate",
+                (0..MAX_VIEW_LAYERS as u32).map(preset_entry).collect(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        aggregate_presets
+            .iter()
+            .map(|preset| preset.entries().len())
+            .sum::<usize>(),
+        MAX_TOTAL_CHANNEL_PRESET_ENTRIES
+    );
+    ProjectState::new(
+        project_id(),
+        dataset_reference("dataset.m4d"),
+        max_view.clone(),
+        aggregate_presets,
+        Vec::new(),
+    )
+    .unwrap();
+
+    let aggregate_artifacts = (0..(MAX_TOTAL_ARTIFACT_SOURCE_LAYER_REFERENCES / MAX_VIEW_LAYERS))
+        .map(|index| {
+            artifact(
+                unique_artifact_handle(index + MAX_ARTIFACTS),
+                (0..MAX_VIEW_LAYERS as u32)
+                    .map(LogicalLayerKey::new)
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        aggregate_artifacts
+            .iter()
+            .map(|artifact| artifact.source_layers().len())
+            .sum::<usize>(),
+        MAX_TOTAL_ARTIFACT_SOURCE_LAYER_REFERENCES
+    );
+    ProjectState::new(
+        project_id(),
+        dataset_reference("dataset.m4d"),
+        max_view,
+        Vec::new(),
+        aggregate_artifacts,
+    )
+    .unwrap();
+}
+
+#[test]
 fn generation_projection_round_trips_the_exact_revision_and_state() {
     let state = valid_project();
     let revision = ProjectRevisionId::new(state.project_id(), 42);
@@ -590,21 +938,43 @@ fn raw_artifact_object(schema: ArtifactSchema) -> RawObjectDescriptor {
 }
 
 fn artifact(handle_id: ArtifactHandleId, source_layers: Vec<LogicalLayerKey>) -> ArtifactReference {
+    artifact_with(
+        handle_id,
+        source_layers,
+        "Table",
+        None,
+        None,
+        ArtifactRecoverability::NonRegenerable,
+    )
+    .unwrap()
+}
+
+fn artifact_with(
+    handle_id: ArtifactHandleId,
+    source_layers: Vec<LogicalLayerKey>,
+    label: impl AsRef<str>,
+    derivation_id: Option<DerivationRecordId>,
+    recipe_id: Option<RecipeId>,
+    recoverability: ArtifactRecoverability,
+) -> Result<ArtifactReference, ProjectModelError> {
     let schema = ArtifactSchema::AnalysisTableV1;
     ArtifactReference::new(
         handle_id,
         schema,
         artifact_content_id(),
         raw_artifact_object(schema),
-        None,
-        None,
+        derivation_id,
+        recipe_id,
         source_layers,
-        "Table",
+        label,
         true,
         ArtifactCompleteness::Complete,
-        ArtifactRecoverability::NonRegenerable,
+        recoverability,
     )
-    .unwrap()
+}
+
+fn unique_artifact_handle(index: usize) -> ArtifactHandleId {
+    ArtifactHandleId::from_bytes((index as u128).to_be_bytes())
 }
 
 fn valid_project() -> ProjectState {
@@ -647,28 +1017,37 @@ proptest! {
     #[test]
     fn high_water_allocation_is_exact_and_project_bound(
         project_bytes in any::<[u8; 16]>(),
-        sequence in 0_u64..u64::MAX,
+        high_water_sequence in 0_u64..u64::MAX,
+        current_selector in any::<u64>(),
     ) {
         let project_id = ProjectId::from_bytes(project_bytes);
-        let mut high_water = ProjectRevisionHighWater::new(project_id, sequence);
-        let next = high_water.allocate_after(ProjectRevisionId::initial(project_id)).unwrap();
+        let current_sequence = current_selector % (high_water_sequence + 1);
+        let current = ProjectRevisionId::new(project_id, current_sequence);
+        let mut high_water = ProjectRevisionHighWater::new(project_id, high_water_sequence);
+        let next = high_water.allocate_after(current).unwrap();
         prop_assert_eq!(next.project_id(), project_id);
-        prop_assert_eq!(next.sequence(), sequence + 1);
-        prop_assert_eq!(high_water.sequence(), sequence + 1);
+        prop_assert_eq!(next.sequence(), high_water_sequence + 1);
+        prop_assert_eq!(high_water.sequence(), high_water_sequence + 1);
     }
 
     #[test]
     fn arbitrary_reorder_keeps_active_selection_by_identity(
-        layer_count in 1_u32..16,
+        priorities in prop::collection::vec(any::<u64>(), 1..16),
         selector in any::<u32>(),
     ) {
+        let layer_count = priorities.len() as u32;
         let active = selector % layer_count;
         let original = view((0..layer_count).map(layer).collect(), active);
-        let reversed = (0..layer_count)
-            .rev()
-            .map(LogicalLayerKey::new)
+        let mut generated_order = priorities
+            .into_iter()
+            .enumerate()
+            .collect::<Vec<_>>();
+        generated_order.sort_by_key(|(index, priority)| (*priority, *index));
+        let generated_order = generated_order
+            .into_iter()
+            .map(|(index, _)| LogicalLayerKey::new(index as u32))
             .collect();
-        let reordered = original.with_layer_order(reversed).unwrap();
+        let reordered = original.with_layer_order(generated_order).unwrap();
 
         prop_assert_eq!(reordered.active_layer(), LogicalLayerKey::new(active));
         prop_assert!(reordered.layer(LogicalLayerKey::new(active)).is_some());

@@ -44,6 +44,33 @@ fn project_store_vm_guest_driver() {
     match role.as_str() {
         "exercise" | "trace" => {
             let result = run_operation(scenario, &root_a, &root_b);
+            if role == "exercise"
+                && env::var("MIRANTE4D_PROJECT_STORE_TRANSITION_ACTION").as_deref() == Ok("fail")
+            {
+                let fault = result.expect_err(
+                    "a hosted fail-injection exercise returned success after its target",
+                );
+                emit_result(
+                    &case,
+                    "exercise",
+                    serde_json::json!({
+                        "operation_result": "injected_failure",
+                        "fault_class": project_store_fault_class(&fault),
+                        "fault": format!("{fault:?}"),
+                        "transition": env::var("MIRANTE4D_PROJECT_STORE_HOSTED_TRANSITION")
+                            .expect("hosted fail transition is present"),
+                        "lane": env::var("MIRANTE4D_PROJECT_STORE_HOSTED_LANE")
+                            .expect("hosted fail lane is present"),
+                        "edge": env::var("MIRANTE4D_PROJECT_STORE_HOSTED_EDGE")
+                            .expect("hosted fail edge is present"),
+                        "occurrence": env::var("MIRANTE4D_PROJECT_STORE_HOSTED_OCCURRENCE")
+                            .expect("hosted fail occurrence is present")
+                            .parse::<u64>()
+                            .expect("hosted fail occurrence is unsigned"),
+                    }),
+                );
+                return;
+            }
             assert!(
                 result.is_ok(),
                 "VM exercise failed before its target: {result:?}"
@@ -67,6 +94,24 @@ fn project_store_vm_guest_driver() {
             emit_result(&case, "validate", counters);
         }
         other => panic!("unknown project-store VM role {other:?}"),
+    }
+}
+
+fn project_store_fault_class(fault: &ProjectStoreFault) -> &'static str {
+    match fault {
+        ProjectStoreFault::QueueFull { .. } => "queue_full",
+        ProjectStoreFault::ReadOnly => "read_only",
+        ProjectStoreFault::WriterContended => "writer_contended",
+        ProjectStoreFault::StaleParent => "stale_parent",
+        ProjectStoreFault::DestinationExists => "destination_exists",
+        ProjectStoreFault::UnsupportedFilesystem => "unsupported_filesystem",
+        ProjectStoreFault::Capacity { .. } => "capacity",
+        ProjectStoreFault::SourceChanged => "source_changed",
+        ProjectStoreFault::DigestMismatch => "digest_mismatch",
+        ProjectStoreFault::Corruption { .. } => "corruption",
+        ProjectStoreFault::ConfirmationRequired => "confirmation_required",
+        ProjectStoreFault::Cancelled => "cancelled",
+        ProjectStoreFault::CommitIndeterminate => "commit_indeterminate",
     }
 }
 

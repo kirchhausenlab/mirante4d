@@ -1,6 +1,6 @@
 # Source-fixture tooling
 
-This isolated tooling builds the four approved small synthetic TIFF source
+This isolated tooling builds the five approved small synthetic TIFF source
 families. The producer writes bytes, the Rust fact oracle derives facts without
 opening TIFF, and the Pillow/lxml reader independently observes the result.
 None imports Mirante4D production code.

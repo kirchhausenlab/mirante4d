@@ -16,8 +16,8 @@ use crate::{
         install_if_current_texture_revision,
     },
     presentation_scheduler::{
-        FixedPresentationTargetRequests, PresentationQuality, PresentationTransaction,
-        PresentationTransactionMember, PresentationTransactionTargets,
+        ActivePresentationLayout, ActivePresentationTarget, PresentationQuality,
+        PresentationTransaction, PresentationTransactionMember, PresentationTransactionTargets,
     },
     product_render_intent::{ProductRenderRequest, cross_section_intent, volume_intent},
     shader_work_envelope_cache::{ShaderWorkEnvelopeBuildError, ShaderWorkEnvelopeLookup},
@@ -38,12 +38,11 @@ use mirante4d_render_api::{
     RenderExtent, RenderRequirements, RenderViewIntent,
 };
 use mirante4d_render_wgpu::{
-    CoordinatedFrameExecutionReport, CoordinatedLogicalTargetSet, CoordinatedMemberDisposition,
-    CoordinatedPublicationGroup, CoordinatedTargetExecutionReport, CoordinatedTargetLayout,
-    CoordinatedTargetRequest, CpuFrameTiming, HiddenRefinementCapabilityFailure,
-    HiddenRefinementFailure, HiddenRefinementState, PipelineCapability,
-    PipelineCompilationFailureCause, RetainedFrameRenderPolicy, VolumeColorSchedule,
-    WgpuRenderRuntimeError,
+    CoordinatedFrameExecutionReport, CoordinatedMemberDisposition, CoordinatedPublicationGroup,
+    CoordinatedTargetExecutionReport, CoordinatedTargetLayout, CoordinatedTargetRequest,
+    CpuFrameTiming, HiddenRefinementCapabilityFailure, HiddenRefinementFailure,
+    HiddenRefinementState, PipelineCapability, PipelineCompilationFailureCause,
+    RetainedFrameRenderPolicy, VolumeColorSchedule, WgpuRenderRuntimeError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +161,8 @@ impl PanelPerformanceMilestones {
 pub(crate) struct RenderAttemptFingerprint {
     source_generation: SourceSessionGeneration,
     layout: CanonicalViewerLayout,
+    layout_generation: u64,
+    active_targets: PresentationTargetSet,
     frames: [Option<FrameIdentity>; 4],
     timepoints: [Option<TimeIndex>; 4],
     requirements: [Option<RenderRequirements>; 4],
@@ -177,6 +178,7 @@ pub(crate) struct RenderAttemptFingerprint {
 impl RenderAttemptFingerprint {
     fn new(
         snapshot: &ApplicationSnapshot,
+        active_layout: &ActivePresentationLayout,
         requests: &[CoordinatedOwnedRequest],
         dataset_runtime_epoch: u64,
         cpu_capacity_epoch: u64,
@@ -202,6 +204,8 @@ impl RenderAttemptFingerprint {
         Self {
             source_generation: snapshot.source_generation(),
             layout: application_view(snapshot).layout(),
+            layout_generation: active_layout.generation(),
+            active_targets: active_layout.targets(),
             frames,
             timepoints,
             requirements,
@@ -218,6 +222,8 @@ impl RenderAttemptFingerprint {
     fn matches_current(&self, current: &Self) -> bool {
         self.source_generation == current.source_generation
             && self.layout == current.layout
+            && self.layout_generation == current.layout_generation
+            && self.active_targets == current.active_targets
             && self.frames == current.frames
             && self.timepoints == current.timepoints
             && self
@@ -788,6 +794,7 @@ struct ColorAttemptTargetFacts {
     current: bool,
     presented: bool,
     deferred_by_backpressure: bool,
+    retry_after_submission: Option<u64>,
     actionable_work_remaining: bool,
     hidden_waiting: bool,
     hidden_refinement: Option<HiddenRefinementState>,
@@ -797,7 +804,7 @@ struct ColorAttemptTargetFacts {
 enum ColorAttemptClass {
     Current,
     Ready,
-    SubmissionWait,
+    SubmissionWait(u64),
     HiddenWait(PresentationTarget),
     RelevantResidency(PresentationTarget),
     Failed(ResidentRenderFailureStatus),
@@ -815,7 +822,17 @@ fn classify_color_attempt_facts(facts: &[ColorAttemptTargetFacts]) -> ColorAttem
         return ColorAttemptClass::Current;
     }
     if facts.iter().any(|target| target.deferred_by_backpressure) {
-        return ColorAttemptClass::SubmissionWait;
+        let submission = facts
+            .iter()
+            .filter(|target| target.deferred_by_backpressure)
+            .map(|target| {
+                target
+                    .retry_after_submission
+                    .expect("a renderer backpressure report captures its exact causal completion")
+            })
+            .min()
+            .expect("at least one target is deferred by backpressure");
+        return ColorAttemptClass::SubmissionWait(submission);
     }
     if let Some(target) = facts.iter().find(|target| target.hidden_waiting) {
         return ColorAttemptClass::HiddenWait(target.target);
@@ -846,7 +863,6 @@ fn normalize_color_attempt_observation(
     report: &CoordinatedFrameExecutionReport,
     requests: &[CoordinatedOwnedRequest],
     active_target: PresentationTarget,
-    next_submission: u64,
 ) -> ColorAttemptObservation {
     let facts = report
         .targets()
@@ -858,6 +874,7 @@ fn normalize_color_attempt_observation(
                 current: target.current(),
                 presented: target.presented(),
                 deferred_by_backpressure: target.deferred_by_backpressure(),
+                retry_after_submission: target.retry_after_submission(),
                 actionable_work_remaining: target.actionable_work_remaining(),
                 hidden_waiting: matches!(
                     hidden_refinement,
@@ -873,10 +890,8 @@ fn normalize_color_attempt_observation(
     match classify_color_attempt_facts(&facts) {
         ColorAttemptClass::Current => ColorAttemptObservation::Current,
         ColorAttemptClass::Ready => ColorAttemptObservation::Ready,
-        ColorAttemptClass::SubmissionWait => {
-            ColorAttemptObservation::Waiting(RenderWaitKey::SubmissionCleanup {
-                submission: next_submission,
-            })
+        ColorAttemptClass::SubmissionWait(submission) => {
+            ColorAttemptObservation::Waiting(RenderWaitKey::SubmissionCleanup { submission })
         }
         ColorAttemptClass::HiddenWait(target) => {
             ColorAttemptObservation::Waiting(RenderWaitKey::HiddenWorker {
@@ -1091,32 +1106,11 @@ struct CoordinatedOwnedRequest {
     staged_3d_refinement: bool,
 }
 
-// The logical variant deliberately keeps its fixed one/four-target storage
-// inline. This value lives for one refresh turn; boxing it would add an
-// allocator dependency to every coordinated logical frame solely to reduce a
-// bounded 2.2 KiB stack value.
-#[allow(clippy::large_enum_variant)]
-enum CoordinatedRequestCohort {
-    Physical(Vec<CoordinatedOwnedRequest>),
-    Logical(FixedPresentationTargetRequests<CoordinatedOwnedRequest>),
-}
-
-impl CoordinatedRequestCohort {
-    fn as_slice(&self) -> &[CoordinatedOwnedRequest] {
-        match self {
-            Self::Physical(requests) => requests,
-            Self::Logical(requests) => requests.as_slice(),
-        }
-    }
-
-    const fn is_logical(&self) -> bool {
-        matches!(self, Self::Logical(_))
-    }
-}
-
-enum BorrowedCoordinatedRequestCohort<'a> {
-    Physical(Vec<CoordinatedTargetRequest<'a>>),
-    Logical(FixedPresentationTargetRequests<CoordinatedTargetRequest<'a>>),
+#[derive(Debug, Clone, Copy)]
+struct TerminalEmptyTarget {
+    target: PresentationTarget,
+    panel: PanelId,
+    surface_generation: u64,
 }
 
 fn borrow_coordinated_request(
@@ -1608,11 +1602,35 @@ impl MiranteWorkbenchApp {
     }
 
     fn record_current_empty_cross_section_presentation(&mut self, panel_id: PanelId) {
+        let generation = self
+            .render_coordination
+            .surface(panel_id.presentation_slot())
+            .generation();
+        self.record_empty_cross_section_presentation(panel_id, generation, true)
+            .expect("a synchronous empty linked publication retains its layout generation");
+    }
+
+    fn record_empty_cross_section_presentation(
+        &mut self,
+        panel_id: PanelId,
+        generation: u64,
+        settle_attempt: bool,
+    ) -> anyhow::Result<()> {
         debug_assert!(panel_id.cross_section_panel().is_some());
         let target = panel_id.presentation_slot();
-        self.clear_cross_section_product_presentation(panel_id);
+        if self.render_coordination.surface(target).generation() != generation {
+            anyhow::bail!(
+                "empty target {target:?} escaped its immutable surface generation {generation}"
+            );
+        }
+        if let Some(product) = self.native_presentation.product_gpu.as_mut() {
+            product.clear_validation_capture(target);
+        }
+        self.render_coordination.clear_presented_frame(target);
+        if settle_attempt {
+            self.render_attempt.settle();
+        }
         self.render_attempt.retire_composition(target);
-        let generation = self.render_coordination.surface(target).generation();
         let schedule = CrossSectionPanelScheduleState {
             generation,
             target_scale_level: None,
@@ -1626,11 +1644,44 @@ impl MiranteWorkbenchApp {
             status: CrossSectionPanelScheduleStatus::Empty,
             reason: CrossSectionPanelScheduleReason::NoSelectedData,
         };
-        assert!(
-            self.render_coordination
-                .record_empty_cross_section_presentation(target, generation, schedule),
-            "a synchronous empty linked publication must match its current surface generation"
-        );
+        if !self
+            .render_coordination
+            .record_empty_cross_section_presentation(target, generation, schedule)
+        {
+            anyhow::bail!("stale empty cross-section presentation was suppressed");
+        }
+        Ok(())
+    }
+
+    fn apply_terminal_empty_targets(
+        &mut self,
+        targets: &[TerminalEmptyTarget],
+    ) -> anyhow::Result<()> {
+        // Validate the whole no-work cohort before mutating any member. This
+        // is the application-side half of atomic semantic publication: a
+        // layout change suppresses the old cohort instead of shortening it.
+        for terminal in targets {
+            if terminal.target != terminal.panel.presentation_slot()
+                || self
+                    .render_coordination
+                    .surface(terminal.target)
+                    .generation()
+                    != terminal.surface_generation
+            {
+                anyhow::bail!(
+                    "terminal target {:?} escaped its immutable layout snapshot",
+                    terminal.target
+                );
+            }
+        }
+        for terminal in targets {
+            self.record_empty_cross_section_presentation(
+                terminal.panel,
+                terminal.surface_generation,
+                false,
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn invalidate_cross_section_panel_display_frames(&mut self) {
@@ -2048,7 +2099,7 @@ impl MiranteWorkbenchApp {
         } else {
             retained_frame_render_policy(true, existing_presentation)
         };
-        // The exact atomic group is attached only after fixed-shape logical
+        // The exact atomic group is attached only after complete dynamic
         // assembly. Reuse remains exclusively renderer-owned; every member
         // crosses the boundary with its complete immutable request.
         let atomic_publication_group = None;
@@ -2387,6 +2438,36 @@ impl MiranteWorkbenchApp {
         Ok(true)
     }
 
+    fn active_presentation_layout(
+        &self,
+        snapshot: &ApplicationSnapshot,
+    ) -> Option<ActivePresentationLayout> {
+        let targets = crate::presentation_scheduler::active_targets_for_layout(
+            application_view(snapshot).layout(),
+        );
+        let mut members = [None; 4];
+        for target in targets {
+            let surface = self.render_coordination.surface(target);
+            // Layout identity describes the desired physical surface, not
+            // the extent of whichever frame is currently presented there.
+            // Those differ during resize and exact-replacement handoff.
+            let extent = surface.render_viewport()?;
+            members[target.index()] = Some(ActivePresentationTarget::new(
+                target,
+                extent,
+                surface.generation(),
+            ));
+        }
+        ActivePresentationLayout::new(
+            self.render_coordination
+                .display_generation()
+                .input_generation,
+            targets,
+            members,
+        )
+        .ok()
+    }
+
     fn desired_coordinated_layout(
         &self,
         snapshot: &ApplicationSnapshot,
@@ -2566,11 +2647,44 @@ impl MiranteWorkbenchApp {
             ));
         }
 
+        let Some(active_layout) = self.active_presentation_layout(&snapshot) else {
+            // An active panel without an exact viewport is not a renderable
+            // layout snapshot. Preserve every predecessor until the UI
+            // publishes one new generation containing all active extents.
+            self.observe_coordinated_display_milestones(false);
+            self.record_current_layout_presentation_if_complete();
+            return Ok(DisplayRefreshWorkTiming::new(
+                DisplayRenderTiming {
+                    path: DisplayRefreshPath::UiBackground,
+                    render_ms: 0.0,
+                    gpu_upload_ms: None,
+                    gpu_compute_ms: None,
+                    egui_texture_ms: 0.0,
+                },
+                visible_brick_request_ms,
+            ));
+        };
+
         let presentation_transaction = self.presentation_scheduler.transaction(
             &snapshot,
             &self.playback_session,
             &self.render_intent_mailbox,
         );
+        let display_generation = self.render_coordination.display_generation();
+        let coordinated = self
+            .render_coordination
+            .coordinated_publication_diagnostics();
+        let pending_input_targets = if display_generation.input_generation > 0
+            && coordinated.current_presentation_generation()
+                != Some(display_generation.input_generation)
+        {
+            active_layout.affected_targets(coordinated.required_targets())
+        } else {
+            PresentationTargetSet::EMPTY
+        };
+        let semantic_targets = presentation_transaction
+            .as_ref()
+            .map_or(pending_input_targets, PresentationTransaction::target_set);
         let playback_contract_active = self.playback_session.contract().is_some();
         let retained_quality_handoff = presentation_transaction
             .as_ref()
@@ -2605,6 +2719,7 @@ impl MiranteWorkbenchApp {
             }
         }
         let mut requests = Vec::with_capacity(4);
+        let mut terminal_empty_targets = Vec::with_capacity(3);
         let base = RenderIntentBase::from_snapshot(&snapshot);
         let resident_camera = self.render_intent_mailbox.renderable_camera(base);
         let effective_timepoint = application_view(&snapshot).timepoint();
@@ -2631,10 +2746,8 @@ impl MiranteWorkbenchApp {
                             plan,
                         )
                     })));
-        let transaction_requires_three_d = presentation_transaction
-            .as_ref()
-            .is_some_and(|transaction| transaction.contains(PresentationTarget::ThreeD));
-        if (transaction_requires_three_d
+        let semantic_requires_three_d = semantic_targets.contains(PresentationTarget::ThreeD);
+        if (semantic_requires_three_d
             || demand_currentness.current_3d
             || resident_navigation_intent)
             && !current_3d_is_empty
@@ -2935,10 +3048,7 @@ impl MiranteWorkbenchApp {
                     || self.render_coordination.frame_fidelity.display_freshness
                         != DisplayedFrameFreshness::Current
                     || self.render_attempt.target_ready(PresentationTarget::ThreeD));
-            let needs_execution = needs_execution
-                || presentation_transaction
-                    .as_ref()
-                    .is_some_and(|transaction| transaction.contains(PresentationTarget::ThreeD));
+            let needs_execution = needs_execution || semantic_requires_three_d;
             let (request_scope, navigation_candidate) = match request_source {
                 VolumeRenderPlanSource::Scope(scope) => (scope, None),
                 VolumeRenderPlanSource::Navigation(index) => (SCOPE_CURRENT_3D, Some(index)),
@@ -2965,9 +3075,7 @@ impl MiranteWorkbenchApp {
 
         if application_view(&snapshot).layout() == CanonicalViewerLayout::FourPanel {
             for panel in [PanelId::Xy, PanelId::Xz, PanelId::Yz] {
-                let transaction_requires_panel = presentation_transaction
-                    .as_ref()
-                    .is_some_and(|transaction| transaction.contains(panel.presentation_slot()));
+                let semantic_requires_panel = semantic_targets.contains(panel.presentation_slot());
                 // A playback-stop handoff is a quality-only transaction. Its
                 // retained front remains the visible authority until the
                 // ordinary stationary planner has produced a current body
@@ -2979,15 +3087,34 @@ impl MiranteWorkbenchApp {
                 {
                     continue;
                 }
-                if !transaction_requires_panel && !demand_renderability.cross_section(panel) {
+                if !semantic_requires_panel && !demand_renderability.cross_section(panel) {
                     continue;
                 }
                 let scope = cross_section_scope(panel)?;
+                if self.current_cross_section_empty_result(panel) {
+                    let target = panel.presentation_slot();
+                    if semantic_requires_panel {
+                        terminal_empty_targets.push(TerminalEmptyTarget {
+                            target,
+                            panel,
+                            surface_generation: self
+                                .render_coordination
+                                .surface(target)
+                                .generation(),
+                        });
+                    } else {
+                        // This is an independently completed target-local
+                        // transition, not a member of the semantic cohort
+                        // currently being assembled.
+                        self.record_current_empty_cross_section_presentation(panel);
+                    }
+                    continue;
+                }
                 let prepared = self
                     .prepared_scope_render_plans
                     .get(&scope)
                     .ok_or_else(|| anyhow::anyhow!("linked scope has no prepared render plan"))?;
-                if !transaction_requires_panel
+                if !semantic_requires_panel
                     && !self.cross_section_panel_needs_display_render(panel, &prepared.requirements)
                 {
                     continue;
@@ -3027,11 +3154,11 @@ impl MiranteWorkbenchApp {
                     true,
                 )?
                 .schedule;
-                if !transaction_requires_panel && !demand_currentness.cross_section(panel) {
+                if !semantic_requires_panel && !demand_currentness.cross_section(panel) {
                     schedule = schedule.provisional();
                 }
                 if schedule.status == CrossSectionPanelScheduleStatus::Empty
-                    && !transaction_requires_panel
+                    && !semantic_requires_panel
                 {
                     self.clear_cross_section_product_presentation(panel);
                     if !self
@@ -3047,7 +3174,7 @@ impl MiranteWorkbenchApp {
                     continue;
                 }
                 if !schedule.is_renderable()
-                    && (!transaction_requires_panel
+                    && (!semantic_requires_panel
                         || schedule.status != CrossSectionPanelScheduleStatus::Empty)
                 {
                     continue;
@@ -3078,9 +3205,23 @@ impl MiranteWorkbenchApp {
             }
         }
 
-        let request_cohort = if let Some(transaction) = presentation_transaction.as_ref() {
+        let terminal_target_set = terminal_empty_targets.iter().try_fold(
+            PresentationTargetSet::EMPTY,
+            |targets, terminal| {
+                if targets.contains(terminal.target) {
+                    anyhow::bail!(
+                        "a semantic presentation assembled terminal target {:?} more than once",
+                        terminal.target
+                    );
+                }
+                Ok(targets.with(terminal.target))
+            },
+        )?;
+        let logical_transaction = presentation_transaction.is_some();
+        if let Some(transaction) = presentation_transaction.as_ref() {
             let incomplete_fingerprint = RenderAttemptFingerprint::new(
                 &snapshot,
+                &active_layout,
                 &requests,
                 self.dataset_runtime_epoch,
                 self.dataset.cpu_capacity_epoch(),
@@ -3107,36 +3248,37 @@ impl MiranteWorkbenchApp {
                     );
                 }
             }
-            let mut logical =
-                match PresentationTransactionTargets::from_slots(transaction.target_set(), members)
-                {
-                    Ok(logical) => logical,
-                    Err(missing) => {
-                        // A logical transaction is fixed-shape. Until every immutable
-                        // body exists, retain the predecessor and do not submit a
-                        // shorter physical vector as if it were the semantic frame.
-                        self.render_attempt.wait(
-                            incomplete_fingerprint,
-                            RenderWaitKey::LogicalMember {
-                                target: missing.0,
-                                family_revision: transaction.expected_revision(missing.0).get(),
-                            },
-                        );
-                        self.observe_coordinated_display_milestones(false);
-                        self.record_current_layout_presentation_if_complete();
-                        return Ok(DisplayRefreshWorkTiming::new(
-                            DisplayRenderTiming {
-                                path: DisplayRefreshPath::UiBackground,
-                                render_ms: 0.0,
-                                gpu_upload_ms: None,
-                                gpu_compute_ms: None,
-                                egui_texture_ms: 0.0,
-                            },
-                            visible_brick_request_ms,
-                        ));
-                    }
-                };
-            let publication_group = transaction.publication_group();
+            let mut logical = match PresentationTransactionTargets::from_slots(
+                transaction.target_set(),
+                terminal_target_set,
+                members,
+            ) {
+                Ok(logical) => logical,
+                Err(missing) => {
+                    // Until every immutable logical member exists, retain
+                    // the predecessor and do not submit a shorter vector
+                    // as if it were the semantic frame.
+                    self.render_attempt.wait(
+                        incomplete_fingerprint,
+                        RenderWaitKey::LogicalMember {
+                            target: missing.0,
+                            family_revision: transaction.expected_revision(missing.0).get(),
+                        },
+                    );
+                    self.observe_coordinated_display_milestones(false);
+                    self.record_current_layout_presentation_if_complete();
+                    return Ok(DisplayRefreshWorkTiming::new(
+                        DisplayRenderTiming {
+                            path: DisplayRefreshPath::UiBackground,
+                            render_ms: 0.0,
+                            gpu_upload_ms: None,
+                            gpu_compute_ms: None,
+                            egui_texture_ms: 0.0,
+                        },
+                        visible_brick_request_ms,
+                    ));
+                }
+            };
             logical.for_each_mut(|member| {
                 debug_assert_eq!(member.source_generation(), transaction.source_generation());
                 debug_assert_eq!(member.timepoint(), transaction.timepoint());
@@ -3152,20 +3294,157 @@ impl MiranteWorkbenchApp {
                     member.quality().layer_scales(),
                     &member.prepared_request().layer_scales
                 ));
-                let request = member.prepared_request_mut();
-                request.atomic_publication_group = Some(publication_group);
-                request.render_policy = RetainedFrameRenderPolicy::ExactFrameOnly;
             });
-            CoordinatedRequestCohort::Logical(logical.into_prepared_requests())
-        } else {
-            CoordinatedRequestCohort::Physical(requests)
-        };
-        let logical_transaction = request_cohort.is_logical();
-        let requests = request_cohort.as_slice();
+            requests = logical.into_prepared_requests();
+        }
 
-        let desired = self.desired_coordinated_layout(&snapshot, requests);
-        let egui_texture_ms = self.apply_coordinated_layout(&desired)?;
-        let Some(active_target) = self.coordinated_active_target(&snapshot, requests) else {
+        if !semantic_targets.is_empty() {
+            // Unaffected active targets retain their current fronts and do
+            // not join this change's preparation or publication wait.
+            requests.retain(|request| semantic_targets.contains(request.target));
+            let incomplete_fingerprint = RenderAttemptFingerprint::new(
+                &snapshot,
+                &active_layout,
+                &requests,
+                self.dataset_runtime_epoch,
+                self.dataset.cpu_capacity_epoch(),
+                self.native_presentation
+                    .product_gpu
+                    .as_ref()
+                    .map_or(0, |product| product.renderer.device_generation().get()),
+            );
+            let mut prepared_targets = PresentationTargetSet::EMPTY;
+            for request in &requests {
+                if prepared_targets.contains(request.target) {
+                    anyhow::bail!(
+                        "a semantic presentation assembled target {:?} more than once",
+                        request.target
+                    );
+                }
+                prepared_targets = prepared_targets.with(request.target);
+            }
+            let complete_targets = prepared_targets.union(terminal_target_set);
+            if let Some(missing) = semantic_targets.difference(complete_targets).iter().next() {
+                let mailbox = self.render_intent_mailbox.snapshot();
+                let family_revision = if missing == PresentationTarget::ThreeD {
+                    mailbox.three_d_revision
+                } else {
+                    mailbox.linked_2d_revision
+                };
+                self.render_attempt.wait(
+                    incomplete_fingerprint,
+                    RenderWaitKey::LogicalMember {
+                        target: missing,
+                        family_revision: family_revision.get(),
+                    },
+                );
+                self.observe_coordinated_display_milestones(false);
+                self.record_current_layout_presentation_if_complete();
+                return Ok(DisplayRefreshWorkTiming::new(
+                    DisplayRenderTiming {
+                        path: DisplayRefreshPath::UiBackground,
+                        render_ms: 0.0,
+                        gpu_upload_ms: None,
+                        gpu_compute_ms: None,
+                        egui_texture_ms: 0.0,
+                    },
+                    visible_brick_request_ms,
+                ));
+            }
+            if complete_targets != semantic_targets {
+                anyhow::bail!("a semantic presentation contains an undeclared target");
+            }
+
+            let exact_required = presentation_transaction.is_some()
+                || requests.iter().any(|request| {
+                    request.render_policy == RetainedFrameRenderPolicy::ExactFrameOnly
+                });
+            if !prepared_targets.is_empty() {
+                // Terminal no-work members are complete semantic members but
+                // are intentionally absent from the renderer's physical
+                // delta. The physical group contains every request that must
+                // become current before those terminal members are exposed.
+                let publication_group = if exact_required {
+                    CoordinatedPublicationGroup::exact_target_set(prepared_targets)
+                } else {
+                    CoordinatedPublicationGroup::first_useful_target_set(prepared_targets)
+                }
+                .expect("a nonempty physical target set forms one publication group");
+                for request in &mut requests {
+                    request.atomic_publication_group = Some(publication_group);
+                    request.render_policy = if exact_required {
+                        RetainedFrameRenderPolicy::ExactFrameOnly
+                    } else {
+                        RetainedFrameRenderPolicy::EveryUsefulFrame
+                    };
+                }
+            }
+        }
+
+        for request in &requests {
+            let Some(member) = active_layout.member(request.target) else {
+                anyhow::bail!(
+                    "coordinated request target {:?} is absent from layout generation {}",
+                    request.target,
+                    active_layout.generation()
+                );
+            };
+            if member.target() != request.target
+                || member.extent() != request.output_extent
+                || member.surface_generation() != request.surface_generation
+            {
+                anyhow::bail!(
+                    "coordinated request target {:?} escaped its immutable layout snapshot",
+                    request.target
+                );
+            }
+        }
+
+        for terminal in &terminal_empty_targets {
+            let Some(member) = active_layout.member(terminal.target) else {
+                anyhow::bail!(
+                    "terminal target {:?} is absent from layout generation {}",
+                    terminal.target,
+                    active_layout.generation()
+                );
+            };
+            if member.target() != terminal.target
+                || member.surface_generation() != terminal.surface_generation
+            {
+                anyhow::bail!(
+                    "terminal target {:?} escaped its immutable layout snapshot",
+                    terminal.target
+                );
+            }
+        }
+
+        if requests.is_empty() && !terminal_empty_targets.is_empty() {
+            self.apply_terminal_empty_targets(&terminal_empty_targets)?;
+            let desired = self.desired_coordinated_layout(&snapshot, &requests);
+            let egui_texture_ms = self.apply_coordinated_layout(&desired)?;
+            if let Some(transaction) = presentation_transaction.as_ref()
+                && terminal_target_set == transaction.target_set()
+            {
+                self.complete_presentation_transaction(&snapshot, transaction);
+            }
+            self.render_attempt.settle();
+            self.observe_coordinated_display_milestones(false);
+            self.record_current_layout_presentation_if_complete();
+            return Ok(DisplayRefreshWorkTiming::new(
+                DisplayRenderTiming {
+                    path: DisplayRefreshPath::UiBackground,
+                    render_ms: 0.0,
+                    gpu_upload_ms: None,
+                    gpu_compute_ms: None,
+                    egui_texture_ms,
+                },
+                visible_brick_request_ms,
+            ));
+        }
+
+        let desired = self.desired_coordinated_layout(&snapshot, &requests);
+        let mut egui_texture_ms = self.apply_coordinated_layout(&desired)?;
+        let Some(active_target) = self.coordinated_active_target(&snapshot, &requests) else {
             self.observe_coordinated_display_milestones(false);
             self.record_current_layout_presentation_if_complete();
             return Ok(DisplayRefreshWorkTiming::new(
@@ -3190,7 +3469,8 @@ impl MiranteWorkbenchApp {
             .get();
         let attempt_fingerprint = RenderAttemptFingerprint::new(
             &snapshot,
-            requests,
+            &active_layout,
+            &requests,
             self.dataset_runtime_epoch,
             self.dataset.cpu_capacity_epoch(),
             renderer_device_generation,
@@ -3252,38 +3532,12 @@ impl MiranteWorkbenchApp {
             self.product_render_attempts = self.product_render_attempts.saturating_add(1);
         }
         let staged_promotion_ready = prepared_staged_promotion.is_some();
-        let borrowed = match &request_cohort {
-            CoordinatedRequestCohort::Physical(requests) => {
-                let mut borrowed = Vec::with_capacity(requests.len());
-                for request in requests {
-                    borrowed.push(borrow_coordinated_request(
-                        request,
-                        display_generation,
-                        staged_promotion_ready,
-                    ));
-                }
-                BorrowedCoordinatedRequestCohort::Physical(borrowed)
-            }
-            CoordinatedRequestCohort::Logical(FixedPresentationTargetRequests::ThreeD(
-                [three_d],
-            )) => BorrowedCoordinatedRequestCohort::Logical(
-                FixedPresentationTargetRequests::ThreeD([borrow_coordinated_request(
-                    three_d,
-                    display_generation,
-                    staged_promotion_ready,
-                )]),
-            ),
-            CoordinatedRequestCohort::Logical(FixedPresentationTargetRequests::FourPanel(
-                [three_d, xy, xz, yz],
-            )) => BorrowedCoordinatedRequestCohort::Logical(
-                FixedPresentationTargetRequests::FourPanel([
-                    borrow_coordinated_request(three_d, display_generation, staged_promotion_ready),
-                    borrow_coordinated_request(xy, display_generation, staged_promotion_ready),
-                    borrow_coordinated_request(xz, display_generation, staged_promotion_ready),
-                    borrow_coordinated_request(yz, display_generation, staged_promotion_ready),
-                ]),
-            ),
-        };
+        let borrowed = requests
+            .iter()
+            .map(|request| {
+                borrow_coordinated_request(request, display_generation, staged_promotion_ready)
+            })
+            .collect::<Vec<_>>();
         let placement_target_group = match (
             requests
                 .iter()
@@ -3303,25 +3557,11 @@ impl MiranteWorkbenchApp {
                 .product_gpu
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("progressive GPU renderer is unavailable"))?;
-            let execution = match &borrowed {
-                BorrowedCoordinatedRequestCohort::Logical(
-                    FixedPresentationTargetRequests::ThreeD([three_d]),
-                ) => product.renderer.execute_coordinated_logical_frame(
-                    snapshot.catalog(),
-                    active_target,
-                    CoordinatedLogicalTargetSet::three_d(*three_d)?,
-                ),
-                BorrowedCoordinatedRequestCohort::Logical(
-                    FixedPresentationTargetRequests::FourPanel([three_d, xy, xz, yz]),
-                ) => product.renderer.execute_coordinated_logical_frame(
-                    snapshot.catalog(),
-                    active_target,
-                    CoordinatedLogicalTargetSet::four_panel(*three_d, *xy, *xz, *yz)?,
-                ),
-                BorrowedCoordinatedRequestCohort::Physical(requests) => product
-                    .renderer
-                    .execute_coordinated_frame(snapshot.catalog(), active_target, requests),
-            };
+            let execution = product.renderer.execute_coordinated_frame(
+                snapshot.catalog(),
+                active_target,
+                &borrowed,
+            );
             match execution {
                 Ok(report) => report,
                 Err(error @ WgpuRenderRuntimeError::StaleFrame { .. }) => {
@@ -3509,15 +3749,7 @@ impl MiranteWorkbenchApp {
                 }
             }
         };
-        let next_submission = self
-            .native_presentation
-            .product_gpu
-            .as_ref()
-            .map_or(0, |product| {
-                product.renderer.next_submission_completion_event()
-            });
-        let observation =
-            normalize_color_attempt_observation(&report, requests, active_target, next_submission);
+        let observation = normalize_color_attempt_observation(&report, &requests, active_target);
         if let ColorAttemptObservation::Failed(failure) = &observation {
             // A local hidden-refinement failure leaves the predecessor and all
             // public transaction state untouched. Residency consequences are
@@ -3541,14 +3773,22 @@ impl MiranteWorkbenchApp {
                 visible_brick_request_ms,
             ));
         }
-        self.apply_coordinated_execution_report(
+        let all_physical_members_current = self.apply_coordinated_execution_report(
             &snapshot,
-            requests,
+            &requests,
             &report,
             prepared_staged_promotion,
-            presentation_transaction.as_ref(),
-            logical_transaction,
         );
+        if all_physical_members_current {
+            self.apply_terminal_empty_targets(&terminal_empty_targets)?;
+            if !terminal_empty_targets.is_empty() {
+                let desired = self.desired_coordinated_layout(&snapshot, &requests);
+                egui_texture_ms += self.apply_coordinated_layout(&desired)?;
+            }
+            if logical_transaction && let Some(transaction) = presentation_transaction.as_ref() {
+                self.complete_presentation_transaction(&snapshot, transaction);
+            }
+        }
         let refill_admission = self.retire_coordinated_gpu_resident_payloads(&report) > 0;
         if refill_admission {
             self.dataset.defer_interactive_admission_refill(true);
@@ -3598,9 +3838,7 @@ impl MiranteWorkbenchApp {
         requests: &[CoordinatedOwnedRequest],
         report: &CoordinatedFrameExecutionReport,
         prepared_staged_promotion: Option<PreparedCoordinatedStagedPromotion>,
-        transaction: Option<&PresentationTransaction>,
-        logical_transaction_assembled: bool,
-    ) {
+    ) -> bool {
         let any_target_applied = report
             .targets()
             .iter()
@@ -3731,6 +3969,7 @@ impl MiranteWorkbenchApp {
                 current: target_report.current(),
                 presented: target_report.presented(),
                 deferred_by_backpressure: target_report.deferred_by_backpressure(),
+                retry_after_submission: target_report.retry_after_submission(),
                 actionable_work_remaining: target_report.actionable_work_remaining(),
                 hidden_waiting: matches!(
                     target_report.hidden_refinement(),
@@ -3816,21 +4055,11 @@ impl MiranteWorkbenchApp {
             self.render_coordination.frame_fidelity.last_failure_kind = None;
             self.render_coordination.frame_fidelity.last_capacity_error = None;
         }
-        let every_logical_member_current = logical_transaction_assembled
-            && requests.iter().all(|request| {
-                report
-                    .target(request.target)
-                    .is_some_and(|target| target.current())
-            });
-        if let Some(transaction) = transaction
-            && every_logical_member_current
-        {
-            // The full renderer report is the proof: every member is either a
-            // newly executed Exact front or a front revalidated under the
-            // same coordinator observation. Advance only the temporal cursor
-            // here; spatial mailboxes remain independently latest-only.
-            self.complete_presentation_transaction(snapshot, transaction);
-        }
+        requests.iter().all(|request| {
+            report
+                .target(request.target)
+                .is_some_and(|target| target.current())
+        })
     }
 
     fn complete_presentation_transaction(
@@ -4818,6 +5047,8 @@ mod requirement_lease_update_tests {
         RenderAttemptFingerprint {
             source_generation: SourceSessionGeneration::new(1),
             layout: CanonicalViewerLayout::Single3d,
+            layout_generation: 1,
+            active_targets: PresentationTargetSet::THREE_D,
             frames: [Some(FrameIdentity::new(frame)), None, None, None],
             timepoints: [Some(TimeIndex::new(0)), None, None, None],
             requirements: std::array::from_fn(|_| None),
@@ -4825,6 +5056,43 @@ mod requirement_lease_update_tests {
             extents: [None; 4],
             layer_scales: std::array::from_fn(|_| None),
             schedules: [Some(VolumeColorSchedule::Direct), None, None, None],
+            dataset_runtime_epoch,
+            cpu_capacity_epoch: 1,
+            renderer_device_generation: 1,
+        }
+    }
+
+    fn linked_render_failure_signature(
+        frame: u64,
+        dataset_runtime_epoch: u64,
+    ) -> RenderAttemptFingerprint {
+        RenderAttemptFingerprint {
+            source_generation: SourceSessionGeneration::new(1),
+            layout: CanonicalViewerLayout::FourPanel,
+            layout_generation: 3,
+            active_targets: PresentationTargetSet::ALL,
+            frames: [
+                None,
+                Some(FrameIdentity::new(frame)),
+                Some(FrameIdentity::new(frame)),
+                Some(FrameIdentity::new(frame)),
+            ],
+            timepoints: [
+                None,
+                Some(TimeIndex::new(0)),
+                Some(TimeIndex::new(0)),
+                Some(TimeIndex::new(0)),
+            ],
+            requirements: std::array::from_fn(|_| None),
+            surface_generations: [None, Some(11), Some(12), Some(13)],
+            extents: [None; 4],
+            layer_scales: std::array::from_fn(|_| None),
+            schedules: [
+                None,
+                Some(VolumeColorSchedule::Direct),
+                Some(VolumeColorSchedule::Direct),
+                Some(VolumeColorSchedule::Direct),
+            ],
             dataset_runtime_epoch,
             cpu_capacity_epoch: 1,
             renderer_device_generation: 1,
@@ -5017,6 +5285,40 @@ mod requirement_lease_update_tests {
                 ResidentRenderFailureStatus::new(FrameFailureKind::BudgetExceeded, "capacity"),
             );
         }
+    }
+
+    #[test]
+    fn linked_member_failure_retains_the_complete_visible_predecessor() {
+        let current = linked_render_failure_signature(7, 17);
+        let mut coordinator = RenderAttemptCoordinator::default();
+        for (target, revision) in [
+            (PresentationTarget::Xy, 21),
+            (PresentationTarget::Xz, 22),
+            (PresentationTarget::Yz, 23),
+        ] {
+            coordinator.note_published_texture(target, 1, revision);
+            coordinator.acknowledge_composition(target, Some((1, revision)));
+        }
+        let predecessor = coordinator.acknowledged_composition;
+
+        assert!(coordinator.begin(current.clone()));
+        coordinator.fail(
+            current.clone(),
+            ResidentRenderFailureStatus::new(
+                FrameFailureKind::BackendLimit,
+                "one linked member failed",
+            ),
+        );
+        assert_eq!(coordinator.acknowledged_composition, predecessor);
+        assert_eq!(coordinator.pending_composition, [None; 4]);
+        for _ in 0..32 {
+            assert!(!coordinator.begin(current.clone()));
+            assert_eq!(coordinator.wake(), RenderWake::None);
+        }
+
+        let successor = linked_render_failure_signature(8, 17);
+        assert!(coordinator.begin(successor));
+        assert_eq!(coordinator.acknowledged_composition, predecessor);
     }
 
     #[test]
@@ -5380,6 +5682,7 @@ mod requirement_lease_update_tests {
             current: false,
             presented,
             deferred_by_backpressure: deferred,
+            retry_after_submission: deferred.then_some(13),
             actionable_work_remaining: actionable,
             hidden_waiting,
             hidden_refinement: None,
@@ -5388,7 +5691,7 @@ mod requirement_lease_update_tests {
         let deferred = facts(false, true, false, false);
         assert!(matches!(
             classify_color_attempt_facts(&[deferred]),
-            ColorAttemptClass::SubmissionWait
+            ColorAttemptClass::SubmissionWait(13)
         ));
         assert!(!report_member_should_apply(
             deferred,
@@ -5512,6 +5815,7 @@ mod requirement_lease_update_tests {
             current: false,
             presented: false,
             deferred_by_backpressure: false,
+            retry_after_submission: None,
             actionable_work_remaining: false,
             hidden_waiting: false,
             hidden_refinement: Some(HiddenRefinementState::Failed(

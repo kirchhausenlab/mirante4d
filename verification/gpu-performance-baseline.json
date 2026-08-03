@@ -1,0 +1,14 @@
+{
+  "schema": "mirante4d-gpu-performance-baseline",
+  "schema_version": 2,
+  "measurement_version": "gpu-performance-v3",
+  "status": "pending_initial_calibration",
+  "baseline_id": "pending-initial-calibration",
+  "accepted_revision": null,
+  "environment": null,
+  "workload_profile_id": null,
+  "metrics": {},
+  "accepted_at": null,
+  "owner_acceptance": null,
+  "supersedes": null
+}

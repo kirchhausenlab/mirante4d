@@ -19,3 +19,9 @@ file|SRC-TIFF-SPEC-004|spec-004/u16-striped.tif|u16|2|4|4|0|0|0|spec004_u16_stri
 file|SRC-TIFF-SPEC-004|spec-004/u16-all-zero.tif|u16|2|4|4|0|0|0|spec004_u16_zero|full|accepted|||
 file|SRC-TIFF-SPEC-004|spec-004/unsupported-u32.tif|u32|1|2|3|0|0|0|spec004_u32_sequence|full|reject_unsupported_dtype|||
 file|SRC-TIFF-SPEC-004|spec-004/nonfinite-f32.tif|f32|1|2|3|0|0|0|spec004_f32_nonfinite|full|reject_nonfinite|||
+family|SRC-TIFF-SPEC-005||||||||||||1,1,0,0,0||portable_compression_container_family
+file|SRC-TIFF-SPEC-005|spec-005/uncompressed-big-endian-u16.tif|u16|1|3|4|0|0|0|spec005_u16_portable|full|accepted|||
+file|SRC-TIFF-SPEC-005|spec-005/lzw-u8-striped.tif|u8|1|4|8|0|0|0|spec005_u8_portable|full|accepted|||
+file|SRC-TIFF-SPEC-005|spec-005/deflate-u8-tiled.tif|u8|1|16|16|0|0|0|spec005_u8_portable|full|accepted|||
+file|SRC-TIFF-SPEC-005|spec-005/old-deflate-u8-striped.tif|u8|1|4|8|0|0|0|spec005_u8_portable|full|accepted|||
+file|SRC-TIFF-SPEC-005|spec-005/packbits-u8-bigtiff.tif|u8|1|4|8|0|0|0|spec005_u8_portable|full|accepted|||

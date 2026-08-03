@@ -27,7 +27,7 @@ exact locked Cargo graph.
 
 - The source TIFF fixture rights, lineage, tool-license, and OME-schema
   attribution record is
-  [`tools/source-fixtures/specification/provenance-license-v1.json`](tools/source-fixtures/specification/provenance-license-v1.json).
+  [`tools/source-fixtures/specification/provenance-license-v2.json`](tools/source-fixtures/specification/provenance-license-v2.json).
   The tracked archive and manifest reproduce byte-for-byte and pass the
   independent fact/reader and bounded-archive validators.
 - The temporary `wayland-scanner` path patch records its upstream archive,

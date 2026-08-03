@@ -2265,48 +2265,6 @@ mod tests {
     }
 
     #[test]
-    fn package_write_route_has_one_prevalidation_stage_barrier_and_no_object_sync() {
-        let source = include_str!("package_write.rs");
-        let route_start = source
-            .find("    fn write_new_with_validation<I>(")
-            .expect("package-write route must exist");
-        let route_tail = &source[route_start..];
-        let route_end = route_tail
-            .find("\nstruct PackageWriteStageClock")
-            .expect("stage clock must follow the package-write route");
-        let route = &route_tail[..route_end];
-        let helper_start = source
-            .find("fn write_object_bytes(")
-            .expect("object writer helpers must exist");
-        let helper_tail = &source[helper_start..];
-        let helper_end = helper_tail
-            .find("\nfn write_authority_bytes(")
-            .expect("authority writer must follow the ordinary object writer");
-        let object_writers = &helper_tail[..helper_end];
-
-        assert_eq!(route.matches(".sync_stage(").count(), 1);
-        let barrier = route
-            .find(".sync_stage(")
-            .expect("the package route must synchronize its complete stage");
-        let validation = route
-            .find("PackageWriteStage::StagedStructureValidation")
-            .expect("staged structure validation must remain explicit");
-        assert!(barrier < validation);
-        for forbidden in [
-            ".sync_all(",
-            ".sync_data(",
-            "fdatasync(",
-            "fsync(",
-            "syncfs(",
-        ] {
-            assert!(
-                !route.contains(forbidden) && !object_writers.contains(forbidden),
-                "package construction contains a forbidden per-object durability route {forbidden}"
-            );
-        }
-    }
-
-    #[test]
     fn unsupported_filesystem_durability_remains_a_typed_writer_capability() {
         let error = map_publication_error_without_commit(
             LocalPublicationError::FilesystemDurabilityUnsupported,

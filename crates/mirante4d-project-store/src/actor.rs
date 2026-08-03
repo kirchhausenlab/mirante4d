@@ -1948,6 +1948,7 @@ mod tests {
         filesystem::TEST_REAL_POLICY_ENV,
         generation::{ArtifactStorage, GenerationDocument, LogicalObjectBinding},
         lease::{GcTransition, GcTransitionTarget, TransitionEdge},
+        local::TestImmutableWriteBehavior,
         wire::ProjectEnvelope,
     };
 
@@ -2594,6 +2595,318 @@ mod tests {
         actor.try_submit(close_command(2)).unwrap();
         public_recv_timeout(&actor);
         actor.join().unwrap();
+    }
+
+    #[test]
+    fn promoted_independent_mutations_are_rejected_by_the_public_actor_without_repair() {
+        let workspace = TestDirectory::new("independent-mutations");
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest_path = repository.join("fixtures/project/manifest.json");
+        let validator_path = repository.join("tools/project-fixtures/validate.py");
+        let output = Command::new("python3")
+            .arg(&validator_path)
+            .arg("--manifest")
+            .arg(&manifest_path)
+            .arg("--emit-mutations")
+            .arg(workspace.path())
+            .output()
+            .expect("run the independent project mutation producer");
+        assert!(
+            output.status.success(),
+            "independent mutation emission failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let mutations = manifest["mutations"]
+            .as_array()
+            .expect("project fixture mutation inventory");
+        assert_eq!(mutations.len(), 16);
+        let mut failures = Vec::new();
+        for mutation in mutations {
+            let id = mutation["id"].as_str().expect("mutation id");
+            let expected = mutation["expected_fault"]
+                .as_str()
+                .expect("independent expected fault");
+            let expected_public = mutation["expected_public_fault"]
+                .as_str()
+                .expect("expected production public fault");
+            let root = workspace.path().join(id).join("recoverable.m4dproj");
+            let before = file_tree(&root);
+            let actual = public_mutation_rejection(&root);
+            let actual_public = project_store_fault_class(&actual);
+            if actual_public != expected_public {
+                failures.push(format!(
+                    "{id}: independent={expected}, expected_public={expected_public}, actual={actual:?}"
+                ));
+            }
+            if file_tree(&root) != before {
+                failures.push(format!("{id}: production inspection mutated the fixture"));
+            }
+            eprintln!(
+                "M4D_PROJECT_MUTATION_V1 id={id} independent_fault={expected} public_fault={actual_public}"
+            );
+        }
+        assert!(
+            failures.is_empty(),
+            "production mutation conformance failures:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn public_actor_capacity_and_permission_faults_preserve_prior_authority_and_reopen() {
+        for (label, behavior, expected_fault) in [
+            (
+                "capacity",
+                TestImmutableWriteBehavior::StorageFull,
+                ProjectStoreFault::Capacity {
+                    stage: "physical object",
+                },
+            ),
+            (
+                "permission",
+                TestImmutableWriteBehavior::ReadOnly,
+                ProjectStoreFault::ReadOnly,
+            ),
+        ] {
+            let project = TestProject::extracted(&format!("public-{label}-fault"));
+            let actor = ProjectStoreActor::start(Default::default()).unwrap();
+            actor
+                .try_submit(ProjectStoreCommand::Open {
+                    request_id: request_id(1),
+                    path: project.store_path(),
+                    mode: ProjectOpenMode::PreferWritable,
+                })
+                .unwrap();
+            let prior_projection = match public_recv_timeout(&actor) {
+                ProjectStoreCompletion::Opened {
+                    request_id: actual,
+                    result: Ok((session, projection)),
+                } if actual == request_id(1) => {
+                    assert_eq!(
+                        session.current_manual_generation(),
+                        Some(generation_id(STALE_MANUAL))
+                    );
+                    projection
+                }
+                other => panic!("unexpected public Open before {label} fault: {other:?}"),
+            };
+            let before = file_tree(project.path());
+            let prior_head = fs::read(project.path().join("refs/head")).unwrap();
+            let root = LocalStoreRoot::open(project.path()).unwrap();
+            let injection = root.inject_next_immutable_write(behavior);
+            let (capture, gate) = gated_manual_capture();
+            gate.release();
+            actor
+                .try_submit(ProjectStoreCommand::ManualSave {
+                    request_id: request_id(2),
+                    capture,
+                })
+                .unwrap();
+            assert!(matches!(
+                public_recv_timeout(&actor),
+                ProjectStoreCompletion::ManualSaved {
+                    request_id: actual,
+                    result: Err(actual_fault),
+                } if actual == request_id(2) && actual_fault == expected_fault
+            ));
+            drop(injection);
+            assert_eq!(
+                fs::read(project.path().join("refs/head")).unwrap(),
+                prior_head
+            );
+            assert_eq!(file_tree(project.path()), before);
+
+            actor.try_submit(close_command(3)).unwrap();
+            assert!(matches!(
+                public_recv_timeout(&actor),
+                ProjectStoreCompletion::Closed {
+                    request_id: actual,
+                    result: Ok(()),
+                } if actual == request_id(3)
+            ));
+            actor.join().unwrap();
+
+            let contender =
+                ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+            assert!(
+                contender.has_writer(),
+                "{label} fault leaked writable authority"
+            );
+            drop(contender);
+
+            let fresh = ProjectStoreActor::start(Default::default()).unwrap();
+            fresh
+                .try_submit(ProjectStoreCommand::Open {
+                    request_id: request_id(4),
+                    path: project.store_path(),
+                    mode: ProjectOpenMode::ReadOnly,
+                })
+                .unwrap();
+            match public_recv_timeout(&fresh) {
+                ProjectStoreCompletion::Opened {
+                    request_id: actual,
+                    result: Ok((session, projection)),
+                } if actual == request_id(4) => {
+                    assert_eq!(
+                        session.current_manual_generation(),
+                        Some(generation_id(STALE_MANUAL))
+                    );
+                    assert_eq!(projection, prior_projection);
+                }
+                other => panic!("unexpected fresh Open after {label} fault: {other:?}"),
+            }
+            fresh.try_submit(close_command(5)).unwrap();
+            public_recv_timeout(&fresh);
+            fresh.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn public_actor_completes_a_manual_save_under_forced_partial_destination_writes() {
+        let project = TestProject::extracted("public-partial-writes");
+        let actor = ProjectStoreActor::start(Default::default()).unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::Open {
+                request_id: request_id(1),
+                path: project.store_path(),
+                mode: ProjectOpenMode::PreferWritable,
+            })
+            .unwrap();
+        match public_recv_timeout(&actor) {
+            ProjectStoreCompletion::Opened {
+                request_id: actual,
+                result: Ok((session, _)),
+            } if actual == request_id(1) => assert_eq!(
+                session.current_manual_generation(),
+                Some(generation_id(STALE_MANUAL))
+            ),
+            other => panic!("unexpected public Open before partial writes: {other:?}"),
+        }
+
+        let root = LocalStoreRoot::open(project.path()).unwrap();
+        let injection = root
+            .inject_next_immutable_write(TestImmutableWriteBehavior::ShortWrites { maximum: 3 });
+        let (capture, gate) = gated_manual_capture();
+        gate.release();
+        actor
+            .try_submit(ProjectStoreCommand::ManualSave {
+                request_id: request_id(2),
+                capture,
+            })
+            .unwrap();
+        let new_generation = match public_recv_timeout(&actor) {
+            ProjectStoreCompletion::ManualSaved {
+                request_id: actual,
+                result: Ok(receipt),
+            } if actual == request_id(2) => {
+                assert_eq!(
+                    receipt.previous_generation_id(),
+                    Some(generation_id(STALE_MANUAL))
+                );
+                assert_eq!(receipt.published_objects(), 1);
+                assert!(receipt.published_bytes() > 0);
+                receipt.current_generation_id()
+            }
+            other => panic!("unexpected partial-write ManualSave completion: {other:?}"),
+        };
+        drop(injection);
+        assert_ne!(new_generation, generation_id(STALE_MANUAL));
+        assert!(file_tree(project.path()).keys().all(|path| {
+            !path
+                .components()
+                .any(|component| component.as_os_str().to_string_lossy().starts_with("tx-"))
+        }));
+
+        actor.try_submit(close_command(3)).unwrap();
+        public_recv_timeout(&actor);
+        actor.join().unwrap();
+        let contender =
+            ProjectStoreLeases::acquire(&root, ProjectOpenMode::PreferWritable).unwrap();
+        assert!(contender.has_writer());
+        drop(contender);
+
+        let fresh = ProjectStoreActor::start(Default::default()).unwrap();
+        fresh
+            .try_submit(ProjectStoreCommand::Open {
+                request_id: request_id(4),
+                path: project.store_path(),
+                mode: ProjectOpenMode::ReadOnly,
+            })
+            .unwrap();
+        assert!(matches!(
+            public_recv_timeout(&fresh),
+            ProjectStoreCompletion::Opened {
+                request_id: actual,
+                result: Ok((session, _)),
+            } if actual == request_id(4)
+                && session.current_manual_generation() == Some(new_generation)
+        ));
+        fresh.try_submit(close_command(5)).unwrap();
+        public_recv_timeout(&fresh);
+        fresh.join().unwrap();
+    }
+
+    fn public_mutation_rejection(root: &Path) -> ProjectStoreFault {
+        let actor = ProjectStoreActor::start(Default::default()).unwrap();
+        actor
+            .try_submit(ProjectStoreCommand::Open {
+                request_id: request_id(1),
+                path: ProjectStorePath::new(root.to_path_buf()).unwrap(),
+                mode: ProjectOpenMode::ReadOnly,
+            })
+            .unwrap();
+        let fault = match public_recv_timeout(&actor) {
+            ProjectStoreCompletion::Opened {
+                request_id: actual,
+                result: Err(fault),
+            } if actual == request_id(1) => fault,
+            ProjectStoreCompletion::Opened {
+                request_id: actual,
+                result: Ok(_),
+            } if actual == request_id(1) => {
+                actor
+                    .try_submit(ProjectStoreCommand::InspectRecovery {
+                        request_id: request_id(2),
+                    })
+                    .unwrap();
+                match public_recv_timeout(&actor) {
+                    ProjectStoreCompletion::RecoveryInspected {
+                        request_id: actual,
+                        result: Err(fault),
+                    } if actual == request_id(2) => fault,
+                    other => panic!("mutated store was accepted by production: {other:?}"),
+                }
+            }
+            other => panic!("unexpected mutated-store Open completion: {other:?}"),
+        };
+        actor.try_submit(close_command(3)).unwrap();
+        assert!(matches!(
+            public_recv_timeout(&actor),
+            ProjectStoreCompletion::Closed { result: Ok(()), .. }
+        ));
+        actor.join().unwrap();
+        fault
+    }
+
+    fn project_store_fault_class(fault: &ProjectStoreFault) -> &'static str {
+        match fault {
+            ProjectStoreFault::QueueFull { .. } => "queue_full",
+            ProjectStoreFault::ReadOnly => "read_only",
+            ProjectStoreFault::WriterContended => "writer_contended",
+            ProjectStoreFault::StaleParent => "stale_parent",
+            ProjectStoreFault::DestinationExists => "destination_exists",
+            ProjectStoreFault::UnsupportedFilesystem => "unsupported_filesystem",
+            ProjectStoreFault::Capacity { .. } => "capacity",
+            ProjectStoreFault::SourceChanged => "source_changed",
+            ProjectStoreFault::DigestMismatch => "digest_mismatch",
+            ProjectStoreFault::Corruption { .. } => "corruption",
+            ProjectStoreFault::ConfirmationRequired => "confirmation_required",
+            ProjectStoreFault::Cancelled => "cancelled",
+            ProjectStoreFault::CommitIndeterminate => "commit_indeterminate",
+        }
     }
 
     #[test]
@@ -6711,20 +7024,7 @@ mod tests {
     }
 
     fn acquire_writer_eventually(root: &LocalStoreRoot) -> ProjectStoreLeases {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            let leases =
-                ProjectStoreLeases::acquire(root, ProjectOpenMode::PreferWritable).unwrap();
-            if leases.has_writer() {
-                return leases;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "writer lease remained unavailable after the parallel fork/exec window"
-            );
-            drop(leases);
-            thread::sleep(Duration::from_millis(1));
-        }
+        crate::lease::acquire_writer_eventually_for_test(root)
     }
 
     fn frozen_generation(id: &str) -> GenerationDocument {

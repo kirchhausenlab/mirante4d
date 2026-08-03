@@ -764,6 +764,23 @@ impl ProjectStoreLeases {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn acquire_writer_eventually_for_test(root: &LocalStoreRoot) -> ProjectStoreLeases {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let leases = ProjectStoreLeases::acquire(root, ProjectOpenMode::PreferWritable).unwrap();
+        if leases.has_writer() {
+            return leases;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "writer lease remained unavailable after the parallel fork/exec window"
+        );
+        drop(leases);
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 const fn gc_store_transition(transition: GcTransition) -> StoreTransition {
     match transition {
         GcTransition::MaintenanceUpgrade => StoreTransition::GcMaintenanceUpgrade,

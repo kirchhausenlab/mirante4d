@@ -14,7 +14,7 @@ const SELECTORS_PATH: &str = "verification/generated/selectors.json";
 const NEXTEST_CONFIG_PATH: &str = ".config/nextest.toml";
 
 #[derive(Debug, Deserialize)]
-pub(super) struct Registry {
+pub(crate) struct Registry {
     schema: String,
     schema_version: u32,
     tools: Vec<ToolPin>,
@@ -118,10 +118,11 @@ pub(super) struct SelectorAdapter {
     expected_ignored_cases: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct SelectorMatch {
     package: String,
-    test_prefix: String,
+    test_prefix: Option<String>,
+    exact_test: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,7 +140,7 @@ struct NonPrLane {
     activation_state: String,
 }
 
-pub(super) fn read_registry() -> anyhow::Result<Registry> {
+pub(crate) fn read_registry() -> anyhow::Result<Registry> {
     let path = repo_path(REGISTRY_PATH);
     let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let registry: Registry = serde_json::from_slice(&bytes)
@@ -293,9 +294,10 @@ fn validate_registry(registry: &Registry) -> anyhow::Result<()> {
     let expected_non_pr = BTreeSet::from([
         "developer-local",
         "format-lifecycle",
+        "gpu-performance",
         "linux-release",
         "project-store-lifecycle",
-        "trusted-gpu",
+        "trusted-gpu-correctness",
     ]);
     let actual_non_pr = registry
         .non_pr_lanes
@@ -307,6 +309,7 @@ fn validate_registry(registry: &Registry) -> anyhow::Result<()> {
     }
 
     let mut adapter_ids = BTreeSet::new();
+    let mut exact_test_authorities = BTreeSet::new();
     for adapter in &registry.selector_adapters {
         if !adapter_ids.insert(adapter.id.as_str())
             || adapter.lane.trim().is_empty()
@@ -324,6 +327,42 @@ fn validate_registry(registry: &Registry) -> anyhow::Result<()> {
         }
         if !all_lane_ids.contains(adapter.lane.as_str()) {
             bail!("selector adapter {:?} names an unknown lane", adapter.id);
+        }
+        for matcher in &adapter.matches {
+            let authority = matcher
+                .test_prefix
+                .as_deref()
+                .or(matcher.exact_test.as_deref());
+            if matcher.package.trim().is_empty()
+                || matcher.test_prefix.is_some() == matcher.exact_test.is_some()
+                || authority.is_none_or(str::is_empty)
+            {
+                bail!(
+                    "selector adapter {:?} has an invalid test matcher",
+                    adapter.id
+                );
+            }
+            if let Some(exact_test) = matcher.exact_test.as_deref()
+                && !exact_test_authorities.insert((matcher.package.as_str(), exact_test))
+            {
+                bail!(
+                    "exact ignored case {}::{exact_test} has duplicate selector authority",
+                    matcher.package
+                );
+            }
+        }
+        if matches!(
+            adapter.lane.as_str(),
+            "trusted-gpu-correctness" | "gpu-performance"
+        ) && adapter
+            .matches
+            .iter()
+            .any(|matcher| matcher.exact_test.is_none())
+        {
+            bail!(
+                "GPU selector adapter {:?} must use exact test names",
+                adapter.id
+            );
         }
     }
     Ok(())
@@ -476,8 +515,16 @@ fn validate_property_groups(groups: &[PropertyGroup]) -> anyhow::Result<()> {
             ("mirante4d-identity", "0x4d34494444494731", 128),
         ),
         (
+            "import-hostile-tiff",
+            ("mirante4d-import-pipeline", "0x4d34494d50544946", 64),
+        ),
+        (
             "project-model",
             ("mirante4d-project-model", "0x4d3450524f4a4d4f", 128),
+        ),
+        (
+            "storage-hostile-parsers",
+            ("mirante4d-storage", "0x4d3453544f525041", 64),
         ),
     ]);
     if groups.len() != expected.len() {
@@ -598,30 +645,53 @@ fn generated_nextest(registry: &Registry) -> anyhow::Result<String> {
          store-success-output = false\n\
          store-failure-output = true\n",
     );
-    let trusted_selector = lane_adapter_selector(registry, "trusted-gpu")?;
+    let trusted_selector = lane_adapter_selector(registry, "trusted-gpu-correctness")?;
     if trusted_selector.contains('\'') {
-        bail!("trusted-gpu selector cannot contain a TOML literal quote");
+        bail!("trusted-gpu-correctness selector cannot contain a TOML literal quote");
+    }
+    let performance_selector = lane_adapter_selector(registry, "gpu-performance")?;
+    if performance_selector.contains('\'') {
+        bail!("gpu-performance selector cannot contain a TOML literal quote");
     }
     text.push_str(&format!(
-        "\n[profile.trusted-gpu]\n\
+        "\n[profile.trusted-gpu-correctness]\n\
          inherits = \"default\"\n\
          test-threads = 1\n\
          global-timeout = \"15m\"\n\n\
-         [[profile.trusted-gpu.overrides]]\n\
+         [[profile.trusted-gpu-correctness.overrides]]\n\
          filter = '{trusted_selector}'\n\
-         slow-timeout = {{ period = \"20s\", terminate-after = 3 }}\n"
+         slow-timeout = {{ period = \"20s\", terminate-after = 3 }}\n\n\
+         [profile.gpu-performance]\n\
+         inherits = \"default\"\n\
+         test-threads = 1\n\
+         global-timeout = \"30m\"\n\n\
+         [[profile.gpu-performance.overrides]]\n\
+         filter = '{performance_selector}'\n\
+         slow-timeout = {{ period = \"60s\", terminate-after = 20 }}\n"
     ));
     Ok(text)
 }
 
-pub(super) fn trusted_gpu_policy(registry: &Registry) -> anyhow::Result<(String, u64)> {
+pub(super) fn trusted_gpu_correctness_policy(registry: &Registry) -> anyhow::Result<(String, u64)> {
     let lane = registry
         .non_pr_lanes
         .iter()
-        .find(|lane| lane.id == "trusted-gpu")
-        .context("verification registry is missing trusted-gpu lane")?;
+        .find(|lane| lane.id == "trusted-gpu-correctness")
+        .context("verification registry is missing trusted-gpu-correctness lane")?;
     Ok((
-        lane_adapter_selector(registry, "trusted-gpu")?,
+        lane_adapter_selector(registry, "trusted-gpu-correctness")?,
+        lane.timeout_secs,
+    ))
+}
+
+pub(crate) fn gpu_performance_policy(registry: &Registry) -> anyhow::Result<(String, u64)> {
+    let lane = registry
+        .non_pr_lanes
+        .iter()
+        .find(|lane| lane.id == "gpu-performance")
+        .context("verification registry is missing gpu-performance lane")?;
+    Ok((
+        lane_adapter_selector(registry, "gpu-performance")?,
         lane.timeout_secs,
     ))
 }
@@ -683,11 +753,12 @@ fn adapter_selector(adapter: &SelectorAdapter) -> String {
         .matches
         .iter()
         .map(|matcher| {
-            format!(
-                "package({}) & test(/{}/)",
-                matcher.package,
-                regex_prefix(&matcher.test_prefix)
-            )
+            let test = match (&matcher.test_prefix, &matcher.exact_test) {
+                (Some(prefix), None) => regex_prefix(prefix),
+                (None, Some(exact)) => regex_exact(exact),
+                _ => unreachable!("validated selector matcher has one test authority"),
+            };
+            format!("package({}) & test(/{}/)", matcher.package, test,)
         })
         .collect::<Vec<_>>();
     if parts.len() == 1 {
@@ -742,6 +813,12 @@ fn regex_prefix(prefix: &str) -> String {
         }
         escaped.push(character);
     }
+    escaped
+}
+
+fn regex_exact(exact: &str) -> String {
+    let mut escaped = regex_prefix(exact);
+    escaped.push('$');
     escaped
 }
 
@@ -830,11 +907,77 @@ pub(super) fn audit_discovery(
     Ok(counts)
 }
 
-fn adapter_matches(adapter: &SelectorAdapter, package: &str, test_name: &str) -> bool {
-    adapter
-        .matches
+pub(super) fn ignored_inventory_for_lane(
+    path: &Path,
+    registry: &Registry,
+    lane: &str,
+) -> anyhow::Result<Vec<String>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let discovery: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let suites = discovery
+        .get("rust-suites")
+        .and_then(Value::as_object)
+        .context("Nextest discovery is missing rust-suites")?;
+    let mut inventory = Vec::new();
+    for suite in suites.values() {
+        let package = suite
+            .get("package-name")
+            .and_then(Value::as_str)
+            .context("Nextest suite is missing package-name")?;
+        let testcases = suite
+            .get("testcases")
+            .and_then(Value::as_object)
+            .context("Nextest suite is missing testcases")?;
+        for (test_name, testcase) in testcases {
+            if !testcase
+                .get("ignored")
+                .and_then(Value::as_bool)
+                .context("Nextest testcase is missing ignored state")?
+            {
+                continue;
+            }
+            let owners = registry
+                .selector_adapters
+                .iter()
+                .filter(|adapter| adapter_matches(adapter, package, test_name))
+                .collect::<Vec<_>>();
+            if owners.len() != 1 {
+                bail!(
+                    "ignored case {package}::{test_name} matched {} selector adapters, expected exactly one",
+                    owners.len()
+                );
+            }
+            if owners[0].lane == lane {
+                inventory.push(format!("{package}::{test_name}"));
+            }
+        }
+    }
+    inventory.sort();
+    let expected = registry
+        .selector_adapters
         .iter()
-        .any(|matcher| matcher.package == package && test_name.starts_with(&matcher.test_prefix))
+        .filter(|adapter| adapter.lane == lane)
+        .map(|adapter| adapter.expected_ignored_cases)
+        .sum::<u64>();
+    if u64::try_from(inventory.len()).ok() != Some(expected) {
+        bail!(
+            "lane {lane:?} expected {expected} ignored cases, discovered {}",
+            inventory.len()
+        );
+    }
+    Ok(inventory)
+}
+
+fn adapter_matches(adapter: &SelectorAdapter, package: &str, test_name: &str) -> bool {
+    adapter.matches.iter().any(|matcher| {
+        matcher.package == package
+            && match (&matcher.test_prefix, &matcher.exact_test) {
+                (Some(prefix), None) => test_name.starts_with(prefix),
+                (None, Some(exact)) => test_name == exact,
+                _ => false,
+            }
+    })
 }
 
 pub(super) fn repo_path(relative: &str) -> PathBuf {
@@ -851,6 +994,42 @@ pub(super) fn repo_path(relative: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+
+    fn gpu_discovery(registry: &Registry, lane: &str) -> Value {
+        let mut suites = serde_json::Map::new();
+        let mut by_package = BTreeMap::<String, serde_json::Map<String, Value>>::new();
+        for adapter in registry
+            .selector_adapters
+            .iter()
+            .filter(|adapter| adapter.lane == lane)
+        {
+            for matcher in &adapter.matches {
+                let exact = matcher
+                    .exact_test
+                    .as_ref()
+                    .expect("GPU registration is exact");
+                by_package
+                    .entry(matcher.package.clone())
+                    .or_default()
+                    .insert(exact.clone(), json!({ "ignored": true }));
+            }
+        }
+        for (index, (package, testcases)) in by_package.into_iter().enumerate() {
+            suites.insert(
+                format!("suite-{index}"),
+                json!({ "package-name": package, "testcases": testcases }),
+            );
+        }
+        json!({ "rust-suites": suites })
+    }
+
+    fn write_discovery(value: &Value) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        serde_json::to_writer(&mut file, value).unwrap();
+        file.flush().unwrap();
+        file
+    }
 
     #[test]
     fn registry_has_exact_required_leaf_set() {
@@ -876,6 +1055,152 @@ mod tests {
     fn project_store_lifecycle_is_an_active_trusted_local_lane() {
         let registry = read_registry().unwrap();
         assert_eq!(project_store_lifecycle_timeout(&registry).unwrap(), 900);
+    }
+
+    #[test]
+    fn gpu_lanes_have_exact_disjoint_inventory_and_fixed_policy() {
+        let registry = read_registry().unwrap();
+        let (correctness_selector, correctness_timeout) =
+            trusted_gpu_correctness_policy(&registry).unwrap();
+        let (performance_selector, performance_timeout) =
+            gpu_performance_policy(&registry).unwrap();
+        assert_eq!(correctness_timeout, 900);
+        assert_eq!(performance_timeout, 1_800);
+        assert!(correctness_selector.contains("test(/^"));
+        assert!(performance_selector.contains("test(/^"));
+        assert!(correctness_selector.contains("$/)"));
+        assert!(performance_selector.contains("$/)"));
+
+        let correctness = write_discovery(&gpu_discovery(&registry, "trusted-gpu-correctness"));
+        let performance = write_discovery(&gpu_discovery(&registry, "gpu-performance"));
+        assert_eq!(
+            ignored_inventory_for_lane(correctness.path(), &registry, "trusted-gpu-correctness")
+                .unwrap()
+                .len(),
+            25
+        );
+        assert_eq!(
+            ignored_inventory_for_lane(performance.path(), &registry, "gpu-performance")
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn gpu_inventory_fails_closed_for_missing_renamed_unignored_or_unassigned_cases() {
+        let registry = read_registry().unwrap();
+        let baseline = gpu_discovery(&registry, "gpu-performance");
+        let suites = baseline["rust-suites"].as_object().unwrap();
+        let (suite_name, suite) = suites.iter().next().unwrap();
+        let suite_name = suite_name.clone();
+        let test_name = suite["testcases"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+
+        let mut missing = baseline.clone();
+        missing["rust-suites"][&suite_name]["testcases"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&test_name);
+        let file = write_discovery(&missing);
+        assert!(ignored_inventory_for_lane(file.path(), &registry, "gpu-performance").is_err());
+
+        let mut renamed = baseline.clone();
+        let case = renamed["rust-suites"][&suite_name]["testcases"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&test_name)
+            .unwrap();
+        renamed["rust-suites"][&suite_name]["testcases"]
+            .as_object_mut()
+            .unwrap()
+            .insert(format!("{test_name}_renamed"), case);
+        let file = write_discovery(&renamed);
+        assert!(ignored_inventory_for_lane(file.path(), &registry, "gpu-performance").is_err());
+
+        let mut unignored = baseline.clone();
+        unignored["rust-suites"][&suite_name]["testcases"][&test_name]["ignored"] = json!(false);
+        let file = write_discovery(&unignored);
+        assert!(ignored_inventory_for_lane(file.path(), &registry, "gpu-performance").is_err());
+
+        let mut unassigned = baseline;
+        unassigned["rust-suites"][&suite_name]["testcases"]
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "gpu_tests::unexpected_ignored_case".to_owned(),
+                json!({ "ignored": true }),
+            );
+        let file = write_discovery(&unassigned);
+        assert!(ignored_inventory_for_lane(file.path(), &registry, "gpu-performance").is_err());
+    }
+
+    #[test]
+    fn duplicate_exact_gpu_registration_is_rejected_before_execution() {
+        let mut registry = read_registry().unwrap();
+        let duplicate = registry
+            .selector_adapters
+            .iter()
+            .find(|adapter| adapter.lane == "gpu-performance")
+            .unwrap()
+            .matches[0]
+            .clone();
+        registry
+            .selector_adapters
+            .iter_mut()
+            .find(|adapter| adapter.lane == "trusted-gpu-correctness")
+            .unwrap()
+            .matches
+            .push(duplicate);
+        assert!(validate_registry(&registry).is_err());
+    }
+
+    #[test]
+    fn project_store_host_and_vm_ignored_cases_have_disjoint_exact_ownership() {
+        let registry = read_registry().unwrap();
+        let hosted = registry
+            .selector_adapters
+            .iter()
+            .find(|adapter| adapter.id == "WP10B-ADAPTER-PROJECT-STORE-HOSTED")
+            .unwrap();
+        assert_eq!(hosted.lane, "project-store-lifecycle");
+        assert_eq!(hosted.expected_ignored_cases, 3);
+        assert_eq!(
+            hosted
+                .matches
+                .iter()
+                .map(|entry| entry.test_prefix.as_deref().unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "actor::tests::hosted_durability_tests::exhaustive_hosted_and_process_transition_matrix",
+                "actor::tests::trash_fresh_process_kill_and_retry_matrix",
+                "actor::tests::purge_fresh_process_kill_and_retry_matrix",
+            ])
+        );
+
+        let guest = registry
+            .selector_adapters
+            .iter()
+            .find(|adapter| adapter.id == "WP10B-ADAPTER-PROJECT-STORE-LIFECYCLE")
+            .unwrap();
+        assert_eq!(guest.lane, "project-store-lifecycle");
+        assert_eq!(guest.expected_ignored_cases, 1);
+        assert_eq!(guest.matches.len(), 1);
+        assert_eq!(
+            guest.matches[0].test_prefix.as_deref(),
+            Some("actor::tests::durability_tests::project_store_vm_guest_driver")
+        );
+        assert!(hosted.matches.iter().all(|host| {
+            guest
+                .matches
+                .iter()
+                .all(|vm| host.test_prefix != vm.test_prefix)
+        }));
     }
 
     #[test]

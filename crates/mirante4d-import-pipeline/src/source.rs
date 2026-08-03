@@ -3943,6 +3943,7 @@ mod tests {
     };
 
     use mirante4d_dataset::{CpuByteLease, CpuLedgerCategory, CpuLedgerError};
+    use proptest::{prelude::*, test_runner::RngSeed};
     use tempfile::tempdir;
     use tiff::{
         encoder::{Compression, DeflateLevel, TiffEncoder, colortype},
@@ -5117,6 +5118,44 @@ mod tests {
             retained_decoder_bytes(MAX_PAGES_PER_FILE),
             Some(32 * 1024 * 1024)
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            max_shrink_iters: 1_024,
+            failure_persistence: None,
+            rng_seed: RngSeed::Fixed(0x4d34_494d_5054_4946),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn bounded_hostile_tiff_preflight_never_panics_or_expands_input(
+            mutation_index in any::<usize>(),
+            replacement in any::<u8>(),
+            truncate_at in any::<u16>(),
+        ) {
+            let temporary = tempdir().unwrap();
+            let path = temporary.path().join("hostile.tif");
+            write_preflight_fixture(
+                &path,
+                &[(259, 3, 1, 1), (273, 4, 1, 0), (279, 4, 1, 1)],
+                0,
+            )
+            .unwrap();
+            let original_len = fs::metadata(&path).unwrap().len() as usize;
+            let mut bytes = fs::read(&path).unwrap();
+            let index = mutation_index % bytes.len();
+            bytes[index] = replacement;
+            bytes.truncate(usize::from(truncate_at).min(bytes.len()));
+            fs::write(&path, &bytes).unwrap();
+            let file = File::open(&path).unwrap();
+            let result = preflight_tiff_ifd_chain(&path, &file, &ImportCancellation::new());
+            prop_assert!(bytes.len() <= original_len);
+            if let Ok(bytes_read) = result {
+                prop_assert!(bytes_read <= 64 * 1024);
+            }
+        }
     }
 
     #[test]

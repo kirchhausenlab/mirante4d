@@ -1,6 +1,6 @@
 # Current Work
 
-Last updated: 2026-08-02
+Last updated: 2026-08-03
 
 ## Current Status
 
@@ -29,6 +29,79 @@ its capture was inadmissible because the bundled fixture was clipped by the
 retained t0 transfer window. A suitable temporal workload, qualifying clean-
 revision trusted lane, and owner acceptance remain P8 work. No performance
 improvement or owner product-validated status is claimed.
+
+The
+[viewer GPU testing refactor](../plans/active/VIEWER_GPU_TESTING_REFACTOR.md)
+is implemented in the repository. The mixed 27-function lane is replaced by
+an exact 25-function correctness lane and a three-function/39-measurement
+release campaign with mapped-product presentation, stall, refinement,
+matching-work, stability, and baseline gates. The baseline remains explicitly
+pending.
+
+The first complete correctness execution exposed six failures at clean commit
+`a6ef07aea1ea04bddeb77efd7ad9cbd0f97a236d`. The owner-approved
+[viewer GPU correctness campaign follow-up](../plans/active/VIEWER_GPU_CORRECTNESS_CAMPAIGN_FOLLOW_UP.md)
+is now implemented: bounded active/affected publication, terminal no-work
+membership, cohort-aware replacement age, forward-reachable numerical
+admission, phase-aware test drivers, corrected stale assertions, and exact
+failed-run attribution. A subsequent clean immutable execution at commit
+`efb745221ba3a78d00a20fe14b843d07f5272d06` reconciled all 25 exact cases and
+passed all 25 serially with zero retries, skips, or unattributed outcomes. The
+same revision's normal release application passed the 141-command render-mode
+matrix and 60-command native-navigation scenario. These are automated mapped-
+product results, not owner visual acceptance. The semantic model supports
+every bounded future panel subset without implementing the flexible-layout UI.
+
+The selected multi-layer performance calibration initially stopped in its
+controlled presentation preflight. A 2026-08-03 live replay corrected the
+attribution: one-second progress publication hid the current command, an
+in-pass repaint could be lost after native geometry changes, and the app
+minimized itself before depending on its dormant minimized UI loop to restore
+itself. The current-tree repair publishes every command transition, gives the
+non-measured probe an external UI wake, lets the app request minimization while
+one X11 controller owns the forced unmap and restore/focus, blocks later
+commands until the observer sees remapping and eframe sees a restored focused
+window, and retains a final nonblank 1920x1080 GPU capture. The resulting
+29-command product validation passed without human intervention.
+
+The original X11 Present receipt remained unevaluated because this
+NVIDIA/Vulkan path emitted zero completion events. The owner-approved
+replacement now combines strict present IDs, bounded `VK_KHR_present_wait`,
+the independent X11 marker/lifecycle observer, and revision-3
+`VK_EXT_present_timing` first-pixel-out feedback. The current-tree boundary
+proof on NVIDIA 595.84 passed 212 submitted/completed presents across nine
+swapchain configurations, accepted 11 changed images including a post-remap
+record, and reported zero fatal queue, correlation, timing, clock, timeout, or
+drain failure.
+
+The normal representative interaction also passed the new exact authority and
+all eight absolute product gates: standalone/four-panel scanout interval p95
+16.96/17.01 ms, resident input-response p99 49.65 ms, maximum active visible
+gap 88.69 ms, resident exact settlement 45.36 ms, prepared nonresident
+replacement 97.50 ms, startup coarse 5.88 ms, and startup exact 1.008 seconds.
+This is first-pixel-out scanout evidence, not a photon or input-to-photon
+claim. The campaign still has zero accepted calibration runs and the pending
+baseline is untouched. Ten accepted calibration runs, comparison pairs,
+owner mapped-product observation, and the separate P7/R11 static-recovery
+campaign remain open.
+
+The
+[import, preprocessing, and storage testing refactor](../plans/active/IMPORT_PREPROCESSING_STORAGE_TESTING_REFACTOR.md)
+is implemented. Independent TIFF facts now cross production inspection and
+publication for every admitted compression family; positive/mutation cases,
+behavioral sync/read/fault oracles, cancellation and crash recovery,
+bounded-hostile parsing, and application/UI handoffs have explicit owners.
+The local performance and mapped-product obligations remain changed-boundary
+evidence and were not silently converted into portable claims.
+
+The
+[project state and persistence testing refactor](../plans/active/PROJECT_STATE_AND_PERSISTENCE_TESTING_REFACTOR.md)
+is implemented. The lifecycle inventory, hosted fresh-process outcomes,
+filesystem-skip semantics, independent production conformance, parallel
+fork/lease harness, compact model coverage, and public actor/service fault
+flows are repaired. Process-crash, qualified ext4, and VM power-cut evidence
+remain explicitly separate; the trusted local lane must still execute before
+those claims are refreshed.
 
 The
 [multichannel performance and visible-layer authority plan](../plans/active/VIEWER_MULTICHANNEL_PERFORMANCE_AND_VISIBLE_LAYER_AUTHORITY.md)
@@ -245,8 +318,10 @@ Trusted Vulkan checks prove the one-resource terminal path agrees with the
 ordinary sparse path for voxel-exact and smooth-linear MIP, DVR, and ISO, with
 dedicated independent numerical oracles retained. On the NVIDIA GeForce RTX
 3070 Ti Laptop GPU, warm resident 64³ rendering at 1920×1080 produced p95 GPU
-times from 1.247 ms to 11.128 ms across those six cases, below the 16.667 ms
-product guideline. The normal release application also passed the 60-command
+times from 1.247 ms to 11.128 ms across those six cases, below the current
+preferred 16.667 ms component observation. That historical five-trial result
+is not the new 120-sample product gate. The normal release application also
+passed the 60-command
 representative Cell navigation scenario with nine nonblank GPU captures,
 exact/current native settlement, independent target revisions, and no
 validation, capacity, demand, or renderer fault.

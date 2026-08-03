@@ -2114,6 +2114,7 @@ dependencies = [
  "mirante4d-storage",
  "mirante4d-ui-egui",
  "pollster",
+ "raw-window-handle",
  "rfd",
  "rustix 1.1.4",
  "serde",
@@ -2126,6 +2127,7 @@ dependencies = [
  "uuid",
  "wgpu",
  "winit",
+ "x11rb",
 ]
 
 [[package]]
@@ -2189,8 +2191,11 @@ dependencies = [
  "mirante4d-domain",
  "mirante4d-identity",
  "mirante4d-storage",
+ "proptest",
  "quick-xml",
  "rustix 1.1.4",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.17",
  "tiff",
@@ -2249,6 +2254,7 @@ dependencies = [
  "mirante4d-render-api",
  "mirante4d-render-reference",
  "pollster",
+ "serde_json",
  "thiserror 2.0.17",
  "wgpu",
 ]
@@ -2272,6 +2278,7 @@ dependencies = [
  "mirante4d-dataset-runtime",
  "mirante4d-domain",
  "mirante4d-identity",
+ "proptest",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -4426,8 +4433,6 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "29.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31f8e1a9e7a8512f276f7c62e018c7fa8d60954303fed2e5750114332049193f"
 dependencies = [
  "android_system_properties",
  "arrayvec",

@@ -108,6 +108,8 @@ fn invalid<T>(reason: &'static str) -> Result<T, StorageProfileError> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::{prelude::*, test_runner::RngSeed};
+
     use super::*;
 
     #[test]
@@ -137,5 +139,29 @@ mod tests {
     fn rejects_duplicate_paths() {
         let path = PackagePath::parse("m4d/profile.json").unwrap();
         assert!(validate_unique_paths([&path, &path]).is_err());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            max_shrink_iters: 1_024,
+            failure_persistence: None,
+            rng_seed: RngSeed::Fixed(0x4d34_5354_4f52_5041),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn accepted_hostile_paths_are_bounded_canonical_and_round_trip(
+            bytes in proptest::collection::vec(any::<u8>(), 0..=300),
+        ) {
+            let candidate = String::from_utf8_lossy(&bytes);
+            if let Ok(path) = PackagePath::parse(&candidate) {
+                prop_assert!(path.as_str().is_ascii());
+                prop_assert!(path.as_str().len() <= MAX_RELATIVE_PATH_BYTES);
+                prop_assert!(path.component_count() <= MAX_FILE_PATH_COMPONENTS);
+                prop_assert!(path.directory_depth() <= MAX_DIRECTORY_DEPTH);
+                prop_assert_eq!(PackagePath::parse(path.as_str()).unwrap(), path);
+            }
+        }
     }
 }

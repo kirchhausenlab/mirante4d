@@ -28,11 +28,11 @@ use mirante4d_render_api::{
     Axis3, CameraFrame, FrameCompleteness, FrameCoverage, FrameIdentity, FrameLimitation,
     FrameProgress, GpuLedgerCategory, IsoShadingPolicy, LogicalLayerKey,
     MAX_EXACT_SHADER_GRID_END_EXCLUSIVE, MAX_RENDER_REQUIREMENTS, PreparedRenderRequirements,
-    PresentationTarget, RenderExtent, RenderIntent, RenderRequirement, RenderRequirements,
-    RenderResourceGrid, RenderResourceGridCatalog, RenderViewIntent, SamplingPolicy, ScaleLevel,
-    ShaderAdmissionError, ShaderEnvelopeAxis, ShaderEnvelopeFailure, ShaderEnvelopeStage,
-    ShaderWorkEnvelope, TimeIndex, VolumePickCompleteness, VolumePickPolicy, VolumePickQuery,
-    VolumePickResult, VolumePickTicket, VolumePickValue, WorldPoint3,
+    PresentationTarget, PresentationTargetSet, RenderExtent, RenderIntent, RenderRequirement,
+    RenderRequirements, RenderResourceGrid, RenderResourceGridCatalog, RenderViewIntent,
+    SamplingPolicy, ScaleLevel, ShaderAdmissionError, ShaderEnvelopeAxis, ShaderEnvelopeFailure,
+    ShaderEnvelopeStage, ShaderWorkEnvelope, TimeIndex, VolumePickCompleteness, VolumePickPolicy,
+    VolumePickQuery, VolumePickResult, VolumePickTicket, VolumePickValue, WorldPoint3,
 };
 
 use super::{
@@ -119,6 +119,30 @@ const MAX_SHADER_SEGMENT_BYTES: u64 = u32::MAX as u64 + 1;
 const INITIAL_PAYLOAD_COMMITMENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PAYLOAD_GROWTH_HEADROOM_BYTES: u64 = 128 * 1024 * 1024;
 static NEXT_RENDERER_DEVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmissionCapacityAdmission {
+    Available,
+    Deferred { retry_after_submission: u64 },
+}
+
+fn submission_capacity_admission(
+    in_flight: usize,
+    additional: usize,
+    maximum: usize,
+    retry_after_submission: u64,
+) -> SubmissionCapacityAdmission {
+    if in_flight
+        .checked_add(additional)
+        .is_some_and(|required| required <= maximum)
+    {
+        SubmissionCapacityAdmission::Available
+    } else {
+        SubmissionCapacityAdmission::Deferred {
+            retry_after_submission,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct PrivatePresentationId(u64);
@@ -3028,6 +3052,7 @@ struct ResidencyPreparationReport {
     command_buffers: u32,
     queue_submissions: u32,
     deferred_by_backpressure: bool,
+    retry_after_submission: Option<u64>,
     newly_resident_keys: Box<[BrickKey]>,
     evicted_keys: Box<[BrickKey]>,
 }
@@ -3285,6 +3310,7 @@ fn coordinated_reused_target_report(
         residency_command_buffers: 0,
         residency_queue_submissions: 0,
         deferred_by_backpressure: false,
+        retry_after_submission: None,
         actionable_work_remaining: false,
         hidden_refinement: None,
         hidden_refinement_job: None,
@@ -3302,6 +3328,7 @@ fn coordinated_zero_delta_report(
         recorded_targets: Box::new([]),
         residency_queue_submissions: 0,
         color_queue_submissions: 0,
+        submitted_through_event: None,
         cpu_timing: None,
         gpu_timing: None,
     }
@@ -5016,6 +5043,33 @@ impl ResidentFrameLeases {
             != 0
     }
 
+    /// Returns the age that will be materialized if `lease` releases its
+    /// final body pin during replacement.
+    ///
+    /// Same-body presentation rebinds deliberately update only the cohort's
+    /// scalar age so their work remains O(1) in requirement count. Replacement
+    /// planning must therefore consult that scalar before ranking the outgoing
+    /// payload; using only the resident resource's materialized age would make
+    /// a just-used body appear old until after the replacement had already
+    /// selected its victim.
+    fn replacement_release_age(
+        &self,
+        key: BrickKey,
+        lease: ResidentFrameLease,
+        materialized_age: u64,
+    ) -> u64 {
+        let record = self
+            .by_id
+            .get(&lease)
+            .expect("a replacement candidate belongs to one live frame lease");
+        debug_assert!(record.requirements.contains_resource(key));
+        let cohort = self
+            .cohorts
+            .get(&record.cohort)
+            .expect("a live frame lease retains its body cohort");
+        materialized_age.max(cohort.latest_used_frame)
+    }
+
     fn is_empty(&self) -> bool {
         self.by_id.is_empty() && self.cohorts.is_empty() && self.pin_counts.is_empty()
     }
@@ -5754,7 +5808,12 @@ impl ResidencyOwner {
                 continue;
             };
             if resource.allocated_bytes != 0 {
-                candidates[resource.segment as usize].insert((resource.last_used_frame, key));
+                let effective_age = self.frame_leases.replacement_release_age(
+                    key,
+                    current,
+                    resource.last_used_frame,
+                );
+                candidates[resource.segment as usize].insert((effective_age, key));
             }
         }
         candidates
@@ -6590,6 +6649,17 @@ impl Runtime {
         self.completed_submission_event
             .load(Ordering::Acquire)
             .saturating_add(1)
+    }
+
+    pub(super) fn poll_submission_completions(&mut self) -> Result<u64, WgpuRenderRuntimeError> {
+        self.ensure_device_available()?;
+        let poll_result = self.device.poll(wgpu::PollType::Poll);
+        self.ensure_device_available()?;
+        poll_result.map_err(|_| WgpuRenderRuntimeError::BackendValidation)?;
+        self.collect_completed_color_leases();
+        self.residency.refresh_transfers()?;
+        self.collect_gpu_timings()?;
+        Ok(self.completed_submission_event.load(Ordering::Acquire))
     }
 
     fn allocate_submission_event(&mut self) -> u64 {
@@ -8163,48 +8233,61 @@ impl Runtime {
         &self,
         requests: &[CoordinatedTargetRequest<'_>],
     ) -> Result<Option<CoordinatedPublicationGroup>, WgpuRenderRuntimeError> {
-        let group = requests
-            .first()
-            .and_then(|request| request.atomic_publication_group());
-        for request in requests {
-            if request.atomic_publication_group() != group {
-                return Err(WgpuRenderRuntimeError::InvalidCoordinatedPublicationGroup);
-            }
-        }
-        let Some(group) = group else {
-            return Ok(None);
-        };
-        let required_policy = if group.exact_required() {
-            RetainedFrameRenderPolicy::ExactFrameOnly
-        } else {
-            RetainedFrameRenderPolicy::EveryUsefulFrame
-        };
-        if group.is_empty()
-            || requests.iter().any(|request| {
-                !group.contains(request.target()) || request.render_policy() != required_policy
-            })
-        {
-            return Err(WgpuRenderRuntimeError::InvalidCoordinatedPublicationGroup);
-        }
-        let timepoint = requests
-            .first()
-            .expect("an atomic group has at least one supplied member")
-            .intent()
-            .timepoint();
-        if requests
-            .iter()
-            .any(|request| request.intent().timepoint() != timepoint)
-            || PresentationTarget::ALL.into_iter().any(|target| {
-                group.contains(target)
-                    && (!self.frame_coordinator.slot(target).desired
-                        || !requests.iter().any(|request| request.target() == target))
-            })
-        {
-            return Err(WgpuRenderRuntimeError::InvalidCoordinatedPublicationGroup);
-        }
-        Ok(Some(group))
+        let active_targets = PresentationTarget::ALL
+            .into_iter()
+            .filter(|target| self.frame_coordinator.slot(*target).desired)
+            .fold(PresentationTargetSet::EMPTY, PresentationTargetSet::with);
+        coordinated_atomic_publication_group_for_active_targets(requests, active_targets)
     }
+}
 
+fn coordinated_atomic_publication_group_for_active_targets(
+    requests: &[CoordinatedTargetRequest<'_>],
+    active_targets: PresentationTargetSet,
+) -> Result<Option<CoordinatedPublicationGroup>, WgpuRenderRuntimeError> {
+    let group = requests
+        .first()
+        .and_then(|request| request.atomic_publication_group());
+    for request in requests {
+        if request.atomic_publication_group() != group {
+            return Err(WgpuRenderRuntimeError::InvalidCoordinatedPublicationGroup);
+        }
+    }
+    let Some(group) = group else {
+        return Ok(None);
+    };
+    let required_policy = if group.exact_required() {
+        RetainedFrameRenderPolicy::ExactFrameOnly
+    } else {
+        RetainedFrameRenderPolicy::EveryUsefulFrame
+    };
+    if group.is_empty()
+        || requests.iter().any(|request| {
+            !group.contains(request.target()) || request.render_policy() != required_policy
+        })
+    {
+        return Err(WgpuRenderRuntimeError::InvalidCoordinatedPublicationGroup);
+    }
+    let timepoint = requests
+        .first()
+        .expect("an atomic group has at least one supplied member")
+        .intent()
+        .timepoint();
+    if requests
+        .iter()
+        .any(|request| request.intent().timepoint() != timepoint)
+        || PresentationTarget::ALL.into_iter().any(|target| {
+            group.contains(target)
+                && (!active_targets.contains(target)
+                    || !requests.iter().any(|request| request.target() == target))
+        })
+    {
+        return Err(WgpuRenderRuntimeError::InvalidCoordinatedPublicationGroup);
+    }
+    Ok(Some(group))
+}
+
+impl Runtime {
     fn coordinated_request_order<'a>(
         &self,
         active_target: PresentationTarget,
@@ -8718,6 +8801,7 @@ impl Runtime {
             command_buffers: 0,
             queue_submissions: 0,
             deferred_by_backpressure: false,
+            retry_after_submission: None,
             newly_resident_keys: Box::new([]),
             evicted_keys: Box::new([]),
         }))
@@ -8734,6 +8818,7 @@ impl Runtime {
         if !self.residency.catalog_is_active(catalog) {
             return Err(WgpuRenderRuntimeError::PayloadContractMismatch);
         }
+        let submission_event_cursor = self.next_submission_event;
         let atomic_publication_group = self.coordinated_atomic_publication_group(targets)?;
         let ordered = self.coordinated_request_order(active_target, targets)?;
         for request in &ordered {
@@ -8746,6 +8831,7 @@ impl Runtime {
                 recorded_targets: Box::new([]),
                 residency_queue_submissions: 0,
                 color_queue_submissions: 0,
+                submitted_through_event: None,
                 cpu_timing: None,
                 gpu_timing: None,
             });
@@ -8951,17 +9037,27 @@ impl Runtime {
                 break;
             }
         }
-        let color_slot_available = self
-            .frame_coordinator
-            .in_flight_color_cutoffs
-            .load(Ordering::Acquire)
-            < MAX_IN_FLIGHT_COLOR_CUTOFFS;
+        let color_capacity_completion = self.next_submission_completion_event();
+        let color_capacity = submission_capacity_admission(
+            self.frame_coordinator
+                .in_flight_color_cutoffs
+                .load(Ordering::Acquire),
+            1,
+            MAX_IN_FLIGHT_COLOR_CUTOFFS,
+            color_capacity_completion,
+        );
+        let color_slot_available = color_capacity == SubmissionCapacityAdmission::Available;
         let reserved_submission_slots = usize::from(cold_selection.is_some());
+        let submission_capacity_completion = self.next_submission_completion_event();
         let current_in_flight = self.in_flight_submissions.load(Ordering::Acquire);
-        if current_in_flight
-            .checked_add(reserved_submission_slots)
-            .is_none_or(|required| required > MAX_IN_FLIGHT_SUBMISSIONS)
-        {
+        if let SubmissionCapacityAdmission::Deferred {
+            retry_after_submission,
+        } = submission_capacity_admission(
+            current_in_flight,
+            reserved_submission_slots,
+            MAX_IN_FLIGHT_SUBMISSIONS,
+            submission_capacity_completion,
+        ) {
             self.diagnostics.backpressure_deferrals =
                 self.diagnostics.backpressure_deferrals.saturating_add(1);
             for plan in &plans {
@@ -8990,6 +9086,7 @@ impl Runtime {
                     residency_command_buffers: 0,
                     residency_queue_submissions: 0,
                     deferred_by_backpressure: true,
+                    retry_after_submission: Some(retry_after_submission),
                     actionable_work_remaining: true,
                     hidden_refinement: None,
                     hidden_refinement_job: None,
@@ -9006,6 +9103,7 @@ impl Runtime {
                 recorded_targets: Box::new([]),
                 residency_queue_submissions: 0,
                 color_queue_submissions: 0,
+                submitted_through_event: None,
                 cpu_timing: None,
                 gpu_timing: None,
             });
@@ -9272,11 +9370,37 @@ impl Runtime {
             .checked_add(capture_bytes)
             .expect("coordinated capture peak was preflighted");
 
+        let final_capacity_completion = self.next_submission_completion_event();
+        let final_submission_capacity = submission_capacity_admission(
+            self.in_flight_submissions.load(Ordering::Acquire),
+            1,
+            MAX_IN_FLIGHT_SUBMISSIONS,
+            final_capacity_completion,
+        );
         let color_submission_available = color_slot_available
-            && self.in_flight_submissions.load(Ordering::Acquire) < MAX_IN_FLIGHT_SUBMISSIONS;
+            && final_submission_capacity == SubmissionCapacityAdmission::Available;
         if !color_submission_available {
+            let retry_after_submission = match (color_capacity, final_submission_capacity) {
+                (
+                    SubmissionCapacityAdmission::Deferred {
+                        retry_after_submission,
+                    },
+                    _,
+                )
+                | (
+                    SubmissionCapacityAdmission::Available,
+                    SubmissionCapacityAdmission::Deferred {
+                        retry_after_submission,
+                    },
+                ) => retry_after_submission,
+                (
+                    SubmissionCapacityAdmission::Available,
+                    SubmissionCapacityAdmission::Available,
+                ) => unreachable!("available color and submission capacity admits color work"),
+            };
             for pass in &color_passes {
                 prepared[pass.report_index].1.deferred_by_backpressure = true;
+                prepared[pass.report_index].1.retry_after_submission = Some(retry_after_submission);
                 self.frame_coordinator
                     .slot_mut(pass.plan.request.target())
                     .color_retry_pending = true;
@@ -9889,6 +10013,7 @@ impl Runtime {
                 residency_command_buffers: report.command_buffers,
                 residency_queue_submissions: report.queue_submissions,
                 deferred_by_backpressure: report.deferred_by_backpressure,
+                retry_after_submission: report.retry_after_submission,
                 actionable_work_remaining: self.coordinated_target_has_actionable_work(target),
                 hidden_refinement,
                 hidden_refinement_job,
@@ -9899,11 +10024,14 @@ impl Runtime {
             executed[target.index()] = Some(execution_report);
         }
         let reports = self.coordinated_complete_reports(&ordered, executed, exact_required);
+        let submitted_through_event = (self.next_submission_event != submission_event_cursor)
+            .then_some(self.next_submission_event.saturating_sub(1));
         Ok(CoordinatedFrameExecutionReport {
             targets: reports,
             recorded_targets,
             residency_queue_submissions,
             color_queue_submissions,
+            submitted_through_event,
             cpu_timing: color_cpu_timing,
             gpu_timing: color_gpu_timing,
         })
@@ -9951,9 +10079,17 @@ impl Runtime {
                 current: current.frame,
             });
         }
+        let capacity_completion = self.next_submission_completion_event();
         let in_flight = self.in_flight_submissions.load(Ordering::Acquire);
         self.diagnostics.current_in_flight_submissions = in_flight;
-        if in_flight >= MAX_IN_FLIGHT_SUBMISSIONS {
+        if let SubmissionCapacityAdmission::Deferred {
+            retry_after_submission,
+        } = submission_capacity_admission(
+            in_flight,
+            1,
+            MAX_IN_FLIGHT_SUBMISSIONS,
+            capacity_completion,
+        ) {
             self.diagnostics.backpressure_deferrals =
                 self.diagnostics.backpressure_deferrals.saturating_add(1);
             return Ok(ResidencyPreparationReport {
@@ -9965,6 +10101,7 @@ impl Runtime {
                 command_buffers: 0,
                 queue_submissions: 0,
                 deferred_by_backpressure: true,
+                retry_after_submission: Some(retry_after_submission),
                 newly_resident_keys: Box::new([]),
                 evicted_keys: Box::new([]),
             });
@@ -10425,6 +10562,7 @@ impl Runtime {
 
         let needs_submission = prepared_directory.is_some();
         let residency_staging_bytes = transfer_bytes;
+        let staging_capacity_completion = self.next_submission_completion_event();
         let staging_slot = if residency_staging_bytes == 0 {
             None
         } else {
@@ -10443,6 +10581,7 @@ impl Runtime {
                     command_buffers: 0,
                     queue_submissions: 0,
                     deferred_by_backpressure: true,
+                    retry_after_submission: Some(staging_capacity_completion),
                     newly_resident_keys: Box::new([]),
                     evicted_keys: Box::new([]),
                 });
@@ -10605,6 +10744,7 @@ impl Runtime {
             command_buffers,
             queue_submissions,
             deferred_by_backpressure: false,
+            retry_after_submission: None,
             newly_resident_keys: uploads
                 .iter()
                 .map(|upload| upload.key)
@@ -12907,6 +13047,281 @@ mod tests {
     }
 
     #[test]
+    fn recent_cohort_rebind_age_prevents_oldest_payload_eviction() {
+        let payloads = (0..8).map(|index| key(21, 0, index, 1)).collect::<Vec<_>>();
+        let revisited = payloads[0];
+        let requirements = frame_requirements(1, &[revisited]);
+        let rebound = requirements
+            .rebind(&frame_intent(9, LogicalLayerKey::new(21)))
+            .expect("same-body frame rebind is valid");
+        let pending = PendingLeaseQueue::new();
+        let mut leases = ResidentFrameLeases::new();
+        let (presentation, mutation) = leases.acquire(requirements, &pending);
+        assert_eq!(mutation.pin_state_changes, vec![revisited]);
+        let pins_before_rebind = leases.pin_counts.clone();
+
+        let rebound_mutation = leases.replace(presentation, rebound, &pending);
+        leases.touch(presentation, FrameIdentity::new(9));
+        assert!(rebound_mutation.pin_state_changes.is_empty());
+        assert!(rebound_mutation.released_body.is_none());
+        assert_eq!(leases.pin_counts, pins_before_rebind);
+
+        let mut replacement_lru = payloads
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, payload)| ((index + 1) as u64, payload))
+            .collect::<BTreeSet<_>>();
+        replacement_lru.remove(&(1, revisited));
+        replacement_lru.insert((
+            leases.replacement_release_age(revisited, presentation, 1),
+            revisited,
+        ));
+
+        assert_eq!(
+            replacement_lru.first().copied(),
+            Some((2, payloads[1])),
+            "the untouched second-oldest payload, not the just-rebound oldest payload, is the replacement victim"
+        );
+        assert_eq!(
+            leases.replacement_release_age(revisited, presentation, 1),
+            9,
+            "replacement planning must rank the outgoing payload by the same age that release will materialize"
+        );
+        let released = leases
+            .release(presentation)
+            .released_body
+            .expect("the final lease releases its body cohort");
+        assert_eq!(released.latest_used_frame, 9);
+        assert!(leases.is_empty());
+    }
+
+    #[test]
+    fn overlapping_cohorts_use_maximum_effective_age_and_preserve_survivor_pins() {
+        let first_only = key(22, 0, 0, 1);
+        let shared = key(22, 0, 1, 1);
+        let survivor_only = key(22, 0, 2, 1);
+        let pending = PendingLeaseQueue::new();
+        let mut leases = ResidentFrameLeases::new();
+        let (first, _) = leases.acquire(frame_requirements(10, &[first_only, shared]), &pending);
+        let (survivor, _) =
+            leases.acquire(frame_requirements(20, &[shared, survivor_only]), &pending);
+        leases.touch(first, FrameIdentity::new(30));
+        leases.touch(survivor, FrameIdentity::new(40));
+
+        assert!(leases.is_pinned_excluding(shared, first));
+        assert_eq!(leases.replacement_release_age(shared, first, 5), 30);
+        let first_release = leases
+            .release(first)
+            .released_body
+            .expect("the first distinct body cohort is released");
+        assert_eq!(first_release.latest_used_frame, 30);
+        assert!(
+            first_release
+                .keys
+                .iter()
+                .any(|(key, became_unpinned)| *key == shared && !became_unpinned)
+        );
+        assert!(leases.is_pinned(shared));
+        assert!(leases.is_pinned(survivor_only));
+        assert_eq!(
+            leases.replacement_release_age(shared, survivor, first_release.latest_used_frame),
+            40,
+            "the survivor's newer cohort age dominates the materialized age from partial retirement"
+        );
+
+        let survivor_release = leases
+            .release(survivor)
+            .released_body
+            .expect("the survivor body cohort is released last");
+        assert_eq!(survivor_release.latest_used_frame, 40);
+        assert!(
+            survivor_release
+                .keys
+                .iter()
+                .any(|(key, became_unpinned)| *key == shared && *became_unpinned)
+        );
+        assert!(leases.is_empty());
+    }
+
+    #[test]
+    fn replacement_preflight_rollback_preserves_age_pin_and_lru_state() {
+        let outgoing = key(23, 0, 0, 1);
+        let untouched = key(23, 0, 1, 1);
+        let pending = PendingLeaseQueue::new();
+        let mut leases = ResidentFrameLeases::new();
+        let (presentation, _) = leases.acquire(frame_requirements(3, &[outgoing]), &pending);
+        leases.touch(presentation, FrameIdentity::new(11));
+        let lru = BTreeSet::from([(3, outgoing), (4, untouched)]);
+
+        let pins_before = leases.pin_counts.clone();
+        let lease_before = leases
+            .by_id
+            .iter()
+            .map(|(lease, record)| {
+                (
+                    *lease,
+                    record.cohort,
+                    record.requirements.frame(),
+                    record.requirements.resource_keys().to_vec(),
+                    record.relevant_pending.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let cohorts_before = leases
+            .cohorts
+            .iter()
+            .map(|(cohort, record)| {
+                (
+                    *cohort,
+                    record.lease_count,
+                    record.latest_used_frame,
+                    record.requirements.resource_keys().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let lru_before = lru.clone();
+
+        // Replacement preflight overlays the effective age in a private plan.
+        // A later capacity refusal discards that plan; no authoritative age,
+        // pin, lease, or LRU structure has been mutated.
+        let effective = leases.replacement_release_age(outgoing, presentation, 3);
+        let mut planned_lru = lru.clone();
+        planned_lru.remove(&(3, outgoing));
+        planned_lru.insert((effective, outgoing));
+        assert_eq!(planned_lru.first().copied(), Some((4, untouched)));
+        drop(planned_lru);
+
+        assert_eq!(leases.pin_counts, pins_before);
+        assert_eq!(
+            leases
+                .by_id
+                .iter()
+                .map(|(lease, record)| {
+                    (
+                        *lease,
+                        record.cohort,
+                        record.requirements.frame(),
+                        record.requirements.resource_keys().to_vec(),
+                        record.relevant_pending.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            lease_before
+        );
+        assert_eq!(
+            leases
+                .cohorts
+                .iter()
+                .map(|(cohort, record)| {
+                    (
+                        *cohort,
+                        record.lease_count,
+                        record.latest_used_frame,
+                        record.requirements.resource_keys().to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            cohorts_before
+        );
+        assert_eq!(lru, lru_before);
+        assert_eq!(
+            leases.release(presentation).pin_state_changes,
+            vec![outgoing]
+        );
+    }
+
+    #[test]
+    fn color_backpressure_waits_for_exact_completion_then_retries_once() {
+        let predecessor = PrivatePresentationId(41);
+        let successor = PrivatePresentationId(42);
+        let mut slot = CoordinatedSlot::empty();
+        slot.desired = true;
+        slot.front = Some(predecessor);
+
+        let admission = submission_capacity_admission(
+            MAX_IN_FLIGHT_COLOR_CUTOFFS,
+            1,
+            MAX_IN_FLIGHT_COLOR_CUTOFFS,
+            8,
+        );
+        let SubmissionCapacityAdmission::Deferred {
+            retry_after_submission,
+        } = admission
+        else {
+            panic!("filled color capacity must defer");
+        };
+        slot.color_retry_pending = true;
+        assert_eq!(retry_after_submission, 8);
+        assert_eq!(slot.front, Some(predecessor));
+
+        let mut retry_attempts = 0;
+        let mut in_flight_color = MAX_IN_FLIGHT_COLOR_CUTOFFS;
+        let mut completion_applied = false;
+        for completed_submission in [7_u64, 8, 8] {
+            if completed_submission == retry_after_submission && !completion_applied {
+                in_flight_color = MAX_IN_FLIGHT_COLOR_CUTOFFS - 1;
+                completion_applied = true;
+            }
+            let retry_is_eligible = slot.color_retry_pending
+                && completed_submission >= retry_after_submission
+                && submission_capacity_admission(
+                    in_flight_color,
+                    1,
+                    MAX_IN_FLIGHT_COLOR_CUTOFFS,
+                    retry_after_submission.saturating_add(1),
+                ) == SubmissionCapacityAdmission::Available;
+            if retry_is_eligible {
+                retry_attempts += 1;
+                slot.color_retry_pending = false;
+                slot.front = Some(successor);
+                in_flight_color += 1;
+            }
+        }
+
+        assert_eq!(retry_attempts, 1);
+        assert_eq!(slot.front, Some(successor));
+        assert!(!slot.color_retry_pending);
+        assert_eq!(in_flight_color, MAX_IN_FLIGHT_COLOR_CUTOFFS);
+    }
+
+    #[test]
+    fn incomplete_declared_physical_group_is_rejected_before_recording() {
+        let payload = key(24, 0, 0, 1);
+        let intent = frame_intent(7, LogicalLayerKey::new(24));
+        let requirements = frame_requirements(7, &[payload]);
+        let group = CoordinatedPublicationGroup::exact_target_set(PresentationTargetSet::ALL)
+            .expect("the complete target universe forms one exact group");
+        let requests = [
+            PresentationTarget::ThreeD,
+            PresentationTarget::Xy,
+            PresentationTarget::Xz,
+        ]
+        .map(|target| {
+            CoordinatedTargetRequest::new(
+                target,
+                &intent,
+                &requirements,
+                1,
+                RetainedFrameRenderPolicy::ExactFrameOnly,
+            )
+            .with_atomic_publication_group(group)
+        });
+        let recorded_targets = Vec::<PresentationTarget>::new();
+        let queue_submissions = 0_u32;
+
+        assert_eq!(
+            coordinated_atomic_publication_group_for_active_targets(
+                &requests,
+                PresentationTargetSet::ALL,
+            ),
+            Err(WgpuRenderRuntimeError::InvalidCoordinatedPublicationGroup)
+        );
+        assert!(recorded_targets.is_empty());
+        assert_eq!(queue_submissions, 0);
+    }
+
+    #[test]
     fn same_body_presentation_rebind_clones_pins_and_empty_offer_index_in_constant_work() {
         let layer = LogicalLayerKey::new(20);
         let keys = (0..4_096)
@@ -13102,24 +13517,30 @@ mod tests {
 
     #[test]
     fn coordinated_first_useful_groups_accept_safe_fallbacks_while_exact_groups_do_not() {
+        let targets =
+            PresentationTargetSet::from_targets([PresentationTarget::Xy, PresentationTarget::Xz]);
+        let first_useful = CoordinatedPublicationGroup::first_useful_target_set(targets)
+            .expect("a nonempty dynamic target set forms a first-useful group");
+        let exact = CoordinatedPublicationGroup::exact_target_set(targets)
+            .expect("a nonempty dynamic target set forms an exact group");
         assert!(coordinated_progress_satisfies_group(
-            CoordinatedPublicationGroup::FULL_LAYOUT_FIRST_USEFUL,
+            first_useful,
             FrameCompleteness::Progressive,
         ));
         assert!(coordinated_progress_satisfies_group(
-            CoordinatedPublicationGroup::FULL_LAYOUT_FIRST_USEFUL,
+            first_useful,
             FrameCompleteness::Complete,
         ));
         assert!(coordinated_progress_satisfies_group(
-            CoordinatedPublicationGroup::FULL_LAYOUT_FIRST_USEFUL,
+            first_useful,
             FrameCompleteness::Exact,
         ));
         assert!(!coordinated_progress_satisfies_group(
-            CoordinatedPublicationGroup::FULL_LAYOUT,
+            exact,
             FrameCompleteness::Complete,
         ));
         assert!(coordinated_progress_satisfies_group(
-            CoordinatedPublicationGroup::FULL_LAYOUT,
+            exact,
             FrameCompleteness::Exact,
         ));
     }

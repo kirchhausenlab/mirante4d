@@ -1,5 +1,5 @@
 mod fixtures;
-mod registry;
+pub(crate) mod registry;
 mod runner;
 
 pub(crate) use runner::{Leaf, verify_leaf, verify_local, verify_pr};

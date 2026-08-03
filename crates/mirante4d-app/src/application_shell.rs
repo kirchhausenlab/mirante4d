@@ -22,7 +22,8 @@ use crate::{
     MiranteWorkbenchApp, ProcessTerminationLatch, current_settings_connection, gpu_memory,
     import_worker_service::{ImportWorkerCompletion, ImportWorkerOutcome},
     import_workflow::{ImportWorkflow, PendingImportRecovery, reset_checkpoint_directory},
-    ui_kit, unified_source_open,
+    presentation_observer::PresentationObserver,
+    product_automation, ui_kit, unified_source_open,
 };
 
 pub struct MiranteApplicationShell {
@@ -38,6 +39,7 @@ pub struct MiranteApplicationShell {
     preprocessing_ui: ui_kit::EguiUiState,
     opening: Option<OpeningDataset>,
     status: Option<String>,
+    presentation_observer: Option<PresentationObserver>,
 }
 
 struct OpeningDataset {
@@ -74,6 +76,7 @@ impl MiranteApplicationShell {
             .workers
             .set_completion_wake(move || completion_ctx.request_repaint());
         ui_kit::configure_visuals(&cc.egui_ctx);
+        let presentation_observer = PresentationObserver::from_creation_context(cc)?;
         let mut shell = Self {
             egui_ctx: cc.egui_ctx.clone(),
             render_state,
@@ -90,6 +93,7 @@ impl MiranteApplicationShell {
             ),
             opening: None,
             status: None,
+            presentation_observer,
         };
         if let Some(path) = initial_dataset {
             shell.start_open(path);
@@ -633,9 +637,27 @@ impl eframe::App for MiranteApplicationShell {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         if let Some(workbench) = self.workbench.as_mut() {
+            let map_after_unmap_observed = self
+                .presentation_observer
+                .as_ref()
+                .is_some_and(PresentationObserver::map_after_unmap_observed);
+            if let Some(automation) = workbench.product_automation.as_mut() {
+                automation.observe_presentation_probe_window_cycle(map_after_unmap_observed);
+            }
             workbench.ui(ui, frame);
+            if let Some(observer) = self.presentation_observer.as_ref() {
+                if let Some(observation) =
+                    product_automation::presentation_observer_observation(workbench)
+                {
+                    observer.observe(observation);
+                }
+                observer.paint_marker(ui.ctx());
+            }
         } else {
             self.show_welcome(ui);
+            if let Some(observer) = self.presentation_observer.as_ref() {
+                observer.paint_marker(ui.ctx());
+            }
         }
     }
 
