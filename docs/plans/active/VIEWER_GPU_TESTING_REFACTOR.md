@@ -273,6 +273,14 @@ finite timing drain, unchanged-repeat exclusion, resize and swapchain
 recreation, unmap/remap exclusion, and zero queue, timeout, duplicate,
 correlation, or validation failures.
 
+Because that activation probe deliberately changes the window and surface, a
+driver timing-properties counter transition is classified as controlled only
+for the first property observation after the independently observed X11
+lifecycle generation advances. This does not create a cadence sample or a
+general exception: a second transition in the same lifecycle fails, and every
+timing-properties transition in the measured representative product remains
+invalidating. Time-domain counter transitions remain invalidating everywhere.
+
 External photodiode or high-speed-camera validation and a Wayland timing
 profile may later cross-check this authority. Neither is required for the
 approved X11 first-pixel-out gate, and neither may be inferred from it.

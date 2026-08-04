@@ -1040,6 +1040,13 @@ physical photons or input-to-photon latency. Without the environment variable
 the extensions and observer are absent and ordinary device, renderer, queue,
 and presentation behavior are unchanged.
 
+The disruptive activation probe and measured product keep separate clock-
+stability rules. In the probe only, the first timing-properties observation
+after an exact X11 lifecycle-generation advance is classified as controlled;
+another change before the next lifecycle advance is fatal. Measured product
+phases never recover a timing-properties counter change. Time-domain changes
+remain fatal in both paths.
+
 Automation-only validation capture remains asynchronous. The independent CPU
 oracle owns expected RGBA, coverage, and validity facts; it is not a product
 renderer. The current generic product capture and image-stat boundary

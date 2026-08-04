@@ -179,6 +179,10 @@ struct TimingCounterState {
     refresh_duration_ns: Option<u64>,
     refresh_interval_ns: Option<u64>,
     refresh_properties_counter: Option<u64>,
+    #[serde(skip)]
+    timing_properties_lifecycle_generation: Option<u64>,
+    #[serde(skip)]
+    refresh_properties_lifecycle_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -254,6 +258,7 @@ struct ObserverState {
     present_timing_timeout_events: u64,
     present_timing_queue_full_events: u64,
     timing_properties_change_events: u64,
+    controlled_lifecycle_timing_properties_change_events: u64,
     time_domain_change_events: u64,
     configured_swapchain_events: u64,
     wait_timeout_events: u64,
@@ -1603,24 +1608,47 @@ fn accept_timing_query(
             "Vulkan returned more timing records than the bounded results queue".to_owned()
         });
     }
-    let counters = state
-        .timing_counters
-        .entry(configured.generation)
-        .or_default();
-    let timing_counter_changed = counters
-        .timing_properties_counter
-        .replace(query.timing_properties_counter)
-        .is_some_and(|previous| previous != query.timing_properties_counter);
-    let time_domain_counter_changed = counters
-        .time_domains_counter
-        .replace(query.time_domains_counter)
-        .is_some_and(|previous| previous != query.time_domains_counter);
+    let lifecycle_generation = state.window_lifecycle_generation;
+    let is_probe = state.scenario.as_deref() == Some("representative_gpu_presentation_probe");
+    let (timing_counter_changed, controlled_timing_counter_change, time_domain_counter_changed) = {
+        let counters = state
+            .timing_counters
+            .entry(configured.generation)
+            .or_default();
+        let previous_lifecycle_generation = counters
+            .timing_properties_lifecycle_generation
+            .replace(lifecycle_generation);
+        let timing_counter_changed = counters
+            .timing_properties_counter
+            .replace(query.timing_properties_counter)
+            .is_some_and(|previous| previous != query.timing_properties_counter);
+        let time_domain_counter_changed = counters
+            .time_domains_counter
+            .replace(query.time_domains_counter)
+            .is_some_and(|previous| previous != query.time_domains_counter);
+        (
+            timing_counter_changed,
+            timing_counter_changed
+                && controlled_probe_property_transition(
+                    is_probe,
+                    previous_lifecycle_generation,
+                    lifecycle_generation,
+                ),
+            time_domain_counter_changed,
+        )
+    };
     if timing_counter_changed {
-        state.timing_properties_change_events =
-            state.timing_properties_change_events.saturating_add(1);
-        state.event_error.get_or_insert_with(|| {
-            "swapchain presentation timing properties changed during observation".to_owned()
-        });
+        if controlled_timing_counter_change {
+            state.controlled_lifecycle_timing_properties_change_events = state
+                .controlled_lifecycle_timing_properties_change_events
+                .saturating_add(1);
+        } else {
+            state.timing_properties_change_events =
+                state.timing_properties_change_events.saturating_add(1);
+            state.event_error.get_or_insert_with(|| {
+                "swapchain presentation timing properties changed during observation".to_owned()
+            });
+        }
     }
     if time_domain_counter_changed {
         state.time_domain_change_events = state.time_domain_change_events.saturating_add(1);
@@ -1838,29 +1866,61 @@ fn record_refresh_properties(
     let Ok(mut state) = shared.state.lock() else {
         return;
     };
-    let counters = state
-        .timing_counters
-        .entry(swapchain_generation)
-        .or_default();
-    let changed = counters
-        .refresh_properties_counter
-        .replace(counter)
-        .is_some_and(|previous| previous != counter)
-        || counters
+    let lifecycle_generation = state.window_lifecycle_generation;
+    let is_probe = state.scenario.as_deref() == Some("representative_gpu_presentation_probe");
+    let (changed, controlled_change) = {
+        let counters = state
+            .timing_counters
+            .entry(swapchain_generation)
+            .or_default();
+        let previous_lifecycle_generation = counters
+            .refresh_properties_lifecycle_generation
+            .replace(lifecycle_generation);
+        let counter_changed = counters
+            .refresh_properties_counter
+            .replace(counter)
+            .is_some_and(|previous| previous != counter);
+        let duration_changed = counters
             .refresh_duration_ns
             .replace(refresh_duration_ns)
-            .is_some_and(|previous| previous != refresh_duration_ns)
-        || counters
+            .is_some_and(|previous| previous != refresh_duration_ns);
+        let interval_changed = counters
             .refresh_interval_ns
             .replace(refresh_interval_ns)
             .is_some_and(|previous| previous != refresh_interval_ns);
+        let changed = counter_changed || duration_changed || interval_changed;
+        (
+            changed,
+            changed
+                && controlled_probe_property_transition(
+                    is_probe,
+                    previous_lifecycle_generation,
+                    lifecycle_generation,
+                ),
+        )
+    };
     if changed {
-        state.timing_properties_change_events =
-            state.timing_properties_change_events.saturating_add(1);
-        state.event_error.get_or_insert_with(|| {
-            "swapchain refresh timing properties changed during observation".to_owned()
-        });
+        if controlled_change {
+            state.controlled_lifecycle_timing_properties_change_events = state
+                .controlled_lifecycle_timing_properties_change_events
+                .saturating_add(1);
+        } else {
+            state.timing_properties_change_events =
+                state.timing_properties_change_events.saturating_add(1);
+            state.event_error.get_or_insert_with(|| {
+                "swapchain refresh timing properties changed during observation".to_owned()
+            });
+        }
     }
+}
+
+fn controlled_probe_property_transition(
+    is_probe: bool,
+    previous_lifecycle_generation: Option<u64>,
+    lifecycle_generation: u64,
+) -> bool {
+    is_probe
+        && previous_lifecycle_generation.is_some_and(|previous| lifecycle_generation > previous)
 }
 
 fn window_is_mapped(connection: &x11rb::rust_connection::RustConnection, window: u32) -> bool {
@@ -2166,6 +2226,8 @@ fn write_report(
         "vulkan_present_timing_timeout": state.present_timing_timeout_events,
         "vulkan_present_timing_queue_full": state.present_timing_queue_full_events,
         "vulkan_timing_properties_changes": state.timing_properties_change_events,
+        "vulkan_timing_properties_controlled_lifecycle_changes": state
+            .controlled_lifecycle_timing_properties_change_events,
         "vulkan_time_domain_changes": state.time_domain_change_events,
         "vulkan_timing_configured_swapchains": state.configured_swapchain_events,
         "vulkan_swapchain_changes": state.swapchain_changes,
@@ -2714,6 +2776,19 @@ mod tests {
         }
     }
 
+    fn timing_shared(scenario: &str, lifecycle_generation: u64) -> Shared {
+        Shared {
+            epoch: Instant::now(),
+            stop: AtomicBool::new(false),
+            wait_stop: AtomicBool::new(false),
+            state: Mutex::new(ObserverState {
+                scenario: Some(scenario.to_owned()),
+                window_lifecycle_generation: lifecycle_generation,
+                ..ObserverState::default()
+            }),
+        }
+    }
+
     #[test]
     fn probe_recovery_is_scoped_to_lifecycle_changes_after_each_present() {
         let mut state = ObserverState {
@@ -2754,6 +2829,84 @@ mod tests {
         state.scenario = Some("representative_gpu_interaction".to_owned());
         state.window_lifecycle_generation = 9;
         assert!(!binding_crossed_controlled_lifecycle(&state, stable));
+    }
+
+    #[test]
+    fn probe_timing_property_recovery_is_scoped_to_one_lifecycle_transition() {
+        let shared = timing_shared("representative_gpu_presentation_probe", 7);
+        record_refresh_properties(&shared, 1, 16_666_666, 16_666_666, 1);
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.window_lifecycle_generation = 8;
+        }
+        record_refresh_properties(&shared, 1, 17_000_000, 17_000_000, 2);
+        {
+            let state = shared.state.lock().unwrap();
+            assert_eq!(
+                state.controlled_lifecycle_timing_properties_change_events,
+                1
+            );
+            assert_eq!(state.timing_properties_change_events, 0);
+            assert!(state.event_error.is_none());
+            let counters = state.timing_counters.get(&1).unwrap();
+            assert_eq!(counters.refresh_properties_counter, Some(2));
+            assert_eq!(counters.refresh_duration_ns, Some(17_000_000));
+            assert_eq!(counters.refresh_interval_ns, Some(17_000_000));
+        }
+
+        record_refresh_properties(&shared, 1, 17_000_000, 17_000_000, 3);
+        let state = shared.state.lock().unwrap();
+        assert_eq!(
+            state.controlled_lifecycle_timing_properties_change_events,
+            1
+        );
+        assert_eq!(state.timing_properties_change_events, 1);
+        assert_eq!(
+            state.event_error.as_deref(),
+            Some("swapchain refresh timing properties changed during observation")
+        );
+    }
+
+    #[test]
+    fn measured_product_never_recovers_a_timing_property_counter_change() {
+        let shared = timing_shared("representative_gpu_interaction", 7);
+        let configured = timing_configuration(1);
+        accept_timing_query(
+            &shared,
+            11,
+            configured,
+            HalTimingQuery {
+                timing_properties_counter: 1,
+                time_domains_counter: 1,
+                records: Vec::new(),
+                incomplete: false,
+            },
+        );
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.window_lifecycle_generation = 8;
+        }
+        accept_timing_query(
+            &shared,
+            11,
+            configured,
+            HalTimingQuery {
+                timing_properties_counter: 2,
+                time_domains_counter: 1,
+                records: Vec::new(),
+                incomplete: false,
+            },
+        );
+        let state = shared.state.lock().unwrap();
+        assert_eq!(
+            state.controlled_lifecycle_timing_properties_change_events,
+            0
+        );
+        assert_eq!(state.timing_properties_change_events, 1);
+        assert_eq!(
+            state.event_error.as_deref(),
+            Some("swapchain presentation timing properties changed during observation")
+        );
     }
 
     fn timing_record(present_id: u64, time_ns: u64) -> HalTimingRecord {

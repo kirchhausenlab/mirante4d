@@ -157,6 +157,15 @@ The observer excludes unchanged, superseded, out-of-date, window-unavailable,
 failed, timed-out, or ambiguous samples. It then runs 39 component
 measurements and the normal `representative_gpu_interaction` product sequence.
 
+The controlled boundary probe is deliberately non-measured while it resizes,
+minimizes, unmaps, remaps, and recreates the surface. A timing-properties
+counter transition is recoverable there only for the first observation after
+an independently observed window-lifecycle generation change, and is reported
+separately as a controlled lifecycle transition. A second transition in the
+same stable lifecycle still rejects the probe. The normal representative
+product has no such recovery: any timing-properties counter transition
+invalidates its cadence evidence.
+
 The report authority is
 `vulkan_ext_present_timing_first_pixel_out_marker_v2`; the campaign and
 baseline measurement version is `gpu-performance-v3`. Present-wait host times
