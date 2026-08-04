@@ -111,6 +111,34 @@ fn presentation_probe_window_state_waits_for_minimize_then_unmaps_and_restores_o
 }
 
 #[test]
+fn presentation_probe_window_state_keeps_a_hard_window_control_deadline() {
+    let origin = Instant::now();
+    let mut state = PresentationProbeWindowState::new(14);
+    state.observe_progress(
+        &SafeProgressSnapshot {
+            heartbeat_sequence: 15,
+            command_count: 29,
+            state: SafeProgressState::Command {
+                index: 14,
+                command_kind: "set_window_minimized",
+                elapsed_ms: 0,
+            },
+        },
+        origin,
+    );
+    assert_eq!(
+        state.deadline_failure(
+            origin + PRESENTATION_PROBE_WINDOW_CONTROL_TIMEOUT - Duration::from_nanos(1)
+        ),
+        None
+    );
+    assert_eq!(
+        state.deadline_failure(origin + PRESENTATION_PROBE_WINDOW_CONTROL_TIMEOUT),
+        Some("the external controller did not observe the requested minimized window")
+    );
+}
+
+#[test]
 fn presentation_probe_x11_parsers_require_one_pid_bound_iconic_client() {
     let windows = "\
 0x02000001  0 123 host Other\n\
@@ -143,6 +171,34 @@ fn presentation_probe_x11_parsers_require_one_pid_bound_iconic_client() {
     .unwrap();
     assert!(normal.restored());
     assert!(parse_xprop_window_manager_state("window state: Normal\n").is_err());
+}
+
+#[test]
+fn presentation_probe_x11_window_discovery_retries_transient_listing_failures() {
+    assert_eq!(
+        classify_wmctrl_client_window_listing(false, "exit status: 1", b"", 456).unwrap(),
+        X11ClientWindowDiscovery::ListingUnavailable {
+            status: "exit status: 1".to_owned(),
+        }
+    );
+    assert_eq!(
+        classify_wmctrl_client_window_listing(true, "exit status: 0", b"", 456).unwrap(),
+        X11ClientWindowDiscovery::NotFound
+    );
+    assert_eq!(
+        classify_wmctrl_client_window_listing(
+            true,
+            "exit status: 0",
+            b"0x04000004 0 456 host Mirante4D\n",
+            456,
+        )
+        .unwrap(),
+        X11ClientWindowDiscovery::Found(X11ClientWindow {
+            id_hex: "0x4000004".to_owned(),
+            id_decimal: "67108868".to_owned(),
+        })
+    );
+    assert!(classify_wmctrl_client_window_listing(true, "exit status: 0", b"\xff", 456,).is_err());
 }
 
 fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_resources: u64) {

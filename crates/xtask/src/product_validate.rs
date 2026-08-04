@@ -5171,6 +5171,13 @@ struct X11ClientWindow {
     id_decimal: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum X11ClientWindowDiscovery {
+    Found(X11ClientWindow),
+    NotFound,
+    ListingUnavailable { status: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct X11WindowManagerState {
     hidden: bool,
@@ -5289,6 +5296,7 @@ enum ProductAutomationExternalControl {
     PresentationProbe {
         state: PresentationProbeWindowState,
         window: Option<X11ClientWindow>,
+        last_window_listing_failure: Option<String>,
     },
 }
 
@@ -5303,6 +5311,7 @@ impl ProductAutomationExternalControl {
                 Ok(Self::PresentationProbe {
                     state: PresentationProbeWindowState::new(minimize_command_index),
                     window: None,
+                    last_window_listing_failure: None,
                 })
             }
         }
@@ -5315,14 +5324,34 @@ impl ProductAutomationExternalControl {
     }
 
     fn poll(&mut self, pid: u32, now: Instant) -> anyhow::Result<()> {
-        let Self::PresentationProbe { state, window } = self else {
+        let Self::PresentationProbe {
+            state,
+            window,
+            last_window_listing_failure,
+        } = self
+        else {
             return Ok(());
         };
         if let Some(reason) = state.deadline_failure(now) {
+            if let Some(failure) = last_window_listing_failure.as_deref() {
+                bail!("{reason}; most recent wmctrl listing failure: {failure}");
+            }
             bail!(reason);
         }
         if window.is_none() {
-            *window = find_x11_client_window(pid)?;
+            match find_x11_client_window(pid)? {
+                X11ClientWindowDiscovery::Found(discovered) => {
+                    *window = Some(discovered);
+                    *last_window_listing_failure = None;
+                }
+                X11ClientWindowDiscovery::NotFound => {
+                    *last_window_listing_failure = None;
+                }
+                X11ClientWindowDiscovery::ListingUnavailable { status } => {
+                    *last_window_listing_failure = Some(status);
+                    return Ok(());
+                }
+            }
         }
         let Some(window) = window.as_ref() else {
             return Ok(());
@@ -5382,16 +5411,35 @@ fn require_presentation_probe_x11_tools() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn find_x11_client_window(pid: u32) -> anyhow::Result<Option<X11ClientWindow>> {
+fn find_x11_client_window(pid: u32) -> anyhow::Result<X11ClientWindowDiscovery> {
     let mut command = Command::new("wmctrl");
     command.args(["-l", "-p"]);
     let output = run_command_with_bounded_output(&mut command, X11_AUTOMATION_OUTPUT_POLICY)
         .context("failed to list X11 client windows")?;
-    if !output.status.success() {
-        bail!("wmctrl client-window listing failed with {}", output.status);
+    classify_wmctrl_client_window_listing(
+        output.status.success(),
+        &output.status.to_string(),
+        &output.stdout,
+        pid,
+    )
+}
+
+fn classify_wmctrl_client_window_listing(
+    status_success: bool,
+    status: &str,
+    stdout: &[u8],
+    pid: u32,
+) -> anyhow::Result<X11ClientWindowDiscovery> {
+    if !status_success {
+        return Ok(X11ClientWindowDiscovery::ListingUnavailable {
+            status: status.to_owned(),
+        });
     }
-    let encoded = String::from_utf8(output.stdout).context("wmctrl output was not UTF-8")?;
-    parse_wmctrl_client_window(&encoded, pid)
+    let encoded = std::str::from_utf8(stdout).context("wmctrl output was not UTF-8")?;
+    Ok(match parse_wmctrl_client_window(encoded, pid)? {
+        Some(window) => X11ClientWindowDiscovery::Found(window),
+        None => X11ClientWindowDiscovery::NotFound,
+    })
 }
 
 fn parse_wmctrl_client_window(output: &str, pid: u32) -> anyhow::Result<Option<X11ClientWindow>> {
