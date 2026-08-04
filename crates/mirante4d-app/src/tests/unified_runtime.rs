@@ -4087,23 +4087,86 @@ fn differential_scope_update_keeps_overlap_and_retires_only_removed_waiters() {
         submitted
     );
 
+    app.dataset.request_shutdown().unwrap();
+}
+
+#[test]
+fn completed_pending_overlap_is_not_resubmitted_or_redecoded_before_ingestion() {
+    let temp = tempfile::tempdir().unwrap();
+    let package = write_target_fixture(temp.path()).unwrap();
+    let opened = open_dataset_and_render_first_frame(&package).unwrap();
+    let mut app = test_workbench_app_without_background_runtime(opened);
+    let snapshot = app.application.snapshot();
+    let layer = application_view(&snapshot).active_layer();
+    let scale = snapshot
+        .catalog()
+        .layer(layer)
+        .unwrap()
+        .scales()
+        .next()
+        .unwrap();
+    let retained = mirante4d_dataset::BrickKey::new(
+        snapshot.catalog().resource_identity(),
+        layer,
+        application_view(&snapshot).timepoint(),
+        scale.level(),
+        mirante4d_dataset::ResourceRegion::new([0, 0, 0], Shape3D::new(1, 1, 1).unwrap())
+            .unwrap(),
+    );
+    dataset_requests::install_prepared_scope_test_fixture(
+        &mut app.dataset,
+        dataset_requests::SCOPE_CURRENT_3D,
+        vec![retained],
+    )
+    .unwrap();
+    app.dataset.begin_submission_pass();
+    app.dataset
+        .submit_scope(
+            dataset_requests::SCOPE_CURRENT_3D,
+            mirante4d_dataset_runtime::RequestPriority::CurrentView,
+        )
+        .unwrap();
+    let retained_ticket = app
+        .dataset
+        .dispatcher()
+        .pending_ticket(dataset_requests::SCOPE_CURRENT_3D, retained)
+        .unwrap();
+
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let diagnostics = app.dataset.dispatcher().diagnostics().unwrap();
-        if diagnostics.queued_requests() == 0
-            && diagnostics.in_flight_decodes() == 0
-            && diagnostics.pending_completions() > 0
-            && diagnostics.completed_decodes() == diagnostics.started_decodes()
-        {
+        // The exact ticket identifies the request, while the single-request
+        // harness makes its pending completion attributable. Both facts are
+        // needed: the source can fill the reservation just before the runtime
+        // publishes the corresponding completion.
+        let request_complete = app
+            .dataset
+            .dispatcher()
+            .request_is_complete(retained_ticket)
+            .unwrap();
+        let completion_pending = app
+            .dataset
+            .dispatcher()
+            .diagnostics()
+            .unwrap()
+            .pending_completions()
+            == 1;
+        if request_complete && completion_pending {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the overlap fixture did not reach a stable decoded baseline"
+            "the retained overlap request did not complete before application ingestion"
         );
         std::thread::yield_now();
     }
     let decoded_before = app.dataset.dispatcher().diagnostics().unwrap();
+    assert_eq!(decoded_before.pending_completions(), 1);
+    assert_eq!(
+        app.dataset
+            .dispatcher()
+            .pending_ticket(dataset_requests::SCOPE_CURRENT_3D, retained),
+        Some(retained_ticket)
+    );
     let storage_before = app.dataset.local_source_diagnostics().unwrap();
 
     dataset_requests::install_prepared_scope_test_fixture(
@@ -4122,6 +4185,20 @@ fn differential_scope_update_keeps_overlap_and_retires_only_removed_waiters() {
 
     let decoded_after = app.dataset.dispatcher().diagnostics().unwrap();
     let storage_after = app.dataset.local_source_diagnostics().unwrap();
+    assert_eq!(
+        app.dataset
+            .dispatcher()
+            .pending_ticket(dataset_requests::SCOPE_CURRENT_3D, retained),
+        Some(retained_ticket),
+        "a completed request awaiting ingestion must retain its exact ticket"
+    );
+    assert!(
+        app.dataset
+            .dispatcher()
+            .request_is_complete(retained_ticket)
+            .unwrap(),
+        "the retained ticket must remain complete until application ingestion"
+    );
     assert_eq!(
         decoded_after.submitted_requests(),
         decoded_before.submitted_requests(),

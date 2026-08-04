@@ -209,7 +209,7 @@ all package/lane defaults remain unchanged. A direct concurrent local run
 passed the two cases in 13.046 and 12.743 seconds respectively.
 
 With the ownership and deadline correction applied, the clean-revision
-portable closeout passed all 1,482 routine unit, contract, and UI cases with
+portable closeout passed all 1,483 routine unit, contract, and UI cases with
 zero retries and reconciled all 46 exact non-routine cases without executing
 them in the portable lane.
 

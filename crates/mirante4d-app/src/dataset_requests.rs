@@ -425,6 +425,14 @@ impl DatasetRequestDispatcher {
     }
 
     #[cfg(test)]
+    pub(crate) fn request_is_complete(&self, ticket: RequestTicket) -> Result<bool, RuntimeFault> {
+        Ok(self
+            .runtime
+            .progress(ticket)?
+            .is_some_and(|progress| progress.is_complete()))
+    }
+
+    #[cfg(test)]
     pub(crate) fn submitted_request_records(&self) -> &[(u64, BrickKey, RequestPriority)] {
         &self.submitted_requests
     }

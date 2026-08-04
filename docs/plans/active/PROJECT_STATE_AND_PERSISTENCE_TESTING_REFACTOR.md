@@ -372,7 +372,7 @@ host phase. The VM guest remains separately selected, and portable
 unsupported-filesystem behavior remains routine. A direct accepted-ext4 run
 passed all four corrected cases with zero retries.
 
-The corrected clean-revision portable closeout reconciled 1,482 routine cases
+The corrected clean-revision portable closeout reconciled 1,483 routine cases
 and 46 exact non-routine cases. Clippy and all routine unit, contract, and UI
 cases passed with zero retries. The separate complete trusted local lifecycle
 lane then also passed: 135 routine project-store cases; the exact four

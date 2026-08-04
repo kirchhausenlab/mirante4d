@@ -79,6 +79,12 @@ Tests are not retried automatically. Generated selectors and exact test
 ownership live in `verification/registry.json` and test source; this document
 does not duplicate their inventory.
 
+Concurrent tests must identify readiness through the exact request, result, or
+ticket they own. Aggregate queue and worker counters are not an exact barrier
+while unrelated work can still advance. Tests that assert aggregate decode or
+storage counts must isolate one attributable request or first prove that every
+unrelated request has settled.
+
 Expensive exhaustive or fault-injection matrices belong in explicit
 developer-local lanes. They are not hidden prerequisites for ordinary pull
 requests.
