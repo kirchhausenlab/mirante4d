@@ -6036,6 +6036,7 @@ fn native_1080p_terminal_navigation_gpu_timing() {
         );
     }
 
+    let mut absolute_failures = Vec::new();
     for (label, state) in cases {
         let (warm_intent, warm_requirements) = intent_and_requirements(
             next_frame,
@@ -6145,10 +6146,11 @@ fn native_1080p_terminal_navigation_gpu_timing() {
                 "validation_errors": 0,
             })
         );
-        assert!(
-            p95_ns <= ABSOLUTE_30_HZ_COMPONENT_NS,
-            "{label} terminal component p95 {p95_ns} ns exceeded the 30-Hz feasibility limit"
-        );
+        if p95_ns > ABSOLUTE_30_HZ_COMPONENT_NS {
+            absolute_failures.push(format!(
+                "{label} terminal component p95 {p95_ns} ns exceeded the 30-Hz feasibility limit"
+            ));
+        }
     }
     assert_eq!(gpu.diagnostics().validation_error_count(), 0);
 
@@ -6159,6 +6161,11 @@ fn native_1080p_terminal_navigation_gpu_timing() {
     assert!(
         Instant::now() <= deadline,
         "native terminal timing exceeded its 900-second deadline"
+    );
+    assert!(
+        absolute_failures.is_empty(),
+        "native terminal absolute feasibility failures: {}",
+        absolute_failures.join("; ")
     );
 }
 
@@ -6280,6 +6287,7 @@ fn fixed_lod_multichannel_gpu_timing_matrix() {
     let mut reference_p95 = BTreeMap::<String, u64>::new();
     let mut maximum_homogeneous_linear_ratio = 0.0_f64;
     let mut maximum_homogeneous_linear_case = String::new();
+    let mut contract_failures = Vec::new();
     for sampling in [SamplingPolicy::VoxelExact, SamplingPolicy::SmoothLinear] {
         for kernel in ["MIP", "DVR", "ISO", "Mixed"] {
             let case_key = format!("{kernel}-{sampling:?}");
@@ -6443,10 +6451,11 @@ fn fixed_lod_multichannel_gpu_timing_matrix() {
                         "validation_errors": 0,
                     })
                 );
-                assert!(
-                    p95_ns <= ABSOLUTE_30_HZ_COMPONENT_NS,
-                    "{reported_kernel}-{sampling:?}-{channel_count}ch component p95 {p95_ns} ns exceeded the 30-Hz feasibility limit"
-                );
+                if p95_ns > ABSOLUTE_30_HZ_COMPONENT_NS {
+                    contract_failures.push(format!(
+                        "{reported_kernel}-{sampling:?}-{channel_count}ch component p95 {p95_ns} ns exceeded the 30-Hz feasibility limit"
+                    ));
+                }
             }
         }
     }
@@ -6461,10 +6470,11 @@ fn fixed_lod_multichannel_gpu_timing_matrix() {
             "met": gate_met,
         })
     );
-    assert!(
-        gate_met,
-        "fixed-LOD homogeneous linear ratio {maximum_homogeneous_linear_ratio:.4} for {maximum_homogeneous_linear_case} exceeded {HOMOGENEOUS_LINEAR_RATIO_LIMIT:.4}"
-    );
+    if !gate_met {
+        contract_failures.push(format!(
+            "fixed-LOD homogeneous linear ratio {maximum_homogeneous_linear_ratio:.4} for {maximum_homogeneous_linear_case} exceeded {HOMOGENEOUS_LINEAR_RATIO_LIMIT:.4}"
+        ));
+    }
     assert_eq!(gpu.diagnostics().validation_error_count(), 0);
 
     drop(offers);
@@ -6474,6 +6484,11 @@ fn fixed_lod_multichannel_gpu_timing_matrix() {
     assert!(
         Instant::now() <= deadline,
         "fixed-LOD multichannel timing exceeded its 1200-second deadline"
+    );
+    assert!(
+        contract_failures.is_empty(),
+        "fixed-LOD multichannel performance contract failures: {}",
+        contract_failures.join("; ")
     );
 }
 

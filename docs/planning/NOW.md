@@ -85,6 +85,16 @@ baseline is untouched. Ten accepted calibration runs, comparison pairs,
 owner mapped-product observation, and the separate P7/R11 static-recovery
 campaign remain open.
 
+The next clean calibration activation passed the presentation probe and
+stopped at a genuine component limit: the 8-channel ISO voxel-exact fixed-LOD
+case measured 58.767 ms p95 against 33.3 ms. A direct replay was required
+because the wrapper had discarded the failed process output. That reporting
+defect is now repaired: component functions finish their declared topology,
+threshold violations are accumulated, complete bounded failure output remains
+private, and the public reason is bounded and path-safe. The threshold and
+pending baseline are unchanged, and the failed attempt contributes zero
+calibration runs.
+
 The
 [import, preprocessing, and storage testing refactor](../plans/active/IMPORT_PREPROCESSING_STORAGE_TESTING_REFACTOR.md)
 is implemented. Independent TIFF facts now cross production inspection and

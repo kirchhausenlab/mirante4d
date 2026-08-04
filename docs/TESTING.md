@@ -156,6 +156,12 @@ resize, map, focus, visibility, post-remap recovery, and extent lifecycle.
 The observer excludes unchanged, superseded, out-of-date, window-unavailable,
 failed, timed-out, or ambiguous samples. It then runs 39 component
 measurements and the normal `representative_gpu_interaction` product sequence.
+Each component benchmark completes its declared case topology before applying
+timing-threshold failures, so one slow case cannot hide the cases after it.
+If the benchmark process fails, the campaign keeps its complete bounded output
+as mode-0600 private evidence and publishes only a bounded, path-safe summary
+of emitted measurements and threshold failures. A failed component stage
+contributes zero calibration runs and never advances to product measurement.
 
 The controlled boundary probe is deliberately non-measured while it resizes,
 minimizes, unmaps, remaps, and recreates the surface. A timing-properties
@@ -220,6 +226,16 @@ input-response p99 49.65 ms, maximum active visible gap 88.69 ms, resident
 exact settlement 45.36 ms, prepared nonresident replacement 97.50 ms, startup
 coarse 5.88 ms, and startup exact 1.008 seconds. The campaign still has zero
 accepted calibration runs and `pending_initial_calibration` is unchanged.
+
+A later clean calibration activation passed the controlled presentation probe
+and reached the component stage. The original wrapper exposed only Nextest
+exit 100; a direct replay recovered the emitted failure: the 8-channel ISO,
+voxel-exact, co-registered fixed-LOD case measured 58.767 ms p95 against the
+33.3 ms feasibility limit. This is a real performance failure, not a probe or
+window-lifecycle failure. The limit was not widened. The component harness now
+finishes the full topology and retains useful failed-run evidence as described
+above; no run from this attempt counts toward calibration.
+
 Do not substitute application publication, GPU completion alone, client-
 surface change, or egui paint queuing for the correlated present-wait, marker,
 and first-pixel-out authority.

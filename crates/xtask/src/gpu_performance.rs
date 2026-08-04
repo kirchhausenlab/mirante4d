@@ -54,6 +54,8 @@ const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_BASELINE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PRIVATE_REPORT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_COMPONENT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_COMPONENT_FAILURE_EVIDENCE_BYTES: u64 = (MAX_COMPONENT_OUTPUT_BYTES as u64) * 2 + 1;
+const MAX_COMPONENT_FAILURE_DETAILS: usize = 8;
 const MAX_PRODUCT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const PUBLIC_REPORT_PATH: &str = "target/mirante4d/gpu-performance/gpu-performance-report.json";
 const BASELINE_RELATIVE_PATH: &str = "verification/gpu-performance-baseline.json";
@@ -543,7 +545,8 @@ fn run_revision(
     let started = Instant::now();
     let wall_started = SystemTime::now();
     let measured = (|| {
-        let component = run_component_benchmarks(config, revision, selector, deadline)?;
+        let component =
+            run_component_benchmarks(config, revision, role, sequence, selector, deadline)?;
         let product = run_product_measurement(config, revision, role, sequence, deadline)?;
         Ok::<_, anyhow::Error>((component, product))
     })();
@@ -604,6 +607,8 @@ struct ComponentRun {
 fn run_component_benchmarks(
     config: &Config,
     revision: &RevisionConfig,
+    role: RevisionRole,
+    sequence: usize,
     selector: &str,
     deadline: Instant,
 ) -> anyhow::Result<ComponentRun> {
@@ -649,13 +654,121 @@ fn run_component_benchmarks(
             max_stderr_bytes: MAX_COMPONENT_OUTPUT_BYTES,
         },
     )?;
-    if !output.status.success() {
-        bail!("component benchmark process failed with {}", output.status);
-    }
     let mut bytes = output.stdout;
     bytes.push(b'\n');
     bytes.extend_from_slice(&output.stderr);
+    if !output.status.success() {
+        let evidence_path = config
+            .private_output_directory
+            .join(format!("component-{}-{sequence}-failure.log", role.name()));
+        write_new_synced_private_file(
+            &evidence_path,
+            &bytes,
+            MAX_COMPONENT_FAILURE_EVIDENCE_BYTES,
+            "GPU component failure evidence",
+        )?;
+        bail!(
+            "component benchmark process failed with {}: {}; full output retained in private evidence with sha256 {}",
+            output.status,
+            component_failure_summary(&bytes),
+            Sha256Hasher::digest(&bytes)
+        );
+    }
     parse_component_output(&bytes, &config.environment)
+}
+
+fn safe_component_failure_label(value: Option<&str>, fallback: &str) -> String {
+    value
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 192
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-' | b'.')
+                })
+        })
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
+fn component_failure_summary(bytes: &[u8]) -> String {
+    let output = String::from_utf8_lossy(bytes);
+    let mut measurement_count = 0_usize;
+    let mut gate_count = 0_usize;
+    let mut malformed_markers = 0_usize;
+    let mut failures = Vec::new();
+    for line in output.lines() {
+        if let Some(offset) = line.find(COMPONENT_MARKER) {
+            match serde_json::from_str::<Value>(&line[offset + COMPONENT_MARKER.len()..]) {
+                Ok(measurement) => {
+                    measurement_count += 1;
+                    if measurement.get("absolute_met").and_then(Value::as_bool) == Some(false) {
+                        let id = safe_component_failure_label(
+                            measurement.get("measurement_id").and_then(Value::as_str),
+                            "unknown_component",
+                        );
+                        let p95_ns = measurement
+                            .get("p95_ns")
+                            .and_then(Value::as_u64)
+                            .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+                        let limit_ns = measurement
+                            .get("absolute_limit_ns")
+                            .and_then(Value::as_u64)
+                            .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+                        failures.push(format!("{id} p95 {p95_ns} ns exceeded {limit_ns} ns"));
+                    }
+                }
+                Err(_) => malformed_markers += 1,
+            }
+        }
+        if let Some(offset) = line.find(COMPONENT_GATE_MARKER) {
+            match serde_json::from_str::<Value>(&line[offset + COMPONENT_GATE_MARKER.len()..]) {
+                Ok(gate) => {
+                    gate_count += 1;
+                    if gate.get("met").and_then(Value::as_bool) == Some(false) {
+                        let name = safe_component_failure_label(
+                            gate.get("gate").and_then(Value::as_str),
+                            "unknown_gate",
+                        );
+                        let observed = gate
+                            .get("observed")
+                            .and_then(Value::as_f64)
+                            .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.4}"));
+                        let threshold = gate
+                            .get("threshold")
+                            .and_then(Value::as_f64)
+                            .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.4}"));
+                        failures.push(format!("{name} observed {observed} exceeded {threshold}"));
+                    }
+                }
+                Err(_) => malformed_markers += 1,
+            }
+        }
+    }
+
+    let failure_count = failures.len();
+    let displayed = failures
+        .iter()
+        .take(MAX_COMPONENT_FAILURE_DETAILS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut summary = format!(
+        "emitted {measurement_count}/{EXPECTED_COMPONENT_MEASUREMENTS} measurements and {gate_count}/1 shape gates"
+    );
+    if malformed_markers != 0 {
+        summary.push_str(&format!("; {malformed_markers} malformed markers"));
+    }
+    if displayed.is_empty() {
+        summary.push_str("; no threshold failure was recoverable from the emitted markers");
+    } else {
+        summary.push_str(&format!("; threshold failures: {}", displayed.join("; ")));
+        if failure_count > displayed.len() {
+            summary.push_str(&format!(
+                "; and {} additional threshold failures",
+                failure_count - displayed.len()
+            ));
+        }
+    }
+    summary
 }
 
 fn parse_component_output(
@@ -3188,6 +3301,67 @@ mod tests {
         measurement["driver"] = json!("other-driver");
         let line = format!("{COMPONENT_MARKER}{measurement}");
         assert!(parse_component_output(line.as_bytes(), &environment()).is_err());
+    }
+
+    #[test]
+    fn component_failure_summary_recovers_thresholds_without_republishing_raw_output() {
+        let passing = component_measurement("native_terminal", "native_terminal::passing");
+        let mut failing = component_measurement(
+            "fixed_lod_multichannel",
+            "fixed_lod_multichannel::ISO::VoxelExact::co-registered-homogeneous::8ch",
+        );
+        failing["p95_ns"] = json!(58_767_360_u64);
+        failing["absolute_met"] = json!(false);
+        let output = [
+            format!("{COMPONENT_MARKER}{passing}"),
+            format!("{COMPONENT_MARKER}{failing}"),
+            format!(
+                "{COMPONENT_GATE_MARKER}{}",
+                json!({
+                    "gate": "fixed_lod_homogeneous_linear_ratio",
+                    "threshold": 1.2,
+                    "observed": 1.35,
+                    "met": false,
+                })
+            ),
+            format!("{COMPONENT_MARKER}not-json"),
+            "private diagnostic that must not be copied".to_owned(),
+        ]
+        .join("\n");
+
+        let summary = component_failure_summary(output.as_bytes());
+        assert!(summary.contains("emitted 2/39 measurements and 1/1 shape gates"));
+        assert!(summary.contains("1 malformed markers"));
+        assert!(summary.contains(
+            "fixed_lod_multichannel::ISO::VoxelExact::co-registered-homogeneous::8ch p95 58767360 ns exceeded 33300000 ns"
+        ));
+        assert!(
+            summary.contains("fixed_lod_homogeneous_linear_ratio observed 1.3500 exceeded 1.2000")
+        );
+        assert!(!summary.contains("private diagnostic"));
+    }
+
+    #[test]
+    fn component_failure_summary_bounds_and_sanitizes_failure_labels() {
+        let mut lines = Vec::new();
+        for index in 0..10 {
+            let mut measurement = component_measurement(
+                "fixed_lod_multichannel",
+                &format!("fixed_lod_multichannel::case{index}"),
+            );
+            measurement["absolute_met"] = json!(false);
+            if index == 0 {
+                measurement["measurement_id"] = json!("/private/path\nsecret");
+            }
+            lines.push(format!("{COMPONENT_MARKER}{measurement}"));
+        }
+
+        let summary = component_failure_summary(lines.join("\n").as_bytes());
+        assert!(summary.contains("unknown_component p95 1000000 ns exceeded 33300000 ns"));
+        assert!(summary.contains("fixed_lod_multichannel::case7"));
+        assert!(!summary.contains("fixed_lod_multichannel::case8"));
+        assert!(summary.contains("and 2 additional threshold failures"));
+        assert!(!summary.contains("/private/path"));
     }
 
     #[test]

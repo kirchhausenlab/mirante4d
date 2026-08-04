@@ -647,6 +647,15 @@ activation/smoke result, not the ten-run accepted-baseline calibration or an
 owner visual acceptance. The campaign still retains zero accepted calibration
 runs and has not created or replaced the pending baseline.
 
+A subsequent clean calibration activation passed its presentation probe and
+entered the component benchmarks. It stopped on a genuine absolute failure:
+the 8-channel ISO voxel-exact co-registered fixed-LOD case measured 58.767 ms
+p95 against the 33.3 ms feasibility limit. The limit remains unchanged and
+the failed activation contributes zero runs. The runner now completes each
+component function's declared topology before failing, retains the complete
+bounded failed-process output as private evidence, and exposes a bounded,
+path-safe threshold summary instead of only the native exit status.
+
 The first clean trusted correctness execution at commit
 `a6ef07aea1ea04bddeb77efd7ad9cbd0f97a236d` reported 19 passes and six
 failures. The implemented

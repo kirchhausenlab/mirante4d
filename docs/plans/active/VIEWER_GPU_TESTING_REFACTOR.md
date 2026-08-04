@@ -1495,6 +1495,18 @@ baseline, photon visibility, input-to-photon latency, or owner visual
 acceptance. The campaign still has zero accepted calibration runs, and no
 baseline was created or replaced.
 
+The next clean calibration activation passed the controlled presentation
+probe and reached the component stage. Its first wrapper result exposed only
+Nextest exit 100 because nonzero process output was discarded. Direct replay
+identified the actual absolute failure: the 8-channel ISO voxel-exact
+co-registered fixed-LOD case measured 58.767 ms p95 against the retained 33.3
+ms limit. No threshold was widened and no calibration run was accepted. The
+implemented closeout now accumulates timing failures while completing every
+case in each component function, retains the complete bounded failed-process
+output as private evidence, and limits the public reason to controlled
+measurement IDs and values. This keeps a real performance failure blocking
+without allowing it to erase the remaining diagnostic measurements.
+
 ## Documentation And Authority Closeout
 
 This closeout keeps implemented facts synchronized in:
