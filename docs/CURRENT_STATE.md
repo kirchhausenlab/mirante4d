@@ -1,6 +1,6 @@
 # Current State
 
-Last reviewed: 2026-08-02
+Last reviewed: 2026-08-03
 
 Mirante4D is public, pre-alpha academic research software. Persisted formats
 and APIs can change through explicit hard cutovers; there is no supported
@@ -382,13 +382,19 @@ the latest spatial snapshots rather than waiting for newest whole-layout
 spatial settlement, so held 3D or linked input cannot turn that temporal action
 into `Wait` or rebuild the slot ring.
 
-Every transaction first assembles the complete fixed-shape logical target set
-from newly prepared and exactly compatible reused members. Only then does it
-derive the physical target delta and exact atomic publication group. An empty
-delta completes without artificial renderer work, while a partial delta cannot
-be mistaken for an incomplete four-panel frame. The renderer's private
-`FrameCoordinator` remains the sole GPU target, queue-submission, completion,
-and texture-swap authority.
+Every transaction snapshots one immutable active layout generation, including
+its unique bounded 3D/XY/XZ/YZ subset and exact member extents/surface
+generations. Its semantic publication set is the active set intersected with
+the targets affected by the change. Newly prepared, exactly compatible reused,
+and terminal no-work members must complete that whole set before publication;
+hidden and unaffected targets add no obligation. Only the nonterminal cohort
+crosses into the renderer, which validates it before deriving the physical
+delta and exact atomic publication group. An empty delta completes without
+artificial renderer work, while a partial physical delta cannot be mistaken
+for a partial semantic frame. The renderer's private `FrameCoordinator`
+remains the sole GPU target, queue-submission, completion, and texture-swap
+authority. The current UI still projects only standalone 3D and the complete
+four-panel layout; two- and three-panel controls are not implemented.
 
 Pause or Stop starts a generic retained-quality transaction after the reducer
 has established the final post-reconciliation render revisions. The last
@@ -582,10 +588,119 @@ exhaustive or redundant integration cases are explicit developer-local checks.
 The first revised run passed 1,357 routine cases in 81.9 seconds after a
 35.4-second Clippy phase.
 
-The changed-boundary trusted Vulkan command runs the focused ignored GPU tests
-directly under its hardware, timeout, and clean-revision guards. Ordinary test
-source is no longer treated as a hash-bound fixture, and no separate WP-09A
-receipt parser can override the native test result.
+The trusted Vulkan cut is now split. `verify-local
+trusted-gpu-correctness` reconciles and runs the exact 25 ignored correctness
+functions under clean-revision, exact-adapter, serial, timeout, and zero-retry
+guards. `gpu-performance` separately owns the three release benchmark
+functions and their 39 measurements, performs 30 warm-ups and 120 measured
+frames, and drives the normal mapped Cell product through an opt-in Vulkan
+present-wait observer. The old mixed `trusted-gpu` command and selector are
+deleted.
+
+The repository GPU baseline remains `pending_initial_calibration`. A ten-run
+calibration was activated on the qualified workstation for the clean
+correctness revision and an owner-selected multi-layer package, but its
+controlled presentation preflight originally stopped before measurement. A
+2026-08-03 live replay established that the old one-second sidecar had
+misattributed the last command and that the probe combined two liveness
+defects: native geometry could consume its in-pass repaint request, and the
+app then depended on its dormant minimized UI loop to restore its own window.
+
+The current-tree harness repair publishes command transitions immediately,
+uses an external UI wake only for this non-measured probe, lets the app request
+minimization while one external X11 controller owns the forced unmap and
+restore/focus, and makes the app wait for an independently observed remap plus
+restored/focused viewport before continuing. It also retains the required
+final nonblank GPU capture. The
+29-command normal-product validation then passed without human intervention
+with exit status zero and requested, observed, and captured extents all
+1920x1080.
+
+The original X11 Present completion authority was unavailable on this
+NVIDIA/Vulkan path. After the workstation moved to the NVIDIA 595.84 open
+driver, the owner-approved replacement retained final-swapchain
+`VK_KHR_present_id`/`VK_KHR_present_wait` completion and the independent X11
+surface marker, and added revision-3 `VK_EXT_present_timing` first-pixel-out
+feedback. Present-wait plus the marker identifies the correct mapped product
+image; first-pixel-out supplies the exact scanout clock. The authority does
+not claim physical photon visibility or input-to-photon latency.
+
+The current-tree real-window boundary proof passed with 212 submitted and
+completed presents across nine configured swapchains. Three normal
+`VK_ERROR_OUT_OF_DATE_KHR` recreation presents were classified separately;
+one timing result returned for such a rejected ID was drained and excluded.
+Eleven changed product images qualified after marker correlation, including a
+post-remap image. The result had zero fatal rejections, unknown or duplicate
+IDs, queue exhaustion, timing/wait failures, timeouts, ambiguous bindings,
+clock changes, or outstanding records.
+
+The normal 89-command representative interaction then passed with 4,448
+submitted/completed presents and 4,043 marker-qualified changed images. On
+the RTX 3070 Ti Laptop GPU, NVIDIA 595.84, X11, 1920×1080 workload, nearest-
+rank scanout interval p95 was 16.96 ms for standalone interaction and 17.01 ms
+for four-panel interaction, both below 33.3 ms. Coarse resident input-response
+p99 was 49.65 ms, maximum active visible gap was 88.69 ms, resident exact
+settlement was 45.36 ms, prepared nonresident exact replacement was 97.50 ms,
+startup coarse visibility was 5.88 ms, and startup exact settlement was
+1.008 seconds; all eight absolute gates passed. This is a current dirty-tree
+activation/smoke result, not the ten-run accepted-baseline calibration or an
+owner visual acceptance. The campaign still retains zero accepted calibration
+runs and has not created or replaced the pending baseline.
+
+A subsequent clean calibration activation passed its presentation probe and
+entered the component benchmarks. It stopped on a genuine absolute failure:
+the 8-channel ISO voxel-exact co-registered fixed-LOD case measured 58.767 ms
+p95 against the 33.3 ms feasibility limit. The limit remains unchanged and
+the failed activation contributes zero runs. The runner now completes each
+component function's declared topology before failing, retains the complete
+bounded failed-process output as private evidence, and exposes a bounded,
+path-safe threshold summary instead of only the native exit status.
+
+The first clean trusted correctness execution at commit
+`a6ef07aea1ea04bddeb77efd7ad9cbd0f97a236d` reported 19 passes and six
+failures. The implemented
+[GPU correctness campaign follow-up](plans/active/VIEWER_GPU_CORRECTNESS_CAMPAIGN_FOLLOW_UP.md)
+replaced fixed one/four publication shapes with the bounded active/affected
+target authority, added terminal no-work membership, corrected cohort-aware
+replacement age and forward-reachable numerical admission, repaired stale and
+phase-racy cases, and added structured per-case attribution.
+
+A subsequent clean immutable execution used commit
+`efb745221ba3a78d00a20fe14b843d07f5272d06`, tree
+`acbcce58fe91ac7e1dd7c1623998a3ab2b22bf11`, the expected Vulkan backend,
+and the NVIDIA GeForce RTX 3070 Ti Laptop GPU. Exact discovery and inventory
+reconciliation passed; all 25 selected cases started, executed, and passed
+serially with zero retries, no skips, and no unevaluated or unattributed case.
+The structured report status is `complete_native_success`.
+
+The
+[GPU testing refactor](plans/active/VIEWER_GPU_TESTING_REFACTOR.md) records the
+implemented command, environment, presentation, matching-work, threshold,
+stability, and owner-acceptance contract and the remaining hardware evidence.
+
+The [import, preprocessing, and storage testing refactor](plans/active/IMPORT_PREPROCESSING_STORAGE_TESTING_REFACTOR.md)
+is implemented in the repository. Production conformance now consumes the
+independent source facts across uncompressed, LZW, current/old Deflate, and
+PackBits cases; target positives and mutations are individually classified;
+source-text tests are replaced by observable fault/counter behavior; bounded
+cancellation, capacity, permission, crash-recovery, hostile-input, app, and UI
+handoff cases are present. This records implementation and portable evidence,
+not an unexecuted mapped-product or local performance result.
+
+The [project state and persistence testing refactor](plans/active/PROJECT_STATE_AND_PERSISTENCE_TESTING_REFACTOR.md)
+is likewise implemented in the repository. Lifecycle ownership, hosted
+fresh-process outcomes, unsupported-filesystem semantics, independent
+mutation conformance, parallel fork/lease reliability, exact model coverage,
+and actor/service capacity and permission faults are repaired. The three
+application-service recovery workflows and the product import/save/reopen
+workflow that require an accepted writable filesystem are exact ignored
+members of the trusted local lane. Standard public runners retain the portable
+unsupported-filesystem contracts but do not own those four positive filesystem
+claims. The corrected clean-revision lane passed all four workflows, all three
+fresh-process matrices, and the separate rootless-KVM two-device ext4 campaign:
+60 of 60 power-cut cases plus the pre-sequence cut passed with zero retries.
+This qualifies the named filesystem/process/VM boundaries; it does not create
+an arbitrary-filesystem or mapped-product durability claim.
 
 The current local Linux x86_64 pre-alpha package passed dependency policy,
 AppStream validation, release-directory/AppImage/tarball construction, and
@@ -603,15 +718,16 @@ See [testing](TESTING.md) for commands and claim language.
 
 A 2026-08-02 read-only audit found rendering cases not covered by the closed
 viewer evidence, and the owner authorized the complete corrective package.
-The correctness cut is implemented in the current working tree. Composed
-Exact transactions now enter the renderer as a complete fixed logical target
-set. Every member binds source/time/frame, exact per-layer map, spatial and
-surface facts, immutable requirement body, promoted-prefetch role, output
-extent, schedule, and renderer lineage. The renderer alone classifies reused
-versus rebuilt members, returns the complete logical dispositions plus the
-physical delta, validates an all-reused transaction against its current
-private fronts, and performs no pipeline/allocation/submission work for a
-genuine zero delta.
+The correctness cut is implemented in the current working tree. Composed Exact
+transactions now use one immutable active-layout generation and the bounded
+intersection of active and affected 3D/XY/XZ/YZ targets. Every executable
+member binds source/time/frame, exact per-layer map, spatial and surface facts,
+immutable requirement body, promoted-prefetch role, output extent, schedule,
+and renderer lineage; an explicit terminal no-work member completes semantics
+without fabricating a GPU body. The renderer alone classifies reused versus
+rebuilt executable members, returns their dispositions plus the physical
+delta, validates an all-reused transaction against its current private fronts,
+and performs no pipeline/allocation/submission work for a genuine zero delta.
 
 One application render-attempt coordinator now owns fingerprint-scoped
 execution, deterministic failure, displayed-fidelity projection, causal
@@ -643,15 +759,22 @@ first-cause latch. Hidden-job, private-presentation, and texture-revision
 identity exhaustion is operation-scoped and never re-enters the exhausted
 allocator.
 
+Replacement planning now ranks each outgoing payload by the greater of its
+materialized resource age and the newest owning pin-cohort age. Same-body
+rebinds, overlapping cohorts, partial retirement, simulation, and commit
+therefore preserve recently revisited resources under one age rule.
+
 The render API is the sole binary32 affine and work-envelope authority.
 Normalized condition and outward-rounded control/inverse error replace
 absolute determinant magnitude; exact singular, condition, nonfinite-control,
 quantized-singular, coordinate, envelope, and sample-count failures remain
 distinct. Grid ends and counts are accepted through `2^23` and rejected at
-`2^23 + 1`. Bounded layer/scale affine results and latest-only target envelope
-results feed semantic demand and renderer controls. Orthographic planning uses
-the validated quaternion axes and relative near-plane arithmetic instead of
-reconstructing a basis from `target - eye`.
+`2^23 + 1`. Volume admission charges only the outward-rounded forward-reachable
+ray interval when direction and slab order are proven; zero or uncertain cases
+remain conservative and fail closed. Bounded layer/scale affine results and
+latest-only target envelope results feed semantic demand and renderer controls.
+Orthographic planning uses the validated quaternion axes and relative
+near-plane arithmetic instead of reconstructing a basis from `target - eye`.
 
 All volume and Pick WGSL paths share binary32 normal/subnormal direction
 classification, finite page-exit logic, and represented-sample segment
@@ -662,11 +785,13 @@ zero, admitted/rejected subnormal, and far-boundary-overflow cases now compare
 MIP, fused/general DVR, ISO, Mixed, both sampling modes, coverage, validity,
 and Pick with independent facts on the trusted Vulkan adapter.
 
-Current-tree real-display automation passes all 141 mapped
+The same clean correctness revision passes all 141 mapped
 `target_fixture_render_modes` commands and all 60
-`representative_native_navigation` commands on the NVIDIA RTX/Vulkan product
-path, with exact/current settlement and no renderer validation error. These
-are internal normal-application automation results, not owner observation.
+`representative_native_navigation` commands on the NVIDIA RTX/Vulkan release
+product path, with exact/current settlement and no renderer validation error.
+These are internal normal-application automation results, not owner
+observation.
+
 The attempted temporal scenario reached an Exact/current timepoint-1 frame but
 its independent capture gate rejected that fixture because the retained
 timepoint-0 transfer window left no intermediate RGB pixels. The direct
@@ -679,12 +804,13 @@ retains three open closeout boundaries. Its required pre-edit P0 A/B overlay
 campaign was not captured before these production edits, so that milestone is
 not retroactively claimed. The immutable A/B/C campaign orchestrator and
 sanitizing evaluator now exist, but the designated private workload has not
-run and R11 performance recovery remains open. The full trusted-GPU lane
-requires a clean revision and correctly refuses this dirty implementation
-tree. The temporal normal-product exercise and owner mapped acceptance remain
-required before the correctness cut is product-validated. Earlier product-
-validation claims remain valid only for their named revisions and do not
-cover these new edge cases.
+run and R11 performance recovery remains open. The trusted correctness
+boundary now has the clean 25-of-25 result above; the separate performance
+calibration remains unevaluated at its presentation probe. The temporal
+normal-product exercise and owner mapped acceptance remain required before the
+correctness cut is product-validated. Earlier product-validation claims remain
+valid only for their named revisions. The mapped automation remains automated
+evidence rather than owner visual acceptance.
 
 ## Viewer Performance And Development Recovery Status
 
@@ -793,14 +919,17 @@ scenario also passed with zero WGPU validation errors. This closes the P2
 authority/correctness milestone on the small target fixture; it is not an
 absolute or representative large-data performance claim.
 
-The native terminal-navigation cut has a separate trusted Vulkan measurement
+The native terminal-navigation cut retains the following historical trusted
+Vulkan measurement
 on the NVIDIA GeForce RTX 3070 Ti Laptop GPU. For one warm resident 64³
 full-volume page at 1920×1080, five-trial p95 GPU pass times were 1.247 ms
 MIP voxel-exact, 3.253 ms DVR voxel-exact, 9.988 ms ISO voxel-exact,
 6.776 ms MIP smooth-linear, 10.278 ms DVR smooth-linear, and 11.128 ms ISO
-smooth-linear. All six satisfy the 16.667 ms product guideline. This is
-repeatable component evidence for the terminal floor, not a claim about every
-finer exact body or monitor-visible interaction.
+smooth-linear. All six were below the now-preferred 16.667 ms component
+observation. The five-trial method is not the current performance gate; the
+new campaign requires 120 measured frames and a 33.3 ms component feasibility
+limit plus separate mapped-product evidence. This historical result is not a
+claim about finer exact bodies or monitor-visible interaction.
 
 The normal release application also completed the representative Cell
 native-navigation scenario. Its 60 commands exercised four-panel linked

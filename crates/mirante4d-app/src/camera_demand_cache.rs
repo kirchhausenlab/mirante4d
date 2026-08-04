@@ -40,7 +40,7 @@ use crate::dataset_demand_plan::{
 use crate::dataset_demand_plan::{
     plan_cross_section_panel_attempt, plan_progressive_current_3d_cancellable,
 };
-use crate::playback_session::{PlaybackFrameContract, PlaybackTargetSet};
+use crate::playback_session::PlaybackFrameContract;
 use crate::retained_leases::RetainedRequirementHandle;
 use crate::semantic_demand::SemanticPlaneReuseEnvelope;
 use crate::viewer_layout::PanelId;
@@ -1586,18 +1586,19 @@ fn plan_visible_demand(
         }) {
             anyhow::bail!("a prepared temporal 3D delta escaped its fixed scale map");
         }
-        match contract.target_set() {
-            PlaybackTargetSet::ThreeD if !cross_sections.is_empty() => {
-                anyhow::bail!("a standalone temporal delta contains linked targets");
-            }
-            PlaybackTargetSet::FullLayout
-                if cross_sections
-                    .iter()
-                    .any(|cross| cross.plan.layer_scales != *contract.layer_scales().as_ref()) =>
-            {
-                anyhow::bail!("a prepared temporal linked delta escaped its fixed scale map");
-            }
-            PlaybackTargetSet::ThreeD | PlaybackTargetSet::FullLayout => {}
+        let targets = contract.target_set();
+        if targets
+            .intersection(mirante4d_render_api::PresentationTargetSet::LINKED_CROSS_SECTIONS)
+            .is_empty()
+            && !cross_sections.is_empty()
+        {
+            anyhow::bail!("a standalone temporal delta contains linked targets");
+        }
+        if cross_sections
+            .iter()
+            .any(|cross| cross.plan.layer_scales != *contract.layer_scales().as_ref())
+        {
+            anyhow::bail!("a prepared temporal linked delta escaped its fixed scale map");
         }
         PreparedVisibleTargets::Temporal(PreparedTemporalDelta {
             contract,

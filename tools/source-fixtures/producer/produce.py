@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import struct
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -61,8 +63,8 @@ def parse_spec(path: Path) -> list[dict[str, str]]:
             raise ValueError(f"unexpected specification header: {reader.fieldnames!r}")
         rows = list(reader)
     files = [row for row in rows if row["kind"] == "file"]
-    if len(files) != 16 or any(row["kind"] not in {"family", "file"} for row in rows):
-        raise ValueError("v1 specification must contain four families and sixteen files")
+    if len(files) != 21 or any(row["kind"] not in {"family", "file"} for row in rows):
+        raise ValueError("v1 specification must contain five families and twenty-one files")
     if len({row["path"] for row in files}) != len(files):
         raise ValueError("v1 specification contains duplicate file paths")
     return files
@@ -108,14 +110,158 @@ def page_values(row: dict[str, str], page: int) -> np.ndarray:
                 value = 0
             elif rule == "spec004_u32_sequence":
                 value = y * width + x
+            elif rule == "spec005_u16_portable":
+                value = 100 * y + x
+            elif rule == "spec005_u8_portable":
+                value = (17 * y + 3 * x) % 251
             else:
                 raise ValueError(f"unsupported value rule {rule!r}")
             values[y, x] = value
     return values
 
 
+def packbits_encode(payload: bytes) -> bytes:
+    """Encode deterministic literal-only PackBits packets."""
+    encoded = bytearray()
+    for start in range(0, len(payload), 128):
+        chunk = payload[start : start + 128]
+        encoded.append(len(chunk) - 1)
+        encoded.extend(chunk)
+    return bytes(encoded)
+
+
+def lzw_encode(payload: bytes) -> bytes:
+    """Emit valid TIFF LZW using bounded 9-bit literal runs.
+
+    A clear code every 200 literals keeps the dictionary below the first code
+    width transition, making this tiny fixture encoder deliberately simple and
+    independent from both tifffile's optional codecs and the production TIFF
+    implementation.
+    """
+    codes: list[int] = []
+    for start in range(0, len(payload), 200):
+        codes.append(256)
+        codes.extend(payload[start : start + 200])
+    codes.append(257)
+    encoded = bytearray()
+    accumulator = 0
+    bits = 0
+    for code in codes:
+        accumulator = (accumulator << 9) | code
+        bits += 9
+        while bits >= 8:
+            bits -= 8
+            encoded.append((accumulator >> bits) & 0xFF)
+    if bits:
+        encoded.append((accumulator << (8 - bits)) & 0xFF)
+    return bytes(encoded)
+
+
+def portable_container(row: dict[str, str]) -> tuple[str, int, int, str]:
+    path = row["path"]
+    if path.endswith("uncompressed-big-endian-u16.tif"):
+        return ">", 42, 1, "strips"
+    if path.endswith("lzw-u8-striped.tif"):
+        return "<", 42, 5, "strips"
+    if path.endswith("deflate-u8-tiled.tif"):
+        return "<", 42, 8, "tiles"
+    if path.endswith("old-deflate-u8-striped.tif"):
+        return "<", 42, 32946, "strips"
+    if path.endswith("packbits-u8-bigtiff.tif"):
+        return "<", 43, 32773, "strips"
+    raise ValueError(f"unknown portable container fixture {path!r}")
+
+
+def encode_portable_tiff(row: dict[str, str]) -> bytes:
+    endian, version, compression, layout = portable_container(row)
+    logical = page_values(row, 0)
+    if row["dtype"] == "u16":
+        payload = b"".join(
+            struct.pack(f"{endian}H", int(value)) for value in logical.flat
+        )
+        bits_per_sample = 16
+    else:
+        payload = bytes(int(value) for value in logical.flat)
+        bits_per_sample = 8
+
+    if compression == 1:
+        encoded_payload = payload
+    elif compression == 5:
+        encoded_payload = lzw_encode(payload)
+    elif compression in {8, 32946}:
+        encoded_payload = zlib.compress(payload, level=9)
+    elif compression == 32773:
+        encoded_payload = packbits_encode(payload)
+    else:
+        raise AssertionError(compression)
+
+    width = int(row["width"])
+    height = int(row["height"])
+    tags: list[tuple[int, int, int, int]] = [
+        (256, 4, 1, width),
+        (257, 4, 1, height),
+        (258, 3, 1, bits_per_sample),
+        (259, 3, 1, compression),
+        (262, 3, 1, 1),
+        (277, 3, 1, 1),
+        (284, 3, 1, 1),
+        (339, 3, 1, 1),
+    ]
+    if layout == "tiles":
+        tags.extend([(322, 4, 1, 16), (323, 4, 1, 16)])
+        offset_tag, byte_count_tag = 324, 325
+    else:
+        tags.append((278, 4, 1, height))
+        offset_tag, byte_count_tag = 273, 279
+    tags.extend([(offset_tag, 16 if version == 43 else 4, 1, 0), (byte_count_tag, 16 if version == 43 else 4, 1, len(encoded_payload))])
+    tags.sort()
+
+    marker = b"II" if endian == "<" else b"MM"
+    if version == 42:
+        data_offset = 8 + 2 + 12 * len(tags) + 4
+        tags = [
+            (tag, kind, count, data_offset if tag == offset_tag else value)
+            for tag, kind, count, value in tags
+        ]
+        output = bytearray(marker + struct.pack(f"{endian}HI", 42, 8))
+        output.extend(struct.pack(f"{endian}H", len(tags)))
+        for tag, kind, count, value in tags:
+            output.extend(struct.pack(f"{endian}HHI", tag, kind, count))
+            if kind == 3:
+                output.extend(struct.pack(f"{endian}H", value) + b"\0\0")
+            elif kind == 4:
+                output.extend(struct.pack(f"{endian}I", value))
+            else:
+                raise AssertionError(kind)
+        output.extend(struct.pack(f"{endian}I", 0))
+    else:
+        data_offset = 16 + 8 + 20 * len(tags) + 8
+        tags = [
+            (tag, kind, count, data_offset if tag == offset_tag else value)
+            for tag, kind, count, value in tags
+        ]
+        output = bytearray(marker + struct.pack(f"{endian}HHH", 43, 8, 0) + struct.pack(f"{endian}Q", 16))
+        output.extend(struct.pack(f"{endian}Q", len(tags)))
+        for tag, kind, count, value in tags:
+            output.extend(struct.pack(f"{endian}HHQ", tag, kind, count))
+            if kind == 3:
+                output.extend(struct.pack(f"{endian}H", value) + b"\0" * 6)
+            elif kind == 4:
+                output.extend(struct.pack(f"{endian}I", value) + b"\0" * 4)
+            elif kind == 16:
+                output.extend(struct.pack(f"{endian}Q", value))
+            else:
+                raise AssertionError(kind)
+        output.extend(struct.pack(f"{endian}Q", 0))
+    output.extend(encoded_payload)
+    return bytes(output)
+
+
 def write_tiff(row: dict[str, str], destination: Path, ome_xml: str) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if row["spec_id"] == "SRC-TIFF-SPEC-005":
+        destination.write_bytes(encode_portable_tiff(row))
+        return
     pages = int(row["pages"])
     rows_per_strip = (
         int(row["height"])

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use std::{env, path::Path};
 
 use anyhow::{Context, bail};
@@ -6,7 +8,7 @@ use crate::product_validate::{is_product_validation_scenario_name, product_valid
 use crate::workflow_audit::workflow_audit;
 
 const PRODUCT_VALIDATE_USAGE: &str = "usage: cargo xtask product-validate [target-package] \
-     [target_fixture_camera_smoke|target_fixture_render_modes|representative_native_navigation|representative_temporal_playback|target_package_integrity_audit|import_preprocessing|b4_project_persistence|pre_alpha_reliability]";
+     [target_fixture_camera_smoke|target_fixture_render_modes|representative_native_navigation|representative_temporal_playback|representative_gpu_interaction|representative_gpu_presentation_probe|target_package_integrity_audit|import_preprocessing|b4_project_persistence|pre_alpha_reliability]";
 
 mod arch;
 #[cfg(test)]
@@ -14,6 +16,7 @@ mod build_contract;
 mod deps;
 mod dev;
 mod documentation;
+mod gpu_performance;
 mod host;
 mod import_performance;
 mod import_performance_t5;
@@ -52,11 +55,11 @@ fn main() -> anyhow::Result<()> {
         }
         "verify-local" => {
             let lane = args.next().context(
-                "usage: cargo xtask verify-local <format-lifecycle|project-store-lifecycle|trusted-gpu>",
+                "usage: cargo xtask verify-local <format-lifecycle|project-store-lifecycle|trusted-gpu-correctness>",
             )?;
             if args.next().is_some() {
                 bail!(
-                    "usage: cargo xtask verify-local <format-lifecycle|project-store-lifecycle|trusted-gpu>"
+                    "usage: cargo xtask verify-local <format-lifecycle|project-store-lifecycle|trusted-gpu-correctness>"
                 );
             }
             verification::verify_local(&lane)
@@ -99,6 +102,9 @@ fn main() -> anyhow::Result<()> {
         "representative-static-rendering-recovery" => {
             representative_static_rendering_recovery::run(args.collect())
                 .map(|path| println!("{}", path.display()))
+        }
+        "gpu-performance" => {
+            gpu_performance::run(args.collect()).map(|path| println!("{}", path.display()))
         }
         "__import-performance-t2-worker" => import_performance::run_worker(args.collect()),
         "docs-check" => documentation::docs_check(),
@@ -158,13 +164,21 @@ bounded promoted target U16 fixture is extracted locally.
 The ordinary bounded scenarios are target_fixture_camera_smoke,
 target_fixture_render_modes, representative_native_navigation,
 representative_temporal_playback, target_package_integrity_audit, and
-import_preprocessing.
+import_preprocessing. The trusted-local GPU scenarios are
+representative_gpu_interaction and representative_gpu_presentation_probe.
 representative_native_navigation requires an explicit package and exercises
 native 3D navigation, all volume modes, smooth sampling, four-panel linked
 input, exact settlement, and return to standalone 3D.
 representative_temporal_playback requires an explicit multi-timepoint package
 and proves direct t0-to-t1 pixel replacement, coordinated four-panel playback,
 camera input during real advancement, 24/12 FPS operation, and Pause teardown.
+representative_gpu_interaction requires the qualified Cell package, mapped
+1920x1080 X11 window, release Vulkan product, and
+MIRANTE4D_PRESENTATION_OBSERVER_REPORT=<absent-private-path>. It exercises the
+fixed standalone/four-panel interaction, resident/prepared refinement,
+mode/sampling/Pick, interruption, and idle contract. The presentation_probe
+scenario is the controlled resize/minimize/focus activation proof for that
+observer and does not emit performance metrics.
 The import scenario
 generates a bounded public TIFF fixture, cancels and resumes preprocessing,
 waits for admitted publication, then renders the imported package. The
@@ -179,7 +193,8 @@ Useful controls:
   MIRANTE4D_PRODUCT_VALIDATE_DISPLAY_CLASS=real_display|virtual_display
   MIRANTE4D_PRODUCT_VALIDATE_PREFLIGHT_ONLY=1
   MIRANTE4D_PRODUCT_VALIDATE_APP_BINARY=<packaged-executable> (uses it directly; skips build)
-  MIRANTE4D_PRODUCT_VALIDATE_SKIP_RELEASE_BUILD=1"
+  MIRANTE4D_PRODUCT_VALIDATE_SKIP_RELEASE_BUILD=1
+  MIRANTE4D_PRODUCT_VALIDATE_OUTPUT_DIR=<absolute-output-root>"
     );
 }
 
@@ -190,7 +205,7 @@ Mirante4D developer tasks
 
   cargo xtask verify-leaf policy|lint|unit|contract|ui
   cargo xtask verify-pr [policy|rust]
-  cargo xtask verify-local <format-lifecycle|project-store-lifecycle|trusted-gpu>
+  cargo xtask verify-local <format-lifecycle|project-store-lifecycle|trusted-gpu-correctness>
   cargo xtask verification-sync [--check]
   cargo xtask verify-deps
   cargo xtask package-linux-release
@@ -203,6 +218,7 @@ Mirante4D developer tasks
   cargo run --release -p xtask -- import-performance-t5-oracle-audit --config /absolute/private/config.json
   cargo run --release -p xtask -- representative-static-rendering-recovery --config /absolute/private/config.json
   cargo run --release -p xtask -- representative-static-rendering-recovery --raw-report /absolute/private/raw-report.json
+  cargo xtask gpu-performance --config /absolute/private/config.json
   cargo xtask docs-check
   cargo xtask run-dev
 

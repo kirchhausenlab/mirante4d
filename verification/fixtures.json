@@ -12,9 +12,9 @@
   },
   "promotions": [
     {
-      "fixture_id": "source-tiff-v1",
+      "fixture_id": "source-tiff-v2",
       "authority": "fixtures/source/manifest.json#/approvals",
-      "approved_on": "2026-07-10",
+      "approved_on": "2026-08-03",
       "changed_bytes_or_facts_require_new_version": true
     },
     {
@@ -37,7 +37,7 @@
   ],
   "records": [
     {
-      "id": "source-tiff-v1",
+      "id": "source-tiff-v2",
       "tier": "T1-source",
       "claim_scope": "source-tiff-layout-and-independent-value-facts",
       "authority_state": "promoted-source-only",
@@ -45,16 +45,16 @@
       "capability": "public-cpu",
       "publication": "public-safe-synthetic",
       "license": "MIT",
-      "path": "fixtures/source/mirante4d-source-tiff-fixtures-v1.tar",
-      "sha256": "f0f082b8bf54abd0bd3f7487ba73ac7a963cec0b3ad73b196eb61b736a7ac051",
+      "path": "fixtures/source/mirante4d-source-tiff-fixtures-v2.tar",
+      "sha256": "6a02e027e15f149ea3c4d6da3b292ad427a7c2cda29c970592b421f29c62d975",
       "manifest": {
         "path": "fixtures/source/manifest.json",
-        "sha256": "230337c8ef9fbf68a7251b002887be501b062675457e70dd4ac423ba79c37220"
+        "sha256": "3106f4a384c40ed70671aaea6f3aa41a5dc090711df4eb9c90bd646c02f55dde"
       },
       "archive": {
-        "path": "fixtures/source/mirante4d-source-tiff-fixtures-v1.tar",
-        "sha256": "f0f082b8bf54abd0bd3f7487ba73ac7a963cec0b3ad73b196eb61b736a7ac051",
-        "bytes": 51200,
+        "path": "fixtures/source/mirante4d-source-tiff-fixtures-v2.tar",
+        "sha256": "6a02e027e15f149ea3c4d6da3b292ad427a7c2cda29c970592b421f29c62d975",
+        "bytes": 61440,
         "compression": "none",
         "max_files": 32,
         "max_directories": 8,
@@ -70,29 +70,29 @@
           "role": "byte-producer",
           "id": "SRC-PRODUCER-001",
           "path": "tools/source-fixtures/producer/produce.py",
-          "sha256": "7f861940a2d6db97f8879f8bead5f9df460c782d7f05e7e836a2f2ba2ea2213e"
+          "sha256": "8444715c9bbbc3798ff9ad3f1b3409e58bd2658971a014a17a9804afc8751d63"
         },
         {
           "role": "expected-fact-oracle",
           "id": "SRC-FACT-001",
           "path": "tools/source-fixtures/fact-oracle/src/main.rs",
-          "sha256": "4b660e2c98b7c9ec17c11a894d22a79b574b6aea94fa73f0383904060acf57ac"
+          "sha256": "a8154c3243d1b348a54e220a5d1f40e759caeaf2fff7c23317089cb07907ca09"
         },
         {
           "role": "independent-reader",
           "id": "SRC-READER-001",
           "path": "tools/source-fixtures/reader/reader.py",
-          "sha256": "0d06868c137efd4d17846d9f137784f465e815f797749fb4d395fd7f8d64c16f"
+          "sha256": "aea5291b6abaea12a306caa0b71a6d51a0a8e3990e4a97f765ea12943fbf617a"
         }
       ],
-      "expected_facts_sha256": "186d2e4c062440cee57b4203c7763f707ed9d1f7bfe7431f32eabee9e2dc6f04",
+      "expected_facts_sha256": "04ab439ad9433ebc3afb6d17cd388b5f6f757d0804b0850a79f3f21d72f693b8",
       "independent_reader_report": {
         "path": "fixtures/source/independent-reader-report.json",
-        "sha256": "c90ae8b62e5cf8e912b852cb460731491b9bb9f999b7be14c5bb2b84cb669b45"
+        "sha256": "e8bc01682551ac9b100a5b2c77b498ab413d4f02446fd463bd3147c579b55b23"
       },
       "promotion": {
         "authority": "fixtures/source/manifest.json#/approvals",
-        "approved_on": "2026-07-10",
+        "approved_on": "2026-08-03",
         "changed_authority_requires_new_version": true
       },
       "limits": {
@@ -141,7 +141,7 @@
       "publication": "public-safe-synthetic",
       "license": "MIT",
       "path": "fixtures/project/manifest.json",
-      "sha256": "2b7fa7c74dda59d41a5fdd32288d18ee9ef9ea28e5ea3449a488c164354037bb",
+      "sha256": "cb0d9c1c3ea6db8d78c5eb89ae2c4ecf49603a71d5eb37c4123f7231d8183f15",
       "validation_command": "python3 tools/project-fixtures/validate.py --manifest fixtures/project/manifest.json --self-test",
       "promotion": {
         "authority": "fixtures/project/manifest.json#/approvals/repository_owner",

@@ -38,7 +38,7 @@ use crate::{
     },
     display_refresh::{RenderAttemptCoordinator, render_backend_for_view},
     native_presentation::NativePresentationBridge,
-    playback_session::{PlaybackFrameContract, PlaybackTargetSet},
+    playback_session::PlaybackFrameContract,
     presentation_scheduler::MissingLogicalTarget,
     product_render_intent::PRODUCT_RENDER_RESOURCE_LIMIT,
     retained_leases::RetainedRequirementHandle,
@@ -1192,6 +1192,30 @@ impl MiranteWorkbenchApp {
             &current,
             self.installed_cross_section_exact_bodies_are_current(),
         )
+    }
+
+    /// True when the installed target-local planning result for `panel`
+    /// belongs to the current effective geometry and is explicitly empty.
+    ///
+    /// This is weaker than durable exact-body currentness only in one useful
+    /// way: an active transient interaction may own a current empty terminal
+    /// result without installing a renderable `PreparedRenderRequirements`
+    /// body. Empty has no GPU body to prepare, but it still needs the same
+    /// planning-signature proof before old pixels may be cleared.
+    pub(crate) fn current_cross_section_empty_result(&self, panel: PanelId) -> bool {
+        let snapshot = self.application.snapshot();
+        let (view, active_target, _) = self.effective_visible_demand_inputs(&snapshot);
+        let current = self.visible_demand_planning_signature(&snapshot, &view, active_target);
+        let Some(installed) = self.visible_demand_planning_signature.as_ref() else {
+            return false;
+        };
+        let scope = cross_section_scope_id(panel);
+        installed
+            .cross_sections
+            .same_common_demand(&current.cross_sections)
+            && installed.cross_sections.panel(panel) == current.cross_sections.panel(panel)
+            && self.installed_cross_section_body_matches_prepared(panel)
+            && self.dataset.scope_is_empty(scope)
     }
 
     pub(crate) fn resident_cross_section_requires_planning(&self) -> bool {
@@ -2554,7 +2578,10 @@ impl MiranteWorkbenchApp {
             if !session.admits_frame(frame)
                 || frame.source_generation() != snapshot.source_generation()
                 || frame.timepoint() != application_view(&snapshot).timepoint()
-                || frame.target_set() != application_view(&snapshot).layout().into()
+                || frame.target_set()
+                    != crate::playback_session::playback_targets_for_layout(
+                        application_view(&snapshot).layout(),
+                    )
             {
                 anyhow::bail!("prepared temporal frame is stale for the live playback contract");
             }
@@ -2803,10 +2830,7 @@ impl MiranteWorkbenchApp {
                     }
                 };
                 for target in PresentationTarget::ALL {
-                    let required = match frame.target_set() {
-                        PlaybackTargetSet::ThreeD => target == PresentationTarget::ThreeD,
-                        PlaybackTargetSet::FullLayout => true,
-                    };
+                    let required = frame.target_set().contains(target);
                     if required && !newly_prepared(target) && !installed_matches(target) {
                         return Err(anyhow::Error::new(MissingLogicalTarget(target)));
                     }

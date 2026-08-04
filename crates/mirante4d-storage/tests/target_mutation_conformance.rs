@@ -103,9 +103,34 @@ fn production_rejects_all_promoted_mutations_at_typed_stages() {
     assert_eq!(manifest.archives.len(), 3);
     assert_eq!(mutations.recipes.len(), 15);
     assert_eq!(reader_report.mutations.len(), 15);
+    let mut failures = Vec::new();
     for recipe in &mutations.recipes {
-        exercise_mutation(&repository, &manifest, &reader_report, recipe);
+        let id = string(recipe, "id").to_owned();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            exercise_mutation(&repository, &manifest, &reader_report, recipe);
+        }));
+        match outcome {
+            Ok(()) => eprintln!("M4D_TARGET_MUTATION_PASS {id}"),
+            Err(payload) => failures.push(format!("{id}: {}", panic_message(payload))),
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "promoted target mutation failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+        })
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
 fn exercise_mutation(

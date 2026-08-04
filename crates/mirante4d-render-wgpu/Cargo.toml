@@ -18,3 +18,4 @@ mirante4d-dataset-runtime.workspace = true
 mirante4d-domain.workspace = true
 mirante4d-render-reference.workspace = true
 pollster.workspace = true
+serde_json.workspace = true

@@ -809,7 +809,7 @@ mod tests {
         assert!(validate_registry_document(&value).is_err());
 
         let mut value = registry();
-        record_mut(&mut value, "source-tiff-v1")["archive"]["bytes"] =
+        record_mut(&mut value, "source-tiff-v2")["archive"]["bytes"] =
             Value::String("51200".into());
         assert!(validate_registry_document(&value).is_err());
 

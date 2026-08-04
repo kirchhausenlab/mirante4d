@@ -7,7 +7,7 @@ use std::{
 
 use mirante4d_app::{
     AppSmokeOptions, MiranteApplicationShell, ProcessTerminationLatch, collect_startup_diagnostics,
-    default_log_path, run_headless_smoke,
+    default_log_path, prepare_presentation_observer, run_headless_smoke,
 };
 use mirante4d_domain::RenderMode;
 use mirante4d_render_wgpu::{qualify_adapter, renderer_device_descriptor};
@@ -120,6 +120,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let initial_dataset = std::env::var_os("MIRANTE4D_DEV_DATASET").map(PathBuf::from);
+    let prepared_presentation_observer = prepare_presentation_observer()?;
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Mirante4D")
@@ -133,7 +134,7 @@ fn main() -> anyhow::Result<()> {
     let process_termination = Arc::new(ProcessTerminationLatch::default());
     install_process_termination_signals(Arc::clone(&process_termination))?;
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Mirante4D",
         native_options,
         Box::new(move |cc| {
@@ -143,8 +144,9 @@ fn main() -> anyhow::Result<()> {
                 process_termination,
             )?))
         }),
-    )
-    .map_err(|err| anyhow::anyhow!("failed to launch native window: {err}"))
+    );
+    drop(prepared_presentation_observer);
+    result.map_err(|err| anyhow::anyhow!("failed to launch native window: {err}"))
 }
 
 fn install_process_termination_signals(

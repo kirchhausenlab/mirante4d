@@ -38,11 +38,12 @@
         "SRC-TIFF-SPEC-001",
         "SRC-TIFF-SPEC-002",
         "SRC-TIFF-SPEC-003",
-        "SRC-TIFF-SPEC-004"
+        "SRC-TIFF-SPEC-004",
+        "SRC-TIFF-SPEC-005"
       ]
     },
     "specification_version": {
-      "const": 1
+      "const": 2
     },
     "status": {
       "enum": [

@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mirante4d.org/schemas/gpu-performance-baseline-v2.schema.json",
+  "title": "Mirante4D GPU performance baseline v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "measurement_version",
+    "status",
+    "baseline_id",
+    "accepted_revision",
+    "environment",
+    "workload_profile_id",
+    "metrics",
+    "accepted_at",
+    "owner_acceptance",
+    "supersedes"
+  ],
+  "properties": {
+    "schema": { "const": "mirante4d-gpu-performance-baseline" },
+    "schema_version": { "const": 2 },
+    "measurement_version": { "const": "gpu-performance-v3" },
+    "status": {
+      "enum": ["pending_initial_calibration", "proposed", "accepted"]
+    },
+    "baseline_id": { "$ref": "#/$defs/token" },
+    "accepted_revision": {
+      "anyOf": [{ "$ref": "#/$defs/revision" }, { "type": "null" }]
+    },
+    "environment": {
+      "anyOf": [{ "$ref": "#/$defs/environment" }, { "type": "null" }]
+    },
+    "workload_profile_id": {
+      "anyOf": [{ "$ref": "#/$defs/token" }, { "type": "null" }]
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/metric" }
+    },
+    "accepted_at": { "type": ["string", "null"] },
+    "owner_acceptance": { "type": ["string", "null"] },
+    "supersedes": {
+      "anyOf": [{ "$ref": "#/$defs/token" }, { "type": "null" }]
+    }
+  },
+  "$defs": {
+    "token": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]{0,127}$"
+    },
+    "revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "platform",
+        "kernel_release",
+        "release_profile",
+        "adapter",
+        "backend",
+        "driver",
+        "display_output",
+        "display_profile_id",
+        "compositor_session_id",
+        "display_refresh_millihz",
+        "target_width_pixels",
+        "target_height_pixels",
+        "power_policy_id",
+        "quiescence_policy_id",
+        "cargo_lock_sha256",
+        "presentation_authority"
+      ],
+      "properties": {
+        "platform": { "const": "linux-x86_64" },
+        "kernel_release": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "release_profile": { "const": "release" },
+        "adapter": { "type": "string", "minLength": 1 },
+        "backend": { "const": "Vulkan" },
+        "driver": { "type": "string", "minLength": 1 },
+        "display_output": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "display_profile_id": { "$ref": "#/$defs/token" },
+        "compositor_session_id": { "$ref": "#/$defs/token" },
+        "display_refresh_millihz": { "type": "integer", "minimum": 30000 },
+        "target_width_pixels": { "const": 1920 },
+        "target_height_pixels": { "const": 1080 },
+        "power_policy_id": { "$ref": "#/$defs/token" },
+        "quiescence_policy_id": { "$ref": "#/$defs/token" },
+        "cargo_lock_sha256": { "$ref": "#/$defs/sha256" },
+        "presentation_authority": {
+          "const": "vulkan_ext_present_timing_first_pixel_out_marker_v2"
+        }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "baseline_value_ns",
+        "calibration_min_ns",
+        "calibration_max_ns",
+        "maximum_proportional_deviation",
+        "stability_limit",
+        "relative_numerator",
+        "relative_denominator",
+        "absolute_limit_ns",
+        "work_identity"
+      ],
+      "properties": {
+        "class": { "enum": ["component", "product"] },
+        "baseline_value_ns": { "type": "integer", "minimum": 1 },
+        "calibration_min_ns": { "type": "integer", "minimum": 1 },
+        "calibration_max_ns": { "type": "integer", "minimum": 1 },
+        "maximum_proportional_deviation": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 0.05
+        },
+        "stability_limit": { "enum": [0.025, 0.05] },
+        "relative_numerator": { "enum": [105, 110] },
+        "relative_denominator": { "const": 100 },
+        "absolute_limit_ns": { "type": "integer", "minimum": 1 },
+        "work_identity": { "type": "object" }
+      }
+    }
+  }
+}

@@ -1016,6 +1016,8 @@ fn run_inner(
     })?;
     let finalization_required_headroom = recheck_finalization_space(&options, &plan, &stage)?;
     required_headroom.set(finalization_required_headroom);
+    #[cfg(test)]
+    maybe_inject_finalization_fault(&options.destination)?;
     let published = preserve_capacity_race(
         finalize_stage(
             stage,
@@ -3033,6 +3035,59 @@ fn check_cancelled(cancellation: &ImportCancellation) -> Result<(), ImportError>
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy)]
+enum TestFinalizationFault {
+    StorageFull,
+    PermissionDenied,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FINALIZATION_FAULT: std::cell::RefCell<Option<(std::path::PathBuf, TestFinalizationFault)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_test_finalization_fault<T>(
+    destination: &Path,
+    fault: TestFinalizationFault,
+    operation: impl FnOnce() -> T,
+) -> T {
+    TEST_FINALIZATION_FAULT.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "nested finalization fault injection"
+        );
+        *slot.borrow_mut() = Some((destination.to_path_buf(), fault));
+    });
+    let result = operation();
+    TEST_FINALIZATION_FAULT.with(|slot| *slot.borrow_mut() = None);
+    result
+}
+
+#[cfg(test)]
+fn maybe_inject_finalization_fault(destination: &Path) -> Result<(), ImportError> {
+    let fault = TEST_FINALIZATION_FAULT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(expected, _)| expected == destination)
+            .map(|(_, fault)| *fault)
+    });
+    let Some(fault) = fault else {
+        return Ok(());
+    };
+    let kind = match fault {
+        TestFinalizationFault::StorageFull => std::io::ErrorKind::StorageFull,
+        TestFinalizationFault::PermissionDenied => std::io::ErrorKind::PermissionDenied,
+    };
+    Err(ImportError::Io {
+        operation: "finalize package fault injection",
+        path: destination.to_path_buf(),
+        source: std::io::Error::from(kind),
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use mirante4d_dataset::{CpuByteLease, CpuLedgerError};
     use tiff::encoder::{Compression, DeflateLevel, TiffEncoder, colortype};
@@ -3165,6 +3220,89 @@ mod tests {
                 available_bytes: 4_096,
             })
         ));
+    }
+
+    #[test]
+    fn full_pipeline_finalization_faults_preserve_source_and_resume_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.tif");
+        let file = fs::File::create(&source).unwrap();
+        let mut encoder = TiffEncoder::new(file).unwrap();
+        for z in 0_u8..2 {
+            let pixels = (0_u8..16)
+                .map(|value| value.wrapping_add(z.wrapping_mul(19)))
+                .collect::<Vec<_>>();
+            encoder
+                .write_image::<colortype::Gray8>(4, 4, &pixels)
+                .unwrap();
+        }
+        let source_before = fs::read(&source).unwrap();
+        let inspection = crate::source::inspect(crate::TiffSource::single_3d(&source)).unwrap();
+        let options = |label: &str| ImportOptions {
+            inspection: inspection.clone(),
+            destination: root.path().join(format!("{label}.m4d")),
+            checkpoint_directory: root.path().join(format!("{label}.checkpoint")),
+            profile: mirante4d_storage::ProfileKind::Current,
+            calibration: crate::SpatialCalibration::new([1.0; 3]),
+            time_step_seconds: None,
+            no_data: None,
+        };
+        let control = run(
+            options("control"),
+            &UnlimitedTestLedger,
+            &ImportCancellation::new(),
+            |_| {},
+        )
+        .unwrap();
+
+        for (label, fault) in [
+            ("storage-full", TestFinalizationFault::StorageFull),
+            ("permission", TestFinalizationFault::PermissionDenied),
+        ] {
+            let faulted = options(label);
+            let error = with_test_finalization_fault(&faulted.destination, fault, || {
+                run(
+                    faulted.clone(),
+                    &UnlimitedTestLedger,
+                    &ImportCancellation::new(),
+                    |_| {},
+                )
+                .unwrap_err()
+            });
+            match fault {
+                TestFinalizationFault::StorageFull => assert!(matches!(
+                    error,
+                    ImportError::CapacityPaused {
+                        required_bytes: 1..,
+                        ..
+                    }
+                )),
+                TestFinalizationFault::PermissionDenied => assert!(matches!(
+                    error,
+                    ImportError::Io {
+                        source,
+                        ..
+                    } if source.kind() == std::io::ErrorKind::PermissionDenied
+                )),
+            }
+            assert!(!faulted.destination.exists());
+            assert!(faulted.checkpoint_directory.is_dir());
+            assert_eq!(fs::read(&source).unwrap(), source_before);
+
+            let resumed = run(
+                faulted,
+                &UnlimitedTestLedger,
+                &ImportCancellation::new(),
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(resumed.receipt().package_id, control.receipt().package_id);
+            assert_eq!(
+                resumed.receipt().scientific_content_id,
+                control.receipt().scientific_content_id
+            );
+            assert_eq!(fs::read(&source).unwrap(), source_before);
+        }
     }
 
     #[test]

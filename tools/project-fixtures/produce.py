@@ -601,22 +601,22 @@ def produce(output: Path) -> dict[str, object]:
     encoded_archive = archive_bytes(files)
     archive_sha = sha256(encoded_archive)
     mutations = [
-        ("envelope-noncanonical", "noncanonical_json"),
-        ("envelope-unknown-field", "unknown_field"),
-        ("head-truncated", "ref_length"),
-        ("head-checksum-flip", "ref_checksum"),
-        ("head-target-missing", "missing_generation"),
-        ("manual-recovery-unrelated-generation", "recovery_mismatch"),
-        ("autosave-recovery-unrelated-generation", "recovery_mismatch"),
-        ("generation-byte-flip", "generation_digest"),
-        ("generation-unknown-field", "unknown_field"),
-        ("generation-project-mismatch", "project_mismatch"),
-        ("revision-above-high-water", "revision_invalid"),
-        ("direct-object-missing", "missing_object"),
-        ("page-truncated", "object_digest"),
-        ("page-reordered", "page_order"),
-        ("page-substituted", "page_substitution"),
-        ("scientific-rebind", "scientific_rebind"),
+        ("envelope-noncanonical", "noncanonical_json", "corruption"),
+        ("envelope-unknown-field", "unknown_field", "corruption"),
+        ("head-truncated", "ref_length", "corruption"),
+        ("head-checksum-flip", "ref_checksum", "corruption"),
+        ("head-target-missing", "missing_generation", "corruption"),
+        ("manual-recovery-unrelated-generation", "recovery_mismatch", "corruption"),
+        ("autosave-recovery-unrelated-generation", "recovery_mismatch", "corruption"),
+        ("generation-byte-flip", "generation_digest", "corruption"),
+        ("generation-unknown-field", "unknown_field", "corruption"),
+        ("generation-project-mismatch", "project_mismatch", "corruption"),
+        ("revision-above-high-water", "revision_invalid", "corruption"),
+        ("direct-object-missing", "missing_object", "corruption"),
+        ("page-truncated", "object_digest", "corruption"),
+        ("page-reordered", "page_order", "corruption"),
+        ("page-substituted", "page_substitution", "corruption"),
+        ("scientific-rebind", "scientific_rebind", "corruption"),
     ]
     regular_bytes = sum(map(len, files.values()))
     manifest: dict[str, object] = {
@@ -656,8 +656,13 @@ def produce(output: Path) -> dict[str, object]:
             "validator": source_binding("tools/project-fixtures/validate.py"),
         },
         "mutations": [
-            {"expected_fault": fault, "id": mutation, "store": "recoverable.m4dproj"}
-            for mutation, fault in mutations
+            {
+                "expected_fault": fault,
+                "expected_public_fault": public_fault,
+                "id": mutation,
+                "store": "recoverable.m4dproj",
+            }
+            for mutation, fault, public_fault in mutations
         ],
         "schema": "mirante4d-foundation-project-fixture-manifest",
         "schema_version": 1,

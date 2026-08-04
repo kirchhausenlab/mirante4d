@@ -336,6 +336,11 @@ fn fail_inject_row(
         Some("fail"),
         CHILD_TIMEOUT,
     );
+    assert!(
+        output.status.success(),
+        "hosted fail injection did not return its typed public outcome for {row:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let hits = parse_rows(&output.stdout, HOSTED_HIT_PREFIX);
     assert_eq!(
         hits.as_slice(),
@@ -343,6 +348,15 @@ fn fail_inject_row(
         "wrong hosted fail marker for {row:?}; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_guest_injected_failure(&output.stdout, flow.case, row);
+
+    let validation = run_child(flow, &roots, "validate", None, None, CHILD_TIMEOUT);
+    assert!(
+        validation.status.success(),
+        "fresh reopen/retry after injected failure failed for {row:?}: {}",
+        String::from_utf8_lossy(&validation.stderr)
+    );
+    assert_guest_passed(&validation.stdout, flow.case, "validate");
 }
 
 fn bracket_targets(traces: &BTreeMap<TransitionRow, usize>) -> Vec<(TransitionPoint, usize)> {
@@ -686,6 +700,38 @@ fn assert_guest_passed(bytes: &[u8], case: &str, role: &str) {
     assert_eq!(results[0]["case"].as_str(), Some(case));
     assert_eq!(results[0]["role"].as_str(), Some(role));
     assert_eq!(results[0]["status"].as_str(), Some("passed"));
+}
+
+fn assert_guest_injected_failure(bytes: &[u8], case: &str, row: &TransitionRow) {
+    let prefix = "mirante4d-project-store-vm-result:";
+    let results = String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| json_after_prefix(line, prefix))
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1, "guest emitted the wrong result count");
+    let result = &results[0];
+    assert_eq!(result["case"].as_str(), Some(case));
+    assert_eq!(result["role"].as_str(), Some("exercise"));
+    assert_eq!(result["status"].as_str(), Some("passed"));
+    let counters = &result["counters"];
+    assert_eq!(
+        counters["operation_result"].as_str(),
+        Some("injected_failure")
+    );
+    assert_eq!(
+        counters["transition"].as_str(),
+        Some(row.transition.as_str())
+    );
+    assert_eq!(counters["lane"].as_str(), Some(row.lane.as_str()));
+    assert_eq!(counters["edge"].as_str(), Some(row.edge.as_str()));
+    assert_eq!(counters["occurrence"].as_u64(), Some(row.occurrence as u64));
+    assert!(
+        matches!(
+            counters["fault_class"].as_str(),
+            Some("corruption" | "commit_indeterminate" | "source_changed" | "capacity")
+        ),
+        "injected transition produced an undeclared public fault for {row:?}: {counters}"
+    );
 }
 
 fn has_existing_exact_failure_matrix(transition: &str) -> bool {

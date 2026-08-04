@@ -510,6 +510,8 @@ fn write_u64(bytes: &mut [u8; RECORD_BYTES], offset: usize, value: u64) {
 
 #[cfg(test)]
 mod tests {
+    use proptest::{prelude::*, test_runner::RngSeed};
+
     use super::*;
 
     fn coordinates() -> PackedIndexCoordinates {
@@ -706,5 +708,31 @@ mod tests {
             PackedIndexRecord::decode(&inverted, IntensityDType::Float32, 1),
             Err(PackedIndexError::InvertedNumericRange)
         ));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            max_shrink_iters: 1_024,
+            failure_persistence: None,
+            rng_seed: RngSeed::Fixed(0x4d34_5354_4f52_5041),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn arbitrary_packed_records_fail_closed_or_reencode_identically(
+            bytes in any::<[u8; RECORD_BYTES]>(),
+            capacity in 0_u64..=1_000_000,
+            dtype_index in 0_u8..3,
+        ) {
+            let dtype = [
+                IntensityDType::Uint8,
+                IntensityDType::Uint16,
+                IntensityDType::Float32,
+            ][usize::from(dtype_index)];
+            if let Ok(record) = PackedIndexRecord::decode(&bytes, dtype, capacity) {
+                prop_assert_eq!(record.encode(), bytes);
+            }
+        }
     }
 }

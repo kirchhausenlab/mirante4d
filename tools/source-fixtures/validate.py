@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Any
 
 
-SPEC_IDS = [f"SRC-TIFF-SPEC-{number:03d}" for number in range(1, 5)]
-ARCHIVE_NAME = "mirante4d-source-tiff-fixtures-v1.tar"
+SPEC_IDS = [f"SRC-TIFF-SPEC-{number:03d}" for number in range(1, 6)]
+ARCHIVE_NAME = "mirante4d-source-tiff-fixtures-v2.tar"
 SOURCEMETA_URL = "https://github.com/sourcemeta/jsonschema/releases/download/v16.1.0/jsonschema-16.1.0-linux-x86_64.zip"
 SOURCEMETA_ARCHIVE_SHA256 = "96b214be67bf25c6184f1d009a94e082d1eaa83787a8f1878607aebf3185668e"
 SOURCEMETA_BINARY_SHA256 = "4aa8ba3f4bc0b1ef4f8d82b109676b186fa66603d1953be25fde22b2854190d5"
@@ -168,7 +168,7 @@ def inspect_archive(archive_path: Path) -> tuple[dict[str, bytes], list[str], li
             else:
                 raise ValidationError("archive contains link, special, sparse, or extension member")
             order.append(path)
-    require(len(files) == 20 and len(directories) == 7, "archive must contain exactly 20 files and 7 directories")
+    require(len(files) == 25 and len(directories) == 8, "archive must contain exactly 25 files and 8 directories")
     require(order == sorted(directories) + sorted(files), "archive member order is not deterministic")
     children: dict[str, int] = {}
     for path in list(files) + directories:
@@ -213,13 +213,33 @@ def validate_records(files: dict[str, bytes], manifest: dict[str, Any]) -> None:
     provenance = json.loads(files["records/provenance-license.json"])
     require(facts.get("schema") == "mirante4d-source-fixture-expected-facts" and facts.get("schema_version") == 1, "facts schema identity failed")
     require(facts.get("fact_authority") == "SRC-FACT-001" and facts.get("axes") == ["t", "c", "z", "y", "x"], "facts authority/axes failed")
-    require(facts.get("logical_voxel_bytes") == 491 and facts.get("logical_voxel_bytes") <= 1024 * 1024, "logical voxel byte total failed")
+    require(facts.get("logical_voxel_bytes") == 867 and facts.get("logical_voxel_bytes") <= 1024 * 1024, "logical voxel byte total failed")
     families = facts.get("specifications", [])
     require([family.get("id") for family in families] == SPEC_IDS, "facts specification identities failed")
     fact_files = [item for family in families for item in family.get("files", [])]
-    require(len(fact_files) == 16 and len({item["path"] for item in fact_files}) == 16, "facts file coverage failed")
+    require(len(fact_files) == 21 and len({item["path"] for item in fact_files}) == 21, "facts file coverage failed")
     require(all(item["path"] in files for item in fact_files), "facts name a missing TIFF")
-    require(sum(item["logical_bytes"] for item in fact_files) == 491, "per-file logical byte relation failed")
+    require(sum(item["logical_bytes"] for item in fact_files) == 867, "per-file logical byte relation failed")
+    require(
+        all(
+            len(bytes.fromhex(item["logical_value_hex"])) == item["logical_bytes"]
+            and sha256(bytes.fromhex(item["logical_value_hex"])) == item["logical_value_sha256"]
+            for item in fact_files
+        ),
+        "canonical logical payload relation failed",
+    )
+    portable = next(family for family in families if family["id"] == "SRC-TIFF-SPEC-005")
+    require(
+        {(item["compression"], item["storage_layout"], item["tiff_version"], item["byte_order"]) for item in portable["files"]}
+        == {
+            (1, "strips", 42, "big"),
+            (5, "strips", 42, "little"),
+            (8, "tiles", 42, "little"),
+            (32946, "strips", 42, "little"),
+            (32773, "strips", 43, "little"),
+        },
+        "portable TIFF compression/container coverage failed",
+    )
     require(manifest["expected_facts"]["sha256"] == sha256(files["records/expected-facts.json"]), "facts record digest failed")
     require(manifest["expected_facts"]["logical_value_sha256"] == facts["logical_value_sha256"], "logical digest relation failed")
     require(grouping.get("schema") == "mirante4d-source-fixture-grouping" and grouping.get("schema_version") == 1, "grouping schema identity failed")
@@ -231,6 +251,11 @@ def validate_records(files: dict[str, bytes], manifest: dict[str, Any]) -> None:
     require(len(recipes) == 8 and len({item["id"] for item in recipes}) == 8, "mutation coverage failed")
     for recipe in recipes:
         require(recipe["base_path"] in files, "mutation base is absent")
+        require(
+            recipe.get("expected_production_fault")
+            in {"tiff", "unsupported_source", "io_unexpected_eof"},
+            "mutation production fault contract failed",
+        )
         base = files[recipe["base_path"]]
         operation = recipe["operation"]
         if operation in {"replace_bytes", "replace_ome_sizez"}:
@@ -297,7 +322,7 @@ def validate(
     for key in ("archive_bytes", "regular_file_bytes", "max_depth", "max_fan_out", "max_path_bytes", "max_file_bytes"):
         require(archive_manifest[key] == metrics[key], f"archive metric {key} failed")
     require(archive_manifest["directories"] == directories, "archive directory inventory failed")
-    require(archive_manifest["logical_voxel_bytes"] == 491, "manifest logical byte total failed")
+    require(archive_manifest["logical_voxel_bytes"] == 867, "manifest logical byte total failed")
     require(set(manifest["files"]) == set(files), "manifest/archive file set failed")
     for path, data in files.items():
         record = manifest["files"][path]
@@ -325,7 +350,7 @@ def self_test(repo: Path, manifest_path: Path, archive_path: Path, validator: Pa
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     cases = []
     for mutate in (
-        lambda value: value["archive"].__setitem__("logical_voxel_bytes", 492),
+        lambda value: value["archive"].__setitem__("logical_voxel_bytes", 868),
         lambda value: value["files"].pop("records/grouping.json"),
         lambda value: value["producer"]["dependencies"][0].__setitem__("release_artifact_sha256", "0" * 64),
         lambda value: value["reproduction"].__setitem__("generated_tree_sha256", "0" * 64),

@@ -25,6 +25,48 @@ exceptions have one separate tool-owned
 ## Plans
 
 The
+[project state and persistence testing refactor](plans/active/PROJECT_STATE_AND_PERSISTENCE_TESTING_REFACTOR.md)
+is the implemented package for repairing lifecycle test
+selection, strengthening hosted fault oracles, eliminating unsupported-
+filesystem false greens, connecting the independent corruption corpus to
+production Rust, stabilizing parallel store tests, and filling compact model
+and public-flow fault gaps. It retains the current store architecture and
+qualified ext4 boundary.
+
+The
+[viewer GPU testing refactor](plans/active/VIEWER_GPU_TESTING_REFACTOR.md)
+is the implemented separation of trusted Vulkan correctness, controlled GPU
+performance, and mapped-product interaction/refinement evidence. It retains
+local-only hardware execution, defines 30 Hz as the minimum and 60 Hz as
+preferred, adds explicit stall/refinement and baseline-lifecycle contracts,
+and deletes the mixed trusted-GPU lane. The initial accepted performance
+baseline and owner product evidence remain pending. The replacement Vulkan
+observer combines present-wait completion and marker identity with
+`VK_EXT_present_timing` first-pixel-out feedback. On the qualified NVIDIA
+595.84/X11 workstation it now proves mapped visibility, exact scanout cadence,
+maximum visible stalls, and coarse settlement without claiming physical
+photon visibility or input-to-photon latency.
+
+The implemented
+[viewer GPU correctness campaign follow-up](plans/active/VIEWER_GPU_CORRECTNESS_CAMPAIGN_FOLLOW_UP.md)
+records the six failures exposed by the first clean 25-case trusted
+correctness execution. It separates three product corrections from three
+obsolete or phase-racy test contracts, adds exact failed-run attribution, and
+defines atomic publication over the currently active, affected panels so the
+repair does not hard-code the future viewer to one four-panel layout. Its
+subsequent clean trusted execution passed all 25 cases; performance preflight
+recovery and owner visual acceptance remain open.
+
+The
+[import, preprocessing, and storage testing refactor](plans/active/IMPORT_PREPROCESSING_STORAGE_TESTING_REFACTOR.md)
+is the implemented audit follow-up for a mostly strong area. It connects
+promoted independent TIFF facts through production import and publication,
+adds proportionate independent compression and fault coverage, replaces
+source-text checks with behavior, improves case-level diagnostics and
+application/UI handoff coverage, and assigns existing local performance
+checks to the changes that can affect them.
+
+The
 [viewer rendering correctness, recovery, and numerical cutover](plans/active/VIEWER_RENDERING_CORRECTNESS_RECOVERY_AND_NUMERICAL_CUTOVER.md)
 is the owner-authorized corrective package for the 2026-08-02 rendering
 audit. Its correctness/recovery/numerical hard cut is implemented in the

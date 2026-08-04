@@ -26,8 +26,10 @@ const FORBIDDEN_AXIS_ALIGNED_2D_CHUNK_PATTERNS: &[&str] = &[
     "SliceChunk",
     "SliceChunks",
 ];
-const ALLOWED_LOCAL_CARGO_OVERRIDES: &[(&str, &str)] =
-    &[("wayland-scanner", "vendor/wayland-scanner")];
+const ALLOWED_LOCAL_CARGO_OVERRIDES: &[(&str, &str)] = &[
+    ("wayland-scanner", "vendor/wayland-scanner"),
+    ("wgpu-hal", "vendor/wgpu-hal"),
+];
 
 const REQUIRED_CRATES: &[(&str, &str)] = &[
     ("mirante4d-analysis-core", "crates/mirante4d-analysis-core"),

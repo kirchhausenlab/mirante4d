@@ -7,7 +7,7 @@ pub(crate) fn apply_viewport_observations(
     render_coordination: &mut RenderCoordinationState,
     render_intent_mailbox: &mut RenderIntentMailbox,
     observations: impl IntoIterator<Item = ViewportObservation>,
-) -> Result<Option<CoordinatedPresentationGroup>, RenderIntentMailboxError> {
+) -> Result<Option<PresentationTargetSet>, RenderIntentMailboxError> {
     let mut three_d_changed = false;
     let mut linked_2d_changed = false;
     for observation in observations {
@@ -25,25 +25,31 @@ pub(crate) fn apply_viewport_observations(
             linked_2d_changed = true;
         }
     }
-    let required_group = match (three_d_changed, linked_2d_changed) {
-        (true, true) => Some(CoordinatedPresentationGroup::FullLayout),
-        (true, false) => Some(CoordinatedPresentationGroup::ThreeD),
-        (false, true) => Some(CoordinatedPresentationGroup::Linked2d),
+    let required_targets = match (three_d_changed, linked_2d_changed) {
+        (true, true) => Some(PresentationTargetSet::ALL),
+        (true, false) => Some(PresentationTargetSet::THREE_D),
+        (false, true) => Some(PresentationTargetSet::LINKED_CROSS_SECTIONS),
         (false, false) => None,
     };
-    if let Some(group) = required_group {
+    if let Some(targets) = required_targets {
         // A render extent participates in the requirement body. Give the
         // affected coalesced family one new frame identity before planning
         // can bind that changed body.
-        let family = match group {
-            CoordinatedPresentationGroup::ThreeD => RenderIntentFamily::ThreeD,
-            CoordinatedPresentationGroup::Linked2d => RenderIntentFamily::Linked2d,
-            CoordinatedPresentationGroup::FullLayout => RenderIntentFamily::Both,
+        let family = match (
+            targets.contains(PresentationSlot::ThreeD),
+            !targets
+                .intersection(PresentationTargetSet::LINKED_CROSS_SECTIONS)
+                .is_empty(),
+        ) {
+            (true, false) => RenderIntentFamily::ThreeD,
+            (false, true) => RenderIntentFamily::Linked2d,
+            (true, true) => RenderIntentFamily::Both,
+            (false, false) => unreachable!("a viewport change affects at least one target"),
         };
         render_intent_mailbox.observe_durable_intent(family)?;
         render_coordination.request_refresh();
     }
-    Ok(required_group)
+    Ok(required_targets)
 }
 
 impl MiranteWorkbenchApp {
@@ -415,11 +421,13 @@ impl MiranteWorkbenchApp {
                 if resident_plane {
                     self.render_intent_mailbox.mark_renderable(base, revision);
                 }
-                let group = match sample.target() {
-                    RenderIntentTarget::ThreeD => CoordinatedPresentationGroup::ThreeD,
-                    RenderIntentTarget::CrossSection(_) => CoordinatedPresentationGroup::Linked2d,
+                let targets = match sample.target() {
+                    RenderIntentTarget::ThreeD => PresentationTargetSet::THREE_D,
+                    RenderIntentTarget::CrossSection(_) => {
+                        PresentationTargetSet::LINKED_CROSS_SECTIONS
+                    }
                 };
-                self.begin_display_input_generation(group);
+                self.begin_display_input_generation(targets);
                 if sample.target() == RenderIntentTarget::ThreeD {
                     self.render_coordination.mark_3d_display_stale();
                 }
@@ -592,7 +600,7 @@ mod tests {
 
         assert_eq!(
             apply_viewport_observations(&mut coordination, &mut mailbox, observations),
-            Ok(Some(CoordinatedPresentationGroup::FullLayout))
+            Ok(Some(PresentationTargetSet::ALL))
         );
         assert_eq!(
             mailbox.snapshot().latest_revision.get(),
@@ -640,7 +648,7 @@ mod tests {
                     ViewportObservation::new(PresentationSlot::Xy, presentation, render),
                 ],
             ),
-            Ok(Some(CoordinatedPresentationGroup::FullLayout))
+            Ok(Some(PresentationTargetSet::ALL))
         );
         assert_eq!(
             mailbox.snapshot().latest_revision.get(),

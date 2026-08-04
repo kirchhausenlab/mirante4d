@@ -901,6 +901,8 @@ impl From<&ManifestPageReference> for WireManifestPageReference {
 
 #[cfg(test)]
 mod tests {
+    use proptest::{prelude::*, test_runner::RngSeed};
+
     use super::*;
 
     fn digest(hex: char) -> ExactBytesDigest {
@@ -975,6 +977,28 @@ mod tests {
             root.package_id().unwrap(),
             changed_root.package_id().unwrap()
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            max_shrink_iters: 1_024,
+            failure_persistence: None,
+            rng_seed: RngSeed::Fixed(0x4d34_5354_4f52_5041),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn hostile_manifest_bytes_fail_closed_or_are_exactly_canonical(
+            bytes in proptest::collection::vec(any::<u8>(), 0..=2_048),
+        ) {
+            if let Ok(page) = ManifestPage::parse_canonical(&bytes) {
+                prop_assert_eq!(page.canonical_bytes().unwrap(), bytes.clone());
+            }
+            if let Ok(root) = ManifestRoot::parse_canonical(&bytes) {
+                prop_assert_eq!(root.canonical_bytes().unwrap(), bytes);
+            }
+        }
     }
 
     #[test]

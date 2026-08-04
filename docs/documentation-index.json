@@ -146,6 +146,30 @@
       "listed_in": "docs/README.md"
     },
     {
+      "path": "docs/plans/active/PROJECT_STATE_AND_PERSISTENCE_TESTING_REFACTOR.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/VIEWER_GPU_TESTING_REFACTOR.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/VIEWER_GPU_CORRECTNESS_CAMPAIGN_FOLLOW_UP.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
+      "path": "docs/plans/active/IMPORT_PREPROCESSING_STORAGE_TESTING_REFACTOR.md",
+      "truth_scope": "target",
+      "authorities": [],
+      "listed_in": "docs/README.md"
+    },
+    {
       "path": "docs/plans/active/PREPROCESSING_BOUNDED_TEMPORAL_PIPELINE.md",
       "truth_scope": "target",
       "authorities": [],

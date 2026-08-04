@@ -35,22 +35,22 @@ HEX32 = re.compile(r"[0-9a-f]{8}\Z")
 HEX64 = re.compile(r"[0-9a-f]{16}\Z")
 
 EXPECTED_MUTATIONS = [
-    ("envelope-noncanonical", "noncanonical_json"),
-    ("envelope-unknown-field", "unknown_field"),
-    ("head-truncated", "ref_length"),
-    ("head-checksum-flip", "ref_checksum"),
-    ("head-target-missing", "missing_generation"),
-    ("manual-recovery-unrelated-generation", "recovery_mismatch"),
-    ("autosave-recovery-unrelated-generation", "recovery_mismatch"),
-    ("generation-byte-flip", "generation_digest"),
-    ("generation-unknown-field", "unknown_field"),
-    ("generation-project-mismatch", "project_mismatch"),
-    ("revision-above-high-water", "revision_invalid"),
-    ("direct-object-missing", "missing_object"),
-    ("page-truncated", "object_digest"),
-    ("page-reordered", "page_order"),
-    ("page-substituted", "page_substitution"),
-    ("scientific-rebind", "scientific_rebind"),
+    ("envelope-noncanonical", "noncanonical_json", "corruption"),
+    ("envelope-unknown-field", "unknown_field", "corruption"),
+    ("head-truncated", "ref_length", "corruption"),
+    ("head-checksum-flip", "ref_checksum", "corruption"),
+    ("head-target-missing", "missing_generation", "corruption"),
+    ("manual-recovery-unrelated-generation", "recovery_mismatch", "corruption"),
+    ("autosave-recovery-unrelated-generation", "recovery_mismatch", "corruption"),
+    ("generation-byte-flip", "generation_digest", "corruption"),
+    ("generation-unknown-field", "unknown_field", "corruption"),
+    ("generation-project-mismatch", "project_mismatch", "corruption"),
+    ("revision-above-high-water", "revision_invalid", "corruption"),
+    ("direct-object-missing", "missing_object", "corruption"),
+    ("page-truncated", "object_digest", "corruption"),
+    ("page-reordered", "page_order", "corruption"),
+    ("page-substituted", "page_substitution", "corruption"),
+    ("scientific-rebind", "scientific_rebind", "corruption"),
 ]
 
 
@@ -707,7 +707,13 @@ def validate_manifest_document(manifest: dict[str, Any], manifest_path: Path, ma
         row = manifest.get("lineages", {}).get(lineage, {})
         relative = checked_repository_path(row.get("path"), f"{lineage} path")
         require(sha256_file(ROOT / relative) == row.get("sha256"), "manifest", f"{lineage} digest")
-    mutation_facts = [(row.get("id"), row.get("expected_fault")) for row in manifest.get("mutations", [])]
+    for row in manifest.get("mutations", []):
+        exact_keys(row, {"expected_fault", "expected_public_fault", "id", "store"}, "manifest mutation")
+        require(row.get("store") == "recoverable.m4dproj", "manifest", "mutation store")
+    mutation_facts = [
+        (row.get("id"), row.get("expected_fault"), row.get("expected_public_fault"))
+        for row in manifest.get("mutations", [])
+    ]
     require(mutation_facts == EXPECTED_MUTATIONS, "manifest", "mutation inventory")
     archive_row = manifest["archive"]
     archive_path = resolve_archive(manifest_path, archive_row["path"])
@@ -801,14 +807,12 @@ def validate_recovery_ahead_state(
     validate_store(files, facts)
 
 
-def reseal_orphan(files: dict[str, bytes], expected: dict[str, Any], mutate: Any) -> tuple[str, dict[str, Any]]:
-    old = expected["recovery_candidates"][0]
+def reseal_generation(files: dict[str, bytes], old: str, mutate: Any) -> tuple[str, dict[str, Any]]:
     path = generation_path(old)
     value = decode_json(files[path], "invalid_json", path)
     mutate(value)
     encoded = canonical_json(value)
     new = generation_identity(encoded)
-    del files[path]
     files[generation_path(new)] = encoded
     return new, value
 
@@ -817,8 +821,8 @@ def paged_artifact(value: dict[str, Any]) -> dict[str, Any]:
     return next(artifact for artifact in value["artifacts"] if artifact["storage"]["kind"] == "paged")
 
 
-def mutate_binding(files: dict[str, bytes], expected: dict[str, Any], operation: str) -> None:
-    old = expected["recovery_candidates"][0]
+def mutate_binding(files: dict[str, bytes], expected: dict[str, Any], operation: str) -> str:
+    old = expected["head"]
     generation = decode_json(files[generation_path(old)], "invalid_json", "orphan")
     artifact = paged_artifact(generation)
     old_descriptor = artifact["storage"]["binding_manifest"]
@@ -842,11 +846,12 @@ def mutate_binding(files: dict[str, bytes], expected: dict[str, Any], operation:
     generation["reachable_objects"].append({"byte_length": new_descriptor["byte_length"], "digest": new_descriptor["digest"]})
     generation["reachable_objects"].sort(key=lambda row: (row["digest"], int(row["byte_length"])))
     encoded = canonical_json(generation)
-    del files[generation_path(old)]
-    files[generation_path(generation_identity(encoded))] = encoded
+    new = generation_identity(encoded)
+    files[generation_path(new)] = encoded
+    return new
 
 
-def run_mutation(base_files: dict[str, bytes], expected: dict[str, Any], mutation: str) -> None:
+def mutated_store(base_files: dict[str, bytes], expected: dict[str, Any], mutation: str) -> dict[str, bytes]:
     files = dict(base_files)
     if mutation == "envelope-noncanonical":
         files["project.json"] += b"\n"
@@ -884,14 +889,17 @@ def run_mutation(base_files: dict[str, bytes], expected: dict[str, Any], mutatio
         value[len(value) // 2] ^= 1
         files[path] = bytes(value)
     elif mutation == "generation-unknown-field":
-        reseal_orphan(files, expected, lambda value: value.__setitem__("unknown", True))
+        new, _ = reseal_generation(files, expected["head"], lambda value: value.__setitem__("unknown", True))
+        files["refs/head"] = reseal_ref_generation(files["refs/head"], new)
     elif mutation == "generation-project-mismatch":
-        reseal_orphan(files, expected, lambda value: value.__setitem__("project_id", "ffffffff-ffff-4fff-8fff-ffffffffffff"))
+        new, _ = reseal_generation(files, expected["head"], lambda value: value.__setitem__("project_id", "ffffffff-ffff-4fff-8fff-ffffffffffff"))
+        files["refs/head"] = reseal_ref_generation(files["refs/head"], new)
     elif mutation == "revision-above-high-water":
         def revision(value: dict[str, Any]) -> None:
             value["revision_sequence"] = "9"
             value["revision_high_water_sequence"] = "8"
-        reseal_orphan(files, expected, revision)
+        new, _ = reseal_generation(files, expected["head"], revision)
+        files["refs/head"] = reseal_ref_generation(files["refs/head"], new)
     elif mutation == "direct-object-missing":
         head = decode_json(files[generation_path(expected["head"])], "invalid_json", "head")
         direct = next(item for item in head["artifacts"] if item["storage"]["kind"] == "direct")
@@ -903,18 +911,46 @@ def run_mutation(base_files: dict[str, bytes], expected: dict[str, Any], mutatio
         path = object_path(binding["pages"][0]["digest"])
         files[path] = files[path][:-1]
     elif mutation == "page-reordered":
-        mutate_binding(files, expected, "reorder")
+        new = mutate_binding(files, expected, "reorder")
+        files["refs/head"] = reseal_ref_generation(files["refs/head"], new)
     elif mutation == "page-substituted":
-        mutate_binding(files, expected, "substitute")
+        new = mutate_binding(files, expected, "substitute")
+        files["refs/head"] = reseal_ref_generation(files["refs/head"], new)
     elif mutation == "scientific-rebind":
         def science(value: dict[str, Any]) -> None:
             original = value["dataset"]["scientific_content_id"]
             final = "0" if original[-1] != "0" else "1"
             value["dataset"]["scientific_content_id"] = original[:-1] + final
-        reseal_orphan(files, expected, science)
+        new, _ = reseal_generation(files, expected["head"], science)
+        files["refs/head"] = reseal_ref_generation(files["refs/head"], new)
     else:
         fail("self_test", f"unknown mutation {mutation}")
+    return files
+
+
+def run_mutation(base_files: dict[str, bytes], expected: dict[str, Any], mutation: str) -> None:
+    files = mutated_store(base_files, expected, mutation)
     validate_store(files, expected)
+
+
+def emit_mutations(manifest_path: Path, output: Path) -> int:
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = decode_json(manifest_bytes[:-1], "manifest", str(manifest_path))
+    require(isinstance(manifest, dict), "manifest", "root")
+    files, stores = validate_manifest_document(manifest, manifest_path, manifest_bytes)
+    split_stores(files, stores)
+    recoverable = store_subset(files, "recoverable.m4dproj")
+    expected = stores[0]
+    require(output.is_dir(), "self_test", "mutation output must be an existing directory")
+    require(not any(output.iterdir()), "self_test", "mutation output must be empty")
+    for mutation, _, _ in EXPECTED_MUTATIONS:
+        case_root = output / mutation / "recoverable.m4dproj"
+        case_root.mkdir(parents=True)
+        for relative, encoded in mutated_store(recoverable, expected, mutation).items():
+            destination = case_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(encoded)
+    return len(EXPECTED_MUTATIONS)
 
 
 def validate_path(manifest_path: Path, self_test: bool) -> dict[str, Any]:
@@ -939,7 +975,7 @@ def validate_path(manifest_path: Path, self_test: bool) -> dict[str, Any]:
         ]:
             validate_recovery_ahead_state(*case)
             recovery_ahead_count += 1
-        for mutation, expected_fault in EXPECTED_MUTATIONS:
+        for mutation, expected_fault, _ in EXPECTED_MUTATIONS:
             try:
                 run_mutation(recoverable, expected, mutation)
             except ValidationError as error:
@@ -968,8 +1004,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--emit-mutations", type=Path)
     args = parser.parse_args()
     try:
+        if args.emit_mutations is not None:
+            count = emit_mutations(args.manifest.resolve(), args.emit_mutations.resolve())
+            print(json.dumps({"emitted_mutations": count, "result": "passed"}, sort_keys=True, separators=(",", ":")))
+            return 0
         result = validate_path(args.manifest.resolve(), args.self_test)
     except (OSError, ValidationError) as error:
         print(f"project fixture validation failed: {error}", file=sys.stderr)

@@ -4,19 +4,12 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use mirante4d_application::{PlaybackFps, SourceSessionGeneration};
 use mirante4d_domain::{LogicalLayerKey, ScaleLevel, TimeIndex, ViewerLayout};
+use mirante4d_render_api::PresentationTargetSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PlaybackTargetSet {
-    ThreeD,
-    FullLayout,
-}
-
-impl From<ViewerLayout> for PlaybackTargetSet {
-    fn from(layout: ViewerLayout) -> Self {
-        match layout {
-            ViewerLayout::Single3d => Self::ThreeD,
-            ViewerLayout::FourPanel => Self::FullLayout,
-        }
+pub(crate) const fn playback_targets_for_layout(layout: ViewerLayout) -> PresentationTargetSet {
+    match layout {
+        ViewerLayout::Single3d => PresentationTargetSet::THREE_D,
+        ViewerLayout::FourPanel => PresentationTargetSet::ALL,
     }
 }
 
@@ -25,7 +18,7 @@ pub(crate) struct PlaybackSessionContract {
     generation: u64,
     source_generation: SourceSessionGeneration,
     fps: PlaybackFps,
-    target_set: PlaybackTargetSet,
+    target_set: PresentationTargetSet,
     layer_scales: Arc<BTreeMap<LogicalLayerKey, ScaleLevel>>,
     slot_count: usize,
     startup_runway: usize,
@@ -42,7 +35,7 @@ pub(crate) struct PlaybackFrameContract {
     session_generation: u64,
     source_generation: SourceSessionGeneration,
     timepoint: TimeIndex,
-    target_set: PlaybackTargetSet,
+    target_set: PresentationTargetSet,
     layer_scales: Arc<BTreeMap<LogicalLayerKey, ScaleLevel>>,
 }
 
@@ -59,7 +52,7 @@ impl PlaybackFrameContract {
         self.timepoint
     }
 
-    pub(crate) const fn target_set(&self) -> PlaybackTargetSet {
+    pub(crate) const fn target_set(&self) -> PresentationTargetSet {
         self.target_set
     }
 
@@ -93,7 +86,7 @@ impl PlaybackSessionContract {
             generation,
             source_generation,
             fps,
-            target_set: layout.into(),
+            target_set: playback_targets_for_layout(layout),
             layer_scales: Arc::new(layer_scales),
             slot_count,
             startup_runway: startup_runway.min(slot_count),
@@ -114,7 +107,7 @@ impl PlaybackSessionContract {
         self.fps
     }
 
-    pub(crate) const fn target_set(&self) -> PlaybackTargetSet {
+    pub(crate) const fn target_set(&self) -> PresentationTargetSet {
         self.target_set
     }
 
@@ -248,7 +241,7 @@ impl PlaybackSession {
             PlaybackSessionState::Contract { contract, .. } => {
                 contract.source_generation() == source_generation
                     && contract.fps() == fps
-                    && contract.target_set() == layout.into()
+                    && contract.target_set() == playback_targets_for_layout(layout)
             }
         };
         if !matches {

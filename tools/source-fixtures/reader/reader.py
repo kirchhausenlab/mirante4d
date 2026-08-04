@@ -63,8 +63,8 @@ def parse_spec(path: Path) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
         rows = list(reader)
     families = [row for row in rows if row["kind"] == "family"]
     files = [row for row in rows if row["kind"] == "file"]
-    if len(families) != 4 or len(files) != 16:
-        raise ValueError("v1 specification must contain four families and sixteen files")
+    if len(families) != 5 or len(files) != 21:
+        raise ValueError("v1 specification must contain five families and twenty-one files")
     if len({row["path"] for row in files}) != len(files):
         raise ValueError("v1 specification contains duplicate paths")
     return families, sorted(files, key=lambda row: row["path"])
@@ -167,12 +167,27 @@ def tag_int(value: Any) -> int:
     return int(value)
 
 
-def frame_bytes(image: Image.Image, dtype: str) -> bytes:
+def frame_bytes(image: Image.Image, dtype: str, byte_order: str) -> bytes:
     raw = image.tobytes()
     expected = image.width * image.height * {"u8": 1, "u16": 2, "u32": 4, "f32": 4}[dtype]
     if len(raw) != expected:
         raise ValueError(f"unexpected decoded byte count {len(raw)}; expected {expected}")
+    if dtype == "u16" and byte_order == "big":
+        raw = b"".join(raw[index : index + 2][::-1] for index in range(0, len(raw), 2))
     return raw
+
+
+def expected_container(row: dict[str, str]) -> tuple[str, int, int, str]:
+    path = row["path"]
+    if row["spec_id"] != "SRC-TIFF-SPEC-005":
+        return "little", 42, 1, "strips"
+    return {
+        "spec-005/uncompressed-big-endian-u16.tif": ("big", 42, 1, "strips"),
+        "spec-005/lzw-u8-striped.tif": ("little", 42, 5, "strips"),
+        "spec-005/deflate-u8-tiled.tif": ("little", 42, 8, "tiles"),
+        "spec-005/old-deflate-u8-striped.tif": ("little", 42, 32946, "strips"),
+        "spec-005/packbits-u8-bigtiff.tif": ("little", 43, 32773, "strips"),
+    }[path]
 
 
 def payload_summary(payload: bytes, dtype: str) -> tuple[Any, Any, str, str]:
@@ -217,8 +232,11 @@ def inspect_file(
     expected_ome: str,
 ) -> tuple[dict[str, Any], bytes]:
     encoded = path.read_bytes()
-    if encoded[:2] != b"II" or encoded[2:4] != b"*\0":
-        raise ValueError("source is not classic little-endian TIFF version 42")
+    byte_order, tiff_version, expected_compression, storage_layout = expected_container(row)
+    expected_marker = b"II" if byte_order == "little" else b"MM"
+    expected_magic = (b"*\0" if byte_order == "little" else b"\0*") if tiff_version == 42 else (b"+\0" if byte_order == "little" else b"\0+")
+    if encoded[:2] != expected_marker or encoded[2:4] != expected_magic:
+        raise ValueError("source TIFF byte order or version differs from specification")
 
     payload = bytearray()
     frame_tags: list[dict[str, Any]] = []
@@ -240,28 +258,35 @@ def inspect_file(
             planar = tag_int(image.tag_v2.get(284, 1))
             bits = tag_int(require_tag(image, 258))
             sample_format = tag_int(image.tag_v2.get(339, 1))
-            rows_per_strip = tag_int(require_tag(image, 278))
             expected_bits, expected_sample_format = {
                 "u8": (8, 1),
                 "u16": (16, 1),
                 "u32": (32, 1),
                 "f32": (32, 3),
             }[row["dtype"]]
-            expected_rows = (
-                int(row["height"])
-                if row["rows_per_strip"] == "full"
-                else int(row["rows_per_strip"])
-            )
-            if (compression, photometric, samples, planar) != (1, 1, 1, 1):
-                raise ValueError("TIFF must be uncompressed one-sample chunky grayscale")
-            if (bits, sample_format, rows_per_strip) != (
-                expected_bits,
-                expected_sample_format,
-                expected_rows,
-            ):
+            if (compression, photometric, samples, planar) != (expected_compression, 1, 1, 1):
+                raise ValueError("TIFF compression or grayscale layout differs from specification")
+            if (bits, sample_format) != (expected_bits, expected_sample_format):
                 raise ValueError(f"dtype/layout tags do not match {row['path']}")
-            strip_offsets = require_tag(image, 273)
-            strip_byte_counts = require_tag(image, 279)
+            if storage_layout == "tiles":
+                tile_width = tag_int(require_tag(image, 322))
+                tile_height = tag_int(require_tag(image, 323))
+                if (tile_width, tile_height) != (16, 16):
+                    raise ValueError("portable tiled fixture must use one 16x16 tile")
+                offsets = require_tag(image, 324)
+                byte_counts = require_tag(image, 325)
+                rows_per_strip = None
+            else:
+                expected_rows = (
+                    int(row["height"])
+                    if row["rows_per_strip"] == "full"
+                    else int(row["rows_per_strip"])
+                )
+                rows_per_strip = tag_int(require_tag(image, 278))
+                if rows_per_strip != expected_rows:
+                    raise ValueError(f"strip layout tags do not match {row['path']}")
+                offsets = require_tag(image, 273)
+                byte_counts = require_tag(image, 279)
             for forbidden in FORBIDDEN_METADATA_TAGS:
                 if image.tag_v2.get(forbidden) is not None:
                     raise ValueError(f"forbidden mutable TIFF metadata tag {forbidden}")
@@ -291,7 +316,7 @@ def inspect_file(
             if row["spec_id"] != "SRC-TIFF-SPEC-001" and resolution_unit not in (None, 1):
                 raise ValueError("non-OME source unexpectedly declares physical resolution")
 
-            payload.extend(frame_bytes(image, row["dtype"]))
+            payload.extend(frame_bytes(image, row["dtype"], byte_order))
             frame_tags.append(
                 {
                     "frame": frame,
@@ -302,8 +327,9 @@ def inspect_file(
                     "samples_per_pixel": samples,
                     "planar_configuration": planar,
                     "rows_per_strip": rows_per_strip,
-                    "strip_offsets": strip_offsets,
-                    "strip_byte_counts": strip_byte_counts,
+                    "storage_layout": storage_layout,
+                    "data_offsets": offsets,
+                    "data_byte_counts": byte_counts,
                     "image_description": description is not None,
                 }
             )
@@ -313,8 +339,10 @@ def inspect_file(
         "path": row["path"],
         "specification_id": row["spec_id"],
         "expected_class": row["expected_class"],
-        "byte_order": "little",
-        "tiff_version": 42,
+        "byte_order": byte_order,
+        "tiff_version": tiff_version,
+        "compression": expected_compression,
+        "storage_layout": storage_layout,
         "dtype": row["dtype"],
         "width": int(row["width"]),
         "height": int(row["height"]),

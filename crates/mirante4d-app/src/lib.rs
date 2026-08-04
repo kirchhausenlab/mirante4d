@@ -33,6 +33,7 @@ mod native_presentation;
 mod package_integrity_audit_service;
 mod playback;
 mod playback_session;
+mod presentation_observer;
 mod presentation_scheduler;
 mod process_termination;
 mod product_automation;
@@ -90,7 +91,7 @@ use mirante4d_application::{
     viewport_interaction::default_camera_for_shape,
 };
 pub use mirante4d_application::{
-    CoordinatedPresentationGroup, CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
+    CrossSectionPanelScheduleReason, CrossSectionPanelScheduleState,
     CrossSectionPanelScheduleStatus, DisplayedFrameFreshness, FrameCompleteness, FrameFailureKind,
     FrameFidelityStatus, LodDecisionReason, RenderBackend,
 };
@@ -117,10 +118,11 @@ use mirante4d_project_store::{
     ProjectGenerationId, ProjectOpenMode, ProjectRecoveryCandidate, ProjectStoreConfig,
     ProjectStoreFault, ProjectStorePath, ProjectStoreRequestId,
 };
-use mirante4d_render_api::PresentationViewport;
+use mirante4d_render_api::{PresentationTargetSet, PresentationViewport};
 use mirante4d_render_wgpu::{RendererEvent, WgpuRenderRuntime, WgpuRenderRuntimeConfig};
 use mirante4d_settings::{RejectedFileDisposition, ResourcePolicy, recommended_for_current_system};
 use mirante4d_ui_egui as ui_kit;
+pub use presentation_observer::{PreparedPresentationObserver, prepare_presentation_observer};
 pub use process_termination::ProcessTerminationLatch;
 use product_automation::ProductAutomationController;
 pub use smoke::{AppSmokeOptions, AppSmokeReport, PlaybackSmokeFrame, run_headless_smoke};
@@ -3221,13 +3223,18 @@ impl MiranteWorkbenchApp {
                 && (previous_view.layout() == CanonicalViewerLayout::FourPanel
                     || next_view.layout() == CanonicalViewerLayout::FourPanel);
         if volume_render_changed || linked_runtime_changed {
-            let required_group = match (volume_render_changed, linked_runtime_changed) {
-                (true, true) => CoordinatedPresentationGroup::FullLayout,
-                (true, false) => CoordinatedPresentationGroup::ThreeD,
-                (false, true) => CoordinatedPresentationGroup::Linked2d,
-                (false, false) => unreachable!("a display input requires an affected group"),
+            let dependencies = match (volume_render_changed, linked_runtime_changed) {
+                (true, true) => PresentationTargetSet::ALL,
+                (true, false) => PresentationTargetSet::THREE_D,
+                (false, true) => PresentationTargetSet::LINKED_CROSS_SECTIONS,
+                (false, false) => unreachable!("a display input requires affected targets"),
             };
-            self.begin_display_input_generation(required_group);
+            let required_targets =
+                presentation_scheduler::active_targets_for_layout(next_view.layout())
+                    .intersection(dependencies);
+            if !required_targets.is_empty() {
+                self.begin_display_input_generation(required_targets);
+            }
         }
         if previous_view == next_view {
             self.request_visible_bricks();
@@ -3315,12 +3322,12 @@ impl MiranteWorkbenchApp {
 
     pub(crate) fn begin_display_input_generation(
         &mut self,
-        required_group: CoordinatedPresentationGroup,
+        required_targets: PresentationTargetSet,
     ) {
         let now_ns = self.display_instrumentation_now_ns();
         let generation = self
             .render_coordination
-            .begin_display_input_generation(now_ns, required_group);
+            .begin_display_input_generation(now_ns, required_targets);
         self.display_performance_milestones
             .begin_generation(generation);
     }
@@ -3344,13 +3351,7 @@ impl MiranteWorkbenchApp {
                 .all(|layer| {
                     layer.current && layer.available_requirements == layer.total_requirements
                 });
-        let linked_2d_current = [
-            PresentationSlot::Xy,
-            PresentationSlot::Xz,
-            PresentationSlot::Yz,
-        ]
-        .into_iter()
-        .all(|slot| {
+        let cross_section_current = |slot| {
             let surface = self.render_coordination.surface(slot);
             surface.display_current()
                 && demand_currentness.cross_section(PanelId::from_presentation_slot(slot))
@@ -3364,20 +3365,24 @@ impl MiranteWorkbenchApp {
                 && surface.layer_presentations().iter().all(|layer| {
                     layer.current && layer.available_requirements == layer.total_requirements
                 })
-        });
-        let full_layout_current = match view.layout() {
-            CanonicalViewerLayout::Single3d => three_d_current,
-            CanonicalViewerLayout::FourPanel => three_d_current && linked_2d_current,
         };
-        let group_current = match self
-            .render_coordination
-            .required_coordinated_presentation_group()
-        {
-            CoordinatedPresentationGroup::ThreeD => three_d_current,
-            CoordinatedPresentationGroup::Linked2d => linked_2d_current,
-            CoordinatedPresentationGroup::FullLayout => full_layout_current,
+        let active_targets = presentation_scheduler::active_targets_for_layout(view.layout());
+        let targets_current = |targets: PresentationTargetSet| {
+            targets.iter().all(|target| {
+                if target == PresentationSlot::ThreeD {
+                    three_d_current
+                } else {
+                    cross_section_current(target)
+                }
+            })
         };
-        if group_current {
+        let required_current = targets_current(
+            self.render_coordination
+                .required_coordinated_presentation_targets()
+                .intersection(active_targets),
+        );
+        let full_layout_current = targets_current(active_targets);
+        if required_current {
             let now_ns = self.display_instrumentation_now_ns();
             self.render_coordination
                 .record_current_group_presentation(now_ns);

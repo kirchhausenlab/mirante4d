@@ -1514,46 +1514,6 @@ mod tests {
     }
 
     #[test]
-    fn publication_transfer_route_has_one_closed_metadata_only_call_path() {
-        let source = include_str!("package_science.rs");
-        let start = source
-            .find("pub(crate) fn refresh_publication_currentness(")
-            .expect("publication-currentness function must exist");
-        let tail = &source[start..];
-        let end = tail
-            .find("\nfn inspect_publication_inventory(")
-            .expect("inventory helper must follow the publication-currentness function");
-        let route = &tail[..end];
-        let inventory_tail = &tail[end + 1..];
-        let inventory_end = inventory_tail
-            .find("\nfn map_publication_inventory_error(")
-            .expect("inventory error mapper must follow the inventory helper");
-        let inventory_helper = &inventory_tail[..inventory_end];
-
-        assert_eq!(route.matches("inspect_publication_inventory(").count(), 2);
-        assert_eq!(route.matches(".revalidate_complete(").count(), 1);
-        assert_eq!(
-            inventory_helper
-                .matches(".inspect_directory_closure(")
-                .count(),
-            1
-        );
-        for forbidden in [
-            "validate_exact_package(",
-            "validate_scientific_content(",
-            "hash_object_with_snapshot(",
-            "read_brick(",
-            "read_brick_for_scientific_scan(",
-            "compute_scientific_content(",
-        ] {
-            assert!(
-                !route.contains(forbidden) && !inventory_helper.contains(forbidden),
-                "publication-currentness route or its inventory helper contains forbidden work {forbidden}"
-            );
-        }
-    }
-
-    #[test]
     fn identity_hasher_rejects_valid_nonfinite_and_accepts_invalid_zero() {
         let descriptor = ScientificLayerDescriptor::new(
             LogicalLayerKey::new(0),

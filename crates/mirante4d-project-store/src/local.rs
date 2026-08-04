@@ -35,7 +35,7 @@ use rustix::{
 use thiserror::Error;
 
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
+use std::sync::{Mutex, OnceLock, atomic::AtomicUsize};
 
 use crate::{
     ProjectGenerationId, ProjectStoreLimits, ProjectStorePath,
@@ -206,6 +206,48 @@ enum ImmutableWriteMode {
     Normal,
     #[cfg(test)]
     InjectStorageFull,
+    #[cfg(test)]
+    InjectReadOnly,
+    #[cfg(test)]
+    InjectShortWrites {
+        maximum: usize,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TestImmutableWriteBehavior {
+    StorageFull,
+    ReadOnly,
+    ShortWrites { maximum: usize },
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestImmutableWriteInjection {
+    root: DirectoryIdentity,
+    behavior: TestImmutableWriteBehavior,
+}
+
+#[cfg(test)]
+pub(crate) struct TestImmutableWriteGuard {
+    root: DirectoryIdentity,
+}
+
+#[cfg(test)]
+impl Drop for TestImmutableWriteGuard {
+    fn drop(&mut self) {
+        test_immutable_write_injections()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|injection| injection.root != self.root);
+    }
+}
+
+#[cfg(test)]
+fn test_immutable_write_injections() -> &'static Mutex<Vec<TestImmutableWriteInjection>> {
+    static INJECTIONS: OnceLock<Mutex<Vec<TestImmutableWriteInjection>>> = OnceLock::new();
+    INJECTIONS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -585,6 +627,39 @@ impl LocalStoreRoot {
 
     pub(crate) const fn descriptor(&self) -> &OwnedFd {
         &self.root
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_next_immutable_write(
+        &self,
+        behavior: TestImmutableWriteBehavior,
+    ) -> TestImmutableWriteGuard {
+        if let TestImmutableWriteBehavior::ShortWrites { maximum } = behavior {
+            assert!(maximum > 0, "short-write injection must make progress");
+        }
+        let root = DirectoryIdentity::from_stat(fstat(&self.root).unwrap())
+            .expect("test injection root must remain a directory");
+        let mut injections = test_immutable_write_injections()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            injections.iter().all(|injection| injection.root != root),
+            "test root already has an immutable-write injection"
+        );
+        injections.push(TestImmutableWriteInjection { root, behavior });
+        TestImmutableWriteGuard { root }
+    }
+
+    #[cfg(test)]
+    fn take_immutable_write_injection(&self) -> Option<TestImmutableWriteBehavior> {
+        let root = DirectoryIdentity::from_stat(fstat(&self.root).ok()?).ok()?;
+        let mut injections = test_immutable_write_injections()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index = injections
+            .iter()
+            .position(|injection| injection.root == root)?;
+        Some(injections.remove(index).behavior)
     }
 
     /// Re-establishes destination-parent durability for an already visible
@@ -2566,6 +2641,20 @@ impl LocalStoreRoot {
             TransitionPoint::new(kind.write()),
             "write a staged immutable file",
         )?;
+        #[cfg(test)]
+        let write_mode = match write_mode {
+            ImmutableWriteMode::Normal => match self.take_immutable_write_injection() {
+                Some(TestImmutableWriteBehavior::StorageFull) => {
+                    ImmutableWriteMode::InjectStorageFull
+                }
+                Some(TestImmutableWriteBehavior::ReadOnly) => ImmutableWriteMode::InjectReadOnly,
+                Some(TestImmutableWriteBehavior::ShortWrites { maximum }) => {
+                    ImmutableWriteMode::InjectShortWrites { maximum }
+                }
+                None => ImmutableWriteMode::Normal,
+            },
+            injected => injected,
+        };
         let facts = match write_mode {
             ImmutableWriteMode::Normal => match source_extent {
                 SourceExtent::Complete => write_exact_source(
@@ -2584,6 +2673,31 @@ impl LocalStoreRoot {
             #[cfg(test)]
             ImmutableWriteMode::InjectStorageFull => {
                 return Err(io_error("write a staged immutable file", Errno::NOSPC));
+            }
+            #[cfg(test)]
+            ImmutableWriteMode::InjectReadOnly => {
+                return Err(io_error("write a staged immutable file", Errno::ROFS));
+            }
+            #[cfg(test)]
+            ImmutableWriteMode::InjectShortWrites { maximum } => {
+                let mut writer = ProgressLimitedWriter {
+                    inner: &mut staged_file,
+                    maximum,
+                };
+                match source_extent {
+                    SourceExtent::Complete => write_exact_source(
+                        &mut writer,
+                        source,
+                        expected.byte_length,
+                        &mut is_cancelled,
+                    )?,
+                    SourceExtent::Segment => write_exact_segment(
+                        &mut writer,
+                        source,
+                        expected.byte_length,
+                        &mut is_cancelled,
+                    )?,
+                }
             }
         };
         lifecycle_after(write, "write a staged immutable file")?;
@@ -3622,13 +3736,14 @@ impl FileIdentity {
     }
 }
 
-fn write_exact_source<R, C>(
-    file: &mut File,
+fn write_exact_source<W, R, C>(
+    file: &mut W,
     source: &mut R,
     expected_bytes: u64,
     is_cancelled: &mut C,
 ) -> Result<ExactBytesFacts, LocalPublicationError>
 where
+    W: Write + ?Sized,
     R: Read + ?Sized,
     C: FnMut() -> bool,
 {
@@ -3677,19 +3792,37 @@ where
         })
 }
 
-fn write_exact_segment<R, C>(
-    file: &mut File,
+fn write_exact_segment<W, R, C>(
+    file: &mut W,
     source: &mut R,
     expected_bytes: u64,
     is_cancelled: &mut C,
 ) -> Result<ExactBytesFacts, LocalPublicationError>
 where
+    W: Write + ?Sized,
     R: Read + ?Sized,
     C: FnMut() -> bool,
 {
     consume_declared_segment(source, expected_bytes, is_cancelled, |bytes| {
         write_all_classified(file, bytes, "write a staged immutable file segment")
     })
+}
+
+#[cfg(test)]
+struct ProgressLimitedWriter<'a> {
+    inner: &'a mut File,
+    maximum: usize,
+}
+
+#[cfg(test)]
+impl Write for ProgressLimitedWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.inner.write(&bytes[..bytes.len().min(self.maximum)])
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 pub(crate) fn write_all_classified<W>(

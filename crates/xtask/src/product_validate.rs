@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     os::unix::{ffi::OsStrExt, fs::MetadataExt, process::ExitStatusExt},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,7 +21,8 @@ use crate::{
     },
     product_automation_progress::{
         FILE_POLL_INTERVAL, ProductAutomationProgressLaunch, ProductAutomationProgressPlan,
-        ProgressMonitorAction, safe_automation_progress_line,
+        ProgressMonitorAction, SafeProgressSnapshot, SafeProgressState,
+        safe_automation_progress_line,
     },
     reports::{read_json_file, write_json_file},
     target_fixture::extract_target_u16_fixture,
@@ -30,7 +31,7 @@ use crate::{
 const PRODUCT_VALIDATION_SCHEMA: &str = "mirante4d-product-validation-report";
 pub(crate) const PRODUCT_AUTOMATION_SCRIPT_SCHEMA: &str = "mirante4d-product-automation-script";
 pub(crate) const PRODUCT_AUTOMATION_REPORT_SCHEMA: &str = "mirante4d-product-automation-report";
-pub(crate) const SCRIPT_SCHEMA_VERSION: u32 = 10;
+pub(crate) const SCRIPT_SCHEMA_VERSION: u32 = 11;
 pub(crate) const REPORT_SCHEMA_VERSION: u32 = 9;
 pub(crate) const IMPORT_OPEN_READY_COMPLETE_STATUS: &str = "open_ready_complete";
 pub(crate) const PRODUCT_AUTOMATION_HARD_SAFETY_LIMIT_FIELDS: [&str; 12] = [
@@ -51,6 +52,7 @@ const PRODUCT_VALIDATION_SCHEMA_VERSION: u32 = 2;
 const PUBLICATION_CURRENTNESS_CONTRACT_ID: &str =
     "mirante4d-publication-currentness-inventory-snapshot-inventory-1";
 const OUTPUT_DIR: &str = "target/mirante4d/product-validation";
+const OUTPUT_DIR_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_OUTPUT_DIR";
 const TIMEOUT_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_TIMEOUT_SECS";
 const ALLOW_NO_DISPLAY_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_ALLOW_NO_DISPLAY";
 const SKIP_RELEASE_BUILD_ENV: &str = "MIRANTE4D_PRODUCT_VALIDATE_SKIP_RELEASE_BUILD";
@@ -62,6 +64,10 @@ const GENERATED_FIXTURE_SCENARIO: &str = "target_fixture_camera_smoke";
 const GENERATED_RENDER_MODES_SCENARIO: &str = "target_fixture_render_modes";
 const REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO: &str = "representative_native_navigation";
 const REPRESENTATIVE_TEMPORAL_PLAYBACK_SCENARIO: &str = "representative_temporal_playback";
+const REPRESENTATIVE_GPU_INTERACTION_SCENARIO: &str = "representative_gpu_interaction";
+const REPRESENTATIVE_GPU_PRESENTATION_PROBE_SCENARIO: &str =
+    "representative_gpu_presentation_probe";
+const PRESENTATION_OBSERVER_REPORT_ENV: &str = "MIRANTE4D_PRESENTATION_OBSERVER_REPORT";
 const B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO: &str = "target_package_integrity_audit";
 const IMPORT_PREPROCESSING_SCENARIO: &str = "import_preprocessing";
 const B4_PROJECT_PERSISTENCE_SCENARIO: &str = "b4_project_persistence";
@@ -118,6 +124,8 @@ const X11_AUTOMATION_OUTPUT_POLICY: BoundedOutputPolicy = BoundedOutputPolicy {
     max_stdout_bytes: 64 * 1024,
     max_stderr_bytes: 64 * 1024,
 };
+const PRESENTATION_PROBE_MINIMIZED_HOLD: Duration = Duration::from_millis(250);
+const PRESENTATION_PROBE_WINDOW_CONTROL_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceClosureSnapshot {
@@ -308,6 +316,7 @@ pub(crate) fn product_validate_report_with_scenario(
     package: Option<&Path>,
     scenario: Option<&str>,
 ) -> anyhow::Result<ProductValidationOutcome> {
+    validate_product_validation_output_root()?;
     let scenario =
         ProductValidationScenario::resolve(scenario, env::var(SCENARIO_ENV).ok().as_deref())?;
     product_validate_report_inner(package, &scenario)
@@ -481,6 +490,10 @@ fn product_validate_report_inner(
         scenario: scenario.name(),
         progress_plan: ProductAutomationProgressPlan::from_script(&script)?,
         progress_launch: ProductAutomationProgressLaunch::new_replacing_stale(&progress_root)?,
+        external_control: ProductAutomationExternalControlPlan::from_script(
+            scenario.name(),
+            &script,
+        )?,
     })?;
     let source_closure_evidence = source_closure_before
         .as_ref()
@@ -493,14 +506,28 @@ fn product_validate_report_inner(
         .and_then(Value::as_bool)
         == Some(false);
 
-    if let Some(progress_failure) = status.progress_failure_reason {
+    if status.progress_failure_reason.is_some() || status.external_control_failure_reason.is_some()
+    {
+        let failure_reason = match (
+            status.progress_failure_reason,
+            status.external_control_failure_reason.as_deref(),
+        ) {
+            (Some(progress_failure), Some(control_failure)) => format!(
+                "native app automation progress protocol failed: {progress_failure}; external window control failed: {control_failure}"
+            ),
+            (Some(progress_failure), None) => {
+                format!("native app automation progress protocol failed: {progress_failure}")
+            }
+            (None, Some(control_failure)) => {
+                format!("external window control failed: {control_failure}")
+            }
+            (None, None) => unreachable!("guard requires at least one process control failure"),
+        };
         write_wrapper_report(WrapperReport {
             path: &wrapper_report_path,
             scenario_name: scenario.name(),
             status: ProductValidationStatus::Failed,
-            failure_reason: Some(format!(
-                "native app automation progress protocol failed: {progress_failure}"
-            )),
+            failure_reason: Some(failure_reason),
             started_at_epoch_ms,
             duration_ms: duration_ms(started_at.elapsed()),
             timeout_secs: timeout_seconds,
@@ -655,6 +682,8 @@ enum ProductValidationScenario {
     GeneratedFixtureRenderModes,
     RepresentativeNativeNavigation,
     RepresentativeTemporalPlayback,
+    RepresentativeGpuInteraction,
+    RepresentativeGpuPresentationProbe,
     B3PackageIntegrityAudit,
     ImportPreprocessing,
     B4ProjectPersistence,
@@ -668,6 +697,10 @@ impl ProductValidationScenario {
             Self::GeneratedFixtureRenderModes => GENERATED_RENDER_MODES_SCENARIO,
             Self::RepresentativeNativeNavigation => REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO,
             Self::RepresentativeTemporalPlayback => REPRESENTATIVE_TEMPORAL_PLAYBACK_SCENARIO,
+            Self::RepresentativeGpuInteraction => REPRESENTATIVE_GPU_INTERACTION_SCENARIO,
+            Self::RepresentativeGpuPresentationProbe => {
+                REPRESENTATIVE_GPU_PRESENTATION_PROBE_SCENARIO
+            }
             Self::B3PackageIntegrityAudit => B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO,
             Self::ImportPreprocessing => IMPORT_PREPROCESSING_SCENARIO,
             Self::B4ProjectPersistence => B4_PROJECT_PERSISTENCE_SCENARIO,
@@ -682,6 +715,10 @@ impl ProductValidationScenario {
             GENERATED_RENDER_MODES_SCENARIO => Ok(Self::GeneratedFixtureRenderModes),
             REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO => Ok(Self::RepresentativeNativeNavigation),
             REPRESENTATIVE_TEMPORAL_PLAYBACK_SCENARIO => Ok(Self::RepresentativeTemporalPlayback),
+            REPRESENTATIVE_GPU_INTERACTION_SCENARIO => Ok(Self::RepresentativeGpuInteraction),
+            REPRESENTATIVE_GPU_PRESENTATION_PROBE_SCENARIO => {
+                Ok(Self::RepresentativeGpuPresentationProbe)
+            }
             B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO => Ok(Self::B3PackageIntegrityAudit),
             IMPORT_PREPROCESSING_SCENARIO => Ok(Self::ImportPreprocessing),
             B4_PROJECT_PERSISTENCE_SCENARIO => Ok(Self::B4ProjectPersistence),
@@ -691,6 +728,8 @@ impl ProductValidationScenario {
                  {GENERATED_FIXTURE_SCENARIO}, {GENERATED_RENDER_MODES_SCENARIO}, \
                  {REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO}, \
                  {REPRESENTATIVE_TEMPORAL_PLAYBACK_SCENARIO}, \
+                 {REPRESENTATIVE_GPU_INTERACTION_SCENARIO}, \
+                 {REPRESENTATIVE_GPU_PRESENTATION_PROBE_SCENARIO}, \
                  {B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO}, {IMPORT_PREPROCESSING_SCENARIO}, or \
                  {B4_PROJECT_PERSISTENCE_SCENARIO}, or {PRE_ALPHA_RELIABILITY_SCENARIO}"
             ),
@@ -704,6 +743,8 @@ impl ProductValidationScenario {
                 | GENERATED_RENDER_MODES_SCENARIO
                 | REPRESENTATIVE_NATIVE_NAVIGATION_SCENARIO
                 | REPRESENTATIVE_TEMPORAL_PLAYBACK_SCENARIO
+                | REPRESENTATIVE_GPU_INTERACTION_SCENARIO
+                | REPRESENTATIVE_GPU_PRESENTATION_PROBE_SCENARIO
                 | B3_PACKAGE_INTEGRITY_AUDIT_SCENARIO
                 | IMPORT_PREPROCESSING_SCENARIO
                 | B4_PROJECT_PERSISTENCE_SCENARIO
@@ -716,6 +757,8 @@ impl ProductValidationScenario {
             Self::GeneratedFixtureCameraSmoke | Self::GeneratedFixtureRenderModes => 60,
             Self::RepresentativeNativeNavigation => B3_SCENARIO_TIMEOUT_SECS,
             Self::RepresentativeTemporalPlayback => B3_SCENARIO_TIMEOUT_SECS,
+            Self::RepresentativeGpuInteraction => 15 * 60,
+            Self::RepresentativeGpuPresentationProbe => B3_SCENARIO_TIMEOUT_SECS,
             Self::B3PackageIntegrityAudit => B3_SCENARIO_TIMEOUT_SECS,
             Self::ImportPreprocessing => IMPORT_SCENARIO_TIMEOUT_SECS,
             Self::B4ProjectPersistence => B4_PHASE_TIMEOUT_SECS * 3,
@@ -725,7 +768,33 @@ impl ProductValidationScenario {
 }
 
 fn product_validation_output_dir(scenario: &ProductValidationScenario) -> PathBuf {
-    Path::new(OUTPUT_DIR).join(scenario.name())
+    env::var_os(OUTPUT_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(OUTPUT_DIR))
+        .join(scenario.name())
+}
+
+fn validate_product_validation_output_root() -> anyhow::Result<()> {
+    let Some(path) = env::var_os(OUTPUT_DIR_ENV).map(PathBuf::from) else {
+        return Ok(());
+    };
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            !matches!(
+                component,
+                Component::RootDir | Component::Normal(_) | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("{OUTPUT_DIR_ENV} must be an absolute path containing only normal components");
+    }
+    if path.exists() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            bail!("{OUTPUT_DIR_ENV} must name a real directory when it exists");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1973,6 +2042,22 @@ fn product_validation_package_and_script(
             let script = representative_temporal_playback_script(&package);
             Ok((package, script, None))
         }
+        ProductValidationScenario::RepresentativeGpuInteraction => {
+            let package = package
+                .context("representative_gpu_interaction requires an explicit target package")?
+                .to_path_buf();
+            let script = representative_gpu_interaction_script(&package);
+            Ok((package, script, None))
+        }
+        ProductValidationScenario::RepresentativeGpuPresentationProbe => {
+            let package = package
+                .context(
+                    "representative_gpu_presentation_probe requires an explicit target package",
+                )?
+                .to_path_buf();
+            let script = representative_gpu_presentation_probe_script(&package);
+            Ok((package, script, None))
+        }
         ProductValidationScenario::B3PackageIntegrityAudit => {
             let package = match package {
                 Some(package) => package.to_path_buf(),
@@ -2245,6 +2330,157 @@ fn representative_native_navigation_script(package: &Path) -> Value {
         .expect("the representative script has commands")
         .extend(iso_and_tail);
     script
+}
+
+pub(crate) fn representative_gpu_interaction_script(package: &Path) -> Value {
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": REPRESENTATIVE_GPU_INTERACTION_SCENARIO,
+        "gpu_timing": true,
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(4_096 * MIB, 16_384),
+        "commands": [
+            { "command": "set_gpu_performance_phase", "phase": "startup" },
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
+            { "command": "set_mapped_client_pixels", "width": 1920, "height": 1080 },
+            { "command": "set_viewer_layout", "layout": "single3d" },
+            { "command": "set_render_mode", "mode": "mip" },
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "voxel_exact" },
+            { "command": "camera_fit_data" },
+            { "command": "wait_for", "condition": "first_frame", "timeout_ms": 120000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "copy_diagnostics", "checkpoint": "resident_standalone_before" },
+
+            { "command": "set_gpu_performance_phase", "phase": "standalone_interaction" },
+            { "command": "camera_orbit_sequence", "samples": 900, "duration_ms": 15000, "yaw_points_per_sample": 0.20, "pitch_points_per_sample": 0.05 },
+            { "command": "camera_zoom_sequence", "samples": 900, "duration_ms": 15000, "scroll_y_points_per_sample": -0.08 },
+            { "command": "set_gpu_performance_phase", "phase": "resident_settlement" },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 120000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "copy_diagnostics", "checkpoint": "resident_standalone_after" },
+
+            { "command": "set_viewer_layout", "layout": "four_panel" },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "copy_diagnostics", "checkpoint": "resident_four_panel_before" },
+            { "command": "set_gpu_performance_phase", "phase": "four_panel_interaction" },
+            { "command": "cross_section_pan_sequence", "panel": "xy", "samples": 900, "duration_ms": 15000, "x_points_per_sample": 0.08, "y_points_per_sample": -0.04 },
+            { "command": "cross_section_rotate_sequence", "panel": "xy", "samples": 900, "duration_ms": 15000, "x_points_per_sample": 0.08, "y_points_per_sample": 0.04, "radians_per_point": 0.0025 },
+            { "command": "set_gpu_performance_phase", "phase": "resident_settlement" },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "assert", "condition": { "four_panel_images_distinct": { "min_different_pixels": 1 } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "copy_diagnostics", "checkpoint": "resident_four_panel_after" },
+
+            { "command": "copy_diagnostics", "checkpoint": "prepared_nonresident_before" },
+            { "command": "set_gpu_performance_phase", "phase": "prepared_nonresident_replacement" },
+            { "command": "camera_zoom", "scroll_y_points": -480.0 },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 120000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "copy_diagnostics", "checkpoint": "prepared_nonresident_after" },
+
+            { "command": "set_gpu_performance_phase", "phase": "mode_sampling_matrix" },
+            { "command": "set_render_mode", "mode": "mip" },
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "voxel_exact" },
+            { "command": "camera_orbit_sequence", "samples": 30, "duration_ms": 500, "yaw_points_per_sample": 0.4, "pitch_points_per_sample": 0.1 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "smooth_linear" },
+            { "command": "camera_orbit_sequence", "samples": 30, "duration_ms": 500, "yaw_points_per_sample": -0.4, "pitch_points_per_sample": 0.1 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "set_render_mode", "mode": "dvr" },
+            { "command": "set_dvr_density_scale", "density_scale": 12.0 },
+            { "command": "camera_orbit_sequence", "samples": 30, "duration_ms": 500, "yaw_points_per_sample": 0.4, "pitch_points_per_sample": -0.1 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "voxel_exact" },
+            { "command": "camera_orbit_sequence", "samples": 30, "duration_ms": 500, "yaw_points_per_sample": -0.4, "pitch_points_per_sample": -0.1 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "set_render_mode", "mode": "iso" },
+            { "command": "set_iso_display_level", "display_level": 0.5 },
+            { "command": "set_layer_iso_shading", "layer_index": 0, "shading": "gradient_lighting" },
+            { "command": "camera_orbit_sequence", "samples": 30, "duration_ms": 500, "yaw_points_per_sample": 0.4, "pitch_points_per_sample": 0.1 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "smooth_linear" },
+            { "command": "camera_orbit_sequence", "samples": 30, "duration_ms": 500, "yaw_points_per_sample": -0.4, "pitch_points_per_sample": 0.1 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "set_layer_render_mode", "layer_index": 0, "mode": "mip" },
+            { "command": "set_layer_render_mode", "layer_index": 1, "mode": "iso" },
+            { "command": "camera_orbit_sequence", "samples": 30, "duration_ms": 500, "yaw_points_per_sample": 0.4, "pitch_points_per_sample": -0.1 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "set_active_tool", "tool": "inspect" },
+            { "command": "probe_hover", "x_fraction": 0.5, "y_fraction": 0.5 },
+            { "command": "primary_click", "x_fraction": 0.5, "y_fraction": 0.5 },
+            { "command": "assert", "condition": "no_render_error" },
+
+            { "command": "copy_diagnostics", "checkpoint": "interrupted_refinement_before" },
+            { "command": "set_gpu_performance_phase", "phase": "interrupted_refinement" },
+            { "command": "camera_zoom", "scroll_y_points": 720.0 },
+            { "command": "camera_orbit_sequence", "samples": 120, "duration_ms": 2000, "yaw_points_per_sample": 0.25, "pitch_points_per_sample": 0.05 },
+            { "command": "camera_pan_sequence", "samples": 120, "duration_ms": 2000, "x_points_per_sample": -0.10, "y_points_per_sample": 0.05 },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 120000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "copy_diagnostics", "checkpoint": "interrupted_refinement_after" },
+
+            { "command": "set_gpu_performance_phase", "phase": "settled_idle" },
+            { "command": "wait_for", "condition": "runtime_idle", "timeout_ms": 120000 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "copy_diagnostics", "checkpoint": "settled_idle_before" },
+            { "command": "sleep_frames", "frames": 30 },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "capture_screenshot", "target": "three_d", "name": "gpu-performance-final" },
+            { "command": "copy_diagnostics", "checkpoint": "settled_idle_after" },
+            { "command": "quit" }
+        ]
+    })
+}
+
+pub(crate) fn representative_gpu_presentation_probe_script(package: &Path) -> Value {
+    json!({
+        "schema": PRODUCT_AUTOMATION_SCRIPT_SCHEMA,
+        "schema_version": SCRIPT_SCHEMA_VERSION,
+        "scenario": REPRESENTATIVE_GPU_PRESENTATION_PROBE_SCENARIO,
+        "gpu_timing": false,
+        "hard_safety_limits": dataset_runtime_hard_safety_limits(4_096 * MIB, 16_384),
+        "commands": [
+            { "command": "set_gpu_performance_phase", "phase": "startup" },
+            { "command": "open_dataset", "path": package },
+            { "command": "wait_for", "condition": "window_ready", "timeout_ms": 5000 },
+            { "command": "set_mapped_client_pixels", "width": 1920, "height": 1080 },
+            { "command": "set_render_target_size", "width": 1920, "height": 1080 },
+            { "command": "set_render_mode", "mode": "mip" },
+            { "command": "set_layer_sampling", "layer_index": 0, "sampling": "voxel_exact" },
+            { "command": "camera_fit_data" },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "sleep_frames", "frames": 12 },
+
+            { "command": "set_render_target_size", "width": 1600, "height": 900 },
+            { "command": "set_mapped_client_pixels", "width": 1600, "height": 900 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "sleep_frames", "frames": 6 },
+
+            { "command": "set_window_minimized", "minimized": true },
+            { "command": "camera_orbit", "yaw_points": 12.0, "pitch_points": 3.0 },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 120000 },
+            { "command": "camera_orbit", "yaw_points": 12.0, "pitch_points": -3.0 },
+            { "command": "wait_for", "condition": "frame_freshness_current", "timeout_ms": 120000 },
+            { "command": "sleep_frames", "frames": 6 },
+
+            { "command": "set_render_target_size", "width": 1920, "height": 1080 },
+            { "command": "set_mapped_client_pixels", "width": 1920, "height": 1080 },
+            { "command": "wait_for", "condition": "coordinated_presentation_settled", "timeout_ms": 120000 },
+            { "command": "sleep_frames", "frames": 12 },
+            { "command": "capture_screenshot", "target": "three_d", "name": "presentation-probe-final-1920x1080" },
+            { "command": "assert", "condition": { "nonblank_panel": { "target": "three_d" } } },
+            { "command": "assert", "condition": "no_render_error" },
+            { "command": "copy_diagnostics" },
+            { "command": "quit" }
+        ]
+    })
 }
 
 fn representative_temporal_playback_script(package: &Path) -> Value {
@@ -4893,6 +5129,406 @@ fn validate_pre_alpha_attempts(attempts: &[Value]) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProductAutomationExternalControlPlan {
+    None,
+    PresentationProbe { minimize_command_index: usize },
+}
+
+impl ProductAutomationExternalControlPlan {
+    fn from_script(scenario: &str, script: &Value) -> anyhow::Result<Self> {
+        if scenario != REPRESENTATIVE_GPU_PRESENTATION_PROBE_SCENARIO {
+            return Ok(Self::None);
+        }
+        let commands = script
+            .get("commands")
+            .and_then(Value::as_array)
+            .context("presentation probe script commands are unavailable")?;
+        let mut minimize_command_index = None;
+        for (index, command) in commands.iter().enumerate() {
+            if command.get("command").and_then(Value::as_str) != Some("set_window_minimized") {
+                continue;
+            }
+            match command.get("minimized").and_then(Value::as_bool) {
+                Some(true) if minimize_command_index.replace(index).is_none() => {}
+                Some(true) => bail!("presentation probe requires exactly one minimize request"),
+                Some(false) => bail!(
+                    "presentation probe restoration must be owned by the external X11 controller"
+                ),
+                None => bail!("presentation probe minimize request is malformed"),
+            }
+        }
+        Ok(Self::PresentationProbe {
+            minimize_command_index: minimize_command_index
+                .context("presentation probe requires one minimize request")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct X11ClientWindow {
+    id_hex: String,
+    id_decimal: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum X11ClientWindowDiscovery {
+    Found(X11ClientWindow),
+    NotFound,
+    ListingUnavailable { status: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct X11WindowManagerState {
+    hidden: bool,
+    iconic: bool,
+}
+
+impl X11WindowManagerState {
+    fn minimized(self) -> bool {
+        self.hidden && self.iconic
+    }
+
+    fn restored(self) -> bool {
+        !self.hidden && !self.iconic
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentationProbeWindowPhase {
+    WaitingForMinimizeCommand,
+    WaitingForMinimized { armed_at: Instant },
+    HoldingMinimized { observed_at: Instant },
+    RestoreRequested { requested_at: Instant },
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentationProbeWindowDecision {
+    None,
+    Unmap,
+    Restore,
+}
+
+#[derive(Debug)]
+struct PresentationProbeWindowState {
+    minimize_command_index: usize,
+    phase: PresentationProbeWindowPhase,
+}
+
+impl PresentationProbeWindowState {
+    fn new(minimize_command_index: usize) -> Self {
+        Self {
+            minimize_command_index,
+            phase: PresentationProbeWindowPhase::WaitingForMinimizeCommand,
+        }
+    }
+
+    fn observe_progress(&mut self, snapshot: &SafeProgressSnapshot, now: Instant) {
+        let SafeProgressState::Command { index, .. } = &snapshot.state else {
+            return;
+        };
+        if matches!(
+            self.phase,
+            PresentationProbeWindowPhase::WaitingForMinimizeCommand
+        ) && *index >= self.minimize_command_index
+        {
+            self.phase = PresentationProbeWindowPhase::WaitingForMinimized { armed_at: now };
+        }
+    }
+
+    fn observe_window(
+        &mut self,
+        state: X11WindowManagerState,
+        now: Instant,
+    ) -> PresentationProbeWindowDecision {
+        match self.phase {
+            PresentationProbeWindowPhase::WaitingForMinimizeCommand
+            | PresentationProbeWindowPhase::Complete => PresentationProbeWindowDecision::None,
+            PresentationProbeWindowPhase::WaitingForMinimized { .. } if state.minimized() => {
+                self.phase = PresentationProbeWindowPhase::HoldingMinimized { observed_at: now };
+                PresentationProbeWindowDecision::Unmap
+            }
+            PresentationProbeWindowPhase::HoldingMinimized { observed_at }
+                if now.saturating_duration_since(observed_at)
+                    >= PRESENTATION_PROBE_MINIMIZED_HOLD =>
+            {
+                self.phase = PresentationProbeWindowPhase::RestoreRequested { requested_at: now };
+                PresentationProbeWindowDecision::Restore
+            }
+            PresentationProbeWindowPhase::RestoreRequested { .. } if state.restored() => {
+                self.phase = PresentationProbeWindowPhase::Complete;
+                PresentationProbeWindowDecision::None
+            }
+            _ => PresentationProbeWindowDecision::None,
+        }
+    }
+
+    fn deadline_failure(&self, now: Instant) -> Option<&'static str> {
+        match self.phase {
+            PresentationProbeWindowPhase::WaitingForMinimized { armed_at }
+                if now.saturating_duration_since(armed_at)
+                    >= PRESENTATION_PROBE_WINDOW_CONTROL_TIMEOUT =>
+            {
+                Some("the external controller did not observe the requested minimized window")
+            }
+            PresentationProbeWindowPhase::RestoreRequested { requested_at }
+                if now.saturating_duration_since(requested_at)
+                    >= PRESENTATION_PROBE_WINDOW_CONTROL_TIMEOUT =>
+            {
+                Some("the externally restored window did not return to normal state")
+            }
+            _ => None,
+        }
+    }
+
+    fn finish(&self) -> anyhow::Result<()> {
+        if self.phase != PresentationProbeWindowPhase::Complete {
+            bail!("presentation probe exited before external minimize/unmap/restore completed");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum ProductAutomationExternalControl {
+    None,
+    PresentationProbe {
+        state: PresentationProbeWindowState,
+        window: Option<X11ClientWindow>,
+        last_window_listing_failure: Option<String>,
+    },
+}
+
+impl ProductAutomationExternalControl {
+    fn new(plan: ProductAutomationExternalControlPlan) -> anyhow::Result<Self> {
+        match plan {
+            ProductAutomationExternalControlPlan::None => Ok(Self::None),
+            ProductAutomationExternalControlPlan::PresentationProbe {
+                minimize_command_index,
+            } => {
+                require_presentation_probe_x11_tools()?;
+                Ok(Self::PresentationProbe {
+                    state: PresentationProbeWindowState::new(minimize_command_index),
+                    window: None,
+                    last_window_listing_failure: None,
+                })
+            }
+        }
+    }
+
+    fn observe_progress(&mut self, snapshot: &SafeProgressSnapshot, now: Instant) {
+        if let Self::PresentationProbe { state, .. } = self {
+            state.observe_progress(snapshot, now);
+        }
+    }
+
+    fn poll(&mut self, pid: u32, now: Instant) -> anyhow::Result<()> {
+        let Self::PresentationProbe {
+            state,
+            window,
+            last_window_listing_failure,
+        } = self
+        else {
+            return Ok(());
+        };
+        if let Some(reason) = state.deadline_failure(now) {
+            if let Some(failure) = last_window_listing_failure.as_deref() {
+                bail!("{reason}; most recent wmctrl listing failure: {failure}");
+            }
+            bail!(reason);
+        }
+        if window.is_none() {
+            match find_x11_client_window(pid)? {
+                X11ClientWindowDiscovery::Found(discovered) => {
+                    *window = Some(discovered);
+                    *last_window_listing_failure = None;
+                }
+                X11ClientWindowDiscovery::NotFound => {
+                    *last_window_listing_failure = None;
+                }
+                X11ClientWindowDiscovery::ListingUnavailable { status } => {
+                    *last_window_listing_failure = Some(status);
+                    return Ok(());
+                }
+            }
+        }
+        let Some(window) = window.as_ref() else {
+            return Ok(());
+        };
+        let Some(window_state) = inspect_x11_window_manager_state(window)? else {
+            return Ok(());
+        };
+        match state.observe_window(window_state, now) {
+            PresentationProbeWindowDecision::None => {}
+            PresentationProbeWindowDecision::Unmap => request_x11_window_unmap(window)?,
+            PresentationProbeWindowDecision::Restore => {
+                request_x11_window_restore(window)?;
+                let restored = inspect_x11_window_manager_state(window)?.context(
+                    "restored presentation-probe window disappeared before state confirmation",
+                )?;
+                state.observe_window(restored, Instant::now());
+                if !matches!(state.phase, PresentationProbeWindowPhase::Complete) {
+                    bail!("external X11 restore returned without normal window state");
+                }
+                eprintln!(
+                    "automation_window_control scope=product_validate scenario={} action=minimize_unmap_restore status=completed",
+                    REPRESENTATIVE_GPU_PRESENTATION_PROBE_SCENARIO,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> anyhow::Result<()> {
+        match self {
+            Self::None => Ok(()),
+            Self::PresentationProbe { state, .. } => state.finish(),
+        }
+    }
+}
+
+fn require_presentation_probe_x11_tools() -> anyhow::Result<()> {
+    if env::var_os("DISPLAY").is_none() {
+        bail!("presentation probe external window control requires a real X11 display");
+    }
+    let observer_report = env::var_os(PRESENTATION_OBSERVER_REPORT_ENV)
+        .map(PathBuf::from)
+        .context("presentation probe requires an independent presentation observer report path")?;
+    if !observer_report.is_absolute() {
+        bail!("{PRESENTATION_OBSERVER_REPORT_ENV} must be absolute");
+    }
+    for (program, argument) in [
+        ("xdotool", "version"),
+        ("xprop", "-version"),
+        ("wmctrl", "-h"),
+    ] {
+        let mut command = Command::new(program);
+        command.arg(argument);
+        run_command_with_bounded_output(&mut command, X11_AUTOMATION_OUTPUT_POLICY)
+            .with_context(|| format!("presentation probe requires {program}"))?;
+    }
+    Ok(())
+}
+
+fn find_x11_client_window(pid: u32) -> anyhow::Result<X11ClientWindowDiscovery> {
+    let mut command = Command::new("wmctrl");
+    command.args(["-l", "-p"]);
+    let output = run_command_with_bounded_output(&mut command, X11_AUTOMATION_OUTPUT_POLICY)
+        .context("failed to list X11 client windows")?;
+    classify_wmctrl_client_window_listing(
+        output.status.success(),
+        &output.status.to_string(),
+        &output.stdout,
+        pid,
+    )
+}
+
+fn classify_wmctrl_client_window_listing(
+    status_success: bool,
+    status: &str,
+    stdout: &[u8],
+    pid: u32,
+) -> anyhow::Result<X11ClientWindowDiscovery> {
+    if !status_success {
+        return Ok(X11ClientWindowDiscovery::ListingUnavailable {
+            status: status.to_owned(),
+        });
+    }
+    let encoded = std::str::from_utf8(stdout).context("wmctrl output was not UTF-8")?;
+    Ok(match parse_wmctrl_client_window(encoded, pid)? {
+        Some(window) => X11ClientWindowDiscovery::Found(window),
+        None => X11ClientWindowDiscovery::NotFound,
+    })
+}
+
+fn parse_wmctrl_client_window(output: &str, pid: u32) -> anyhow::Result<Option<X11ClientWindow>> {
+    let mut matches = Vec::new();
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(id_hex) = fields.next() else {
+            continue;
+        };
+        let _desktop = fields.next();
+        let Some(raw_pid) = fields.next() else {
+            continue;
+        };
+        if raw_pid.parse::<u32>().ok() != Some(pid) {
+            continue;
+        }
+        let encoded_id = id_hex
+            .strip_prefix("0x")
+            .context("wmctrl returned a non-hexadecimal X11 window ID")?;
+        let id = u64::from_str_radix(encoded_id, 16)
+            .context("wmctrl returned an invalid X11 window ID")?;
+        matches.push(X11ClientWindow {
+            id_hex: format!("0x{id:x}"),
+            id_decimal: id.to_string(),
+        });
+    }
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        count => bail!("presentation probe found {count} X11 client windows for one app process"),
+    }
+}
+
+fn inspect_x11_window_manager_state(
+    window: &X11ClientWindow,
+) -> anyhow::Result<Option<X11WindowManagerState>> {
+    let mut command = Command::new("xprop");
+    command.args(["-id", &window.id_hex, "_NET_WM_STATE", "WM_STATE"]);
+    let output = run_command_with_bounded_output(&mut command, X11_AUTOMATION_OUTPUT_POLICY)
+        .context("failed to inspect X11 window-manager state")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let encoded = String::from_utf8(output.stdout).context("xprop output was not UTF-8")?;
+    parse_xprop_window_manager_state(&encoded).map(Some)
+}
+
+fn parse_xprop_window_manager_state(output: &str) -> anyhow::Result<X11WindowManagerState> {
+    if !output.contains("_NET_WM_STATE") || !output.contains("window state:") {
+        bail!("xprop output omitted required window-manager state");
+    }
+    Ok(X11WindowManagerState {
+        hidden: output.contains("_NET_WM_STATE_HIDDEN"),
+        iconic: output
+            .lines()
+            .map(str::trim)
+            .any(|line| line == "window state: Iconic"),
+    })
+}
+
+fn request_x11_window_unmap(window: &X11ClientWindow) -> anyhow::Result<()> {
+    let mut command = Command::new("xdotool");
+    command.args(["windowunmap", "--sync", &window.id_decimal]);
+    let output = run_command_with_bounded_output(&mut command, X11_AUTOMATION_OUTPUT_POLICY)
+        .context("failed to unmap the minimized presentation-probe window")?;
+    if !output.status.success() {
+        bail!("xdotool window unmap failed with {}", output.status);
+    }
+    Ok(())
+}
+
+fn request_x11_window_restore(window: &X11ClientWindow) -> anyhow::Result<()> {
+    let mut map = Command::new("xdotool");
+    map.args(["windowmap", "--sync", &window.id_decimal]);
+    let output = run_command_with_bounded_output(&mut map, X11_AUTOMATION_OUTPUT_POLICY)
+        .context("failed to remap the presentation-probe window")?;
+    if !output.status.success() {
+        bail!("xdotool window map failed with {}", output.status);
+    }
+    let mut restore = Command::new("wmctrl");
+    restore.args(["-i", "-R", &window.id_hex]);
+    let output = run_command_with_bounded_output(&mut restore, X11_AUTOMATION_OUTPUT_POLICY)
+        .context("failed to restore the presentation-probe window")?;
+    if !output.status.success() {
+        bail!("wmctrl window restore failed with {}", output.status);
+    }
+    Ok(())
+}
+
 struct ProductAutomationRun<'a> {
     binary: &'a Path,
     package: &'a Path,
@@ -4905,9 +5541,11 @@ struct ProductAutomationRun<'a> {
     scenario: &'a str,
     progress_plan: ProductAutomationProgressPlan,
     progress_launch: ProductAutomationProgressLaunch,
+    external_control: ProductAutomationExternalControlPlan,
 }
 
 fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<ProductProcessStatus> {
+    let mut external_control = ProductAutomationExternalControl::new(run.external_control)?;
     let stdout = fs::File::create(run.stdout_path)
         .with_context(|| format!("failed to create {}", run.stdout_path.display()))?;
     let stderr = fs::File::create(run.stderr_path)
@@ -4943,6 +5581,10 @@ fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<Produ
             .try_wait()
             .context("failed to poll product validation child process")?
         {
+            let external_control_failure_reason = external_control
+                .finish()
+                .err()
+                .map(|error| error.to_string());
             return Ok(ProductProcessStatus {
                 timed_out: false,
                 exit_status: Some(exit_status.to_string()),
@@ -4950,12 +5592,14 @@ fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<Produ
                 progress_failure_reason: progress_monitor
                     .finalize_at_exit(now)
                     .map(|failure| failure.reason_code()),
+                external_control_failure_reason,
             });
         }
         if now >= next_progress_poll {
             match progress_monitor.poll_at(now) {
                 ProgressMonitorAction::Continue => {}
                 ProgressMonitorAction::Emit(snapshot) => {
+                    external_control.observe_progress(&snapshot, now);
                     let line =
                         safe_automation_progress_line("product_validate", run.scenario, &snapshot)?;
                     eprintln!("{line}");
@@ -4968,10 +5612,22 @@ fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<Produ
                         exit_status: exit_status.map(|status| status.to_string()),
                         exit_success: exit_status.map(|status| status.success()),
                         progress_failure_reason: Some(failure.reason_code()),
+                        external_control_failure_reason: None,
                     });
                 }
             }
             next_progress_poll = now + FILE_POLL_INTERVAL;
+        }
+        if let Err(error) = external_control.poll(child.id(), now) {
+            terminate_process_tree(&mut child);
+            let exit_status = child.wait().ok();
+            return Ok(ProductProcessStatus {
+                timed_out: false,
+                exit_status: exit_status.map(|status| status.to_string()),
+                exit_success: exit_status.map(|status| status.success()),
+                progress_failure_reason: None,
+                external_control_failure_reason: Some(error.to_string()),
+            });
         }
         if now >= deadline {
             terminate_process_tree(&mut child);
@@ -4981,6 +5637,7 @@ fn run_product_automation(run: ProductAutomationRun<'_>) -> anyhow::Result<Produ
                 exit_status,
                 exit_success: None,
                 progress_failure_reason: None,
+                external_control_failure_reason: None,
             });
         }
         thread::sleep(Duration::from_millis(100));
@@ -4993,6 +5650,7 @@ struct ProductProcessStatus {
     exit_status: Option<String>,
     exit_success: Option<bool>,
     progress_failure_reason: Option<&'static str>,
+    external_control_failure_reason: Option<String>,
 }
 
 struct WrapperReport<'a> {

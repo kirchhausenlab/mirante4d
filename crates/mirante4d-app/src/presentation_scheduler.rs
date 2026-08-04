@@ -2,7 +2,7 @@
 //!
 //! This module owns no GPU work.  It selects the one semantic transaction
 //! that the renderer's `FrameCoordinator` must execute next and provides the
-//! fixed-shape logical-target assembly used before an incremental physical
+//! dynamic logical-target assembly used before an incremental physical
 //! demand delta is installed.
 
 use std::{collections::BTreeMap, fmt, sync::Arc};
@@ -15,13 +15,122 @@ use mirante4d_application::{
 use mirante4d_domain::{
     CameraView, CrossSectionView, LogicalLayerKey, ScaleLevel, TimeIndex, ViewerLayout,
 };
-use mirante4d_render_api::{FrameCompleteness, PresentationTarget};
-use mirante4d_render_wgpu::CoordinatedPublicationGroup;
+use mirante4d_render_api::{
+    FrameCompleteness, PresentationTarget, PresentationTargetSet, RenderExtent,
+};
 
 use crate::{
     application_view,
-    playback_session::{PlaybackFrameContract, PlaybackSession, PlaybackTargetSet},
+    playback_session::{PlaybackFrameContract, PlaybackSession, playback_targets_for_layout},
 };
+
+pub(crate) const fn active_targets_for_layout(layout: ViewerLayout) -> PresentationTargetSet {
+    match layout {
+        ViewerLayout::Single3d => PresentationTargetSet::THREE_D,
+        ViewerLayout::FourPanel => PresentationTargetSet::ALL,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ActivePresentationTarget {
+    target: PresentationTarget,
+    extent: RenderExtent,
+    surface_generation: u64,
+}
+
+impl ActivePresentationTarget {
+    pub(crate) const fn new(
+        target: PresentationTarget,
+        extent: RenderExtent,
+        surface_generation: u64,
+    ) -> Self {
+        Self {
+            target,
+            extent,
+            surface_generation,
+        }
+    }
+
+    pub(crate) const fn target(self) -> PresentationTarget {
+        self.target
+    }
+
+    pub(crate) const fn extent(self) -> RenderExtent {
+        self.extent
+    }
+
+    pub(crate) const fn surface_generation(self) -> u64 {
+        self.surface_generation
+    }
+}
+
+/// Immutable fixed-capacity rendering layout for one semantic transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActivePresentationLayout {
+    generation: u64,
+    targets: PresentationTargetSet,
+    members: [Option<ActivePresentationTarget>; 4],
+}
+
+impl ActivePresentationLayout {
+    pub(crate) fn new(
+        generation: u64,
+        targets: PresentationTargetSet,
+        members: [Option<ActivePresentationTarget>; 4],
+    ) -> Result<Self, ActivePresentationLayoutError> {
+        for target in PresentationTarget::ALL {
+            match members[target.index()] {
+                Some(member) if member.target == target && targets.contains(target) => {}
+                None if !targets.contains(target) => {}
+                _ => return Err(ActivePresentationLayoutError { target }),
+            }
+        }
+        Ok(Self {
+            generation,
+            targets,
+            members,
+        })
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) const fn targets(&self) -> PresentationTargetSet {
+        self.targets
+    }
+
+    pub(crate) const fn affected_targets(
+        &self,
+        dependencies: PresentationTargetSet,
+    ) -> PresentationTargetSet {
+        self.targets.intersection(dependencies)
+    }
+
+    pub(crate) const fn member(
+        &self,
+        target: PresentationTarget,
+    ) -> Option<ActivePresentationTarget> {
+        self.members[target.index()]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ActivePresentationLayoutError {
+    target: PresentationTarget,
+}
+
+impl fmt::Display for ActivePresentationLayoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "active layout member {:?} is missing or misplaced",
+            self.target
+        )
+    }
+}
+
+impl std::error::Error for ActivePresentationLayoutError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PresentationTransactionCause {
@@ -67,25 +176,12 @@ impl PresentationTransaction {
         self.cross_section
     }
 
-    pub(crate) const fn publication_group(&self) -> CoordinatedPublicationGroup {
-        match self.layout {
-            ViewerLayout::Single3d => CoordinatedPublicationGroup::THREE_D,
-            ViewerLayout::FourPanel => CoordinatedPublicationGroup::FULL_LAYOUT,
-        }
-    }
-
-    pub(crate) const fn target_set(&self) -> PlaybackTargetSet {
-        match self.layout {
-            ViewerLayout::Single3d => PlaybackTargetSet::ThreeD,
-            ViewerLayout::FourPanel => PlaybackTargetSet::FullLayout,
-        }
+    pub(crate) const fn target_set(&self) -> PresentationTargetSet {
+        active_targets_for_layout(self.layout)
     }
 
     pub(crate) const fn contains(&self, target: PresentationTarget) -> bool {
-        match self.layout {
-            ViewerLayout::Single3d => target.index() == PresentationTarget::ThreeD.index(),
-            ViewerLayout::FourPanel => true,
-        }
+        self.target_set().contains(target)
     }
 
     pub(crate) const fn expected_revision(
@@ -190,7 +286,7 @@ impl ComposedPresentationScheduler {
         };
         let view = application_view(snapshot);
         if contract.source_generation() != snapshot.source_generation()
-            || contract.target_set() != PlaybackTargetSet::from(view.layout())
+            || contract.target_set() != playback_targets_for_layout(view.layout())
         {
             return false;
         }
@@ -256,7 +352,7 @@ impl ComposedPresentationScheduler {
                 .pending_frame_contract(view.timepoint())
                 .filter(|contract| {
                     contract.source_generation() == snapshot.source_generation()
-                        && contract.target_set() == PlaybackTargetSet::from(view.layout())
+                        && contract.target_set() == playback_targets_for_layout(view.layout())
                 });
         if let Some(reserved) = self.reserved_temporal.as_ref() {
             if pending_contract.as_ref().is_some_and(|contract| {
@@ -271,7 +367,7 @@ impl ComposedPresentationScheduler {
         }
         if let Some(contract) = pending_contract
             && contract.source_generation() == snapshot.source_generation()
-            && contract.target_set() == PlaybackTargetSet::from(view.layout())
+            && contract.target_set() == playback_targets_for_layout(view.layout())
         {
             let base = RenderIntentBase::from_snapshot(snapshot);
             let mailbox_snapshot = mailbox.snapshot();
@@ -405,113 +501,78 @@ impl<T> PresentationTransactionMember<T> {
         &self.prepared_request
     }
 
-    pub(crate) const fn prepared_request_mut(&mut self) -> &mut T {
-        &mut self.prepared_request
-    }
-
     pub(crate) fn into_prepared_request(self) -> T {
         self.prepared_request
     }
 }
 
 #[derive(Debug)]
-pub(crate) enum PresentationTransactionTargets<T> {
-    ThreeD {
-        three_d: PresentationTransactionMember<T>,
-    },
-    FourPanel {
-        three_d: PresentationTransactionMember<T>,
-        xy: PresentationTransactionMember<T>,
-        xz: PresentationTransactionMember<T>,
-        yz: PresentationTransactionMember<T>,
-    },
+pub(crate) struct PresentationTransactionTargets<T> {
+    targets: PresentationTargetSet,
+    terminal_no_work: PresentationTargetSet,
+    members: [Option<PresentationTransactionMember<T>>; 4],
 }
 
 impl<T> PresentationTransactionTargets<T> {
     pub(crate) fn from_slots(
-        target_set: PlaybackTargetSet,
-        mut members: [Option<PresentationTransactionMember<T>>; 4],
+        targets: PresentationTargetSet,
+        terminal_no_work: PresentationTargetSet,
+        members: [Option<PresentationTransactionMember<T>>; 4],
     ) -> Result<Self, MissingLogicalTarget> {
-        let mut take = |target: PresentationTarget| {
-            let Some(member) = members[target.index()].take() else {
-                return Err(MissingLogicalTarget(target));
-            };
-            if member.target != target {
-                return Err(MissingLogicalTarget(target));
-            }
-            Ok(member)
-        };
-        let targets = match target_set {
-            PlaybackTargetSet::ThreeD => Self::ThreeD {
-                three_d: take(PresentationTarget::ThreeD)?,
-            },
-            PlaybackTargetSet::FullLayout => Self::FourPanel {
-                three_d: take(PresentationTarget::ThreeD)?,
-                xy: take(PresentationTarget::Xy)?,
-                xz: take(PresentationTarget::Xz)?,
-                yz: take(PresentationTarget::Yz)?,
-            },
-        };
-        if let Some(member) = members.into_iter().flatten().next() {
-            return Err(MissingLogicalTarget(member.target));
+        if targets.is_empty() || !terminal_no_work.difference(targets).is_empty() {
+            return Err(MissingLogicalTarget(PresentationTarget::ThreeD));
         }
-        Ok(targets)
+        for target in PresentationTarget::ALL {
+            match members[target.index()].as_ref() {
+                Some(member)
+                    if targets.contains(target)
+                        && !terminal_no_work.contains(target)
+                        && member.target == target => {}
+                None if targets.contains(target) && terminal_no_work.contains(target) => {}
+                None if !targets.contains(target) => {}
+                Some(member) => return Err(MissingLogicalTarget(member.target)),
+                None => return Err(MissingLogicalTarget(target)),
+            }
+        }
+        Ok(Self {
+            targets,
+            terminal_no_work,
+            members,
+        })
     }
 
     pub(crate) fn for_each_mut(
         &mut self,
         mut visit: impl FnMut(&mut PresentationTransactionMember<T>),
     ) {
-        match self {
-            Self::ThreeD { three_d } => visit(three_d),
-            Self::FourPanel {
-                three_d,
-                xy,
-                xz,
-                yz,
-            } => {
-                visit(three_d);
-                visit(xy);
-                visit(xz);
-                visit(yz);
+        for target in self.targets {
+            if !self.terminal_no_work.contains(target) {
+                visit(
+                    self.members[target.index()]
+                        .as_mut()
+                        .expect("a nonterminal logical target owns one immutable request"),
+                );
             }
         }
     }
 
-    pub(crate) fn into_prepared_requests(self) -> FixedPresentationTargetRequests<T> {
-        match self {
-            Self::ThreeD { three_d } => {
-                FixedPresentationTargetRequests::ThreeD([three_d.into_prepared_request()])
+    pub(crate) fn into_prepared_requests(mut self) -> Vec<T> {
+        let mut requests = Vec::with_capacity(
+            self.targets
+                .len()
+                .saturating_sub(self.terminal_no_work.len()),
+        );
+        for target in self.targets {
+            if !self.terminal_no_work.contains(target) {
+                requests.push(
+                    self.members[target.index()]
+                        .take()
+                        .expect("a nonterminal logical target owns one immutable request")
+                        .into_prepared_request(),
+                );
             }
-            Self::FourPanel {
-                three_d,
-                xy,
-                xz,
-                yz,
-            } => FixedPresentationTargetRequests::FourPanel([
-                three_d.into_prepared_request(),
-                xy.into_prepared_request(),
-                xz.into_prepared_request(),
-                yz.into_prepared_request(),
-            ]),
         }
-    }
-}
-
-/// Fixed storage for the prepared requests of one complete logical
-/// transaction. The canonical array order is 3D, XY, XZ, YZ.
-#[derive(Debug)]
-pub(crate) enum FixedPresentationTargetRequests<T> {
-    ThreeD([T; 1]),
-    FourPanel([T; 4]),
-}
-
-impl<T> FixedPresentationTargetRequests<T> {
-    pub(crate) const fn as_slice(&self) -> &[T] {
-        match self {
-            Self::ThreeD(requests) => requests,
-            Self::FourPanel(requests) => requests,
-        }
+        requests
     }
 }
 
@@ -539,6 +600,222 @@ mod tests {
 
     use super::*;
 
+    fn target_set_from_bits(bits: u8) -> PresentationTargetSet {
+        PresentationTarget::ALL
+            .into_iter()
+            .filter(|target| bits & (1 << target.index()) != 0)
+            .fold(PresentationTargetSet::EMPTY, PresentationTargetSet::with)
+    }
+
+    fn active_layout(generation: u64, targets: PresentationTargetSet) -> ActivePresentationLayout {
+        let extent = RenderExtent::new(64, 48).unwrap();
+        let members = std::array::from_fn(|index| {
+            let target = PresentationTarget::ALL[index];
+            targets
+                .contains(target)
+                .then_some(ActivePresentationTarget::new(
+                    target,
+                    extent,
+                    generation + index as u64,
+                ))
+        });
+        ActivePresentationLayout::new(generation, targets, members).unwrap()
+    }
+
+    #[test]
+    fn active_affected_target_set_covers_every_bounded_layout_combination() {
+        for active_bits in 0_u8..16 {
+            let active = target_set_from_bits(active_bits);
+            let layout = active_layout(7, active);
+            assert_eq!(
+                layout.targets().iter().collect::<Vec<_>>(),
+                PresentationTarget::ALL
+                    .into_iter()
+                    .filter(|target| active.contains(*target))
+                    .collect::<Vec<_>>(),
+                "active targets retain canonical order for mask {active_bits:04b}"
+            );
+            for dependency_bits in 0_u8..16 {
+                let dependencies = target_set_from_bits(dependency_bits);
+                assert_eq!(
+                    layout.affected_targets(dependencies),
+                    active.intersection(dependencies),
+                    "active={active_bits:04b} dependencies={dependency_bits:04b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn layout_generation_change_suppresses_old_group_without_shrinking_it() {
+        let old_targets = PresentationTargetSet::ALL;
+        let old = active_layout(11, old_targets);
+        let replacement_targets = old_targets.without(PresentationTarget::Yz);
+        let replacement = active_layout(12, replacement_targets);
+
+        assert_eq!(
+            old.affected_targets(PresentationTargetSet::LINKED_CROSS_SECTIONS),
+            PresentationTargetSet::LINKED_CROSS_SECTIONS,
+            "the in-flight old cohort keeps its original membership"
+        );
+        assert_eq!(
+            replacement.affected_targets(PresentationTargetSet::LINKED_CROSS_SECTIONS),
+            PresentationTargetSet::LINKED_CROSS_SECTIONS.without(PresentationTarget::Yz)
+        );
+        assert_ne!(old.generation(), replacement.generation());
+        assert_ne!(old, replacement);
+    }
+
+    #[test]
+    fn hidden_linked_target_tracks_semantic_state_without_render_obligation() {
+        let visible_targets = PresentationTargetSet::ALL.without(PresentationTarget::Yz);
+        let visible = active_layout(20, visible_targets);
+        let linked_work = visible.affected_targets(PresentationTargetSet::LINKED_CROSS_SECTIONS);
+        assert_eq!(
+            linked_work,
+            PresentationTargetSet::LINKED_CROSS_SECTIONS.without(PresentationTarget::Yz)
+        );
+
+        let mut envelope_work = [0_u64; 4];
+        let mut body_work = [0_u64; 4];
+        let mut residency_work = [0_u64; 4];
+        let mut texture_work = [0_u64; 4];
+        let mut publication_work = [0_u64; 4];
+        let mut latest_linked_revision = 0_u64;
+        for revision in [31_u64, 32] {
+            latest_linked_revision = revision;
+            for target in linked_work {
+                envelope_work[target.index()] += 1;
+                body_work[target.index()] += 1;
+                residency_work[target.index()] += 1;
+                texture_work[target.index()] += 1;
+                publication_work[target.index()] += 1;
+            }
+        }
+        assert_eq!(envelope_work[PresentationTarget::Yz.index()], 0);
+        assert_eq!(body_work[PresentationTarget::Yz.index()], 0);
+        assert_eq!(residency_work[PresentationTarget::Yz.index()], 0);
+        assert_eq!(texture_work[PresentationTarget::Yz.index()], 0);
+        assert_eq!(publication_work[PresentationTarget::Yz.index()], 0);
+        assert_eq!(envelope_work[PresentationTarget::ThreeD.index()], 0);
+
+        let opened = active_layout(21, PresentationTargetSet::ALL);
+        assert_eq!(
+            opened.affected_targets(PresentationTargetSet::from_target(PresentationTarget::Yz)),
+            PresentationTargetSet::from_target(PresentationTarget::Yz)
+        );
+        let opened_member = PresentationTransactionMember::new(
+            PresentationTarget::Yz,
+            SourceSessionGeneration::new(7),
+            TimeIndex::new(3),
+            RenderIntentRevision::new(latest_linked_revision),
+            opened
+                .member(PresentationTarget::Yz)
+                .expect("the opened layout contains YZ")
+                .surface_generation(),
+            PresentationQuality::exact(Arc::new(BTreeMap::new())),
+            latest_linked_revision,
+        );
+        assert_eq!(opened_member.spatial_frame().get(), 32);
+        assert_eq!(*opened_member.prepared_request(), 32);
+    }
+
+    #[test]
+    fn out_of_order_linked_prerequisites_publish_the_visible_affected_group_once() {
+        let active = active_layout(30, PresentationTargetSet::ALL);
+        let targets = active.affected_targets(PresentationTargetSet::LINKED_CROSS_SECTIONS);
+        let completion_order = [
+            PresentationTarget::Yz,
+            PresentationTarget::Xy,
+            PresentationTarget::Xz,
+        ];
+        let mut ready = PresentationTargetSet::EMPTY;
+        let mut publication_attempts = 0_u64;
+        let mut published = Vec::new();
+
+        for completed in completion_order {
+            ready = ready.with(completed);
+            let members = std::array::from_fn(|index| {
+                let target = PresentationTarget::ALL[index];
+                (targets.contains(target) && ready.contains(target)).then(|| {
+                    PresentationTransactionMember::new(
+                        target,
+                        SourceSessionGeneration::new(7),
+                        TimeIndex::new(3),
+                        RenderIntentRevision::new(44),
+                        30 + index as u64,
+                        PresentationQuality::exact(Arc::new(BTreeMap::new())),
+                        target,
+                    )
+                })
+            });
+            match PresentationTransactionTargets::from_slots(
+                targets,
+                PresentationTargetSet::EMPTY,
+                members,
+            ) {
+                Ok(group) => {
+                    publication_attempts += 1;
+                    published = group.into_prepared_requests();
+                }
+                Err(_) => {
+                    assert!(published.is_empty(), "no ready subset may publish");
+                }
+            }
+        }
+
+        assert_eq!(publication_attempts, 1);
+        assert_eq!(
+            published,
+            vec![
+                PresentationTarget::Xy,
+                PresentationTarget::Xz,
+                PresentationTarget::Yz,
+            ]
+        );
+        assert!(!targets.contains(PresentationTarget::ThreeD));
+        assert_eq!(
+            active
+                .member(PresentationTarget::ThreeD)
+                .unwrap()
+                .surface_generation(),
+            30,
+            "unrelated visible 3D remains outside the linked cohort"
+        );
+    }
+
+    #[test]
+    fn terminal_no_work_member_completes_semantics_without_entering_physical_delta() {
+        let targets = PresentationTargetSet::LINKED_CROSS_SECTIONS;
+        let terminal = PresentationTargetSet::from_target(PresentationTarget::Yz);
+        let members = std::array::from_fn(|index| {
+            let target = PresentationTarget::ALL[index];
+            matches!(target, PresentationTarget::Xy | PresentationTarget::Xz).then(|| {
+                PresentationTransactionMember::new(
+                    target,
+                    SourceSessionGeneration::new(7),
+                    TimeIndex::new(3),
+                    RenderIntentRevision::new(44),
+                    30 + index as u64,
+                    PresentationQuality::exact(Arc::new(BTreeMap::new())),
+                    target,
+                )
+            })
+        });
+
+        let physical = PresentationTransactionTargets::from_slots(targets, terminal, members)
+            .unwrap()
+            .into_prepared_requests();
+        assert_eq!(
+            physical,
+            vec![PresentationTarget::Xy, PresentationTarget::Xz]
+        );
+        assert!(
+            !physical.contains(&PresentationTarget::Yz),
+            "a terminal empty member is semantic completion, not GPU work"
+        );
+    }
+
     #[test]
     fn composed_physical_delta_matrix_keeps_complete_logical_members() {
         let member = |target, renderer_will_reuse| {
@@ -564,9 +841,12 @@ mod tests {
                 let target = PresentationTarget::ALL[index];
                 Some(member(target, reused_bits & (1 << target.index()) != 0))
             });
-            let mut assembled =
-                PresentationTransactionTargets::from_slots(PlaybackTargetSet::FullLayout, members)
-                    .unwrap();
+            let mut assembled = PresentationTransactionTargets::from_slots(
+                PresentationTargetSet::ALL,
+                PresentationTargetSet::EMPTY,
+                members,
+            )
+            .unwrap();
             let mut observed = Vec::new();
             assembled.for_each_mut(|member| {
                 observed.push((member.target(), *member.prepared_request()));
@@ -626,10 +906,7 @@ mod tests {
                 RenderIntentRevision::new(19)
             );
         }
-        assert_eq!(
-            transaction.publication_group(),
-            CoordinatedPublicationGroup::FULL_LAYOUT
-        );
+        assert_eq!(transaction.target_set(), PresentationTargetSet::ALL);
     }
 
     #[test]

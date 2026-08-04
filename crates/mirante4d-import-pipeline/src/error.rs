@@ -81,5 +81,14 @@ pub enum ImportError {
     #[error(transparent)]
     ZarrMetadata(#[from] ZarrMetadataError),
     #[error(transparent)]
-    Writer(#[from] PackageWriteError),
+    Writer(PackageWriteError),
+}
+
+impl From<PackageWriteError> for ImportError {
+    fn from(error: PackageWriteError) -> Self {
+        match error {
+            PackageWriteError::Cancelled => Self::Cancelled,
+            error => Self::Writer(error),
+        }
+    }
 }

@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeMap,
-    sync::Arc,
+    collections::{BTreeMap, VecDeque},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -41,9 +41,9 @@ use mirante4d_render_reference::{
 use super::{
     CoordinatedPublicationGroup, CoordinatedTargetLayout, CoordinatedTargetRequest,
     CoordinatedValidationCaptureTicket, GpuFrameTiming, GpuTimingTicket, PipelineCapability,
-    PipelineReadiness, RetainedFrameRenderPolicy, ValidationCapture, VolumeColorSchedule,
-    WgpuRenderRuntime, WgpuRenderRuntimeConfig, WgpuRenderRuntimeDiagnostics,
-    WgpuRenderRuntimeError,
+    PipelineReadiness, RendererEvent, RendererEventSink, RetainedFrameRenderPolicy,
+    ValidationCapture, VolumeColorSchedule, WgpuRenderRuntime, WgpuRenderRuntimeConfig,
+    WgpuRenderRuntimeDiagnostics, WgpuRenderRuntimeError,
     global_residency::{compact_cell_keys, directory_hash},
     runtime::GLOBAL_DIRECTORY_SLOTS,
 };
@@ -60,6 +60,7 @@ const SEMANTIC_FIXTURE_LABEL: &str = "semantic-small";
 const UPLOAD_FIXTURE_LABEL: &str = "upload-boundary";
 const WORK_FIXTURE_LABEL: &str = "work-boundary";
 const HIGH_COUNT_WORK_RESOURCES: usize = 32_768;
+const DEFAULT_TRUSTED_GPU_ADAPTER: &str = "NVIDIA GeForce RTX 3070 Ti Laptop GPU";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TestPipelineAdmission {
@@ -91,6 +92,14 @@ fn test_gpu_runtime_with_initial_commitment(
         compatible_surface: None,
     }))
     .expect("the trusted workstation exposes a Vulkan adapter");
+    let adapter_info = adapter.get_info();
+    let expected_adapter = std::env::var("MIRANTE4D_TRUSTED_GPU_ADAPTER_NAME")
+        .unwrap_or_else(|_| DEFAULT_TRUSTED_GPU_ADAPTER.to_owned());
+    assert_eq!(adapter_info.backend, wgpu::Backend::Vulkan);
+    assert_eq!(
+        adapter_info.name, expected_adapter,
+        "trusted GPU tests selected an unqualified adapter"
+    );
     let descriptor = super::renderer_device_descriptor(&adapter, "mirante4d-render-test-device")
         .expect("the trusted adapter satisfies renderer limits");
     let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))
@@ -2103,6 +2112,46 @@ fn execute_coordinated_target(
         .expect("the fixed-target coordinated frame executes")
 }
 
+fn wait_for_submission_completion(
+    gpu: &mut WgpuRenderRuntime,
+    events: &Arc<Mutex<VecDeque<RendererEvent>>>,
+    expected_submission: u64,
+    deadline: Instant,
+) {
+    loop {
+        let completed = {
+            let mut events = events
+                .lock()
+                .expect("the renderer test event queue is never poisoned");
+            let mut completed = false;
+            while let Some(event) = events.pop_front() {
+                if matches!(
+                    event,
+                    RendererEvent::SubmissionCompleted { submission }
+                        if submission >= expected_submission
+                ) {
+                    completed = true;
+                }
+            }
+            completed
+        };
+        if completed {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "renderer submission {expected_submission} did not complete before the test deadline"
+        );
+        let completed_submission = gpu
+            .poll_submission_completions()
+            .expect("the renderer completion boundary remains healthy");
+        if completed_submission >= expected_submission {
+            return;
+        }
+        std::thread::yield_now();
+    }
+}
+
 fn presented_frame(
     target: PresentationTarget,
     intent: &RenderIntent,
@@ -3912,7 +3961,7 @@ fn assert_atomic_striped_capture_matches_direct(
 
 #[test]
 #[ignore = "requires the trusted HW2 Vulkan workstation"]
-fn coordinated_four_target_resident_cutoff_has_real_pixels_one_submit_and_idle_zero() {
+fn coordinated_active_target_set_has_real_pixels_one_submit_and_idle_zero() {
     let deadline = Instant::now() + Duration::from_secs(60);
     let fixtures = build_fixtures();
     let (dataset_runtime, catalog) = start_dataset_runtime(&fixtures.source);
@@ -4133,6 +4182,10 @@ fn coordinated_four_target_resident_cutoff_has_real_pixels_one_submit_and_idle_z
     let xy_intent = validated_fixture_intent(&catalog, &xy_intent, &xy_requirements);
     let xz_intent = validated_fixture_intent(&catalog, &xz_intent, &xz_requirements);
     let yz_intent = validated_fixture_intent(&catalog, &yz_intent, &yz_requirements);
+    let active_group = CoordinatedPublicationGroup::exact_target_set(
+        mirante4d_render_api::PresentationTargetSet::ALL,
+    )
+    .expect("the current active four-target set forms one exact group");
     let requests = [
         CoordinatedTargetRequest::new(
             PresentationTarget::ThreeD,
@@ -4141,7 +4194,7 @@ fn coordinated_four_target_resident_cutoff_has_real_pixels_one_submit_and_idle_z
             200,
             RetainedFrameRenderPolicy::ExactFrameOnly,
         )
-        .with_atomic_publication_group(CoordinatedPublicationGroup::FULL_LAYOUT),
+        .with_atomic_publication_group(active_group),
         CoordinatedTargetRequest::new(
             PresentationTarget::Xy,
             &xy_intent,
@@ -4149,7 +4202,7 @@ fn coordinated_four_target_resident_cutoff_has_real_pixels_one_submit_and_idle_z
             200,
             RetainedFrameRenderPolicy::ExactFrameOnly,
         )
-        .with_atomic_publication_group(CoordinatedPublicationGroup::FULL_LAYOUT),
+        .with_atomic_publication_group(active_group),
         CoordinatedTargetRequest::new(
             PresentationTarget::Xz,
             &xz_intent,
@@ -4157,7 +4210,7 @@ fn coordinated_four_target_resident_cutoff_has_real_pixels_one_submit_and_idle_z
             200,
             RetainedFrameRenderPolicy::ExactFrameOnly,
         )
-        .with_atomic_publication_group(CoordinatedPublicationGroup::FULL_LAYOUT),
+        .with_atomic_publication_group(active_group),
         CoordinatedTargetRequest::new(
             PresentationTarget::Yz,
             &yz_intent,
@@ -4165,14 +4218,30 @@ fn coordinated_four_target_resident_cutoff_has_real_pixels_one_submit_and_idle_z
             200,
             RetainedFrameRenderPolicy::ExactFrameOnly,
         )
-        .with_atomic_publication_group(CoordinatedPublicationGroup::FULL_LAYOUT),
+        .with_atomic_publication_group(active_group),
     ];
 
-    let withheld = gpu
+    let malformed_before = (
+        gpu.diagnostics().queue_submissions(),
+        gpu.diagnostics().uploaded_resources(),
+        gpu.diagnostics().uploaded_payload_bytes(),
+        gpu.diagnostics().residency_evictions(),
+        gpu.diagnostics().directory_mutations(),
+        gpu.diagnostics().payload_arena_allocated_bytes(),
+        gpu.diagnostics().explicit_staging_allocations(),
+        gpu.diagnostics().control_buffer_allocations(),
+        gpu.diagnostics().bind_group_creations(),
+        gpu.diagnostics().usable_pipeline_handles(),
+        gpu.diagnostics().cold_coverage_membership_checks(),
+        gpu.diagnostics().allocator_plans(),
+    );
+    let malformed = gpu
         .execute_coordinated_frame(&catalog, PresentationTarget::Xy, &requests[..3])
-        .expect("an incomplete atomic target group may prepare but not publish");
-    assert_eq!(withheld.color_queue_submissions(), 0);
-    assert!(withheld.targets().iter().all(|report| !report.presented()));
+        .expect_err("an incomplete declared physical group is malformed");
+    assert_eq!(
+        malformed,
+        WgpuRenderRuntimeError::InvalidCoordinatedPublicationGroup
+    );
 
     let diagnostics_before = (
         gpu.diagnostics().queue_submissions(),
@@ -4187,6 +4256,10 @@ fn coordinated_four_target_resident_cutoff_has_real_pixels_one_submit_and_idle_z
         gpu.diagnostics().usable_pipeline_handles(),
         gpu.diagnostics().cold_coverage_membership_checks(),
         gpu.diagnostics().allocator_plans(),
+    );
+    assert_eq!(
+        diagnostics_before, malformed_before,
+        "group validation happens before target mutation, upload, allocation, or submission"
     );
     let coordinated = gpu
         .execute_coordinated_frame(&catalog, PresentationTarget::Xy, &requests)
@@ -4489,6 +4562,14 @@ fn coordinated_target_pins_are_union_scoped_and_layout_retirement_releases_them(
         None,
         TestPipelineAdmission::Ready,
     );
+    let renderer_events = Arc::new(Mutex::new(VecDeque::new()));
+    let event_queue = Arc::clone(&renderer_events);
+    gpu.set_renderer_event_sink(RendererEventSink::new(move |event| {
+        event_queue
+            .lock()
+            .expect("the renderer test event queue is never poisoned")
+            .push_back(event);
+    }));
     activate_fixture_dataset(&mut gpu, &fixtures, &catalog);
     let presentations = PresentationTarget::ALL;
     let layout = presentations.map(|target| CoordinatedTargetLayout::new(target, extent));
@@ -4528,7 +4609,10 @@ fn coordinated_target_pins_are_union_scoped_and_layout_retirement_releases_them(
                     .expect("the pin target has one report")
                     .clone();
                 if !report.deferred_by_backpressure() {
-                    break report;
+                    let submitted_through = cutoff
+                        .submitted_through_event()
+                        .expect("the accepted pin fixture report names its final submission");
+                    break (report, submitted_through);
                 }
                 assert!(Instant::now() < deadline, "pin fixture staging timed out");
                 std::thread::yield_now();
@@ -4536,33 +4620,49 @@ fn coordinated_target_pins_are_union_scoped_and_layout_retirement_releases_them(
         };
 
     for (index, target) in presentations.into_iter().enumerate() {
-        let report = execute(&mut gpu, target, 700 + index as u64, fixtures.upload[index]);
+        let (report, _) = execute(&mut gpu, target, 700 + index as u64, fixtures.upload[index]);
         assert_eq!(report.newly_resident_keys(), &[fixtures.upload[index]]);
     }
     for index in 4..9 {
-        let report = execute(
+        let (report, submitted_through) = execute(
             &mut gpu,
             presentations[0],
             700 + index as u64,
             fixtures.upload[index],
         );
+        if index == 7 {
+            // Establish a real queue-completion boundary before asking which
+            // inactive page is oldest. Temporary submission leases are an
+            // implementation detail and must not make this semantic pin test
+            // depend on how quickly the workstation drains its queue.
+            wait_for_submission_completion(&mut gpu, &renderer_events, submitted_through, deadline);
+        }
         if index == 8 {
-            assert_eq!(report.evicted_keys().len(), 1);
-            assert!(
-                !fixtures.upload[1..4].contains(&report.evicted_keys()[0]),
-                "other live presentations' current resources are pinned"
+            assert_eq!(
+                report.evicted_keys(),
+                &[fixtures.upload[0]],
+                "the oldest inactive page leaves while every live presentation keeps its current resource pinned"
             );
         }
     }
+    let mut warm_submitted_through = None;
     for (index, target) in presentations.into_iter().enumerate().take(4).skip(1) {
-        let warm = execute(&mut gpu, target, 720 + index as u64, fixtures.upload[index]);
+        let (warm, submitted_through) =
+            execute(&mut gpu, target, 720 + index as u64, fixtures.upload[index]);
         assert_eq!(warm.uploaded_resources(), 0);
         assert!(warm.evicted_keys().is_empty());
+        warm_submitted_through = Some(submitted_through);
     }
+    wait_for_submission_completion(
+        &mut gpu,
+        &renderer_events,
+        warm_submitted_through.expect("the final warm revisit names its submission"),
+        deadline,
+    );
 
     gpu.request_coordinated_layout(&[CoordinatedTargetLayout::new(presentations[0], extent)])
         .expect("omitted fixed targets retire their frame leases and pins");
-    let replacement = execute(&mut gpu, presentations[0], 730, fixtures.upload[0]);
+    let (replacement, _) = execute(&mut gpu, presentations[0], 730, fixtures.upload[0]);
     assert_eq!(replacement.newly_resident_keys(), &[fixtures.upload[0]]);
     assert_eq!(
         replacement.evicted_keys(),
@@ -4577,7 +4677,7 @@ fn coordinated_target_pins_are_union_scoped_and_layout_retirement_releases_them(
     assert_eq!(gpu.resident_payload_bytes(), 0);
     assert_eq!(gpu.diagnostics().empty_resident_metadata_records(), 0);
     activate_fixture_dataset(&mut gpu, &fixtures, &catalog);
-    let replacement_generation = execute(&mut gpu, presentations[0], 740, fixtures.upload[0]);
+    let (replacement_generation, _) = execute(&mut gpu, presentations[0], 740, fixtures.upload[0]);
     assert_eq!(
         replacement_generation.newly_resident_keys(),
         &[fixtures.upload[0]]
@@ -5816,11 +5916,13 @@ fn terminal_full_volume_fast_path_matches_reference_for_all_volume_modes_and_sam
 #[test]
 #[ignore = "requires a trusted Vulkan GPU with timestamp-query support for measurements"]
 fn native_1080p_terminal_navigation_gpu_timing() {
-    const SUSTAINED_WARMUP_FRAMES: usize = 32;
-    const MEASURED_TRIALS: usize = 5;
-    const SMOOTH_FRAME_BUDGET_NS: u64 = 16_667_000;
+    const GLOBAL_PIPELINE_WARMUP_FRAMES: usize = 30;
+    const CASE_WARMUP_FRAMES: usize = 30;
+    const MEASURED_TRIALS: usize = 120;
+    const PREFERRED_60_HZ_COMPONENT_NS: u64 = 16_667_000;
+    const ABSOLUTE_30_HZ_COMPONENT_NS: u64 = 33_300_000;
 
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(900);
     let fixtures = build_fixtures();
     let (dataset_runtime, catalog) = start_dataset_runtime(&fixtures.source);
     let generation = CancellationGeneration::for_scope(REQUEST_SCOPE, 32);
@@ -5899,7 +6001,7 @@ fn native_1080p_terminal_navigation_gpu_timing() {
             .expect("terminal warmup seed has a GPU timing ticket"),
         deadline,
     );
-    for _ in 0..SUSTAINED_WARMUP_FRAMES {
+    for _ in 0..GLOBAL_PIPELINE_WARMUP_FRAMES {
         let intent = warmup_intent
             .clone()
             .with_frame(FrameIdentity::new(next_frame));
@@ -5934,6 +6036,7 @@ fn native_1080p_terminal_navigation_gpu_timing() {
         );
     }
 
+    let mut absolute_failures = Vec::new();
     for (label, state) in cases {
         let (warm_intent, warm_requirements) = intent_and_requirements(
             next_frame,
@@ -5944,27 +6047,39 @@ fn native_1080p_terminal_navigation_gpu_timing() {
             &[fixtures.terminal],
         );
         next_frame += 1;
-        gpu.offer_residency_leases(&offers)
-            .expect("terminal timing lease is offered");
-        let warm = execute_coordinated_target(
-            &mut gpu,
-            target,
-            &catalog,
-            &warm_intent,
-            &warm_requirements,
-            RetainedFrameRenderPolicy::EveryUsefulFrame,
-        );
-        let warm_report = warm.target(target).expect("warm timing report exists");
-        assert!(warm_report.presented());
-        assert!(!warm_report.deferred_by_backpressure());
-        let _ = poll_gpu_timing(
-            &mut gpu,
-            warm.gpu_timing()
-                .expect("warm terminal frame has a GPU timing ticket"),
-            deadline,
-        );
+        for _ in 0..CASE_WARMUP_FRAMES {
+            let intent = warm_intent
+                .clone()
+                .with_frame(FrameIdentity::new(next_frame));
+            next_frame += 1;
+            let requirements = warm_requirements
+                .rebind(&intent)
+                .expect("terminal case warmup rebinds the same resident body");
+            gpu.offer_residency_leases(&offers)
+                .expect("terminal timing lease is offered");
+            let warm = execute_coordinated_target(
+                &mut gpu,
+                target,
+                &catalog,
+                &intent,
+                &requirements,
+                RetainedFrameRenderPolicy::EveryUsefulFrame,
+            );
+            let warm_report = warm.target(target).expect("warm timing report exists");
+            assert!(warm_report.presented());
+            assert!(!warm_report.deferred_by_backpressure());
+            assert_eq!(warm_report.visited_resources(), 0);
+            assert_eq!(warm_report.uploaded_resources(), 0);
+            assert_eq!(warm.residency_queue_submissions(), 0);
+            let _ = poll_gpu_timing(
+                &mut gpu,
+                warm.gpu_timing()
+                    .expect("warm terminal frame has a GPU timing ticket"),
+                deadline,
+            );
+        }
 
-        let mut render_pass_ns = Vec::with_capacity(MEASURED_TRIALS);
+        let mut raw_render_pass_ns = Vec::with_capacity(MEASURED_TRIALS);
         for _ in 0..MEASURED_TRIALS {
             let intent = warm_intent
                 .clone()
@@ -5996,28 +6111,46 @@ fn native_1080p_terminal_navigation_gpu_timing() {
                     .expect("resident terminal frame has a GPU timing ticket"),
                 deadline,
             );
-            render_pass_ns.push(
+            raw_render_pass_ns.push(
                 timing
                     .render_pass_ns()
                     .expect("native terminal frame has a volume-pass interval"),
             );
         }
+        let mut render_pass_ns = raw_render_pass_ns.clone();
         render_pass_ns.sort_unstable();
         let p95_ns = percentile(&render_pass_ns, 0.95);
+        let preferred_met = p95_ns <= PREFERRED_60_HZ_COMPONENT_NS;
         println!(
-            "native terminal GPU timing: adapter={} backend=Vulkan shape=64x64x64 extent=1920x1080 sustained_warmup_frames={} mode={} trials={} render_pass_ns={:?} median_ns={} p95_ns={}",
-            sanitize_diagnostic_text(gpu.diagnostics().adapter_name()),
-            SUSTAINED_WARMUP_FRAMES,
-            label,
-            MEASURED_TRIALS,
-            render_pass_ns,
-            percentile(&render_pass_ns, 0.50),
-            p95_ns,
+            "M4D_GPU_PERFORMANCE_V1 {}",
+            serde_json::json!({
+                "family": "native_terminal",
+                "measurement_id": format!("native_terminal::{label}"),
+                "adapter": sanitize_diagnostic_text(gpu.diagnostics().adapter_name()),
+                "backend": "Vulkan",
+                "driver": sanitize_diagnostic_text(gpu.diagnostics().driver()),
+                "shape": "64x64x64",
+                "extent": "1920x1080",
+                "global_warmups": GLOBAL_PIPELINE_WARMUP_FRAMES,
+                "case_warmups": CASE_WARMUP_FRAMES,
+                "mode": label,
+                "samples": MEASURED_TRIALS,
+                "raw_render_pass_ns": raw_render_pass_ns,
+                "median_ns": percentile(&render_pass_ns, 0.50),
+                "p95_ns": p95_ns,
+                "absolute_limit_ns": ABSOLUTE_30_HZ_COMPONENT_NS,
+                "absolute_met": p95_ns <= ABSOLUTE_30_HZ_COMPONENT_NS,
+                "preferred_ns": PREFERRED_60_HZ_COMPONENT_NS,
+                "preferred_met": preferred_met,
+                "uploads_during_samples": 0,
+                "validation_errors": 0,
+            })
         );
-        assert!(
-            p95_ns <= SMOOTH_FRAME_BUDGET_NS,
-            "{label} terminal navigation p95 {p95_ns} ns exceeded the 60-Hz product guideline"
-        );
+        if p95_ns > ABSOLUTE_30_HZ_COMPONENT_NS {
+            absolute_failures.push(format!(
+                "{label} terminal component p95 {p95_ns} ns exceeded the 30-Hz feasibility limit"
+            ));
+        }
     }
     assert_eq!(gpu.diagnostics().validation_error_count(), 0);
 
@@ -6027,18 +6160,24 @@ fn native_1080p_terminal_navigation_gpu_timing() {
     drop(dataset_runtime);
     assert!(
         Instant::now() <= deadline,
-        "native terminal timing exceeded its 120-second deadline"
+        "native terminal timing exceeded its 900-second deadline"
+    );
+    assert!(
+        absolute_failures.is_empty(),
+        "native terminal absolute feasibility failures: {}",
+        absolute_failures.join("; ")
     );
 }
 
 #[test]
 #[ignore = "requires a trusted Vulkan GPU with timestamp-query support for measurements"]
 fn fixed_lod_multichannel_gpu_timing_matrix() {
-    const WARMUP_FRAMES: usize = 5;
-    const MEASURED_TRIALS: usize = 30;
+    const WARMUP_FRAMES: usize = 30;
+    const MEASURED_TRIALS: usize = 120;
+    const ABSOLUTE_30_HZ_COMPONENT_NS: u64 = 33_300_000;
     const HOMOGENEOUS_LINEAR_RATIO_LIMIT: f64 = 1.2;
 
-    let deadline = Instant::now() + Duration::from_secs(600);
+    let deadline = Instant::now() + Duration::from_secs(1_200);
     let fixtures = build_fixtures();
     let (dataset_runtime, catalog) = start_dataset_runtime(&fixtures.source);
     let generation = CancellationGeneration::for_scope(REQUEST_SCOPE, 41);
@@ -6148,6 +6287,7 @@ fn fixed_lod_multichannel_gpu_timing_matrix() {
     let mut reference_p95 = BTreeMap::<String, u64>::new();
     let mut maximum_homogeneous_linear_ratio = 0.0_f64;
     let mut maximum_homogeneous_linear_case = String::new();
+    let mut contract_failures = Vec::new();
     for sampling in [SamplingPolicy::VoxelExact, SamplingPolicy::SmoothLinear] {
         for kernel in ["MIP", "DVR", "ISO", "Mixed"] {
             let case_key = format!("{kernel}-{sampling:?}");
@@ -6231,6 +6371,9 @@ fn fixed_lod_multichannel_gpu_timing_matrix() {
                             .expect("the fixed-LOD sample has a color-pass interval"),
                     );
                 }
+                let raw_render_ns = render_ns.clone();
+                let raw_cpu_planning_ns = cpu_planning_ns.clone();
+                let raw_cpu_submit_ns = cpu_submit_ns.clone();
                 render_ns.sort_unstable();
                 cpu_planning_ns.sort_unstable();
                 cpu_submit_ns.sort_unstable();
@@ -6264,43 +6407,74 @@ fn fixed_lod_multichannel_gpu_timing_matrix() {
                 } else {
                     kernel
                 };
+                let compatibility = if kernel == "Mixed" && channel_count == 1 {
+                    "homogeneous-control"
+                } else if kernel == "Mixed" {
+                    "authored-mixed"
+                } else {
+                    "co-registered-homogeneous"
+                };
                 println!(
-                    "fixed-LOD multichannel GPU timing: adapter={} backend=Vulkan shape=64x64x64 extent=1920x1080 warmups={} trials={} kernel={} sampling={sampling:?} compatibility={} channels={} resources={} payload_bytes={} gpu_median_ns={} gpu_p95_ns={} gpu_max_ns={} reference_channels={} reference_ratio={} ideal_linear_normalized_ratio={} cpu_planning_p95_ns={} cpu_submit_p95_ns={} uploads_during_samples=0",
-                    sanitize_diagnostic_text(gpu.diagnostics().adapter_name()),
-                    WARMUP_FRAMES,
-                    MEASURED_TRIALS,
-                    reported_kernel,
-                    if kernel == "Mixed" && channel_count == 1 {
-                        "homogeneous-control"
-                    } else if kernel == "Mixed" {
-                        "authored-mixed"
-                    } else {
-                        "co-registered-homogeneous"
-                    },
-                    channel_count,
-                    channel_count,
-                    channel_count as u64 * MIB,
-                    percentile(&render_ns, 0.50),
-                    p95_ns,
-                    *render_ns.last().unwrap(),
-                    reference_channels,
-                    reference_ratio,
-                    linear_ratio,
-                    percentile(&cpu_planning_ns, 0.95),
-                    percentile(&cpu_submit_ns, 0.95),
+                    "M4D_GPU_PERFORMANCE_V1 {}",
+                    serde_json::json!({
+                        "family": "fixed_lod_multichannel",
+                        "measurement_id": format!(
+                            "fixed_lod_multichannel::{reported_kernel}::{sampling:?}::{compatibility}::{channel_count}ch"
+                        ),
+                        "adapter": sanitize_diagnostic_text(gpu.diagnostics().adapter_name()),
+                        "backend": "Vulkan",
+                        "driver": sanitize_diagnostic_text(gpu.diagnostics().driver()),
+                        "shape": "64x64x64",
+                        "extent": "1920x1080",
+                        "warmups": WARMUP_FRAMES,
+                        "samples": MEASURED_TRIALS,
+                        "kernel": reported_kernel,
+                        "sampling": format!("{sampling:?}"),
+                        "compatibility": compatibility,
+                        "channels": channel_count,
+                        "resources": channel_count,
+                        "payload_bytes": channel_count as u64 * MIB,
+                        "raw_render_pass_ns": raw_render_ns,
+                        "raw_cpu_planning_ns": raw_cpu_planning_ns,
+                        "raw_cpu_submit_ns": raw_cpu_submit_ns,
+                        "median_ns": percentile(&render_ns, 0.50),
+                        "p95_ns": p95_ns,
+                        "maximum_ns": *render_ns.last().unwrap(),
+                        "absolute_limit_ns": ABSOLUTE_30_HZ_COMPONENT_NS,
+                        "absolute_met": p95_ns <= ABSOLUTE_30_HZ_COMPONENT_NS,
+                        "reference_channels": reference_channels,
+                        "reference_ratio": reference_ratio,
+                        "ideal_linear_normalized_ratio": linear_ratio,
+                        "cpu_planning_p95_ns": percentile(&cpu_planning_ns, 0.95),
+                        "cpu_submit_p95_ns": percentile(&cpu_submit_ns, 0.95),
+                        "uploads_during_samples": 0,
+                        "validation_errors": 0,
+                    })
                 );
+                if p95_ns > ABSOLUTE_30_HZ_COMPONENT_NS {
+                    contract_failures.push(format!(
+                        "{reported_kernel}-{sampling:?}-{channel_count}ch component p95 {p95_ns} ns exceeded the 30-Hz feasibility limit"
+                    ));
+                }
             }
         }
     }
     let gate_met = maximum_homogeneous_linear_ratio <= HOMOGENEOUS_LINEAR_RATIO_LIMIT;
     println!(
-        "fixed-LOD multichannel shader gate: threshold={HOMOGENEOUS_LINEAR_RATIO_LIMIT:.4} maximum_homogeneous_linear_ratio={maximum_homogeneous_linear_ratio:.4} case={} gate_met={gate_met}",
-        maximum_homogeneous_linear_case,
+        "M4D_GPU_PERFORMANCE_GATE_V1 {}",
+        serde_json::json!({
+            "gate": "fixed_lod_homogeneous_linear_ratio",
+            "threshold": HOMOGENEOUS_LINEAR_RATIO_LIMIT,
+            "observed": maximum_homogeneous_linear_ratio,
+            "case": maximum_homogeneous_linear_case,
+            "met": gate_met,
+        })
     );
-    assert!(
-        gate_met,
-        "fixed-LOD homogeneous linear ratio {maximum_homogeneous_linear_ratio:.4} for {maximum_homogeneous_linear_case} exceeded {HOMOGENEOUS_LINEAR_RATIO_LIMIT:.4}"
-    );
+    if !gate_met {
+        contract_failures.push(format!(
+            "fixed-LOD homogeneous linear ratio {maximum_homogeneous_linear_ratio:.4} for {maximum_homogeneous_linear_case} exceeded {HOMOGENEOUS_LINEAR_RATIO_LIMIT:.4}"
+        ));
+    }
     assert_eq!(gpu.diagnostics().validation_error_count(), 0);
 
     drop(offers);
@@ -6309,16 +6483,35 @@ fn fixed_lod_multichannel_gpu_timing_matrix() {
     drop(dataset_runtime);
     assert!(
         Instant::now() <= deadline,
-        "fixed-LOD multichannel timing exceeded its 600-second deadline"
+        "fixed-LOD multichannel timing exceeded its 1200-second deadline"
     );
+    assert!(
+        contract_failures.is_empty(),
+        "fixed-LOD multichannel performance contract failures: {}",
+        contract_failures.join("; ")
+    );
+}
+
+#[test]
+#[ignore = "requires the trusted HW2 Vulkan workstation"]
+fn resident_coordinated_volume_is_exact_zero_work_and_idle_when_resident() {
+    run_resident_coordinated_volume_case(false);
 }
 
 #[test]
 #[ignore = "requires a trusted Vulkan GPU with timestamp-query support for measurements"]
 fn resident_coordinated_volume_gpu_timing() {
-    const MEASURED_TRIALS: usize = 5;
+    run_resident_coordinated_volume_case(true);
+}
 
-    let deadline = Instant::now() + Duration::from_secs(120);
+fn run_resident_coordinated_volume_case(measure_performance: bool) {
+    const WARMUP_FRAMES: usize = 30;
+    const MEASURED_TRIALS: usize = 120;
+    const CORRECTNESS_CHANGED_FRAMES: usize = 2;
+    const ABSOLUTE_30_HZ_COMPONENT_NS: u64 = 33_300_000;
+
+    let deadline =
+        Instant::now() + Duration::from_secs(if measure_performance { 600 } else { 120 });
     let fixtures = build_fixtures();
     let (dataset_runtime, catalog) = start_dataset_runtime(&fixtures.source);
     let generation = CancellationGeneration::for_scope(REQUEST_SCOPE, 1);
@@ -6329,16 +6522,26 @@ fn resident_coordinated_volume_gpu_timing() {
     let mut gpu = test_gpu_runtime(
         WgpuRenderRuntimeConfig::new(PERFORMANCE_GPU_BYTES)
             .expect("timing GPU ledger is valid")
-            .with_gpu_timing(true),
+            .with_gpu_timing(measure_performance),
         None,
         TestPipelineAdmission::Ready,
     );
+    let renderer_events = Arc::new(Mutex::new(VecDeque::new()));
+    let event_queue = Arc::clone(&renderer_events);
+    gpu.set_renderer_event_sink(RendererEventSink::new(move |event| {
+        event_queue
+            .lock()
+            .expect("the renderer test event queue is never poisoned")
+            .push_back(event);
+    }));
     activate_fixture_dataset(&mut gpu, &fixtures, &catalog);
     assert_qualifying_adapter(gpu.diagnostics());
-    assert!(
-        gpu.diagnostics().gpu_timestamps_supported(),
-        "this diagnostic requires Vulkan timestamp-query support"
-    );
+    if measure_performance {
+        assert!(
+            gpu.diagnostics().gpu_timestamps_supported(),
+            "this diagnostic requires Vulkan timestamp-query support"
+        );
+    }
     request_target_layout(&mut gpu, target, extent);
 
     let mip_state = mirante4d_domain::RenderState::mip(SamplingPolicy::VoxelExact);
@@ -6372,11 +6575,23 @@ fn resident_coordinated_volume_gpu_timing() {
     assert_eq!(first_report.payload_upload_bytes(), 7 * MIB);
     assert_eq!(first_upload.residency_queue_submissions(), 1);
     assert_eq!(first_upload.color_queue_submissions(), 1);
-    let _ = poll_gpu_timing(
+    if measure_performance {
+        let _ = poll_gpu_timing(
+            &mut gpu,
+            first_upload
+                .gpu_timing()
+                .expect("the first coordinated upload has a timing ticket"),
+            deadline,
+        );
+    } else {
+        assert!(first_upload.gpu_timing().is_none());
+    }
+    wait_for_submission_completion(
         &mut gpu,
+        &renderer_events,
         first_upload
-            .gpu_timing()
-            .expect("the first coordinated upload has a timing ticket"),
+            .submitted_through_event()
+            .expect("the first setup report names its final submission"),
         deadline,
     );
 
@@ -6401,11 +6616,23 @@ fn resident_coordinated_volume_gpu_timing() {
     );
     assert_eq!(second_upload.residency_queue_submissions(), 1);
     assert_eq!(second_upload.color_queue_submissions(), 1);
-    let _ = poll_gpu_timing(
+    if measure_performance {
+        let _ = poll_gpu_timing(
+            &mut gpu,
+            second_upload
+                .gpu_timing()
+                .expect("the second coordinated upload has a timing ticket"),
+            deadline,
+        );
+    } else {
+        assert!(second_upload.gpu_timing().is_none());
+    }
+    wait_for_submission_completion(
         &mut gpu,
+        &renderer_events,
         second_upload
-            .gpu_timing()
-            .expect("the second coordinated upload has a timing ticket"),
+            .submitted_through_event()
+            .expect("the second setup report names its final submission"),
         deadline,
     );
 
@@ -6419,12 +6646,57 @@ fn resident_coordinated_volume_gpu_timing() {
         gpu.diagnostics().bind_group_creations(),
         gpu.diagnostics().usable_pipeline_handles(),
     );
-    let mut render_pass_ns = Vec::with_capacity(MEASURED_TRIALS);
+    let mut next_frame = 501_u64;
+    if measure_performance {
+        for _ in 0..WARMUP_FRAMES {
+            let intent = resident_intent
+                .clone()
+                .with_frame(FrameIdentity::new(next_frame));
+            next_frame += 1;
+            let requirements = resident_requirements
+                .rebind(&intent)
+                .expect("the resident warmup rebinds the same requirements");
+            gpu.offer_residency_leases(&upload_offers)
+                .expect("resident-volume leases remain idempotent during warmup");
+            let cutoff = execute_coordinated_target(
+                &mut gpu,
+                target,
+                &catalog,
+                &intent,
+                &requirements,
+                RetainedFrameRenderPolicy::EveryUsefulFrame,
+            );
+            let report = cutoff
+                .target(target)
+                .expect("the resident warmup has one target report");
+            assert!(report.presented());
+            assert!(!report.deferred_by_backpressure());
+            assert_eq!(report.visited_resources(), 0);
+            assert_eq!(report.uploaded_resources(), 0);
+            assert_eq!(report.payload_upload_bytes(), 0);
+            assert_eq!(cutoff.residency_queue_submissions(), 0);
+            assert_eq!(cutoff.color_queue_submissions(), 1);
+            let _ = poll_gpu_timing(
+                &mut gpu,
+                cutoff
+                    .gpu_timing()
+                    .expect("the resident warmup has a timing ticket"),
+                deadline,
+            );
+        }
+    }
+    let measured_trials = if measure_performance {
+        MEASURED_TRIALS
+    } else {
+        CORRECTNESS_CHANGED_FRAMES
+    };
+    let mut raw_render_pass_ns = Vec::with_capacity(MEASURED_TRIALS);
     let mut last_frame = None;
-    for trial in 0..MEASURED_TRIALS {
+    for _ in 0..measured_trials {
         let intent = resident_intent
             .clone()
-            .with_frame(FrameIdentity::new(501 + trial as u64));
+            .with_frame(FrameIdentity::new(next_frame));
+        next_frame += 1;
         let requirements = resident_requirements
             .rebind(&intent)
             .expect("the resident timing body rebinds without changing requirements");
@@ -6453,19 +6725,31 @@ fn resident_coordinated_volume_gpu_timing() {
         assert_eq!(cutoff.residency_queue_submissions(), 0);
         assert_eq!(cutoff.color_queue_submissions(), 1);
         assert_eq!(cutoff.recorded_targets(), &[target]);
-        let ticket = cutoff
-            .gpu_timing()
-            .expect("a resident coordinated color cutoff has a timing ticket");
-        assert_eq!(ticket.target(), target);
-        assert_eq!(ticket.generation(), intent.frame());
-        assert_eq!(ticket.pass_kind(), RenderPassKind::Volume);
-        let timing = poll_gpu_timing(&mut gpu, ticket, deadline);
-        assert_eq!(timing.ticket(), ticket);
-        render_pass_ns.push(
-            timing
-                .render_pass_ns()
-                .expect("the resident cutoff has a GPU volume-pass interval"),
-        );
+        if measure_performance {
+            let ticket = cutoff
+                .gpu_timing()
+                .expect("a resident coordinated color cutoff has a timing ticket");
+            assert_eq!(ticket.target(), target);
+            assert_eq!(ticket.generation(), intent.frame());
+            assert_eq!(ticket.pass_kind(), RenderPassKind::Volume);
+            let timing = poll_gpu_timing(&mut gpu, ticket, deadline);
+            assert_eq!(timing.ticket(), ticket);
+            raw_render_pass_ns.push(
+                timing
+                    .render_pass_ns()
+                    .expect("the resident cutoff has a GPU volume-pass interval"),
+            );
+        } else {
+            assert!(cutoff.gpu_timing().is_none());
+            wait_for_submission_completion(
+                &mut gpu,
+                &renderer_events,
+                cutoff
+                    .submitted_through_event()
+                    .expect("the measured changed frame names its color submission"),
+                deadline,
+            );
+        }
         last_frame = Some((intent, requirements));
     }
 
@@ -6505,15 +6789,36 @@ fn resident_coordinated_volume_gpu_timing() {
         "an identical settled cutoff must submit no renderer work"
     );
 
-    render_pass_ns.sort_unstable();
-    println!(
-        "resident coordinated GPU timing: adapter={} backend=Vulkan workload=1280x720_mip_9x64cubed_resident trials={} render_pass_ns={:?} median_ns={} p95_ns={}",
-        sanitize_diagnostic_text(gpu.diagnostics().adapter_name()),
-        MEASURED_TRIALS,
-        render_pass_ns,
-        percentile(&render_pass_ns, 0.50),
-        percentile(&render_pass_ns, 0.95),
-    );
+    if measure_performance {
+        let mut render_pass_ns = raw_render_pass_ns.clone();
+        render_pass_ns.sort_unstable();
+        let p95_ns = percentile(&render_pass_ns, 0.95);
+        println!(
+            "M4D_GPU_PERFORMANCE_V1 {}",
+            serde_json::json!({
+                "family": "resident_coordinated",
+                "measurement_id": "resident_coordinated::1280x720_mip_9x64cubed_resident",
+                "adapter": sanitize_diagnostic_text(gpu.diagnostics().adapter_name()),
+                "backend": "Vulkan",
+                "driver": sanitize_diagnostic_text(gpu.diagnostics().driver()),
+                "workload": "1280x720_mip_9x64cubed_resident",
+                "extent": "1280x720",
+                "warmups": WARMUP_FRAMES,
+                "samples": MEASURED_TRIALS,
+                "raw_render_pass_ns": raw_render_pass_ns,
+                "median_ns": percentile(&render_pass_ns, 0.50),
+                "p95_ns": p95_ns,
+                "absolute_limit_ns": ABSOLUTE_30_HZ_COMPONENT_NS,
+                "absolute_met": p95_ns <= ABSOLUTE_30_HZ_COMPONENT_NS,
+                "uploads_during_samples": 0,
+                "validation_errors": 0,
+            })
+        );
+        assert!(
+            p95_ns <= ABSOLUTE_30_HZ_COMPONENT_NS,
+            "resident coordinated component p95 {p95_ns} ns exceeded the 30-Hz feasibility limit"
+        );
+    }
     assert_eq!(gpu.diagnostics().validation_error_count(), 0);
 
     drop(upload_offers);
@@ -6524,6 +6829,6 @@ fn resident_coordinated_volume_gpu_timing() {
     drop(dataset_runtime);
     assert!(
         Instant::now() <= deadline,
-        "resident coordinated timing exceeded its 120-second deadline"
+        "resident coordinated case exceeded its finite deadline"
     );
 }

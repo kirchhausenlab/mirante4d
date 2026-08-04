@@ -54,6 +54,19 @@
       ],
       "binding": "each named file is an independent bounded source case",
       "reject": ["unsupported uint32", "nonfinite float32", "corrupt TIFF structure"]
+    },
+    {
+      "specification_id": "SRC-TIFF-SPEC-005",
+      "grouping_id": "portable_compression_container_family",
+      "paths": [
+        "spec-005/deflate-u8-tiled.tif",
+        "spec-005/lzw-u8-striped.tif",
+        "spec-005/old-deflate-u8-striped.tif",
+        "spec-005/packbits-u8-bigtiff.tif",
+        "spec-005/uncompressed-big-endian-u16.tif"
+      ],
+      "binding": "each named file independently binds one admitted compression or portable TIFF container boundary",
+      "reject": ["unsupported compression", "malformed tile or strip table", "invalid BigTIFF header"]
     }
   ]
 }

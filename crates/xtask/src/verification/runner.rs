@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -9,7 +10,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::process::{cargo_command, ensure_nextest, run_command_with_timeout};
 
@@ -23,6 +24,32 @@ const TARGET_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
 const PROJECT_FIXTURE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
 const PROJECT_STORE_VM_SELF_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 const PROJECT_STORE_HOSTED_MATRIX_TIMEOUT_MS: u64 = 180_000;
+const TRUSTED_GPU_RESULT_STREAM_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+const PROJECT_STORE_HOST_ONLY_IGNORED_CASES: [&str; 3] = [
+    "actor::tests::hosted_durability_tests::exhaustive_hosted_and_process_transition_matrix",
+    "actor::tests::trash_fresh_process_kill_and_retry_matrix",
+    "actor::tests::purge_fresh_process_kill_and_retry_matrix",
+];
+
+const PROJECT_STORE_QUALIFIED_FILESYSTEM_IGNORED_CASES: [(&str, &str); 4] = [
+    (
+        "mirante4d-application",
+        "project_store_service::tests::qualified_filesystem_open_recovery_inspection_failure_enters_recovery_only",
+    ),
+    (
+        "mirante4d-application",
+        "project_store_service::tests::qualified_filesystem_automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit",
+    ),
+    (
+        "mirante4d-application",
+        "project_store_service::tests::qualified_filesystem_recovery_selected_save_as_establishes_the_new_project",
+    ),
+    (
+        "mirante4d-app",
+        "tests::import_analyze_save_and_reopen_without_a_global_integrity_audit",
+    ),
+];
 
 const PROJECT_STORE_PROCESS_MATRIX_CASES: [(&str, u64); 3] = [
     (
@@ -143,9 +170,9 @@ pub(crate) fn verify_local(lane: &str) -> anyhow::Result<()> {
     match lane {
         "format-lifecycle" => verify_format_lifecycle(),
         "project-store-lifecycle" => verify_project_store_lifecycle(),
-        "trusted-gpu" => verify_trusted_gpu(),
+        "trusted-gpu-correctness" => verify_trusted_gpu_correctness(),
         _ => bail!(
-            "unknown local verification lane {lane:?}; expected format-lifecycle|project-store-lifecycle|trusted-gpu"
+            "unknown local verification lane {lane:?}; expected format-lifecycle|project-store-lifecycle|trusted-gpu-correctness"
         ),
     }
 }
@@ -187,12 +214,17 @@ fn verify_project_store_lifecycle() -> anyhow::Result<()> {
     phases.record_identity(&identity);
 
     let mut hosted_evidence = None;
+    let hosted_selector = project_store_local_host_selector();
     let hosted_passed = phases.run(
-        "hosted-process-hostile-runtime",
-        "NEXTEST_USER_CONFIG_FILE=none cargo nextest run --color never --package mirante4d-project-store --frozen --no-fail-fast --retries 0 --flaky-result fail --no-tests fail --success-output immediate --no-output-indent",
+        "host-process-hostile-runtime-qualified-filesystem",
+        format!(
+            "NEXTEST_USER_CONFIG_FILE=none cargo nextest run --color never --package mirante4d-project-store --frozen --no-fail-fast --retries 0 --flaky-result fail --no-tests fail --success-output immediate --no-output-indent && NEXTEST_USER_CONFIG_FILE=none cargo nextest run --color never --workspace --frozen --run-ignored only --no-fail-fast --retries 0 --flaky-result fail --no-tests fail --success-output immediate --no-output-indent -E '{hosted_selector}'"
+        ),
         || {
-            let mut command = isolated_nextest_command();
-            command.args([
+            let output = fs::File::create(&hosted_output_path)
+                .with_context(|| format!("failed to create {}", hosted_output_path.display()))?;
+            let mut routine = isolated_nextest_command();
+            routine.args([
                 "nextest",
                 "run",
                 "--color",
@@ -211,14 +243,47 @@ fn verify_project_store_lifecycle() -> anyhow::Result<()> {
                 "immediate",
                 "--no-output-indent",
             ]);
-            let output = fs::File::create(&hosted_output_path)
-                .with_context(|| format!("failed to create {}", hosted_output_path.display()))?;
-            command.stdout(Stdio::from(output.try_clone()?));
-            command.stderr(Stdio::from(output));
-            let command_result = run_command_with_timeout(
-                &mut command,
+            routine.stdout(Stdio::from(output.try_clone()?));
+            routine.stderr(Stdio::from(output));
+            run_command_with_timeout(
+                &mut routine,
                 project_store_lifecycle_remaining(deadline)?,
-            );
+            )?;
+
+            let output = OpenOptions::new()
+                .append(true)
+                .open(&hosted_output_path)
+                .with_context(|| format!("failed to append {}", hosted_output_path.display()))?;
+            let mut host_only = isolated_nextest_command();
+            host_only.args([
+                "nextest",
+                "run",
+                "--color",
+                "never",
+                "--workspace",
+                "--frozen",
+                "--run-ignored",
+                "only",
+                "--no-fail-fast",
+                "--retries",
+                "0",
+                "--flaky-result",
+                "fail",
+                "--no-tests",
+                "fail",
+                "--success-output",
+                "immediate",
+                "--no-output-indent",
+                "-E",
+                &hosted_selector,
+            ]);
+            host_only.stdout(Stdio::from(output.try_clone()?));
+            host_only.stderr(Stdio::from(output));
+            run_command_with_timeout(
+                &mut host_only,
+                project_store_lifecycle_remaining(deadline)?,
+            )?;
+
             let encoded = fs::read_to_string(&hosted_output_path)
                 .with_context(|| format!("failed to read {}", hosted_output_path.display()))?;
             print!("{encoded}");
@@ -226,7 +291,6 @@ fn verify_project_store_lifecycle() -> anyhow::Result<()> {
             if let Ok(evidence) = &parsed {
                 hosted_evidence = Some(evidence.clone());
             }
-            command_result?;
             project_store_lifecycle_remaining(deadline)?;
             parsed?;
             Ok(())
@@ -311,6 +375,21 @@ fn verify_project_store_lifecycle() -> anyhow::Result<()> {
     }
     let report_result = phases.write_report(&report_path, "project-store-lifecycle", &identity);
     phases.finish("project-store-lifecycle").and(report_result)
+}
+
+fn project_store_local_host_selector() -> String {
+    let cases = PROJECT_STORE_HOST_ONLY_IGNORED_CASES
+        .iter()
+        .map(|case| format!("test(={case})"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let process_cases = format!("package(mirante4d-project-store) & ({cases})");
+    let qualified_filesystem_cases = PROJECT_STORE_QUALIFIED_FILESYSTEM_IGNORED_CASES
+        .iter()
+        .map(|(package, case)| format!("package({package}) & test(={case})"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!("({process_cases}) | ({qualified_filesystem_cases})")
 }
 
 fn project_store_lifecycle_remaining(deadline: Instant) -> anyhow::Result<Duration> {
@@ -408,6 +487,15 @@ fn parse_project_store_hosted_suite_evidence(output: &str) -> anyhow::Result<Val
             bail!("hosted project-store output lacks a passing result for {case}");
         }
     }
+    for (package, case) in PROJECT_STORE_QUALIFIED_FILESYSTEM_IGNORED_CASES {
+        let suffix = format!("{package} {case}");
+        if !output
+            .lines()
+            .any(|line| line.contains("PASS") && line.trim_end().ends_with(&suffix))
+        {
+            bail!("project-store output lacks a passing qualified-filesystem result for {case}");
+        }
+    }
     let process_matrices = [
         parse_project_store_process_matrix(
             output,
@@ -452,7 +540,8 @@ fn parse_project_store_hosted_suite_evidence(output: &str) -> anyhow::Result<Val
             "power_loss_simulated": false,
             "durability_claim": false
         },
-        "process_matrices": process_matrices
+        "process_matrices": process_matrices,
+        "qualified_filesystem_success_cases": PROJECT_STORE_QUALIFIED_FILESYSTEM_IGNORED_CASES.len()
     }))
 }
 
@@ -1239,59 +1328,429 @@ fn string_array<'a>(
         .collect()
 }
 
-fn verify_trusted_gpu() -> anyhow::Result<()> {
+fn verify_trusted_gpu_correctness() -> anyhow::Result<()> {
     if env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
-        bail!("trusted-gpu verification must not run in GitHub Actions");
+        bail!("trusted-gpu-correctness verification must not run in GitHub Actions");
     }
     if env::var("MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL").as_deref() != Ok("1") {
         bail!(
-            "trusted-gpu verification requires MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 on the trusted machine"
+            "trusted-gpu-correctness verification requires MIRANTE4D_XTASK_ALLOW_TRUSTED_LOCAL=1 on the trusted machine"
         );
     }
     ensure_nextest()?;
     let registry = registry::read_registry()?;
-    let (selector, timeout_secs) = registry::trusted_gpu_policy(&registry)?;
+    let (selector, timeout_secs) = registry::trusted_gpu_correctness_policy(&registry)?;
     let identity = RunIdentity::gather()?;
     if !identity.qualifying {
         bail!(
-            "trusted-gpu verification requires a qualifying clean revision: {}",
+            "trusted-gpu-correctness verification requires a qualifying clean revision: {}",
             identity.qualification_issues.join("; ")
         );
     }
-    let report_path = verification_report_path("verify-local-trusted-gpu")?;
+    let report_path = verification_report_path("verify-local-trusted-gpu-correctness")?;
+    let discovery_path = report_path
+        .parent()
+        .context("trusted GPU report path has no parent")?
+        .join("trusted-gpu-correctness-discovery.json");
+    let result_stream_path = report_path
+        .parent()
+        .context("trusted GPU report path has no parent")?
+        .join("trusted-gpu-correctness-results.jsonl");
     let mut phases = PhaseCollector::default();
     phases.record_identity(&identity);
-    let command_text = format!(
-        "NEXTEST_USER_CONFIG_FILE=none cargo nextest run --workspace --frozen --profile trusted-gpu --run-ignored only --no-fail-fast --retries 0 --flaky-result fail --no-tests fail --success-output final --no-output-indent -E '{selector}'"
+    let discovered = phases.run(
+        "trusted-gpu-correctness-discovery",
+        "NEXTEST_USER_CONFIG_FILE=none cargo nextest list --workspace --frozen --profile trusted-gpu-correctness --run-ignored all --message-format json",
+        || {
+            let output = fs::File::create(&discovery_path).with_context(|| {
+                format!("failed to create {}", discovery_path.display())
+            })?;
+            let mut command = isolated_nextest_command();
+            command.args([
+                "nextest",
+                "list",
+                "--workspace",
+                "--frozen",
+                "--profile",
+                "trusted-gpu-correctness",
+                "--run-ignored",
+                "all",
+                "--message-format",
+                "json",
+            ]);
+            command.stdout(Stdio::from(output));
+            run_command_with_timeout(&mut command, DISCOVERY_TIMEOUT)
+        },
     );
-    phases.run("trusted-gpu", command_text, || {
-        let mut command = isolated_nextest_command();
-        command.args([
-            "nextest",
-            "run",
-            "--workspace",
-            "--frozen",
-            "--profile",
-            "trusted-gpu",
-            "--run-ignored",
-            "only",
-            "--no-fail-fast",
-            "--retries",
-            "0",
-            "--flaky-result",
-            "fail",
-            "--no-tests",
-            "fail",
-            "--success-output",
-            "final",
-            "--no-output-indent",
-            "-E",
-            &selector,
-        ]);
-        run_command_with_timeout(&mut command, Duration::from_secs(timeout_secs))
-    });
-    let report_result = phases.write_report(&report_path, "trusted-gpu", &identity);
-    phases.finish("trusted-gpu").and(report_result)
+    let mut inventory = Vec::new();
+    let inventory_ok = if discovered {
+        phases.run(
+            "trusted-gpu-correctness-inventory",
+            "exact registered ignored-name reconciliation",
+            || {
+                registry::audit_discovery(&discovery_path, &registry)?;
+                inventory = registry::ignored_inventory_for_lane(
+                    &discovery_path,
+                    &registry,
+                    "trusted-gpu-correctness",
+                )?;
+                if inventory.len() < 25 {
+                    bail!(
+                        "trusted GPU correctness inventory has {} cases, expected at least 25",
+                        inventory.len()
+                    );
+                }
+                Ok(())
+            },
+        )
+    } else {
+        phases.block(
+            "trusted-gpu-correctness-inventory",
+            "test discovery did not complete",
+        );
+        false
+    };
+    let command_text = format!(
+        "NEXTEST_USER_CONFIG_FILE=none NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --workspace --frozen --profile trusted-gpu-correctness --run-ignored only --no-fail-fast --retries 0 --flaky-result fail --no-tests fail --success-output final --no-output-indent --message-format libtest-json-plus --message-format-version 0.1 -E '{selector}'"
+    );
+    let execution_ok = if inventory_ok {
+        phases.run("trusted-gpu-correctness", command_text, || {
+            let result_stream = fs::File::create(&result_stream_path)
+                .with_context(|| format!("failed to create {}", result_stream_path.display()))?;
+            let mut command = isolated_nextest_command();
+            command.env("NEXTEST_EXPERIMENTAL_LIBTEST_JSON", "1");
+            command.args([
+                "nextest",
+                "run",
+                "--workspace",
+                "--frozen",
+                "--profile",
+                "trusted-gpu-correctness",
+                "--run-ignored",
+                "only",
+                "--no-fail-fast",
+                "--retries",
+                "0",
+                "--flaky-result",
+                "fail",
+                "--no-tests",
+                "fail",
+                "--success-output",
+                "final",
+                "--no-output-indent",
+                "--message-format",
+                "libtest-json-plus",
+                "--message-format-version",
+                "0.1",
+                "-E",
+                &selector,
+            ]);
+            command.stdout(Stdio::from(result_stream));
+            run_command_with_timeout(&mut command, Duration::from_secs(timeout_secs))
+        })
+    } else {
+        phases.block(
+            "trusted-gpu-correctness",
+            "exact correctness inventory was not established",
+        );
+        false
+    };
+    let attribution = if inventory_ok {
+        let parsed = parse_trusted_gpu_result_file(&result_stream_path, &inventory, execution_ok);
+        let attribution_ok = phases.run(
+            "trusted-gpu-correctness-attribution",
+            "bounded structured Nextest result reconciliation",
+            || {
+                parsed
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| anyhow::anyhow!("{error:#}"))
+            },
+        );
+        match parsed {
+            Ok(attribution) if attribution_ok => attribution,
+            Ok(_) => TrustedGpuCaseAttribution::fail_closed(
+                &inventory,
+                "structured attribution phase failed",
+            ),
+            Err(error) => TrustedGpuCaseAttribution::fail_closed(&inventory, &format!("{error:#}")),
+        }
+    } else {
+        phases.block(
+            "trusted-gpu-correctness-attribution",
+            "exact correctness inventory was not established",
+        );
+        TrustedGpuCaseAttribution::fail_closed(
+            &inventory,
+            "exact correctness inventory was not established",
+        )
+    };
+    phases.record_evidence(
+        "trusted_gpu_correctness",
+        json!({
+            "backend": "Vulkan",
+            "expected_adapter": env::var("MIRANTE4D_TRUSTED_GPU_ADAPTER_NAME")
+                .unwrap_or_else(|_| "NVIDIA GeForce RTX 3070 Ti Laptop GPU".to_owned()),
+            "discovered_names": inventory.clone(),
+            "selected_names": inventory.clone(),
+            "started_names": attribution.started_names,
+            "executed_names": attribution.executed_names,
+            "passed_names": attribution.passed_names,
+            "failed_names": attribution.failed_names,
+            "skipped_names": attribution.skipped_names,
+            "not_started_names": attribution.not_started_names,
+            "unevaluated_names": attribution.unevaluated_names,
+            "failed_case_kinds": attribution.failed_case_kinds,
+            "per_case_execution_attribution": attribution.status,
+            "attribution_error": attribution.error,
+            "native_process_succeeded": execution_ok,
+            "structured_result_format": "nextest-libtest-json-plus-0.1",
+            "structured_result_file": "trusted-gpu-correctness-results.jsonl",
+            "zero_retries": true,
+            "serial": true,
+        }),
+    );
+    let _ = fs::remove_file(&discovery_path);
+    let report_result = phases.write_report(&report_path, "trusted-gpu-correctness", &identity);
+    phases.finish("trusted-gpu-correctness").and(report_result)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TrustedGpuCaseAttribution {
+    status: &'static str,
+    started_names: Vec<String>,
+    executed_names: Vec<String>,
+    passed_names: Vec<String>,
+    failed_names: Vec<String>,
+    skipped_names: Vec<String>,
+    not_started_names: Vec<String>,
+    unevaluated_names: Vec<String>,
+    failed_case_kinds: BTreeMap<String, String>,
+    error: Option<String>,
+}
+
+impl TrustedGpuCaseAttribution {
+    fn fail_closed(inventory: &[String], error: &str) -> Self {
+        Self {
+            status: "invalid_structured_evidence",
+            started_names: Vec::new(),
+            executed_names: Vec::new(),
+            passed_names: Vec::new(),
+            failed_names: Vec::new(),
+            skipped_names: Vec::new(),
+            not_started_names: inventory.to_vec(),
+            unevaluated_names: inventory.to_vec(),
+            failed_case_kinds: BTreeMap::new(),
+            error: Some(error.to_owned()),
+        }
+    }
+}
+
+fn parse_trusted_gpu_result_file(
+    path: &Path,
+    inventory: &[String],
+    native_success: bool,
+) -> anyhow::Result<TrustedGpuCaseAttribution> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("structured result stream {} is absent", path.display()))?;
+    if metadata.len() == 0 || metadata.len() > TRUSTED_GPU_RESULT_STREAM_MAX_BYTES {
+        bail!(
+            "structured result stream has {} bytes, expected 1..={TRUSTED_GPU_RESULT_STREAM_MAX_BYTES}",
+            metadata.len()
+        );
+    }
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read structured result stream {}", path.display()))?;
+    parse_trusted_gpu_results(&bytes, inventory, native_success)
+}
+
+fn parse_trusted_gpu_results(
+    bytes: &[u8],
+    inventory: &[String],
+    native_success: bool,
+) -> anyhow::Result<TrustedGpuCaseAttribution> {
+    if bytes.is_empty() || !bytes.ends_with(b"\n") {
+        bail!("structured result stream is empty or truncated");
+    }
+    let selected = inventory.iter().cloned().collect::<BTreeSet<_>>();
+    if selected.len() != inventory.len() {
+        bail!("trusted GPU selected inventory contains duplicate names");
+    }
+    let mut saw_suite = false;
+    let mut started = BTreeSet::new();
+    let mut passed = BTreeSet::new();
+    let mut failed = BTreeSet::new();
+    let mut skipped = BTreeSet::new();
+    let mut failure_kinds = BTreeMap::new();
+    let mut filtered_started = BTreeSet::new();
+    let mut filtered_ignored = BTreeSet::new();
+    for (line_index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let event: Value = serde_json::from_slice(line).with_context(|| {
+            format!(
+                "structured result line {} is not valid JSON",
+                line_index + 1
+            )
+        })?;
+        let object = event.as_object().with_context(|| {
+            format!("structured result line {} is not an object", line_index + 1)
+        })?;
+        let kind = object
+            .get("type")
+            .and_then(Value::as_str)
+            .with_context(|| format!("structured result line {} has no type", line_index + 1))?;
+        let outcome = object
+            .get("event")
+            .and_then(Value::as_str)
+            .with_context(|| format!("structured result line {} has no event", line_index + 1))?;
+        match kind {
+            "suite" => {
+                if !matches!(outcome, "started" | "ok" | "failed") {
+                    bail!("structured suite event {outcome:?} is unsupported");
+                }
+                saw_suite = true;
+            }
+            "test" => {
+                let emitted_name =
+                    object
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .with_context(|| {
+                            format!("structured test line {} has no name", line_index + 1)
+                        })?;
+                let name = canonical_nextest_test_name(emitted_name)?;
+                if !selected.contains(&name) {
+                    // `libtest-json-plus` preserves filtered cases as
+                    // synthetic `started` events. Most receive an `ignored`
+                    // terminal, while an entirely filtered test binary can
+                    // omit those terminals. Neither form is an execution.
+                    // Any unregistered `ok` or `failed` result remains
+                    // contradictory evidence and must fail closed.
+                    match outcome {
+                        "started" => {
+                            if !filtered_started.insert(emitted_name.to_owned()) {
+                                bail!(
+                                    "structured result starts filtered test {name:?} more than once"
+                                );
+                            }
+                        }
+                        "ignored" => {
+                            if !filtered_started.contains(emitted_name) {
+                                bail!(
+                                    "structured result ignores filtered test {name:?} before it starts"
+                                );
+                            }
+                            if !filtered_ignored.insert(emitted_name.to_owned()) {
+                                bail!(
+                                    "structured result terminates filtered test {name:?} more than once"
+                                );
+                            }
+                        }
+                        "ok" | "failed" => {
+                            bail!("structured result executes unexpected test {name:?}");
+                        }
+                        other => bail!("structured test event {other:?} is unsupported"),
+                    }
+                    continue;
+                }
+                match outcome {
+                    "started" => {
+                        if !started.insert(name.clone()) {
+                            bail!("structured result starts test {name:?} more than once");
+                        }
+                    }
+                    "ok" => {
+                        record_terminal_result(&name, &started, &passed, &failed, &skipped)?;
+                        passed.insert(name);
+                    }
+                    "failed" => {
+                        record_terminal_result(&name, &started, &passed, &failed, &skipped)?;
+                        let failure_kind = if object.get("reason").and_then(Value::as_str)
+                            == Some("time limit exceeded")
+                        {
+                            "timeout"
+                        } else {
+                            "test_failure_or_abort"
+                        };
+                        failure_kinds.insert(name.clone(), failure_kind.to_owned());
+                        failed.insert(name);
+                    }
+                    "ignored" => {
+                        record_terminal_result(&name, &started, &passed, &failed, &skipped)?;
+                        skipped.insert(name);
+                    }
+                    other => bail!("structured test event {other:?} is unsupported"),
+                }
+            }
+            other => bail!("structured result type {other:?} is unsupported"),
+        }
+    }
+    if !saw_suite {
+        bail!("structured result stream contains no suite event");
+    }
+    let terminal = passed
+        .union(&failed)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .union(&skipped)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let not_started = selected.difference(&started).cloned().collect::<Vec<_>>();
+    let unevaluated = selected.difference(&terminal).cloned().collect::<Vec<_>>();
+    if native_success && (!failed.is_empty() || !skipped.is_empty() || !unevaluated.is_empty()) {
+        bail!("successful native process disagrees with incomplete or failing case results");
+    }
+    if !native_success && failed.is_empty() && skipped.is_empty() && unevaluated.is_empty() {
+        bail!("nonzero native process disagrees with an apparently all-pass result stream");
+    }
+    let executed = passed.union(&failed).cloned().collect::<Vec<_>>();
+    Ok(TrustedGpuCaseAttribution {
+        status: if native_success {
+            "complete_native_success"
+        } else {
+            "exact_partial_or_failed_native_run"
+        },
+        started_names: started.iter().cloned().collect(),
+        executed_names: executed,
+        passed_names: passed.into_iter().collect(),
+        failed_names: failed.into_iter().collect(),
+        skipped_names: skipped.into_iter().collect(),
+        not_started_names: not_started,
+        unevaluated_names: unevaluated,
+        failed_case_kinds: failure_kinds,
+        error: None,
+    })
+}
+
+fn canonical_nextest_test_name(emitted: &str) -> anyhow::Result<String> {
+    let (package, binary_and_test) = emitted
+        .split_once("::")
+        .context("structured test name has no package separator")?;
+    let (_, test) = binary_and_test
+        .split_once('$')
+        .context("structured test name has no binary/test separator")?;
+    if package.is_empty() || test.is_empty() || test.contains('#') || test.contains("@stress-") {
+        bail!("structured test name {emitted:?} is not one zero-retry case identity");
+    }
+    Ok(format!("{package}::{test}"))
+}
+
+fn record_terminal_result(
+    name: &str,
+    started: &BTreeSet<String>,
+    passed: &BTreeSet<String>,
+    failed: &BTreeSet<String>,
+    skipped: &BTreeSet<String>,
+) -> anyhow::Result<()> {
+    if !started.contains(name) {
+        bail!("structured result terminates test {name:?} before it starts");
+    }
+    if passed.contains(name) || failed.contains(name) || skipped.contains(name) {
+        bail!("structured result terminates test {name:?} more than once");
+    }
+    Ok(())
 }
 
 fn exact_object<'a>(
@@ -2237,6 +2696,183 @@ mod tests {
         assert!(Leaf::parse("fast").is_err());
     }
 
+    fn trusted_gpu_inventory(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("gpu-package::gpu_tests::case_{index:02}"))
+            .collect()
+    }
+
+    fn trusted_gpu_stream(
+        inventory: &[String],
+        passed: usize,
+        failed: usize,
+        started_without_terminal: usize,
+    ) -> Vec<u8> {
+        assert!(passed + failed + started_without_terminal <= inventory.len());
+        let mut events = Vec::new();
+        events.push(json!({
+            "type": "suite",
+            "event": "started",
+            "test_count": inventory.len(),
+            "nextest": {
+                "crate": "gpu-package",
+                "test_binary": "gpu_binary",
+                "kind": "lib"
+            }
+        }));
+        for (index, canonical) in inventory
+            .iter()
+            .take(passed + failed + started_without_terminal)
+            .enumerate()
+        {
+            let test = canonical.split_once("::").unwrap().1;
+            let emitted = format!("gpu-package::gpu_binary${test}");
+            events.push(json!({ "type": "test", "event": "started", "name": emitted }));
+            if index < passed {
+                events.push(json!({
+                    "type": "test",
+                    "event": "ok",
+                    "name": emitted,
+                    "exec_time": 0.01
+                }));
+            } else if index < passed + failed {
+                events.push(json!({
+                    "type": "test",
+                    "event": "failed",
+                    "name": emitted,
+                    "exec_time": 0.01,
+                    "stdout": "bounded failure"
+                }));
+            }
+        }
+        if started_without_terminal == 0 && passed + failed == inventory.len() {
+            events.push(json!({
+                "type": "suite",
+                "event": if failed == 0 { "ok" } else { "failed" },
+                "passed": passed,
+                "failed": failed,
+                "ignored": 0,
+                "measured": 0,
+                "filtered_out": 0,
+                "exec_time": 1.0,
+                "nextest": {
+                    "crate": "gpu-package",
+                    "test_binary": "gpu_binary",
+                    "kind": "lib"
+                }
+            }));
+        }
+        let mut encoded = events
+            .into_iter()
+            .map(|event| serde_json::to_string(&event).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+        encoded.push(b'\n');
+        encoded
+    }
+
+    #[test]
+    fn failed_trusted_gpu_run_retains_exact_per_case_attribution() {
+        let inventory = trusted_gpu_inventory(25);
+        let attribution =
+            parse_trusted_gpu_results(&trusted_gpu_stream(&inventory, 19, 6, 0), &inventory, false)
+                .unwrap();
+
+        assert_eq!(attribution.status, "exact_partial_or_failed_native_run");
+        assert_eq!(attribution.started_names, inventory);
+        assert_eq!(attribution.executed_names.len(), 25);
+        assert_eq!(attribution.passed_names.len(), 19);
+        assert_eq!(attribution.failed_names.len(), 6);
+        assert!(attribution.skipped_names.is_empty());
+        assert!(attribution.not_started_names.is_empty());
+        assert!(attribution.unevaluated_names.is_empty());
+        assert!(
+            attribution
+                .failed_case_kinds
+                .values()
+                .all(|kind| kind == "test_failure_or_abort")
+        );
+    }
+
+    #[test]
+    fn all_pass_and_interrupted_trusted_gpu_streams_reconcile_exactly() {
+        let inventory = trusted_gpu_inventory(25);
+        let all_pass =
+            parse_trusted_gpu_results(&trusted_gpu_stream(&inventory, 25, 0, 0), &inventory, true)
+                .unwrap();
+        assert_eq!(all_pass.status, "complete_native_success");
+        assert_eq!(all_pass.passed_names, inventory);
+        assert!(all_pass.unevaluated_names.is_empty());
+
+        let mut filtered_stream = trusted_gpu_stream(&inventory, 25, 0, 0);
+        filtered_stream.extend_from_slice(
+            format!(
+                "{}\n{}\n{}\n",
+                json!({
+                    "type": "test",
+                    "event": "started",
+                    "name": "gpu-package::gpu_binary$portable_tests::filtered_case"
+                }),
+                json!({
+                    "type": "test",
+                    "event": "ignored",
+                    "name": "gpu-package::gpu_binary$portable_tests::filtered_case"
+                }),
+                json!({
+                    "type": "test",
+                    "event": "started",
+                    "name": "gpu-package::entirely_filtered_binary$portable_tests::filtered_without_terminal"
+                })
+            )
+            .as_bytes(),
+        );
+        let with_filtered_binary_inventory =
+            parse_trusted_gpu_results(&filtered_stream, &inventory, true).unwrap();
+        assert_eq!(with_filtered_binary_inventory.passed_names, inventory);
+        assert_eq!(with_filtered_binary_inventory.executed_names.len(), 25);
+
+        let interrupted =
+            parse_trusted_gpu_results(&trusted_gpu_stream(&inventory, 3, 1, 1), &inventory, false)
+                .unwrap();
+        assert_eq!(interrupted.started_names.len(), 5);
+        assert_eq!(interrupted.passed_names.len(), 3);
+        assert_eq!(interrupted.failed_names.len(), 1);
+        assert_eq!(interrupted.not_started_names.len(), 20);
+        assert_eq!(interrupted.unevaluated_names.len(), 21);
+    }
+
+    #[test]
+    fn truncated_or_contradictory_trusted_gpu_results_fail_closed() {
+        let inventory = trusted_gpu_inventory(25);
+        let mut truncated = trusted_gpu_stream(&inventory, 19, 6, 0);
+        truncated.pop();
+        assert!(parse_trusted_gpu_results(&truncated, &inventory, false).is_err());
+
+        let mut unexpected_inventory = inventory.clone();
+        unexpected_inventory[24] = "gpu-package::gpu_tests::unexpected".to_owned();
+        assert!(
+            parse_trusted_gpu_results(
+                &trusted_gpu_stream(&unexpected_inventory, 19, 6, 0),
+                &inventory,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_trusted_gpu_results(
+                &trusted_gpu_stream(&inventory, 25, 0, 0),
+                &inventory,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_trusted_gpu_results(&trusted_gpu_stream(&inventory, 19, 6, 0), &inventory, true,)
+                .is_err()
+        );
+    }
+
     fn valid_project_store_lifecycle_evidence() -> Value {
         let rows = expected_project_store_vm_rows().unwrap();
         let transition_cut_cases = rows.len() as u64;
@@ -2396,11 +3032,17 @@ mod tests {
             .map(|case| format!("PASS mirante4d-project-store {case}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let output = format!("{marker}{passing_cases}\n");
+        let passing_qualified_filesystem_cases = PROJECT_STORE_QUALIFIED_FILESYSTEM_IGNORED_CASES
+            .iter()
+            .map(|(package, case)| format!("PASS {package} {case}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = format!("{marker}{passing_cases}\n{passing_qualified_filesystem_cases}\n");
         let hosted = parse_project_store_hosted_suite_evidence(&output).unwrap();
         assert_eq!(hosted["result"], "passed");
         assert_eq!(hosted["transition_matrix"]["discovered_edge_rows"], 424);
         assert_eq!(hosted["process_matrices"][1]["facts"]["fresh_reopens"], 34);
+        assert_eq!(hosted["qualified_filesystem_success_cases"], 4);
 
         let aggregate = project_store_b2_aggregate_evidence(hosted);
         assert_eq!(aggregate["result"], "passed");
@@ -2442,7 +3084,7 @@ mod tests {
         assert!(parse_project_store_hosted_suite_evidence("no marker").is_err());
         assert!(
             parse_project_store_hosted_suite_evidence(&format!(
-                "{marker}{marker}{passing_cases}\n"
+                "{marker}{marker}{passing_cases}\n{passing_qualified_filesystem_cases}\n"
             ))
             .is_err()
         );
@@ -2475,6 +3117,28 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            parse_project_store_hosted_suite_evidence(
+                &output.replace(
+                    "PASS mirante4d-app tests::import_analyze_save_and_reopen_without_a_global_integrity_audit",
+                    "FAIL mirante4d-app tests::import_analyze_save_and_reopen_without_a_global_integrity_audit"
+                )
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn project_store_local_host_selector_owns_process_and_qualified_filesystem_cases() {
+        let selector = project_store_local_host_selector();
+        assert_eq!(selector.matches("test(=").count(), 7);
+        for case in PROJECT_STORE_HOST_ONLY_IGNORED_CASES {
+            assert!(selector.contains(&format!("test(={case})")));
+        }
+        for (package, case) in PROJECT_STORE_QUALIFIED_FILESYSTEM_IGNORED_CASES {
+            assert!(selector.contains(&format!("package({package}) & test(={case})")));
+        }
+        assert!(!selector.contains("project_store_vm_guest_driver"));
     }
 
     #[test]

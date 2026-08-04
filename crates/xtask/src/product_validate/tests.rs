@@ -18,8 +18,191 @@ fn x11_automation_helpers_have_short_silence_absolute_and_output_bounds() {
     assert_eq!(X11_AUTOMATION_OUTPUT_POLICY.max_stderr_bytes, 64 * 1024);
 }
 
+#[test]
+fn presentation_probe_assigns_restore_to_one_external_x11_controller() {
+    let script = representative_gpu_presentation_probe_script(Path::new("/private/cell.m4d"));
+    validate_product_automation_script(&script).unwrap();
+    assert_eq!(
+        ProductAutomationExternalControlPlan::from_script(
+            REPRESENTATIVE_GPU_PRESENTATION_PROBE_SCENARIO,
+            &script,
+        )
+        .unwrap(),
+        ProductAutomationExternalControlPlan::PresentationProbe {
+            minimize_command_index: 14,
+        }
+    );
+    let minimized = script["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|command| command["command"] == "set_window_minimized")
+        .collect::<Vec<_>>();
+    assert_eq!(minimized.len(), 1);
+    assert_eq!(minimized[0]["minimized"], true);
+    assert_eq!(script["commands"].as_array().unwrap().len(), 29);
+    assert_eq!(script["commands"][24]["command"], "capture_screenshot");
+    assert_eq!(script["commands"][24]["target"], "three_d");
+}
+
+#[test]
+fn presentation_probe_window_state_waits_for_minimize_then_unmaps_and_restores_once() {
+    let origin = Instant::now();
+    let mut state = PresentationProbeWindowState::new(14);
+    let progress = |index| SafeProgressSnapshot {
+        heartbeat_sequence: u64::try_from(index + 1).unwrap(),
+        command_count: 29,
+        state: SafeProgressState::Command {
+            index,
+            command_kind: "wait_for",
+            elapsed_ms: 0,
+        },
+    };
+    state.observe_progress(&progress(13), origin);
+    assert_eq!(
+        state.phase,
+        PresentationProbeWindowPhase::WaitingForMinimizeCommand
+    );
+    state.observe_progress(&progress(14), origin);
+    assert!(matches!(
+        state.phase,
+        PresentationProbeWindowPhase::WaitingForMinimized { .. }
+    ));
+    let normal = X11WindowManagerState {
+        hidden: false,
+        iconic: false,
+    };
+    let minimized = X11WindowManagerState {
+        hidden: true,
+        iconic: true,
+    };
+    assert_eq!(
+        state.observe_window(normal, origin),
+        PresentationProbeWindowDecision::None
+    );
+    assert_eq!(
+        state.observe_window(minimized, origin + Duration::from_millis(10)),
+        PresentationProbeWindowDecision::Unmap
+    );
+    assert_eq!(
+        state.observe_window(
+            minimized,
+            origin + Duration::from_millis(10) + PRESENTATION_PROBE_MINIMIZED_HOLD
+                - Duration::from_nanos(1),
+        ),
+        PresentationProbeWindowDecision::None
+    );
+    assert_eq!(
+        state.observe_window(
+            minimized,
+            origin + Duration::from_millis(10) + PRESENTATION_PROBE_MINIMIZED_HOLD,
+        ),
+        PresentationProbeWindowDecision::Restore
+    );
+    assert_eq!(
+        state.observe_window(
+            normal,
+            origin + Duration::from_millis(11) + PRESENTATION_PROBE_MINIMIZED_HOLD,
+        ),
+        PresentationProbeWindowDecision::None
+    );
+    assert_eq!(state.phase, PresentationProbeWindowPhase::Complete);
+    state.finish().unwrap();
+}
+
+#[test]
+fn presentation_probe_window_state_keeps_a_hard_window_control_deadline() {
+    let origin = Instant::now();
+    let mut state = PresentationProbeWindowState::new(14);
+    state.observe_progress(
+        &SafeProgressSnapshot {
+            heartbeat_sequence: 15,
+            command_count: 29,
+            state: SafeProgressState::Command {
+                index: 14,
+                command_kind: "set_window_minimized",
+                elapsed_ms: 0,
+            },
+        },
+        origin,
+    );
+    assert_eq!(
+        state.deadline_failure(
+            origin + PRESENTATION_PROBE_WINDOW_CONTROL_TIMEOUT - Duration::from_nanos(1)
+        ),
+        None
+    );
+    assert_eq!(
+        state.deadline_failure(origin + PRESENTATION_PROBE_WINDOW_CONTROL_TIMEOUT),
+        Some("the external controller did not observe the requested minimized window")
+    );
+}
+
+#[test]
+fn presentation_probe_x11_parsers_require_one_pid_bound_iconic_client() {
+    let windows = "\
+0x02000001  0 123 host Other\n\
+0x04000004  0 456 host Mirante4D\n";
+    assert_eq!(
+        parse_wmctrl_client_window(windows, 456).unwrap(),
+        Some(X11ClientWindow {
+            id_hex: "0x4000004".to_owned(),
+            id_decimal: "67108868".to_owned(),
+        })
+    );
+    assert!(parse_wmctrl_client_window(windows, 789).unwrap().is_none());
+    assert!(
+        parse_wmctrl_client_window("0x04000004 0 456 host A\n0x04000005 0 456 host B\n", 456,)
+            .is_err()
+    );
+
+    let minimized = parse_xprop_window_manager_state(
+        "_NET_WM_STATE(ATOM) = _NET_WM_STATE_HIDDEN\n\
+         WM_STATE(WM_STATE):\n\
+         window state: Iconic\n",
+    )
+    .unwrap();
+    assert!(minimized.minimized());
+    let normal = parse_xprop_window_manager_state(
+        "_NET_WM_STATE(ATOM) = _NET_WM_STATE_FOCUSED\n\
+         WM_STATE(WM_STATE):\n\
+         window state: Normal\n",
+    )
+    .unwrap();
+    assert!(normal.restored());
+    assert!(parse_xprop_window_manager_state("window state: Normal\n").is_err());
+}
+
+#[test]
+fn presentation_probe_x11_window_discovery_retries_transient_listing_failures() {
+    assert_eq!(
+        classify_wmctrl_client_window_listing(false, "exit status: 1", b"", 456).unwrap(),
+        X11ClientWindowDiscovery::ListingUnavailable {
+            status: "exit status: 1".to_owned(),
+        }
+    );
+    assert_eq!(
+        classify_wmctrl_client_window_listing(true, "exit status: 0", b"", 456).unwrap(),
+        X11ClientWindowDiscovery::NotFound
+    );
+    assert_eq!(
+        classify_wmctrl_client_window_listing(
+            true,
+            "exit status: 0",
+            b"0x04000004 0 456 host Mirante4D\n",
+            456,
+        )
+        .unwrap(),
+        X11ClientWindowDiscovery::Found(X11ClientWindow {
+            id_hex: "0x4000004".to_owned(),
+            id_decimal: "67108868".to_owned(),
+        })
+    );
+    assert!(classify_wmctrl_client_window_listing(true, "exit status: 0", b"\xff", 456,).is_err());
+}
+
 fn assert_dataset_runtime_limits(script: &Value, total_bytes: u64, resident_resources: u64) {
-    assert_eq!(SCRIPT_SCHEMA_VERSION, 10);
+    assert_eq!(SCRIPT_SCHEMA_VERSION, 11);
     assert_eq!(REPORT_SCHEMA_VERSION, 9);
     assert_eq!(script["schema_version"], SCRIPT_SCHEMA_VERSION);
     assert_eq!(
@@ -1535,7 +1718,7 @@ fn fixed_product_automation_script_validation_rejects_wrong_schema() {
         validate_product_automation_script(&predecessor_version)
             .unwrap_err()
             .to_string()
-            .contains("schema_version must be 10")
+            .contains("schema_version must be 11")
     );
 }
 

@@ -46,6 +46,7 @@ pub(super) struct ProductAutomationProgressPublisher {
     heartbeat_sequence: u64,
     last_published_at: Option<Instant>,
     observed_command_index: usize,
+    last_published_command_index: Option<usize>,
     command_started_at: Instant,
     closeout_started_at: Option<Instant>,
     closeout_published: bool,
@@ -101,6 +102,7 @@ impl ProductAutomationProgressPublisher {
             heartbeat_sequence: 0,
             last_published_at: None,
             observed_command_index: 0,
+            last_published_command_index: None,
             command_started_at: now,
             closeout_started_at: None,
             closeout_published: false,
@@ -124,10 +126,12 @@ impl ProductAutomationProgressPublisher {
         if self.closeout_published {
             return Ok(false);
         }
+        let command_changed = self.last_published_command_index != Some(index);
         self.observe_command(index, now);
-        if self
-            .last_published_at
-            .is_some_and(|published| now.saturating_duration_since(published) < PROGRESS_INTERVAL)
+        if !command_changed
+            && self.last_published_at.is_some_and(|published| {
+                now.saturating_duration_since(published) < PROGRESS_INTERVAL
+            })
         {
             return Ok(false);
         }
@@ -141,6 +145,7 @@ impl ProductAutomationProgressPublisher {
             },
             now,
         )?;
+        self.last_published_command_index = Some(index);
         Ok(true)
     }
 
@@ -310,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_publication_is_immediate_then_one_second_bounded() {
+    fn progress_publication_is_immediate_on_command_change_then_one_second_bounded() {
         let root = tempfile::tempdir().unwrap();
         let origin = Instant::now();
         let mut publisher = publisher_at(root.path(), origin);
@@ -320,21 +325,33 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(read_record(root.path())["heartbeat_sequence"], 1);
-        assert!(
-            !publisher
-                .publish_command_if_due(3, 1, "wait_for", origin + Duration::from_millis(999),)
-                .unwrap()
-        );
-        assert_eq!(read_record(root.path())["state"]["index"], 0);
+        // The controller observes the next command as soon as the previous
+        // command completes. Publication must still identify that new command
+        // immediately instead of mistaking "observed" for "published".
+        publisher.observe_command(1, origin + Duration::from_millis(999));
         assert!(
             publisher
-                .publish_command_if_due(3, 1, "wait_for", origin + Duration::from_secs(1),)
+                .publish_command_if_due(3, 1, "wait_for", origin + Duration::from_millis(999),)
                 .unwrap()
         );
         let record = read_record(root.path());
         assert_eq!(record["heartbeat_sequence"], 2);
         assert_eq!(record["state"]["index"], 1);
-        assert_eq!(record["state"]["elapsed_ms"], 1);
+        assert_eq!(record["state"]["elapsed_ms"], 0);
+        assert!(
+            !publisher
+                .publish_command_if_due(3, 1, "wait_for", origin + Duration::from_millis(1_998),)
+                .unwrap()
+        );
+        assert!(
+            publisher
+                .publish_command_if_due(3, 1, "wait_for", origin + Duration::from_millis(1_999),)
+                .unwrap()
+        );
+        let record = read_record(root.path());
+        assert_eq!(record["heartbeat_sequence"], 3);
+        assert_eq!(record["state"]["index"], 1);
+        assert_eq!(record["state"]["elapsed_ms"], 1_000);
     }
 
     #[test]

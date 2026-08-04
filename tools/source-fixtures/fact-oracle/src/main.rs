@@ -1,11 +1,12 @@
 use std::{env, fs, path::Path};
 
 const HEADER: &str = "kind|spec_id|path|dtype|pages|height|width|t|c|z_start|value_rule|rows_per_strip|expected_class|shape_tczyx|calibration_xyz_um|grouping_id";
-const SPEC_IDS: [&str; 4] = [
+const SPEC_IDS: [&str; 5] = [
     "SRC-TIFF-SPEC-001",
     "SRC-TIFF-SPEC-002",
     "SRC-TIFF-SPEC-003",
     "SRC-TIFF-SPEC-004",
+    "SRC-TIFF-SPEC-005",
 ];
 const FINITE_F32_BITS: [u32; 12] = [
     0xbfc0_0000,
@@ -58,12 +59,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let spec = args
         .next()
-        .ok_or("usage: fact-oracle <v1.tsv> <facts.json>")?;
+        .ok_or("usage: fact-oracle <v2.tsv> <facts.json>")?;
     let output = args
         .next()
-        .ok_or("usage: fact-oracle <v1.tsv> <facts.json>")?;
+        .ok_or("usage: fact-oracle <v2.tsv> <facts.json>")?;
     if args.next().is_some() {
-        return Err("usage: fact-oracle <v1.tsv> <facts.json>".into());
+        return Err("usage: fact-oracle <v2.tsv> <facts.json>".into());
     }
     let (families, mut files) = parse_spec(Path::new(&spec))?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -135,8 +136,8 @@ fn parse_spec(path: &Path) -> Result<(Vec<Family>, Vec<FileSpec>), Box<dyn std::
             other => return Err(format!("unknown specification row kind {other:?}").into()),
         }
     }
-    if families.len() != 4 || files.len() != 16 {
-        return Err("v1 specification must contain four families and sixteen files".into());
+    if families.len() != 5 || files.len() != 21 {
+        return Err("v1 specification must contain five families and twenty-one files".into());
     }
     for (index, expected) in SPEC_IDS.iter().enumerate() {
         if families.get(index).map(|family| family.id.as_str()) != Some(*expected) {
@@ -246,6 +247,7 @@ fn file_fact_json(
     } else {
         file.rows_per_strip.clone()
     };
+    let (byte_order, tiff_version, compression, storage_layout) = container_facts(file)?;
     let mut output = String::new();
     output.push_str(&format!("{prefix}{{\n"));
     output.push_str(&format!(
@@ -259,10 +261,15 @@ fn file_fact_json(
     output.push_str(&format!("{prefix}  \"ifd_count\": {},\n", file.pages));
     output.push_str(&format!("{prefix}  \"width\": {},\n", file.width));
     output.push_str(&format!("{prefix}  \"height\": {},\n", file.height));
-    output.push_str(&format!(
-        "{prefix}  \"rows_per_strip\": {},\n",
-        rows_per_strip
-    ));
+    output.push_str(&format!("{prefix}  \"byte_order\": {},\n", json_string(byte_order)));
+    output.push_str(&format!("{prefix}  \"tiff_version\": {tiff_version},\n"));
+    output.push_str(&format!("{prefix}  \"compression\": {compression},\n"));
+    output.push_str(&format!("{prefix}  \"storage_layout\": {},\n", json_string(storage_layout)));
+    if storage_layout == "tiles" {
+        output.push_str(&format!("{prefix}  \"rows_per_strip\": null,\n"));
+    } else {
+        output.push_str(&format!("{prefix}  \"rows_per_strip\": {rows_per_strip},\n"));
+    }
     output.push_str(&format!(
         "{prefix}  \"bits_per_value\": {},\n",
         bits_per_value
@@ -278,6 +285,10 @@ fn file_fact_json(
     output.push_str(&format!(
         "{prefix}  \"logical_value_sha256\": \"{}\",\n",
         sha256_hex(payload)
+    ));
+    output.push_str(&format!(
+        "{prefix}  \"logical_value_hex\": {},\n",
+        json_string(&hex_bytes(payload))
     ));
     output.push_str(&format!(
         "{prefix}  \"minimum\": {},\n",
@@ -336,6 +347,8 @@ fn logical_payload(file: &FileSpec) -> Result<Vec<u8>, Box<dyn std::error::Error
                             .extend_from_slice(&NONFINITE_F32_BITS[explicit_index].to_le_bytes());
                         explicit_index += 1;
                     }
+                    "spec005_u16_portable" => push_u16(&mut payload, 100 * y + x)?,
+                    "spec005_u8_portable" => push_u8(&mut payload, (17 * y + 3 * x) % 251)?,
                     other => return Err(format!("unknown value rule {other:?}").into()),
                 }
             }
@@ -346,6 +359,22 @@ fn logical_payload(file: &FileSpec) -> Result<Vec<u8>, Box<dyn std::error::Error
         return Err(format!("payload size mismatch for {}", file.path).into());
     }
     Ok(payload)
+}
+
+fn container_facts(
+    file: &FileSpec,
+) -> Result<(&'static str, u16, u16, &'static str), Box<dyn std::error::Error>> {
+    if file.spec_id != "SRC-TIFF-SPEC-005" {
+        return Ok(("little", 42, 1, "strips"));
+    }
+    Ok(match file.path.as_str() {
+        "spec-005/uncompressed-big-endian-u16.tif" => ("big", 42, 1, "strips"),
+        "spec-005/lzw-u8-striped.tif" => ("little", 42, 5, "strips"),
+        "spec-005/deflate-u8-tiled.tif" => ("little", 42, 8, "tiles"),
+        "spec-005/old-deflate-u8-striped.tif" => ("little", 42, 32946, "strips"),
+        "spec-005/packbits-u8-bigtiff.tif" => ("little", 43, 32773, "strips"),
+        other => return Err(format!("unknown portable TIFF container {other:?}").into()),
+    })
 }
 
 fn push_u8(output: &mut Vec<u8>, value: u64) -> Result<(), Box<dyn std::error::Error>> {
@@ -474,6 +503,10 @@ fn json_string(value: &str) -> String {
     }
     output.push('\"');
     output
+}
+
+fn hex_bytes(value: &[u8]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn sha256_hex(input: &[u8]) -> String {

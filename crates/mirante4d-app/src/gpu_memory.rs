@@ -374,6 +374,9 @@ mod tests {
         }))
         .expect("the trusted workstation exposes its Vulkan adapter");
         let info = adapter.get_info();
+        let expected_adapter = std::env::var("MIRANTE4D_TRUSTED_GPU_ADAPTER_NAME")
+            .unwrap_or_else(|_| "NVIDIA GeForce RTX 3070 Ti Laptop GPU".to_owned());
+        assert_eq!(info.name, expected_adapter);
         let facts = SelectedAdapterMemoryFacts::discover(&adapter);
         eprintln!("selected-adapter memory facts: {facts:?}");
 

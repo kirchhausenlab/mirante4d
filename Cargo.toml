@@ -19,7 +19,7 @@ members = [
     "crates/mirante4d-ui-egui",
     "crates/xtask",
 ]
-exclude = ["vendor/wayland-scanner"]
+exclude = ["vendor/wayland-scanner", "vendor/wgpu-hal"]
 resolver = "3"
 
 [workspace.package]
@@ -40,6 +40,7 @@ insta = { version = "1.48.0", default-features = false }
 pollster = "0.4.0"
 proptest = "1.11.0"
 quick-xml = "0.41.0"
+raw-window-handle = "0.6.2"
 rfd = "0.15.4"
 rustix = { version = "=1.1.4", features = ["fs", "system", "time"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -57,6 +58,7 @@ unicode-normalization = "=0.1.25"
 uuid = { version = "1.23.3", features = ["v4"] }
 wgpu = "29.0.3"
 winit = { version = "0.30.13", default-features = false, features = ["wayland-csd-adwaita-notitle", "wayland-dlopen"] }
+x11rb = { version = "=0.13.2", default-features = false }
 yaml-rust2 = "0.11.0"
 zarrs_metadata = "=0.7.5"
 zstd = { version = "=0.13.3", default-features = false }
@@ -81,3 +83,4 @@ mirante4d-ui-egui = { path = "crates/mirante4d-ui-egui" }
 
 [patch.crates-io]
 wayland-scanner = { path = "vendor/wayland-scanner" }
+wgpu-hal = { path = "vendor/wgpu-hal" }

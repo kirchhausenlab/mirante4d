@@ -2468,7 +2468,7 @@ mod tests {
     use super::*;
     use crate::{
         ProjectObjectSource, ProjectOpenMode, filesystem::TEST_REAL_POLICY_ENV,
-        wire::ProjectEnvelope,
+        lease::acquire_writer_eventually_for_test, wire::ProjectEnvelope,
     };
 
     static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -4388,8 +4388,7 @@ mod tests {
         drop(indeterminate_leases);
         drop(indeterminate_root);
         let retry_root = LocalStoreRoot::open(indeterminate_destination.as_path()).unwrap();
-        let retry_leases =
-            ProjectStoreLeases::acquire(&retry_root, ProjectOpenMode::PreferWritable).unwrap();
+        let retry_leases = acquire_writer_eventually_for_test(&retry_root);
         let (fresh_retry, fresh_retry_opens) = frozen_capture_with_facts(
             "provisional.m4dproj",
             &frozen,
