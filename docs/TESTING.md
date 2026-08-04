@@ -161,7 +161,9 @@ timing-threshold failures, so one slow case cannot hide the cases after it.
 If the benchmark process fails, the campaign keeps its complete bounded output
 as mode-0600 private evidence and publishes only a bounded, path-safe summary
 of emitted measurements and threshold failures. A failed component stage
-contributes zero calibration runs and never advances to product measurement.
+contributes zero calibration runs, never advances to product measurement, and
+reports both product visibility/stall and exact-cadence axes as `unevaluated`
+rather than fabricating failures for work that did not run.
 
 The controlled boundary probe is deliberately non-measured while it resizes,
 minimizes, unmaps, remaps, and recreates the surface. A timing-properties

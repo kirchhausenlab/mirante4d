@@ -163,6 +163,26 @@ enum CampaignDisposition {
     Unevaluated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CampaignStage {
+    Qualification,
+    Component,
+    Product,
+    Evaluation,
+}
+
+struct CampaignProgress {
+    stage: CampaignStage,
+}
+
+impl Default for CampaignProgress {
+    fn default() -> Self {
+        Self {
+            stage: CampaignStage::Qualification,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CampaignBoundaryError {
     disposition: CampaignDisposition,
@@ -201,6 +221,16 @@ fn campaign_status(error: &anyhow::Error) -> &'static str {
     }
 }
 
+fn campaign_axis_statuses(
+    overall_status: &'static str,
+    stage: CampaignStage,
+) -> (&'static str, &'static str) {
+    match stage {
+        CampaignStage::Qualification | CampaignStage::Component => ("unevaluated", "unevaluated"),
+        CampaignStage::Product | CampaignStage::Evaluation => (overall_status, overall_status),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RunRecord {
     sequence: usize,
@@ -218,6 +248,15 @@ struct RunRecord {
     product_structural_evidence: Value,
     metrics: Vec<MetricSample>,
     duration_ms: u64,
+}
+
+struct RunInvocation<'a> {
+    role: RevisionRole,
+    sequence: usize,
+    pair_index: Option<usize>,
+    selector: &'a str,
+    deadline: Instant,
+    progress: &'a mut CampaignProgress,
 }
 
 #[derive(Debug, Serialize)]
@@ -332,15 +371,18 @@ pub(crate) fn run(args: Vec<String>) -> anyhow::Result<PathBuf> {
 
     let started_at_epoch_ms = epoch_ms();
     let mut runs = Vec::new();
-    let campaign = execute_campaign(&config, &repository_root, &mut runs);
+    let mut progress = CampaignProgress::default();
+    let campaign = execute_campaign(&config, &repository_root, &mut runs, &mut progress);
     let (status, visibility_status, exact_cadence_status, evaluation, failure) = match campaign {
         Ok(evaluation) => ("pass", "pass", "pass", evaluation, None),
         Err(error) => {
             let status = campaign_status(&error);
+            let (visibility_status, exact_cadence_status) =
+                campaign_axis_statuses(status, progress.stage);
             (
                 status,
-                "not_passed",
-                status,
+                visibility_status,
+                exact_cadence_status,
                 json!({ "result": status, "reason": error.to_string() }),
                 Some(error.to_string()),
             )
@@ -435,6 +477,7 @@ fn execute_campaign(
     config: &Config,
     repository_root: &Path,
     runs: &mut Vec<RunRecord>,
+    progress: &mut CampaignProgress,
 ) -> anyhow::Result<Value> {
     guard_environment(config).map_err(|error| {
         boundary_error(
@@ -480,13 +523,17 @@ fn execute_campaign(
                 runs.push(run_revision(
                     config,
                     &config.baseline,
-                    RevisionRole::Baseline,
-                    sequence,
-                    None,
-                    &selector,
-                    deadline,
+                    RunInvocation {
+                        role: RevisionRole::Baseline,
+                        sequence,
+                        pair_index: None,
+                        selector: &selector,
+                        deadline,
+                        progress,
+                    },
                 )?);
             }
+            progress.stage = CampaignStage::Evaluation;
             calibration_evaluation(config, runs)
         }
         Operation::Compare => {
@@ -512,15 +559,19 @@ fn execute_campaign(
                     runs.push(run_revision(
                         config,
                         revision,
-                        role,
-                        sequence,
-                        Some(pair_index),
-                        &selector,
-                        deadline,
+                        RunInvocation {
+                            role,
+                            sequence,
+                            pair_index: Some(pair_index),
+                            selector: &selector,
+                            deadline,
+                            progress,
+                        },
                     )?);
                     sequence += 1;
                 }
             }
+            progress.stage = CampaignStage::Evaluation;
             comparison_evaluation(config, &baseline, runs)
         }
     }
@@ -529,12 +580,17 @@ fn execute_campaign(
 fn run_revision(
     config: &Config,
     revision: &RevisionConfig,
-    role: RevisionRole,
-    sequence: usize,
-    pair_index: Option<usize>,
-    selector: &str,
-    deadline: Instant,
+    invocation: RunInvocation<'_>,
 ) -> anyhow::Result<RunRecord> {
+    let RunInvocation {
+        role,
+        sequence,
+        pair_index,
+        selector,
+        deadline,
+        progress,
+    } = invocation;
+    progress.stage = CampaignStage::Component;
     guard_environment(config).map_err(|error| {
         boundary_error(
             CampaignDisposition::Invalid,
@@ -547,6 +603,7 @@ fn run_revision(
     let measured = (|| {
         let component =
             run_component_benchmarks(config, revision, role, sequence, selector, deadline)?;
+        progress.stage = CampaignStage::Product;
         let product = run_product_measurement(config, revision, role, sequence, deadline)?;
         Ok::<_, anyhow::Error>((component, product))
     })();
@@ -3159,6 +3216,26 @@ mod tests {
             cargo_lock_sha256: "a".repeat(64),
             presentation_authority: PRESENTATION_AUTHORITY.to_owned(),
         }
+    }
+
+    #[test]
+    fn campaign_axes_distinguish_unrun_product_work_from_failure_and_evaluation() {
+        assert_eq!(
+            campaign_axis_statuses("invalid", CampaignStage::Qualification),
+            ("unevaluated", "unevaluated")
+        );
+        assert_eq!(
+            campaign_axis_statuses("fail", CampaignStage::Component),
+            ("unevaluated", "unevaluated")
+        );
+        assert_eq!(
+            campaign_axis_statuses("fail", CampaignStage::Product),
+            ("fail", "fail")
+        );
+        assert_eq!(
+            campaign_axis_statuses("fail", CampaignStage::Evaluation),
+            ("fail", "fail")
+        );
     }
 
     fn component_measurement(family: &str, id: &str) -> Value {
