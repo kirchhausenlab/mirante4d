@@ -108,6 +108,8 @@ struct PresentBinding {
     swapchain: u64,
     swapchain_generation: u64,
     marker_sequence: u32,
+    marker_spec: MarkerSpec,
+    window_lifecycle_generation: u64,
     submitted_at_ns: Option<u64>,
 }
 
@@ -272,6 +274,7 @@ struct ObserverState {
     measured_unmap_events: u64,
     map_events: u64,
     unmap_events: u64,
+    window_lifecycle_generation: u64,
     map_after_unmap_observed: bool,
     surface_generation_changes: u64,
     last_surface_generation: Option<u64>,
@@ -450,8 +453,8 @@ impl wgpu::hal::vulkan::present_wait_observer::PresentationWaitObserver for Pres
                 .get_or_insert_with(|| "present used an unconfigured timing swapchain".to_owned());
             return None;
         };
-        if state.marker_spec.is_none()
-            || state.present_bindings.len() >= MAX_WAIT_TASKS
+        let marker_spec = state.marker_spec?;
+        if state.present_bindings.len() >= MAX_WAIT_TASKS
             || state.timing_bindings.len() >= MAX_WAIT_TASKS
         {
             if state.present_bindings.len() >= MAX_WAIT_TASKS
@@ -478,12 +481,15 @@ impl wgpu::hal::vulkan::present_wait_observer::PresentationWaitObserver for Pres
         }
         state.last_swapchain = Some(raw_swapchain);
         let marker_sequence = state.marker_sequence;
+        let window_lifecycle_generation = state.window_lifecycle_generation;
         state.present_bindings.insert(
             present_id,
             PresentBinding {
                 swapchain: raw_swapchain,
                 swapchain_generation: configured.generation,
                 marker_sequence,
+                marker_spec,
+                window_lifecycle_generation,
                 submitted_at_ns: None,
             },
         );
@@ -1027,13 +1033,10 @@ fn process_present_wait(
     };
     match result {
         Ok(()) => {
-            let (binding, marker_spec) = match shared.state.lock() {
+            let binding = match shared.state.lock() {
                 Ok(mut state) => {
                     state.complete_events = state.complete_events.saturating_add(1);
-                    (
-                        state.present_bindings.remove(&task.present_id),
-                        state.marker_spec,
-                    )
+                    state.present_bindings.remove(&task.present_id)
                 }
                 Err(_) => return,
             };
@@ -1050,11 +1053,6 @@ fn process_present_wait(
                 record_marker_outcome(shared, task.present_id, MarkerOutcome::Nonqualifying);
                 return;
             }
-            let Some(marker_spec) = marker_spec else {
-                record_nonqualifying_completion(shared);
-                record_marker_outcome(shared, task.present_id, MarkerOutcome::Nonqualifying);
-                return;
-            };
             if !window_is_mapped(marker_connection, window) {
                 record_window_unavailable_completion(shared);
                 record_marker_outcome(shared, task.present_id, MarkerOutcome::Nonqualifying);
@@ -1062,7 +1060,7 @@ fn process_present_wait(
             }
             let marker_deadline = Instant::now() + MARKER_SETTLE_TIMEOUT;
             let sequence = loop {
-                match read_marker_sequence(marker_connection, window, marker_spec) {
+                match read_marker_sequence(marker_connection, window, binding.marker_spec) {
                     Ok(sequence) if sequence == binding.marker_sequence => break Some(sequence),
                     Ok(sequence) if sequence > binding.marker_sequence => {
                         if let Ok(mut state) = shared.state.lock() {
@@ -1074,7 +1072,7 @@ fn process_present_wait(
                         break None;
                     }
                     Ok(sequence) if Instant::now() >= marker_deadline => {
-                        if controlled_recreation_recovery(shared) {
+                        if controlled_lifecycle_recovery(shared, binding) {
                             record_window_unavailable_completion(shared);
                         } else {
                             record_ambiguous_completion(
@@ -1097,12 +1095,15 @@ fn process_present_wait(
                             break None;
                         }
                         if Instant::now() >= marker_deadline {
-                            if controlled_recreation_recovery(shared) {
+                            if controlled_lifecycle_recovery(shared, binding) {
                                 record_window_unavailable_completion(shared);
                             } else {
                                 record_error(
                                     shared,
-                                    format!("presentation marker readback failed: {error}"),
+                                    format!(
+                                        "presentation marker readback failed for present ID {} in swapchain generation {}: {error}",
+                                        task.present_id, task.swapchain_generation,
+                                    ),
                                 );
                             }
                             break None;
@@ -1306,12 +1307,16 @@ fn handle_event(window: u32, shared: &Shared, event: Event) {
     match event {
         Event::ConfigureNotify(event) if event.window == window => {
             if let Ok(mut state) = shared.state.lock() {
+                state.window_lifecycle_generation =
+                    state.window_lifecycle_generation.saturating_add(1);
                 state.configure_events = state.configure_events.saturating_add(1);
                 state.final_geometry = Some((event.width, event.height));
             }
         }
         Event::FocusOut(event) if event.event == window => {
             if let Ok(mut state) = shared.state.lock() {
+                state.window_lifecycle_generation =
+                    state.window_lifecycle_generation.saturating_add(1);
                 state.focus_loss_events = state.focus_loss_events.saturating_add(1);
                 if observer_measurement_phase(&state) {
                     state.measured_focus_loss_events =
@@ -1319,19 +1324,29 @@ fn handle_event(window: u32, shared: &Shared, event: Event) {
                 }
             }
         }
+        Event::FocusIn(event) if event.event == window => {
+            if let Ok(mut state) = shared.state.lock() {
+                state.window_lifecycle_generation =
+                    state.window_lifecycle_generation.saturating_add(1);
+            }
+        }
         Event::VisibilityNotify(event) if event.window == window => {
-            if u8::from(event.state) != 0
-                && let Ok(mut state) = shared.state.lock()
-            {
-                state.occlusion_events = state.occlusion_events.saturating_add(1);
-                if observer_measurement_phase(&state) {
-                    state.measured_occlusion_events =
-                        state.measured_occlusion_events.saturating_add(1);
+            if let Ok(mut state) = shared.state.lock() {
+                state.window_lifecycle_generation =
+                    state.window_lifecycle_generation.saturating_add(1);
+                if u8::from(event.state) != 0 {
+                    state.occlusion_events = state.occlusion_events.saturating_add(1);
+                    if observer_measurement_phase(&state) {
+                        state.measured_occlusion_events =
+                            state.measured_occlusion_events.saturating_add(1);
+                    }
                 }
             }
         }
         Event::MapNotify(event) if event.window == window => {
             if let Ok(mut state) = shared.state.lock() {
+                state.window_lifecycle_generation =
+                    state.window_lifecycle_generation.saturating_add(1);
                 state.map_events = state.map_events.saturating_add(1);
                 state.currently_mapped = true;
                 if state.unmap_events > 0 {
@@ -1344,6 +1359,8 @@ fn handle_event(window: u32, shared: &Shared, event: Event) {
         }
         Event::UnmapNotify(event) if event.window == window => {
             if let Ok(mut state) = shared.state.lock() {
+                state.window_lifecycle_generation =
+                    state.window_lifecycle_generation.saturating_add(1);
                 state.unmap_events = state.unmap_events.saturating_add(1);
                 state.occlusion_events = state.occlusion_events.saturating_add(1);
                 if observer_measurement_phase(&state) {
@@ -1382,12 +1399,21 @@ fn observer_measurement_phase(state: &ObserverState) -> bool {
         })
 }
 
-fn controlled_recreation_recovery(shared: &Shared) -> bool {
-    shared.state.lock().is_ok_and(|state| {
-        state.scenario.as_deref() == Some("representative_gpu_presentation_probe")
-            && state.unmap_events > 0
-            && state.map_after_unmap_observed
-    })
+fn controlled_lifecycle_recovery(shared: &Shared, binding: PresentBinding) -> bool {
+    shared
+        .state
+        .lock()
+        .is_ok_and(|state| binding_crossed_controlled_lifecycle(&state, binding))
+}
+
+fn binding_crossed_controlled_lifecycle(state: &ObserverState, binding: PresentBinding) -> bool {
+    state.scenario.as_deref() == Some("representative_gpu_presentation_probe")
+        && (state.window_lifecycle_generation > binding.window_lifecycle_generation
+            || state
+                .configured_swapchain_history
+                .keys()
+                .next_back()
+                .is_some_and(|generation| *generation > binding.swapchain_generation))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2458,13 +2484,6 @@ fn record_window_unavailable_completion(shared: &Shared) {
     }
 }
 
-fn record_nonqualifying_completion(shared: &Shared) {
-    if let Ok(mut state) = shared.state.lock() {
-        state.nonqualifying_completion_events =
-            state.nonqualifying_completion_events.saturating_add(1);
-    }
-}
-
 fn record_ambiguous_completion(shared: &Shared, error: String) {
     if let Ok(mut state) = shared.state.lock() {
         state.ambiguous_completion_events = state.ambiguous_completion_events.saturating_add(1);
@@ -2662,6 +2681,24 @@ mod tests {
         }
     }
 
+    fn present_binding(
+        swapchain_generation: u64,
+        window_lifecycle_generation: u64,
+    ) -> PresentBinding {
+        PresentBinding {
+            swapchain: 11,
+            swapchain_generation,
+            marker_sequence: 1,
+            marker_spec: MarkerSpec {
+                x: 4,
+                y: 4,
+                cell_pixels: 2,
+            },
+            window_lifecycle_generation,
+            submitted_at_ns: Some(1),
+        }
+    }
+
     fn timing_configuration(generation: u64) -> ConfiguredSwapchain {
         ConfiguredSwapchain {
             generation,
@@ -2675,6 +2712,48 @@ mod tests {
                 time_domain_id: 7,
             },
         }
+    }
+
+    #[test]
+    fn probe_recovery_is_scoped_to_lifecycle_changes_after_each_present() {
+        let mut state = ObserverState {
+            scenario: Some("representative_gpu_presentation_probe".to_owned()),
+            window_lifecycle_generation: 7,
+            ..ObserverState::default()
+        };
+        state
+            .configured_swapchain_history
+            .insert(1, timing_configuration(1).configuration);
+
+        let stable = present_binding(1, 7);
+        assert!(!binding_crossed_controlled_lifecycle(&state, stable));
+
+        state.window_lifecycle_generation = 8;
+        assert!(binding_crossed_controlled_lifecycle(&state, stable));
+
+        let after_window_transition = present_binding(1, 8);
+        assert!(!binding_crossed_controlled_lifecycle(
+            &state,
+            after_window_transition
+        ));
+
+        state
+            .configured_swapchain_history
+            .insert(2, timing_configuration(2).configuration);
+        assert!(binding_crossed_controlled_lifecycle(
+            &state,
+            after_window_transition
+        ));
+
+        let stable_after_recreation = present_binding(2, 8);
+        assert!(!binding_crossed_controlled_lifecycle(
+            &state,
+            stable_after_recreation
+        ));
+
+        state.scenario = Some("representative_gpu_interaction".to_owned());
+        state.window_lifecycle_generation = 9;
+        assert!(!binding_crossed_controlled_lifecycle(&state, stable));
     }
 
     fn timing_record(present_id: u64, time_ns: u64) -> HalTimingRecord {
@@ -2757,6 +2836,12 @@ mod tests {
                 swapchain: 11,
                 swapchain_generation: 1,
                 marker_sequence: 11,
+                marker_spec: MarkerSpec {
+                    x: 0,
+                    y: 0,
+                    cell_pixels: 1,
+                },
+                window_lifecycle_generation: 0,
                 submitted_at_ns: None,
             },
         );
@@ -2779,6 +2864,12 @@ mod tests {
                 swapchain: 11,
                 swapchain_generation: 1,
                 marker_sequence: 10,
+                marker_spec: MarkerSpec {
+                    x: 0,
+                    y: 0,
+                    cell_pixels: 1,
+                },
+                window_lifecycle_generation: 0,
                 submitted_at_ns: None,
             },
         );
