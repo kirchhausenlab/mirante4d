@@ -13,7 +13,11 @@ ui = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'package(mirante4d-app) & test(=tests::typed_import_commands_cancel_resume_publish_and_open_without_a_display)'
-slow-timeout = { period = "5s", terminate-after = 6 }
+slow-timeout = { period = "10s", terminate-after = 6 }
+
+[[profile.default.overrides]]
+filter = 'package(mirante4d-import-pipeline) & test(=streaming::tests::full_pipeline_finalization_faults_preserve_source_and_resume_exactly)'
+slow-timeout = { period = "10s", terminate-after = 6 }
 
 [[profile.default.overrides]]
 filter = 'package(mirante4d-import-pipeline) & test(=promoted_source_facts_drive_production_inspection_decode_and_publication)'

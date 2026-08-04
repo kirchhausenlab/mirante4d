@@ -32,6 +32,25 @@ const PROJECT_STORE_HOST_ONLY_IGNORED_CASES: [&str; 3] = [
     "actor::tests::purge_fresh_process_kill_and_retry_matrix",
 ];
 
+const PROJECT_STORE_QUALIFIED_FILESYSTEM_IGNORED_CASES: [(&str, &str); 4] = [
+    (
+        "mirante4d-application",
+        "project_store_service::tests::qualified_filesystem_open_recovery_inspection_failure_enters_recovery_only",
+    ),
+    (
+        "mirante4d-application",
+        "project_store_service::tests::qualified_filesystem_automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit",
+    ),
+    (
+        "mirante4d-application",
+        "project_store_service::tests::qualified_filesystem_recovery_selected_save_as_establishes_the_new_project",
+    ),
+    (
+        "mirante4d-app",
+        "tests::import_analyze_save_and_reopen_without_a_global_integrity_audit",
+    ),
+];
+
 const PROJECT_STORE_PROCESS_MATRIX_CASES: [(&str, u64); 3] = [
     (
         "actor::tests::pin_and_unpin_fresh_process_kill_and_retry_matrix",
@@ -195,11 +214,11 @@ fn verify_project_store_lifecycle() -> anyhow::Result<()> {
     phases.record_identity(&identity);
 
     let mut hosted_evidence = None;
-    let hosted_selector = project_store_host_only_selector();
+    let hosted_selector = project_store_local_host_selector();
     let hosted_passed = phases.run(
-        "hosted-process-hostile-runtime",
+        "host-process-hostile-runtime-qualified-filesystem",
         format!(
-            "NEXTEST_USER_CONFIG_FILE=none cargo nextest run --color never --package mirante4d-project-store --frozen --no-fail-fast --retries 0 --flaky-result fail --no-tests fail --success-output immediate --no-output-indent && NEXTEST_USER_CONFIG_FILE=none cargo nextest run --color never --package mirante4d-project-store --frozen --run-ignored only --no-fail-fast --retries 0 --flaky-result fail --no-tests fail --success-output immediate --no-output-indent -E '{hosted_selector}'"
+            "NEXTEST_USER_CONFIG_FILE=none cargo nextest run --color never --package mirante4d-project-store --frozen --no-fail-fast --retries 0 --flaky-result fail --no-tests fail --success-output immediate --no-output-indent && NEXTEST_USER_CONFIG_FILE=none cargo nextest run --color never --workspace --frozen --run-ignored only --no-fail-fast --retries 0 --flaky-result fail --no-tests fail --success-output immediate --no-output-indent -E '{hosted_selector}'"
         ),
         || {
             let output = fs::File::create(&hosted_output_path)
@@ -241,8 +260,7 @@ fn verify_project_store_lifecycle() -> anyhow::Result<()> {
                 "run",
                 "--color",
                 "never",
-                "--package",
-                "mirante4d-project-store",
+                "--workspace",
                 "--frozen",
                 "--run-ignored",
                 "only",
@@ -359,13 +377,19 @@ fn verify_project_store_lifecycle() -> anyhow::Result<()> {
     phases.finish("project-store-lifecycle").and(report_result)
 }
 
-fn project_store_host_only_selector() -> String {
+fn project_store_local_host_selector() -> String {
     let cases = PROJECT_STORE_HOST_ONLY_IGNORED_CASES
         .iter()
         .map(|case| format!("test(={case})"))
         .collect::<Vec<_>>()
         .join(" | ");
-    format!("package(mirante4d-project-store) & ({cases})")
+    let process_cases = format!("package(mirante4d-project-store) & ({cases})");
+    let qualified_filesystem_cases = PROJECT_STORE_QUALIFIED_FILESYSTEM_IGNORED_CASES
+        .iter()
+        .map(|(package, case)| format!("package({package}) & test(={case})"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!("({process_cases}) | ({qualified_filesystem_cases})")
 }
 
 fn project_store_lifecycle_remaining(deadline: Instant) -> anyhow::Result<Duration> {
@@ -463,6 +487,15 @@ fn parse_project_store_hosted_suite_evidence(output: &str) -> anyhow::Result<Val
             bail!("hosted project-store output lacks a passing result for {case}");
         }
     }
+    for (package, case) in PROJECT_STORE_QUALIFIED_FILESYSTEM_IGNORED_CASES {
+        let suffix = format!("{package} {case}");
+        if !output
+            .lines()
+            .any(|line| line.contains("PASS") && line.trim_end().ends_with(&suffix))
+        {
+            bail!("project-store output lacks a passing qualified-filesystem result for {case}");
+        }
+    }
     let process_matrices = [
         parse_project_store_process_matrix(
             output,
@@ -507,7 +540,8 @@ fn parse_project_store_hosted_suite_evidence(output: &str) -> anyhow::Result<Val
             "power_loss_simulated": false,
             "durability_claim": false
         },
-        "process_matrices": process_matrices
+        "process_matrices": process_matrices,
+        "qualified_filesystem_success_cases": PROJECT_STORE_QUALIFIED_FILESYSTEM_IGNORED_CASES.len()
     }))
 }
 
@@ -2998,11 +3032,17 @@ mod tests {
             .map(|case| format!("PASS mirante4d-project-store {case}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let output = format!("{marker}{passing_cases}\n");
+        let passing_qualified_filesystem_cases = PROJECT_STORE_QUALIFIED_FILESYSTEM_IGNORED_CASES
+            .iter()
+            .map(|(package, case)| format!("PASS {package} {case}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = format!("{marker}{passing_cases}\n{passing_qualified_filesystem_cases}\n");
         let hosted = parse_project_store_hosted_suite_evidence(&output).unwrap();
         assert_eq!(hosted["result"], "passed");
         assert_eq!(hosted["transition_matrix"]["discovered_edge_rows"], 424);
         assert_eq!(hosted["process_matrices"][1]["facts"]["fresh_reopens"], 34);
+        assert_eq!(hosted["qualified_filesystem_success_cases"], 4);
 
         let aggregate = project_store_b2_aggregate_evidence(hosted);
         assert_eq!(aggregate["result"], "passed");
@@ -3044,7 +3084,7 @@ mod tests {
         assert!(parse_project_store_hosted_suite_evidence("no marker").is_err());
         assert!(
             parse_project_store_hosted_suite_evidence(&format!(
-                "{marker}{marker}{passing_cases}\n"
+                "{marker}{marker}{passing_cases}\n{passing_qualified_filesystem_cases}\n"
             ))
             .is_err()
         );
@@ -3077,15 +3117,28 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            parse_project_store_hosted_suite_evidence(
+                &output.replace(
+                    "PASS mirante4d-app tests::import_analyze_save_and_reopen_without_a_global_integrity_audit",
+                    "FAIL mirante4d-app tests::import_analyze_save_and_reopen_without_a_global_integrity_audit"
+                )
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn project_store_host_selector_owns_only_the_three_host_process_cases() {
-        assert_eq!(
-            project_store_host_only_selector(),
-            "package(mirante4d-project-store) & (test(=actor::tests::hosted_durability_tests::exhaustive_hosted_and_process_transition_matrix) | test(=actor::tests::trash_fresh_process_kill_and_retry_matrix) | test(=actor::tests::purge_fresh_process_kill_and_retry_matrix))"
-        );
-        assert!(!project_store_host_only_selector().contains("project_store_vm_guest_driver"));
+    fn project_store_local_host_selector_owns_process_and_qualified_filesystem_cases() {
+        let selector = project_store_local_host_selector();
+        assert_eq!(selector.matches("test(=").count(), 7);
+        for case in PROJECT_STORE_HOST_ONLY_IGNORED_CASES {
+            assert!(selector.contains(&format!("test(={case})")));
+        }
+        for (package, case) in PROJECT_STORE_QUALIFIED_FILESYSTEM_IGNORED_CASES {
+            assert!(selector.contains(&format!("package({package}) & test(={case})")));
+        }
+        assert!(!selector.contains("project_store_vm_guest_driver"));
     }
 
     #[test]

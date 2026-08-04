@@ -691,9 +691,16 @@ The [project state and persistence testing refactor](plans/active/PROJECT_STATE_
 is likewise implemented in the repository. Lifecycle ownership, hosted
 fresh-process outcomes, unsupported-filesystem semantics, independent
 mutation conformance, parallel fork/lease reliability, exact model coverage,
-and actor/service capacity and permission faults are repaired. The accepted
-ext4 VM power-cut and qualified-filesystem claims still require their named
-clean local lane; portable or hosted process tests do not substitute for it.
+and actor/service capacity and permission faults are repaired. The three
+application-service recovery workflows and the product import/save/reopen
+workflow that require an accepted writable filesystem are exact ignored
+members of the trusted local lane. Standard public runners retain the portable
+unsupported-filesystem contracts but do not own those four positive filesystem
+claims. The corrected clean-revision lane passed all four workflows, all three
+fresh-process matrices, and the separate rootless-KVM two-device ext4 campaign:
+60 of 60 power-cut cases plus the pre-sequence cut passed with zero retries.
+This qualifies the named filesystem/process/VM boundaries; it does not create
+an arbitrary-filesystem or mapped-product durability claim.
 
 The current local Linux x86_64 pre-alpha package passed dependency policy,
 AppStream validation, release-directory/AppImage/tarball construction, and

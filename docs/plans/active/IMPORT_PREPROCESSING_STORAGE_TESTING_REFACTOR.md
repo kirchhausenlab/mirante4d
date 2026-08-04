@@ -198,6 +198,21 @@ ceilings based on measured 14-second, 28-second, and 48-second local runs; no
 crate-wide or lane-wide timeout was weakened. The 42 registered ignored cases
 were audited but not executed.
 
+The first standard public-runner activation supplied additional timing
+evidence. The typed cancel/resume/publish/open workflow exceeded its former
+20-second internal publication deadline under concurrent load, and the
+control-plus-two-fault/resume finalization workflow reached its former
+20-second runner ceiling while still making bounded progress. Each exact test
+now has a registered 60-second Nextest ceiling; the typed workflow has a
+45-second internal progress deadline for a more specific failure. Retries and
+all package/lane defaults remain unchanged. A direct concurrent local run
+passed the two cases in 13.046 and 12.743 seconds respectively.
+
+With the ownership and deadline correction applied, the clean-revision
+portable closeout passed all 1,482 routine unit, contract, and UI cases with
+zero retries and reconciled all 46 exact non-routine cases without executing
+them in the portable lane.
+
 ## Completion Standard
 
 This plan is complete only when:

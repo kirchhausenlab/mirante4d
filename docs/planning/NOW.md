@@ -110,8 +110,15 @@ is implemented. The lifecycle inventory, hosted fresh-process outcomes,
 filesystem-skip semantics, independent production conformance, parallel
 fork/lease harness, compact model coverage, and public actor/service fault
 flows are repaired. Process-crash, qualified ext4, and VM power-cut evidence
-remain explicitly separate; the trusted local lane must still execute before
-those claims are refreshed.
+remain explicitly separate. The first standard-runner activation exposed four
+accepted-filesystem success workflows in the routine inventory; they now have
+exact ignored ownership in the trusted local lane, while portable rejection
+contracts remain routine. The corrected clean-revision lane passed the four
+qualified-filesystem workflows, all three fresh-process matrices, and all 60
+rootless-KVM ext4 power-cut cases with zero retries. The same activation
+identified two multi-publication import integrations whose former ceilings
+were below observed concurrent runner time; only those exact tests now receive
+bounded 60-second ceilings and zero retries.
 
 The
 [multichannel performance and visible-layer authority plan](../plans/active/VIEWER_MULTICHANNEL_PERFORMANCE_AND_VISIBLE_LAYER_AUTHORITY.md)

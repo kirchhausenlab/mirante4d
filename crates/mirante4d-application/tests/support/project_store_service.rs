@@ -568,6 +568,7 @@ fn foreground_completion_at_autosave_deadline_does_not_capture_the_stale_snapsho
 }
 
 #[test]
+#[ignore = "requires the trusted local accepted-filesystem lifecycle lane"]
 fn qualified_filesystem_open_recovery_inspection_failure_enters_recovery_only() {
     let directory = TestDirectory::new();
     let path = ProjectStorePath::new(directory.path().join("recovery.m4dproj")).unwrap();
@@ -624,6 +625,7 @@ fn qualified_filesystem_open_recovery_inspection_failure_enters_recovery_only() 
 }
 
 #[test]
+#[ignore = "requires the trusted local accepted-filesystem lifecycle lane"]
 fn qualified_filesystem_automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit()
 {
     let directory = TestDirectory::new();
@@ -709,6 +711,7 @@ fn qualified_filesystem_automatic_recovery_review_selects_only_newer_and_leaves_
 }
 
 #[test]
+#[ignore = "requires the trusted local accepted-filesystem lifecycle lane"]
 fn qualified_filesystem_recovery_selected_save_as_establishes_the_new_project() {
     let directory = TestDirectory::new();
     let source = ProjectStorePath::new(directory.path().join("recovery.m4dproj")).unwrap();

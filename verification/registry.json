@@ -22,9 +22,15 @@
   "test_timeout_overrides": [
     {
       "selector": "package(mirante4d-app) & test(=tests::typed_import_commands_cancel_resume_publish_and_open_without_a_display)",
-      "warn_ms": 5000,
-      "terminate_ms": 30000,
-      "reason": "This display-free product integration performs setup inspection, a deliberately paused cancellation, checkpointed resume, complete package publication, and normal open through the typed application commands. Its measured local execution is about 14 seconds."
+      "warn_ms": 10000,
+      "terminate_ms": 60000,
+      "reason": "This display-free product integration performs setup inspection, a deliberately paused cancellation, checkpointed resume, complete package publication, and normal open through the typed application commands. Its measured local execution is about 14 seconds, while the standard hosted runner required more than 25 seconds under concurrent import load."
+    },
+    {
+      "selector": "package(mirante4d-import-pipeline) & test(=streaming::tests::full_pipeline_finalization_faults_preserve_source_and_resume_exactly)",
+      "warn_ms": 10000,
+      "terminate_ms": 60000,
+      "reason": "This integration performs one control publication plus storage-full and permission-denied fault/resume publications. The standard hosted runner reached the former 20-second contract ceiling while the case was still making bounded progress."
     },
     {
       "selector": "package(mirante4d-import-pipeline) & test(=promoted_source_facts_drive_production_inspection_decode_and_publication)",
@@ -481,6 +487,35 @@
         }
       ],
       "expected_ignored_cases": 1
+    },
+    {
+      "id": "WP10B-ADAPTER-QUALIFIED-FILESYSTEM-APPLICATION",
+      "lane": "project-store-lifecycle",
+      "owner": "mirante4d-application-and-product-workflows",
+      "requirements": [
+        "WP-10B-project-store"
+      ],
+      "fixture_tier": "none-or-T2",
+      "capability": "trusted-local-ext4",
+      "matches": [
+        {
+          "package": "mirante4d-application",
+          "exact_test": "project_store_service::tests::qualified_filesystem_open_recovery_inspection_failure_enters_recovery_only"
+        },
+        {
+          "package": "mirante4d-application",
+          "exact_test": "project_store_service::tests::qualified_filesystem_automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit"
+        },
+        {
+          "package": "mirante4d-application",
+          "exact_test": "project_store_service::tests::qualified_filesystem_recovery_selected_save_as_establishes_the_new_project"
+        },
+        {
+          "package": "mirante4d-app",
+          "exact_test": "tests::import_analyze_save_and_reopen_without_a_global_integrity_audit"
+        }
+      ],
+      "expected_ignored_cases": 4
     },
     {
       "id": "WP10B-ADAPTER-PROJECT-STORE-HOSTED",

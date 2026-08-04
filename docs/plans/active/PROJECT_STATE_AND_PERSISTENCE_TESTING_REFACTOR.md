@@ -350,10 +350,10 @@ preserving prior authority.
 
 Portable model, store, application-service, hosted matrix, independent
 fixture, registry, and parallel-repeat evidence is part of the implementation
-closeout. The accepted-ext4 and rootless VM phases still require a clean
-trusted-local revision and are not replaced by the hosted process tests. No
-new power-cut or broader-filesystem claim is made from leaving those local
-phases pending.
+closeout. At that initial checkpoint, the accepted-ext4 and rootless VM phases
+still required a clean trusted-local revision and were not replaced by the
+hosted process tests. No power-cut or broader-filesystem claim was made from
+leaving those local phases pending.
 
 The final portable working-tree closeout passed the complete policy group,
 including the four-store, sixteen-mutation, four-recovery-state project
@@ -361,6 +361,28 @@ fixture and the VM harness self-test. Clippy, exact discovery ownership, and
 all 1,453 routine unit/contract/UI cases then passed with zero retries. The 42
 registered ignored cases were discovered and audited but not executed; that
 set includes the deliberately deferred trusted filesystem and GPU work.
+
+The first standard public-runner activation then exposed a remaining ownership
+error: three application-service recovery success workflows and one product
+import/save/reopen success workflow require the accepted writable-filesystem
+tuple, but were still in the portable routine inventory. The hard correction
+marks those four tests ignored, registers their exact package/test identities,
+and executes them with the three host process matrices in the trusted local
+host phase. The VM guest remains separately selected, and portable
+unsupported-filesystem behavior remains routine. A direct accepted-ext4 run
+passed all four corrected cases with zero retries.
+
+The corrected clean-revision portable closeout reconciled 1,482 routine cases
+and 46 exact non-routine cases. Clippy and all routine unit, contract, and UI
+cases passed with zero retries. The separate complete trusted local lifecycle
+lane then also passed: 135 routine project-store cases; the exact four
+accepted-filesystem workflows; the exhaustive 424-row transition matrix; the
+Trash and Purge fresh-process matrices; and all 60 rootless-KVM power-cut cases
+across two independent ext4 devices, plus the pre-sequence cut. It used zero
+test or harness retries and remained within the 900-second aggregate deadline.
+That evidence qualifies only the registered process, accepted-filesystem, and
+VM boundaries; it does not claim arbitrary-filesystem or mapped-product
+durability.
 
 ## Completion Standard
 

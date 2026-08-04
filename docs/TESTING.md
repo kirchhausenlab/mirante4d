@@ -407,11 +407,20 @@ The project-store lifecycle lane is intentionally not a routine PR check.
 
 The owner-approved
 [project state and persistence testing refactor](plans/active/PROJECT_STATE_AND_PERSISTENCE_TESTING_REFACTOR.md)
-is now being implemented. Its target separates routine, host-process,
-qualified-filesystem, and VM-guest ownership; requires post-failure and
-production corruption oracles; and forbids green success-path returns when
-the writable filesystem capability is absent. Current commands remain
-authoritative until the plan's hard cutover is complete.
+is implemented. The local lane runs the routine project-store package and
+then exactly seven ignored host-side cases: three fresh-process crash/retry
+matrices and four accepted-filesystem application/product workflows. The
+rootless VM guest remains a separate phase in the same lane. A standard public
+runner is not an accepted writable-filesystem environment, so the four named
+success workflows are excluded from routine verification; portable
+unsupported-filesystem tests remain routine and must prove the typed rejection
+rather than return green early.
+
+Two import integrations legitimately perform several complete publications.
+Their exact registered selectors have 60-second Nextest ceilings with zero
+retries; no package-wide or lane-wide timeout is relaxed. The typed
+cancel/resume case also has a 45-second internal publication deadline so a
+failure identifies stalled product progress before the runner terminates it.
 
 Import and preprocessing work can use:
 

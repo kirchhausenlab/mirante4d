@@ -1161,8 +1161,41 @@ mod tests {
     }
 
     #[test]
-    fn project_store_host_and_vm_ignored_cases_have_disjoint_exact_ownership() {
+    fn project_store_host_vm_and_qualified_cases_have_disjoint_exact_ownership() {
         let registry = read_registry().unwrap();
+        let qualified = registry
+            .selector_adapters
+            .iter()
+            .find(|adapter| adapter.id == "WP10B-ADAPTER-QUALIFIED-FILESYSTEM-APPLICATION")
+            .unwrap();
+        assert_eq!(qualified.lane, "project-store-lifecycle");
+        assert_eq!(qualified.expected_ignored_cases, 4);
+        assert_eq!(
+            qualified
+                .matches
+                .iter()
+                .map(|entry| (entry.package.as_str(), entry.exact_test.as_deref().unwrap()))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                (
+                    "mirante4d-application",
+                    "project_store_service::tests::qualified_filesystem_open_recovery_inspection_failure_enters_recovery_only",
+                ),
+                (
+                    "mirante4d-application",
+                    "project_store_service::tests::qualified_filesystem_automatic_recovery_review_selects_only_newer_and_leaves_branches_explicit",
+                ),
+                (
+                    "mirante4d-application",
+                    "project_store_service::tests::qualified_filesystem_recovery_selected_save_as_establishes_the_new_project",
+                ),
+                (
+                    "mirante4d-app",
+                    "tests::import_analyze_save_and_reopen_without_a_global_integrity_audit",
+                ),
+            ])
+        );
+
         let hosted = registry
             .selector_adapters
             .iter()

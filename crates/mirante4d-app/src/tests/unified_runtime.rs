@@ -4446,7 +4446,7 @@ fn typed_import_commands_cancel_resume_publish_and_open_without_a_display() {
         },
         &context,
     );
-    let publication_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let publication_deadline = std::time::Instant::now() + Duration::from_secs(45);
     while app.import.workers.status().is_importing() {
         app.drain_import_results(&context);
         assert!(
@@ -4946,6 +4946,7 @@ impl mirante4d_dataset::CpuByteLedger for TestImportLedger {
 }
 
 #[test]
+#[ignore = "requires the trusted local accepted-filesystem lifecycle lane"]
 fn import_analyze_save_and_reopen_without_a_global_integrity_audit() {
     let temp = tempfile::tempdir().unwrap();
     let source = write_source_time_series_fixture(temp.path()).unwrap();
