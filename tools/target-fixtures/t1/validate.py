@@ -24,7 +24,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[3]
-SCHEMA = ROOT / "docs/plans/active/foundation-refactor/schemas/foundation-target-fixture-manifest-v1.schema.json"
+SCHEMA = ROOT / "verification/fixture-schemas/foundation-target-fixture-manifest-v1.schema.json"
 OME_SCHEMA = ROOT / "verification/standards/ome-ngff-0.5.2/0.5/schemas/image.schema"
 OME_VERSION = ROOT / "verification/standards/ome-ngff-0.5.2/0.5/schemas/_version.schema"
 FINAL_PREFIX = "fixtures/target/"
@@ -891,7 +891,7 @@ def semantic_validate(
     require(sha256_file(Path(__file__)) == validator_decl["sha256"], "validator source digest mismatch")
     require(
         validator_decl["manifest_schema_path"]
-        == "docs/plans/active/foundation-refactor/schemas/foundation-target-fixture-manifest-v1.schema.json",
+        == "verification/fixture-schemas/foundation-target-fixture-manifest-v1.schema.json",
         "manifest schema path mismatch",
     )
     require(sha256_file(SCHEMA) == validator_decl["manifest_schema_sha256"], "manifest schema digest mismatch")

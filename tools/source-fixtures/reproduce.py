@@ -438,7 +438,7 @@ def build_manifest(
         children[parent] = children.get(parent, 0) + 1
     regular_bytes = sum((root / path).stat().st_size for path in files)
     return {
-        "$schema": "../../docs/plans/active/foundation-refactor/schemas/foundation-source-fixture-manifest-v1.schema.json",
+        "$schema": "../../verification/fixture-schemas/foundation-source-fixture-manifest-v1.schema.json",
         "schema": "mirante4d-foundation-source-fixture-manifest",
         "schema_version": 1,
         "specification_ids": SPEC_IDS,

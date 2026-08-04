@@ -1,7 +1,7 @@
 # Data Format And Safety
 
-Mirante4D uses strict native packages so scientific meaning, storage, and
-runtime expectations are explicit before a dataset opens.
+Mirante4D uses strict native packages. Scientific meaning, storage, and
+runtime limits are explicit before a dataset opens.
 
 ## Active Dataset Profile
 
@@ -12,182 +12,204 @@ runtime expectations are explicit before a dataset opens.
 - Image metadata: OME-NGFF 0.5.2
 - Array storage: Zarr 3.0 with indexed sharding
 - Intensity dtypes: `uint8`, `uint16`, and finite `float32`
-- Axes: explicit time and spatial axes; channels are separate logical layers
+- Axes: explicit time and spatial axes; channels are logical layers
 - Project store: `mirante4d-project-store-v1`
 - Settings document: `mirante4d-settings-v1`
 
-The product opens only this strict target profile. Unsupported identities,
-malformed metadata, inconsistent payloads, and unrecognized profile variants
-are rejected rather than guessed or migrated.
+The product opens only this profile. Unsupported identities, malformed
+metadata, inconsistent payloads, and unknown variants fail. They do not select
+a repair, migration, or generic OME-Zarr path.
 
-`0` is valid intensity unless an explicit reviewed no-data policy says
-otherwise. Validity metadata is shared by import, storage, rendering, and
-analysis. Missing data for an occupied region is incomplete/loading state, not
-empty scientific data.
+`0` is valid intensity unless a reviewed no-data policy says otherwise.
+Missing data for an occupied region is incomplete state, not scientific zero.
 
-## Storage And Identity
+## Storage Terms
 
-- A **brick** is the runtime spatial block used for loading and rendering.
-- A **chunk** is the logical Zarr storage unit.
-- A **shard** is one physical storage object containing multiple chunks.
+- A **brick** is a semantic runtime spatial block.
+- A **chunk** is a logical Zarr storage unit.
+- A **shard** is one physical object that contains several chunks.
 
-Indexed sharding keeps file count and I/O amplification bounded. Creating one
-physical file or sidecar per brick is forbidden.
+Indexed sharding keeps file count and I/O amplification bounded. A file or
+sidecar for each brick is forbidden.
 
-`mirante4d-storage` owns bounded structural admission, strict runtime object
-and brick reads, explicit package-integrity auditing, and create-only package
-publication. Ordinary packages open after metadata/schema/profile, path,
-object-type, declared-length, and manifest-structure admission. They do not
-wait for a full encoded-object or decoded-content scan. Every consumed object
-retains checksum and currentness checks, while externally supplied packed
-facts remain hints until the corresponding payload has been decoded and
-checked.
+`mirante4d-storage` owns package paths, manifest limits, bounded admission,
+reads, integrity checks, explicit audits, and create-only publication.
+`mirante4d-import-pipeline` produces the profile from TIFF sources.
 
-`mirante4d-import-pipeline` writes validated target packages from TIFF and
-OME-TIFF sources. Import never changes source data. It writes to an owned
-stage, validates the result, and publishes only to a previously absent
-destination.
+## Import Source Contract
 
-The import source is an explicit per-channel manifest. Each channel declares
-its label and exactly one interpretation: a single 3D TIFF, immediate 3D TIFF
-children ordered as timepoints, or immediate single-page TIFF children
-ordered as Z. Directory traversal is non-recursive and filenames carry no
-scientific coordinate semantics. All channels currently require the same
-`T/Z/Y/X` geometry and dtype; mixed-dtype package layout and float16 remain
-unsupported. New imports write channel labels into optional canonical display
-layer metadata. Existing packages with the field absent retain ordinal-derived
-runtime labels and need no compatibility reader or migration.
+The import source is an explicit list of one through 64 named channels. Each
+channel declares exactly one interpretation:
 
-Imported spatial pyramids follow one deterministic geometry contract. Time is
-never reduced. Starting at S0, each spatial dimension is ceil-divided by two
-until the coarsest shape satisfies both:
+- one 3D TIFF;
+- immediate 3D TIFF children ordered as timepoints; or
+- immediate single-page TIFF children ordered as Z.
+
+Directory traversal is non-recursive. Lexical child order is canonical.
+Filenames have no scientific coordinate meaning. Labels must be unique after
+normalization. All channels require one common `T/Z/Y/X` shape and dtype.
+
+New imports store optional canonical display labels. A package without that
+optional field uses ordinal-derived labels. This does not require a second
+format reader.
+
+Import accepts grayscale `uint8`, `uint16`, and finite `float32` TIFF pages.
+Compression can be uncompressed, LZW, current or old Deflate, or PackBits.
+Other decoder workspaces are outside the audited memory boundary and fail as
+unsupported.
+
+Source inspection and decode bind the reviewed path to the opened descriptor
+generation. Import checks that generation before, during, and after use. It
+never writes source data.
+
+## Spatial Pyramid
+
+Time is never reduced. Starting at S0, each spatial dimension is ceil-divided
+by two until both conditions are true:
 
 ```text
 max(z, y, x) <= 64
 z * y * x <= 262,144 voxels per layer and timepoint
 ```
 
-A small source that already satisfies both conditions remains single-scale.
-A larger or long-thin source receives however many distinct factor-two levels
-its geometry requires. The closed two-digit profile admits up to 64 levels;
-the largest possible `u64` dimension reaches the terminal contract in 59, so
-this bound covers every representable `Shape4D` rather than imposing a
-product LOD count. The terminal geometry—not an ordinal such as S6—is the
-viewer navigation-floor contract.
+A source that already meets both conditions remains S0-only. The profile
+admits up to 64 spatial levels. This covers the maximum representable
+`Shape4D` dimension.
 
-`mirante4d-storage` owns these terminal constants and the sole pure factor-two
-shape sequence. Import production consumes that authority, and representative
-DS logical-brick and shard ceilings are checked against it so a geometry
-change cannot leave admission on a predecessor scale count.
+The terminal geometry is the viewer navigation-floor contract. No fixed scale
+ordinal has that role.
 
-Reviewed no-data imports resolve one immutable policy from channel zero at
-timepoint zero. Automatic value detection accepts the first exact typed value
-whose samples fill a `5 x 5 x 5` block in deterministic Z/Y/X traversal; it
-supports uint8, uint16, and finite float32 stored bits. A complete second scan
-then marks every same-value `5 x 5 x 5` seed and performs face-six connected
-reconstruction through exact-value voxels. The resulting immutable row-packed
-spatial mask is the union of components containing at least one seed; equal-
-valued voxels disconnected from every seed remain valid. An automatic no-match
-is successful and uses the ordinary all-valid representation. The independent
-constant-plane rule records every exactly constant source Z plane from that
-same volume. Neither rule inspects or validates later channels/timepoints; the
-fixed mask geometry and Z indices apply dataset-wide. Manual uint8 mode remains
-dataset-wide exact-value equality and does not use spatial reconstruction.
+## No-Data And Validity
 
-At S0, automatic mode classifies fixed spatial-mask membership, while manual
-uint8 mode classifies value equality. Classification occurs only outside
-recorded constant planes and receives the in-bounds Chebyshev-radius-one
-invalid dilation (zero Z radius for 2D). Constant-plane invalidity is strictly
-plane-local and never dilates. Each later LOD averages only final-valid samples
-in its aligned,
-odd-tail-clipped factor-two parent block. Value-derived unsupported regions
-retain the same one-child-voxel dilation, while a coarse sample is hidden by
-the plane rule only when its complete contributing base-Z interval is hidden.
-Thus a thin hidden plane may disappear at coarse resolution without its fill
-intensity contaminating the mean. A derived mean numerically equal to the
-resolved value remains valid. Every final invalid sample uses typed canonical
-zero.
+Reviewed no-data import resolves one immutable policy from channel zero at
+timepoint zero.
 
-The recipe records request mode, automatic block edge, face-six connectivity,
-fixed-mask scope and row-packed encoding, exact mask digest and voxel count,
-exact typed resolution or no-match, constant-Z indices, classification,
-morphology, reduction, rounding, support, and canonicalization under
-`tiff-import-typed-first-volume-no-data` version `2.0.0`. A request that
-resolves no mask or plane emits no validity arrays and retains the ordinary
-point-decimated all-valid route.
+Automatic value detection finds the first exact typed value whose samples
+fill a `5 x 5 x 5` block in deterministic Z/Y/X order. A complete second scan
+marks all such seeds and reconstructs every face-connected equal-value
+component that contains a seed. Equal-valued voxels disconnected from all
+seeds remain valid. No seed is a normal all-valid result.
 
-Validity-aware mean levels use an axis-aware centered OME transform. An axis
-reduced by cumulative factor `F` has scale `base_spacing * F` and translation
-`base_spacing * (F - 1) / 2`; an axis already of length one keeps factor one
-and zero translation. Existing complete packages retain their recorded arrays
-and transforms and are not reinterpreted. Incomplete predecessor no-data
-checkpoints do not resume under the current resolved-policy plan binding.
+Constant-plane detection records each exactly constant source Z plane from
+the same volume. It is independent of automatic value detection. The fixed
+mask and plane indices apply to every channel and timepoint. Later volumes do
+not change the policy.
 
-Incomplete imports use one current, non-portable final-layout stage beside the
-requested destination. One `(timepoint, channel)` unit is decoded into bounded
-little-endian cache scratch and encoded into bounded unit spool scratch.
-Completed outer shards are committed directly to their final package-relative
-paths; there is no complete decoded-base cache and no dataset-scale encoded
-checkpoint copy. The private control directory holds a chained shard journal,
-canonical unit journal, fixed-position decoded-unit digests, packed-index
-records, resolved no-data policy, and one resumable scientific-hash frontier
-per channel. Journal records follow the payload durability barrier and name
-only a durable canonical prefix. Recovery removes an incomplete bounded
-suffix, rejects corruption or a wrong source/plan binding, and never migrates
-the predecessor checkpoint schema. A canonical plane above the explicit
-64 MiB work-unit ceiling still fails before ingest. Checkpoint control is
-removed before validation/publication and is never part of the `.m4d` profile.
-The stage journal also retains a cumulative durable-payload prefix per input
-ordinal. That index is private resume/accounting state: it lets preprocessing
-deduct bytes already committed for the active temporal unit without treating
-the package-wide output ceiling as a free-space reservation. It does not alter
-package identity or the public format.
+Manual `uint8` mode uses dataset-wide exact-value equality. It does not use
+spatial reconstruction.
 
-Pixel and validity chunks are numerically produced and inner-encoded once
-through the storage codec authority. The bounded unit spool validates kind,
-encoded/decoded length, checksum, single-frame extent, ordering, and profile
-before those exact inner bytes enter final-layout outer shards; it is deleted
-after the durable stage and unit journals advance. Packed-index chunks are
-assembled after all unit records are present. Scientific and exact package
-identities retain their existing contracts.
+At S0, automatic mode classifies fixed spatial-mask membership. Manual mode
+classifies value equality. Value-derived invalidity uses an in-bounds
+Chebyshev-radius-one dilation. Its Z radius is zero for 2D data. Constant-plane
+invalidity is plane-local and never dilates.
+
+Each coarser value is the mean of final-valid samples in its aligned,
+odd-tail-clipped factor-two parent block. Integer means use half-up rounding.
+Float means use finite `f64` accumulation and canonical `float32` output.
+Value-support dilation continues through coarse validity. A coarse sample is
+hidden by the plane rule only when its complete contributing base-Z interval
+is hidden.
+
+A derived valid mean can equal the resolved no-data value. It remains valid.
+Every final invalid sample uses typed canonical zero.
+
+Validity-aware levels use centered OME transforms. For cumulative reduction
+factor `F`, an affected axis uses:
+
+```text
+scale = base_spacing * F
+translation = base_spacing * (F - 1) / 2
+```
+
+An axis of length one keeps factor one and zero translation.
+
+The recipe records request mode, block edge, connectivity, fixed-mask scope,
+mask digest, resolved typed value or no-match, constant-plane indices,
+classification, morphology, reduction, rounding, support, and
+canonicalization. An all-valid result emits no validity arrays.
+
+## Checkpoint And Publication
+
+An incomplete import uses one private final-layout stage beside the requested
+destination. The stage contains:
+
+- one current unit cache;
+- at most one future decoded cache;
+- one current bounded encoded spool;
+- a compact shard and unit journal;
+- fixed-position decoded digests and packed records;
+- the resolved no-data policy; and
+- one resumable scientific-hash frontier per channel.
+
+The future cache has no scientific-hash, spool, shard, journal, or publication
+authority. The canonical owner consumes it only at its exact unit ordinal.
+
+Completed outer shards enter their final package-relative positions. Journal
+records follow payload durability and name one valid prefix. Recovery removes
+an incomplete suffix. It rejects corrupt state or the wrong source and plan
+binding. It does not migrate an old checkpoint schema.
+
+Disk admission reserves bounded unfinished-unit and finalization headroom.
+The predicted full package size is guidance only. A safe capacity pause keeps
+the checkpoint and offers Resume.
+
+Pixel and validity chunks are numerically produced and inner-encoded once.
+The spool validates kind, length, checksum, frame extent, order, and profile
+before the exact inner bytes enter outer shards. Publication removes private
+checkpoint control, validates the staged package, completes its durability
+order, and renames only to an absent destination.
+
+## Package Admission And Integrity
+
+Ordinary open checks metadata, profile, paths, object types, declared lengths,
+and bounded manifest structure. It does not wait for a complete encoded and
+decoded content scan.
+
+Each consumed object still receives checksum and pre/post-use mutation checks.
+Packed payload facts from an external package are hints until the matching
+payload passes its first required check. An import capability can transfer
+facts already checked by the same create-only publication.
+
+A separate explicit full audit checks encoded objects, S0 content addresses,
+and packed-fact self-consistency. It is bounded and cancellable. It does not
+promote or revoke the open source. Package self-agreement does not prove
+authorship, provenance, or biological correctness.
+
+## Identity
 
 The scientific content address is independent of storage layout. The exact
-package digest covers the package bytes. Either digest names content under its
-specified algorithm; package self-agreement does not authenticate the producer
-or prove scientific correctness. Recipe, derivation, rights, citation, and
-analysis artifact identities remain explicit typed records rather than
-filenames or informal metadata.
+package digest covers package bytes. These identities do not substitute for
+derivation, rights, citation, or independent scientific validation.
+
+Recipe, derivation, artifact, project, and source identities are typed. They
+do not come from filenames or informal metadata.
 
 ## Data Safety
 
-- Import, validation, project recovery, and maintenance never modify source
+- Import, validation, recovery, and maintenance never modify source
   microscopy data.
-- Writers stage output, validate it, and publish atomically under an explicit
-  create-only or replacement policy. Incomplete output never appears complete.
-- A consumed object that changes across its guarded read fails that dependent
-  operation with its exact object and phase. An explicit full audit reports
-  package self-consistency without promoting or revoking the open source or
-  clearing already presented pixels.
-- There are no compatibility readers or in-application migrations during
+- Writers stage, validate, and publish through an explicit atomic policy.
+- Incomplete output never appears complete.
+- A changing consumed object fails the dependent operation with its object and
+  phase.
+- There are no compatibility readers or in-product migrations during
   pre-alpha development.
-- Analysis results carry source and operation provenance. Preview,
-  approximate, partial, and complete states are distinct; only complete
-  results can be exported as final results.
-- Public evidence must not expose private paths, dataset metadata, or raw
-  qualification identities.
+- Preview, partial, approximate, and complete results remain distinct.
+- Only complete analysis results can become final exported artifacts.
+- Public evidence cannot contain private paths, credentials, or unpublished
+  dataset metadata.
 
-## Project Format And Scope
+## Project Format
 
-The accepted project-store service is the sole product route for New, Open,
-Save, Save As, autosave, and recovery. Project records retain typed content
-addresses and optional exact-package pins, but project I/O does not wait for an
-unrelated whole-package integrity audit. The project format remains
-experimental.
+The project-store service is the sole product route for New, Open, Save, Save
+As, autosave, and recovery. Project records retain typed content addresses and
+optional exact-package pins. Project I/O does not wait for an unrelated full
+package audit.
 
-The active dataset profile does not promise backward compatibility, stable
-public release support, or generic OME-Zarr compatibility. Its exact normative
-standards are recorded in
+The dataset and project formats remain experimental. They do not promise
+backward compatibility, stable release support, or generic OME-Zarr input.
+
+Normative format sources are in
 [`architecture/wp10a-normative-standards.json`](../architecture/wp10a-normative-standards.json).
-The closed control wire is implemented by `mirante4d-storage` and described
-above. The bounded independent corpus is
+The independent bounded target corpus is
 [`fixtures/target/manifest.json`](../fixtures/target/manifest.json).

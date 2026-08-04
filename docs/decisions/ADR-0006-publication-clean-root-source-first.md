@@ -1,50 +1,47 @@
-# ADR-0006 — Clean Public Source Before Full Public Data
+# ADR-0006: Separate Source Publication From Data Publication
 
-Status: ACCEPTED
+Status: Accepted
+
 Accepted: 2026-07-09
-Last reviewed: 2026-07-14
-Current-state effect: WP-04 PUBLIC CUTOVER COMPLETE
 
-WP-04 completed the clean-root publication cutover. The public repository is
-now canonical, protected `main` is operational, and the private predecessor
-history remains outside the public object graph.
+Last reviewed: 2026-08-04
 
 ## Context
 
-Mirante4D should be genuinely open source, while full microscopy-data release
-requires separate artifact-level rights, privacy, hosting, permanence, cost,
-integrity, and citation decisions.
+Open-source code and redistributable microscopy data have different rights,
+privacy, hosting, permanence, cost, integrity, provenance, and citation
+requirements.
+
+Publishing source does not prove that a full dataset is safe or useful to
+publish.
 
 ## Decision
 
-- License the source under standard MIT terms.
-- Begin public development from one independently constructed, sanitized root
-  commit. Pre-public Git objects, refs, workflow history, artifacts, and caches
-  are not part of the public source repository.
-- Record attribution, lineage, citation, retained-asset provenance, and the
-  clean-root construction deliberately in the public source tree.
-- Publish only small approved repository fixtures unless a separate dataset
-  release is authorized.
-- Defer full microscopy-dataset selection, licensing, hosting, DOI, candidate
-  validation, upload, and publication to a separately approved open-data
-  handoff.
+- Publish source under the MIT License from the approved public history.
+- Keep private predecessor history outside the public object graph.
+- Keep retained source assets and small fixtures tied to reviewed provenance
+  and rights.
+- Publish only small approved repository fixtures by default.
+- Require a separate owner decision for any full microscopy dataset,
+  derivative, hosting location, DOI, or release lifecycle.
 
 ## Consequences
 
-Public source availability does not imply that a full dataset is licensed,
-approved, reproducible, or available for redistribution. Target formats remain
-experimental until their own release gates. Full-data delays do not block
-ordinary source or software development.
+Source and software work can continue without a public full dataset. Public
+source availability does not imply dataset redistribution rights,
+reproducibility, permanence, or scientific endorsement.
 
-## Enforcement
+External dataset contributions remain outside the normal contribution policy.
+A rights or privacy uncertainty blocks the affected artifact, not unrelated
+source development.
 
-The WP-04 cutover passed its disclosure, credential, dependency, provenance,
-license, workflow, clean-clone, and reproducibility gates. The public
-repository must preserve those boundaries. Any new secret or rights uncertainty
-blocks the affected release, and external dataset contributions remain closed
-until a later governance decision.
+## Guardrails
 
-## Owning Documents
+- Never put secrets, private history, or unpublished microscopy data in the
+  public repository.
+- Do not treat a public URL as proof of redistribution rights.
+- Do not infer a dataset release from the presence of synthetic fixtures.
+- A full-data release needs its own reviewed authority and verification.
 
-- [Current State](../CURRENT_STATE.md)
-- [Deferred open-data plan](../plans/deferred/OPEN_DATA_FOLLOW_ON.md)
+[Current state](../CURRENT_STATE.md) owns current publication status.
+[Contributing](../../CONTRIBUTING.md) owns contribution policy.

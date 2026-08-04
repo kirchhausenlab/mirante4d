@@ -51,7 +51,7 @@ active authorities as a documentation defect; do not silently choose one.
   heading or label. Only add supporting copy when the user explicitly asks for it or
   when it is necessary to prevent misunderstanding or error, and never use it to
   restate the heading.
-  
+
 ## Tangible Progress, Anti-Ceremony, and Honest Credit
 
 The purpose of this project is working, deployable software delivered

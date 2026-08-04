@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     env, fs,
     path::{Component, Path, PathBuf},
     process::Command,
@@ -7,16 +7,13 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use serde::Deserialize;
 
 use crate::process::run_command_with_timeout;
 
-const INDEX_PATH: &str = "docs/documentation-index.json";
-const INDEX_SCHEMA: &str = "mirante4d-documentation-index";
-const INDEX_SCHEMA_VERSION: u32 = 1;
 const ROOT_INDEX: &str = "docs/README.md";
-const MAX_INDEX_BYTES: u64 = 128 * 1024;
-const MAX_DOCUMENTS: usize = 64;
+const DECISION_INDEX: &str = "docs/decisions/README.md";
+const ACTIVE_PLAN_DIRECTORY: &str = "docs/plans/active";
+const DECISION_DIRECTORY: &str = "docs/decisions";
 const MAX_WALKED_ENTRIES: usize = 512;
 const MAX_DIRECTORY_DEPTH: usize = 16;
 pub(crate) const DOCS_CHECK_TIMEOUT: Duration = Duration::from_secs(90);
@@ -26,56 +23,24 @@ const REQUIRED_READ_ORDER: &[&str] = &[
     "docs/CURRENT_STATE.md",
     "docs/planning/NOW.md",
 ];
-const REQUIRED_AUTHORITIES: &[(&str, &str)] = &[
-    ("agent-policy", "docs/AGENTS.md"),
-    ("documentation-index", "docs/README.md"),
-    ("product-charter", "docs/PRODUCT.md"),
-    ("current-state", "docs/CURRENT_STATE.md"),
-    ("current-work", "docs/planning/NOW.md"),
-    ("unresolved-backlog", "docs/BACKLOG.md"),
-    ("architecture", "docs/ARCHITECTURE.md"),
-    ("data-format", "docs/DATA_FORMAT.md"),
-    ("development-commands", "docs/DEVELOPMENT.md"),
-    ("verification", "docs/TESTING.md"),
-    ("release", "docs/RELEASE.md"),
-    ("decisions", "docs/decisions/README.md"),
-    ("dependency-exceptions", "docs/DEPENDENCY_EXCEPTIONS.md"),
+const REQUIRED_INDEX_LINKS: &[&str] = &[
+    "docs/AGENTS.md",
+    "docs/PRODUCT.md",
+    "docs/CURRENT_STATE.md",
+    "docs/planning/NOW.md",
+    "docs/ARCHITECTURE.md",
+    "docs/DATA_FORMAT.md",
+    "docs/TESTING.md",
+    "docs/DEVELOPMENT.md",
+    "docs/RELEASE.md",
+    "docs/decisions/README.md",
+    "docs/BACKLOG.md",
+    "docs/DEPENDENCY_EXCEPTIONS.md",
 ];
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DocumentationIndex {
-    schema: String,
-    schema_version: u32,
-    read_order: Vec<String>,
-    documents: Vec<DocumentRecord>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DocumentRecord {
-    path: String,
-    truth_scope: TruthScope,
-    authorities: Vec<String>,
-    listed_in: NullablePath,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum TruthScope {
-    Current,
-    Target,
-    Deferred,
-    Reference,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(transparent)]
-struct NullablePath(Option<String>);
 
 pub(crate) fn docs_check() -> anyhow::Result<()> {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    check_index_at(&repo_root)?;
+    check_docs_at(&repo_root)?;
 
     let mut rumdl = Command::new(env::var_os("MIRANTE4D_RUMDL").unwrap_or_else(|| "rumdl".into()));
     rumdl.current_dir(&repo_root).args([
@@ -89,197 +54,56 @@ pub(crate) fn docs_check() -> anyhow::Result<()> {
     ]);
     run_command_with_timeout(&mut rumdl, DOCS_CHECK_TIMEOUT)?;
 
-    println!("docs-check passed: exact inventory, authority graph, read order, links, and anchors");
+    println!(
+        "docs-check passed: authorities, read order, active plans, ADRs, links, anchors, and formatting"
+    );
     Ok(())
 }
 
-fn check_index_at(repo_root: &Path) -> anyhow::Result<()> {
-    let index_path = repo_root.join(INDEX_PATH);
-    let metadata = fs::metadata(&index_path)
-        .with_context(|| format!("failed to inspect {}", index_path.display()))?;
-    if !metadata.is_file() {
-        bail!("{INDEX_PATH} must be a regular file");
-    }
-    if metadata.len() > MAX_INDEX_BYTES {
-        bail!(
-            "{INDEX_PATH} is {} bytes; maximum is {MAX_INDEX_BYTES}",
-            metadata.len()
-        );
+fn check_docs_at(repo_root: &Path) -> anyhow::Result<()> {
+    require_regular_file(repo_root, "AGENTS.md")?;
+    require_regular_file(repo_root, ROOT_INDEX)?;
+
+    for path in REQUIRED_INDEX_LINKS {
+        require_regular_file(repo_root, path)?;
+        require_markdown_link(repo_root, ROOT_INDEX, path)?;
     }
 
-    let source = fs::read_to_string(&index_path)
-        .with_context(|| format!("failed to read {}", index_path.display()))?;
-    let index: DocumentationIndex =
-        serde_json::from_str(&source).with_context(|| format!("failed to parse {INDEX_PATH}"))?;
-    validate_index(repo_root, &index)
-}
-
-fn validate_index(repo_root: &Path, index: &DocumentationIndex) -> anyhow::Result<()> {
-    if index.schema != INDEX_SCHEMA {
-        bail!(
-            "{INDEX_PATH} schema must be {INDEX_SCHEMA:?}, found {:?}",
-            index.schema
-        );
-    }
-    if index.schema_version != INDEX_SCHEMA_VERSION {
-        bail!(
-            "{INDEX_PATH} schema_version must be {INDEX_SCHEMA_VERSION}, found {}",
-            index.schema_version
-        );
-    }
-    if index.documents.is_empty() || index.documents.len() > MAX_DOCUMENTS {
-        bail!(
-            "{INDEX_PATH} must list 1..={MAX_DOCUMENTS} documents, found {}",
-            index.documents.len()
-        );
-    }
-
-    let expected_read_order = REQUIRED_READ_ORDER
-        .iter()
-        .map(|path| (*path).to_owned())
-        .collect::<Vec<_>>();
-    if index.read_order != expected_read_order {
-        bail!(
-            "{INDEX_PATH} read_order must be {:?}, found {:?}",
-            REQUIRED_READ_ORDER,
-            index.read_order
-        );
-    }
-
-    let mut records = BTreeMap::new();
-    let mut authority_owners = BTreeMap::new();
-    for record in &index.documents {
-        validate_document_path(&record.path)?;
-        if records.insert(record.path.as_str(), record).is_some() {
-            bail!("{INDEX_PATH} lists duplicate document {:?}", record.path);
-        }
-        for authority in &record.authorities {
-            validate_authority_token(authority)?;
-            if let Some(previous) =
-                authority_owners.insert(authority.as_str(), record.path.as_str())
-            {
-                bail!(
-                    "authority {authority:?} is owned by both {previous:?} and {:?}",
-                    record.path
-                );
-            }
-        }
-    }
-
-    for &(authority, required_owner) in REQUIRED_AUTHORITIES {
-        match authority_owners.get(authority) {
-            Some(actual_owner) if *actual_owner == required_owner => {}
-            Some(actual_owner) => bail!(
-                "authority {authority:?} must be owned by {required_owner:?}, found {actual_owner:?}"
-            ),
-            None => bail!("required authority {authority:?} is missing"),
-        }
-        let expected_scope = if authority == "decisions" {
-            TruthScope::Reference
-        } else {
-            TruthScope::Current
-        };
-        let record = records
-            .get(required_owner)
-            .with_context(|| format!("required authority owner {required_owner:?} is missing"))?;
-        if record.truth_scope != expected_scope {
-            bail!(
-                "authority {authority:?} owner {required_owner:?} must have truth_scope {expected_scope:?}, found {:?}",
-                record.truth_scope
-            );
-        }
-    }
-
-    for path in &index.read_order {
-        if !records.contains_key(path.as_str()) {
-            bail!("read_order path {path:?} is not registered");
-        }
-    }
-
-    validate_listing_graph(&records)?;
-
-    let registered = records
-        .keys()
-        .map(|path| (*path).to_owned())
-        .collect::<BTreeSet<_>>();
-    let discovered = collect_markdown_inventory(repo_root)?;
-    if registered != discovered {
-        let missing = discovered
-            .difference(&registered)
-            .cloned()
-            .collect::<Vec<_>>();
-        let stale = registered
-            .difference(&discovered)
-            .cloned()
-            .collect::<Vec<_>>();
-        bail!(
-            "{INDEX_PATH} does not match docs/**/*.md; unregistered={missing:?}, missing_files={stale:?}"
-        );
-    }
-
-    validate_declared_links(repo_root, &records)?;
-    validate_read_order_links(repo_root, &index.read_order)?;
+    validate_read_order_links(repo_root)?;
     require_markdown_link(repo_root, "AGENTS.md", "docs/AGENTS.md")?;
     require_markdown_link(repo_root, "docs/AGENTS.md", ROOT_INDEX)?;
 
+    let inventory = collect_markdown_inventory(repo_root)?;
+    for path in inventory
+        .iter()
+        .filter(|path| is_direct_child(path, ACTIVE_PLAN_DIRECTORY))
+    {
+        require_markdown_link(repo_root, ROOT_INDEX, path)?;
+    }
+    for path in inventory.iter().filter(|path| is_adr(path)) {
+        require_markdown_link(repo_root, DECISION_INDEX, path)?;
+    }
+
     Ok(())
 }
 
-fn validate_listing_graph(records: &BTreeMap<&str, &DocumentRecord>) -> anyhow::Result<()> {
-    for (path, record) in records {
-        match (*path, record.listed_in.0.as_deref()) {
-            (ROOT_INDEX, None) => {}
-            (ROOT_INDEX, Some(parent)) => {
-                bail!("{ROOT_INDEX} must be the only listing root, not listed in {parent:?}")
-            }
-            (_, None) => bail!("document {path:?} must declare listed_in"),
-            (_, Some(parent)) => {
-                validate_document_path(parent)?;
-                if !records.contains_key(parent) {
-                    bail!("document {path:?} is listed in unregistered document {parent:?}");
-                }
-            }
-        }
-
-        let mut current = *path;
-        let mut visited = BTreeSet::new();
-        while current != ROOT_INDEX {
-            if !visited.insert(current) {
-                bail!("listed_in cycle prevents {path:?} from reaching {ROOT_INDEX}");
-            }
-            let current_record = records
-                .get(current)
-                .with_context(|| format!("listed_in path {current:?} is not registered"))?;
-            current = current_record.listed_in.0.as_deref().with_context(|| {
-                format!("listed_in chain for {path:?} stops before {ROOT_INDEX}")
-            })?;
-            if visited.len() > records.len() {
-                bail!("listed_in chain for {path:?} exceeds the document inventory");
-            }
-        }
+fn require_regular_file(repo_root: &Path, path: &str) -> anyhow::Result<()> {
+    let absolute = repo_root.join(path);
+    let metadata = fs::symlink_metadata(&absolute)
+        .with_context(|| format!("required documentation file is missing: {path}"))?;
+    if !metadata.file_type().is_file() {
+        bail!("required documentation path must be a regular file: {path}");
     }
     Ok(())
 }
 
-fn validate_declared_links(
-    repo_root: &Path,
-    records: &BTreeMap<&str, &DocumentRecord>,
-) -> anyhow::Result<()> {
-    for (path, record) in records {
-        if let Some(parent) = record.listed_in.0.as_deref() {
-            require_markdown_link(repo_root, parent, path)?;
-        }
-    }
-    Ok(())
-}
-
-fn validate_read_order_links(repo_root: &Path, read_order: &[String]) -> anyhow::Result<()> {
+fn validate_read_order_links(repo_root: &Path) -> anyhow::Result<()> {
     let source = read_markdown(repo_root, ROOT_INDEX)?;
     let read_order_section = markdown_section(&source, "Read Order")
         .context("docs/README.md must contain a ## Read Order section")?;
     let mut previous_offset = None;
 
-    for path in read_order {
+    for path in REQUIRED_READ_ORDER {
         let target = relative_link_target(ROOT_INDEX, path);
         let needle = format!("]({target})");
         let offsets = read_order_section
@@ -293,7 +117,7 @@ fn validate_read_order_links(repo_root: &Path, read_order: &[String]) -> anyhow:
             );
         }
         if previous_offset.is_some_and(|previous| offsets[0] <= previous) {
-            bail!("read-order links in {ROOT_INDEX} do not follow the registered order");
+            bail!("read-order links in {ROOT_INDEX} do not follow the required order");
         }
         previous_offset = Some(offsets[0]);
     }
@@ -349,6 +173,18 @@ fn relative_link_target(parent: &str, child: &str) -> String {
         .join("/")
 }
 
+fn is_direct_child(path: &str, directory: &str) -> bool {
+    Path::new(path).parent() == Some(Path::new(directory))
+}
+
+fn is_adr(path: &str) -> bool {
+    is_direct_child(path, DECISION_DIRECTORY)
+        && Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("ADR-") && name.ends_with(".md"))
+}
+
 fn validate_document_path(path: &str) -> anyhow::Result<()> {
     if !path.starts_with("docs/") || !path.ends_with(".md") {
         bail!("documentation path must match docs/**/*.md, found {path:?}");
@@ -370,19 +206,6 @@ fn validate_document_path(path: &str) -> anyhow::Result<()> {
     }
     if normalized.to_str() != Some(path) {
         bail!("documentation path is not normalized UTF-8: {path:?}");
-    }
-    Ok(())
-}
-
-fn validate_authority_token(authority: &str) -> anyhow::Result<()> {
-    let valid = !authority.is_empty()
-        && !authority.starts_with('-')
-        && !authority.ends_with('-')
-        && authority
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    if !valid {
-        bail!("authority token must use lowercase words separated by hyphens: {authority:?}");
     }
     Ok(())
 }
@@ -443,134 +266,93 @@ fn collect_markdown_inventory(repo_root: &Path) -> anyhow::Result<BTreeSet<Strin
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use super::*;
 
+    const ACTIVE_PLAN: &str = "docs/plans/active/CURRENT_PLAN.md";
+    const ADR: &str = "docs/decisions/ADR-0001-test-decision.md";
+
     #[test]
-    fn documentation_index_accepts_exact_inventory_and_rooted_listing_graph() {
+    fn documentation_tree_accepts_authorities_and_discovered_lifecycle_docs() {
         let fixture = DocumentationFixture::new();
-        check_index_at(fixture.root()).unwrap();
+        check_docs_at(fixture.root()).unwrap();
     }
 
     #[test]
-    fn documentation_index_rejects_unregistered_markdown() {
+    fn documentation_tree_accepts_unlisted_reference_markdown() {
         let fixture = DocumentationFixture::new();
-        fs::write(fixture.root().join("docs/EXTRA.md"), "# Extra\n").unwrap();
+        fixture.write("docs/reference/NOTE.md", "# Note\n");
+        check_docs_at(fixture.root()).unwrap();
+    }
 
-        let error = check_index_at(fixture.root()).unwrap_err().to_string();
+    #[test]
+    fn documentation_tree_rejects_missing_required_authority() {
+        let fixture = DocumentationFixture::new();
+        fs::remove_file(fixture.root().join("docs/PRODUCT.md")).unwrap();
+
+        let error = check_docs_at(fixture.root()).unwrap_err().to_string();
         assert!(
-            error.contains("unregistered=[\"docs/EXTRA.md\"]"),
+            error.contains("required documentation file is missing"),
             "{error}"
         );
+        assert!(error.contains("docs/PRODUCT.md"), "{error}");
     }
 
     #[test]
-    fn documentation_index_rejects_unsafe_paths_and_unknown_fields() {
+    fn documentation_tree_rejects_wrong_read_order() {
         let fixture = DocumentationFixture::new();
-        fixture.mutate_index(|index| {
-            index["documents"][0]["path"] = json!("docs/../README.md");
-        });
-        let error = check_index_at(fixture.root()).unwrap_err().to_string();
-        assert!(error.contains("not normalized"), "{error}");
-
-        let fixture = DocumentationFixture::new();
-        fixture.mutate_index(|index| index["unexpected"] = json!(true));
-        let error = format!("{:#}", check_index_at(fixture.root()).unwrap_err());
-        assert!(error.contains("unknown field"), "{error}");
-    }
-
-    #[test]
-    fn documentation_index_rejects_duplicate_authority_and_listing_cycle() {
-        let fixture = DocumentationFixture::new();
-        fixture.mutate_index(|index| {
-            index["documents"][1]["authorities"] = json!(["documentation-index"]);
-        });
-        let error = check_index_at(fixture.root()).unwrap_err().to_string();
-        assert!(error.contains("owned by both"), "{error}");
-
-        let fixture = DocumentationFixture::new();
-        fixture.mutate_index(|index| {
-            index["documents"][1]["listed_in"] = json!("docs/CURRENT_STATE.md");
-            index["documents"][3]["listed_in"] = json!("docs/PRODUCT.md");
-        });
-        let error = check_index_at(fixture.root()).unwrap_err().to_string();
-        assert!(error.contains("listed_in cycle"), "{error}");
-    }
-
-    #[test]
-    fn documentation_index_rejects_a_declared_listing_without_a_real_link() {
-        let fixture = DocumentationFixture::new();
-        fixture.mutate_markdown(ROOT_INDEX, |source| {
-            source.replace("[docs/BACKLOG.md](BACKLOG.md)\n", "")
-        });
-
-        let error = check_index_at(fixture.root()).unwrap_err().to_string();
-        assert!(error.contains("relative target \"BACKLOG.md\""), "{error}");
-    }
-
-    #[test]
-    fn documentation_index_rejects_duplicate_or_misordered_read_order_links() {
-        let fixture = DocumentationFixture::new();
-        fixture.mutate_markdown(ROOT_INDEX, |source| {
-            source.replace("\n## Other", "\n[duplicate](PRODUCT.md)\n\n## Other")
-        });
-        let error = check_index_at(fixture.root()).unwrap_err().to_string();
-        assert!(error.contains("must appear exactly once"), "{error}");
-
-        let fixture = DocumentationFixture::new();
-        fixture.mutate_markdown(ROOT_INDEX, |source| {
+        fixture.mutate(ROOT_INDEX, |source| {
             source
-                .replace("[docs/PRODUCT.md](PRODUCT.md)", "[read-order-swap-marker]")
-                .replace(
-                    "[docs/CURRENT_STATE.md](CURRENT_STATE.md)",
-                    "[docs/PRODUCT.md](PRODUCT.md)",
-                )
-                .replace(
-                    "[read-order-swap-marker]",
-                    "[docs/CURRENT_STATE.md](CURRENT_STATE.md)",
-                )
+                .replace("[Product](PRODUCT.md)", "[read-order-marker]")
+                .replace("[Current state](CURRENT_STATE.md)", "[Product](PRODUCT.md)")
+                .replace("[read-order-marker]", "[Current state](CURRENT_STATE.md)")
         });
-        let error = check_index_at(fixture.root()).unwrap_err().to_string();
+
+        let error = check_docs_at(fixture.root()).unwrap_err().to_string();
         assert!(
-            error.contains("do not follow the registered order"),
+            error.contains("do not follow the required order"),
             "{error}"
         );
     }
 
     #[test]
-    fn documentation_index_rejects_broken_agent_entry_links() {
+    fn documentation_tree_rejects_missing_active_plan_link() {
         let fixture = DocumentationFixture::new();
-        fixture.mutate_markdown("AGENTS.md", |source| {
+        fixture.mutate(ROOT_INDEX, |source| {
+            source.replace("[Active plan](plans/active/CURRENT_PLAN.md)\n", "")
+        });
+
+        let error = check_docs_at(fixture.root()).unwrap_err().to_string();
+        assert!(error.contains(ACTIVE_PLAN), "{error}");
+    }
+
+    #[test]
+    fn documentation_tree_rejects_missing_adr_link() {
+        let fixture = DocumentationFixture::new();
+        fixture.mutate(DECISION_INDEX, |source| {
+            source.replace("[Decision](ADR-0001-test-decision.md)\n", "")
+        });
+
+        let error = check_docs_at(fixture.root()).unwrap_err().to_string();
+        assert!(error.contains(ADR), "{error}");
+    }
+
+    #[test]
+    fn documentation_tree_rejects_broken_agent_entry_links() {
+        let fixture = DocumentationFixture::new();
+        fixture.mutate("AGENTS.md", |source| {
             source.replace("](docs/AGENTS.md)", "](missing.md)")
         });
-        let error = check_index_at(fixture.root()).unwrap_err().to_string();
+        let error = check_docs_at(fixture.root()).unwrap_err().to_string();
         assert!(error.contains("\"AGENTS.md\" must contain"), "{error}");
 
         let fixture = DocumentationFixture::new();
-        fixture.mutate_markdown("docs/AGENTS.md", |source| {
+        fixture.mutate("docs/AGENTS.md", |source| {
             source.replace("](README.md)", "](missing.md)")
         });
-        let error = check_index_at(fixture.root()).unwrap_err().to_string();
+        let error = check_docs_at(fixture.root()).unwrap_err().to_string();
         assert!(error.contains("\"docs/AGENTS.md\" must contain"), "{error}");
-    }
-
-    #[test]
-    fn documentation_index_rejects_required_authority_truth_scope_drift() {
-        let fixture = DocumentationFixture::new();
-        fixture.mutate_index(|index| {
-            let product = index["documents"]
-                .as_array_mut()
-                .unwrap()
-                .iter_mut()
-                .find(|record| record["path"] == "docs/PRODUCT.md")
-                .unwrap();
-            product["truth_scope"] = json!("target");
-        });
-
-        let error = check_index_at(fixture.root()).unwrap_err().to_string();
-        assert!(error.contains("must have truth_scope Current"), "{error}");
     }
 
     struct DocumentationFixture {
@@ -579,158 +361,60 @@ mod tests {
 
     impl DocumentationFixture {
         fn new() -> Self {
-            let directory = tempfile::tempdir().unwrap();
-            let documents = vec![
-                document("docs/README.md", "current", &["documentation-index"], None),
-                document(
-                    "docs/PRODUCT.md",
-                    "current",
-                    &["product-charter"],
-                    Some(ROOT_INDEX),
-                ),
-                document(
-                    "docs/AGENTS.md",
-                    "current",
-                    &["agent-policy"],
-                    Some(ROOT_INDEX),
-                ),
-                document(
-                    "docs/CURRENT_STATE.md",
-                    "current",
-                    &["current-state"],
-                    Some(ROOT_INDEX),
-                ),
-                document(
-                    "docs/planning/NOW.md",
-                    "current",
-                    &["current-work"],
-                    Some(ROOT_INDEX),
-                ),
-                document(
-                    "docs/BACKLOG.md",
-                    "current",
-                    &["unresolved-backlog"],
-                    Some(ROOT_INDEX),
-                ),
-                document(
-                    "docs/ARCHITECTURE.md",
-                    "current",
-                    &["architecture"],
-                    Some(ROOT_INDEX),
-                ),
-                document(
-                    "docs/DATA_FORMAT.md",
-                    "current",
-                    &["data-format"],
-                    Some(ROOT_INDEX),
-                ),
-                document(
-                    "docs/DEVELOPMENT.md",
-                    "current",
-                    &["development-commands"],
-                    Some(ROOT_INDEX),
-                ),
-                document(
-                    "docs/TESTING.md",
-                    "current",
-                    &["verification"],
-                    Some(ROOT_INDEX),
-                ),
-                document("docs/RELEASE.md", "current", &["release"], Some(ROOT_INDEX)),
-                document(
-                    "docs/decisions/README.md",
-                    "reference",
-                    &["decisions"],
-                    Some(ROOT_INDEX),
-                ),
-                document(
-                    "docs/DEPENDENCY_EXCEPTIONS.md",
-                    "current",
-                    &["dependency-exceptions"],
-                    Some(ROOT_INDEX),
-                ),
-            ];
-            let index = json!({
-                "schema": INDEX_SCHEMA,
-                "schema_version": INDEX_SCHEMA_VERSION,
-                "read_order": REQUIRED_READ_ORDER,
-                "documents": documents,
-            });
-            for record in index["documents"].as_array().unwrap() {
-                let path = record["path"].as_str().unwrap();
-                let destination = directory.path().join(path);
-                fs::create_dir_all(destination.parent().unwrap()).unwrap();
-                let source = if path == ROOT_INDEX {
-                    format!("# {path}\n\n## Read Order\n\n")
-                } else {
-                    format!("# {path}\n")
-                };
-                fs::write(destination, source).unwrap();
-            }
-            for record in index["documents"].as_array().unwrap() {
-                let Some(parent) = record["listed_in"].as_str() else {
-                    continue;
-                };
-                let path = record["path"].as_str().unwrap();
-                let parent_path = directory.path().join(parent);
-                let mut source = fs::read_to_string(&parent_path).unwrap();
-                source.push_str(&format!(
-                    "[{path}]({})\n",
-                    relative_link_target(parent, path)
-                ));
-                fs::write(parent_path, source).unwrap();
-            }
-            let readme = directory.path().join(ROOT_INDEX);
-            let mut readme_source = fs::read_to_string(&readme).unwrap();
-            readme_source.push_str("\n## Other\n");
-            fs::write(readme, readme_source).unwrap();
+            let fixture = Self {
+                directory: tempfile::tempdir().unwrap(),
+            };
 
-            let agents = directory.path().join("docs/AGENTS.md");
-            let mut agents_source = fs::read_to_string(&agents).unwrap();
-            agents_source.push_str("[Documentation index](README.md)\n");
-            fs::write(agents, agents_source).unwrap();
-            fs::write(
-                directory.path().join("AGENTS.md"),
-                "# Agents\n\n[Agent guide](docs/AGENTS.md)\n",
-            )
-            .unwrap();
-            fs::write(
-                directory.path().join(INDEX_PATH),
-                serde_json::to_vec_pretty(&index).unwrap(),
-            )
-            .unwrap();
-            Self { directory }
+            fixture.write("AGENTS.md", "# Agents\n\n[Agent guide](docs/AGENTS.md)\n");
+            fixture.write(
+                "docs/AGENTS.md",
+                "# Agent Guide\n\n[Documentation](README.md)\n",
+            );
+            for path in REQUIRED_INDEX_LINKS {
+                if *path != "docs/AGENTS.md" && *path != ROOT_INDEX {
+                    fixture.write(path, &format!("# {path}\n"));
+                }
+            }
+            fixture.write(ACTIVE_PLAN, "# Current Plan\n");
+            fixture.write(ADR, "# Test Decision\n");
+            fixture.write(
+                DECISION_INDEX,
+                "# Decisions\n\n[Decision](ADR-0001-test-decision.md)\n",
+            );
+
+            let mut index = String::from(
+                "# Documentation\n\n\
+                 ## Read Order\n\n\
+                 1. [Product](PRODUCT.md)\n\
+                 2. [Current state](CURRENT_STATE.md)\n\
+                 3. [Current work](planning/NOW.md)\n\n\
+                 ## Index\n\n",
+            );
+            for path in REQUIRED_INDEX_LINKS {
+                index.push_str(&format!(
+                    "[{path}]({})\n",
+                    relative_link_target(ROOT_INDEX, path)
+                ));
+            }
+            index.push_str("[Active plan](plans/active/CURRENT_PLAN.md)\n");
+            fixture.write(ROOT_INDEX, &index);
+            fixture
         }
 
         fn root(&self) -> &Path {
             self.directory.path()
         }
 
-        fn mutate_index(&self, mutate: impl FnOnce(&mut Value)) {
-            let path = self.root().join(INDEX_PATH);
-            let mut index: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            mutate(&mut index);
-            fs::write(path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
+        fn write(&self, path: &str, source: &str) {
+            let destination = self.root().join(path);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::write(destination, source).unwrap();
         }
 
-        fn mutate_markdown(&self, path: &str, mutate: impl FnOnce(String) -> String) {
-            let path = self.root().join(path);
-            let source = fs::read_to_string(&path).unwrap();
-            fs::write(path, mutate(source)).unwrap();
+        fn mutate(&self, path: &str, mutate: impl FnOnce(String) -> String) {
+            let destination = self.root().join(path);
+            let source = fs::read_to_string(&destination).unwrap();
+            fs::write(destination, mutate(source)).unwrap();
         }
-    }
-
-    fn document(
-        path: &str,
-        truth_scope: &str,
-        authorities: &[&str],
-        listed_in: Option<&str>,
-    ) -> Value {
-        json!({
-            "path": path,
-            "truth_scope": truth_scope,
-            "authorities": authorities,
-            "listed_in": listed_in,
-        })
     }
 }

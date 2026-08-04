@@ -1,26 +1,19 @@
 # Architecture Decision Records
 
-Last updated: 2026-07-26
+ADRs preserve durable rationale. They do not own current implementation facts;
+[Current state](../CURRENT_STATE.md) and the domain guides do.
 
-These ADRs preserve the decisions behind the completed foundation refactor.
-They explain rationale but do not replace `docs/CURRENT_STATE.md` as the
-authority for current facts.
+The numbering has gaps because obsolete or operational records were deleted.
+Git history remains the archive.
 
-| ADR | Decision | Decision IDs |
-| --- | --- | --- |
-| [ADR-0001](ADR-0001-foundation-program-and-hard-cutovers.md) | Deep foundation program with staged hard cutovers and no compatibility debris | OD-001–OD-008; PRG-001/002/003/008/015 |
-| [ADR-0002](ADR-0002-strict-m4d-format-lifecycle-and-identity.md) | Strict M4D/OME-NGFF profile, lifecycle, sharding, and identity families | D-007/D-008/D-009 |
-| [ADR-0003](ADR-0003-immutable-project-generations.md) | Immutable content-addressed project generations and durability | D-010 |
-| [ADR-0004](ADR-0004-workspace-graph-and-two-epoch-cutover.md) | Sixteen-crate ownership DAG and two-epoch clean-repository gated trunk | D-017/D-018/D-019 |
-| [ADR-0005](ADR-0005-verification-and-zero-cost-ci.md) | Six verification leaves, two zero-cost checks, and trusted-local evidence | D-022/D-023 |
-| [ADR-0006](ADR-0006-publication-clean-root-source-first.md) | Clean public source root before a separate full-data release | D-001/D-002/D-019/D-021 |
-| [ADR-0007](ADR-0007-foundation-dataset-hardware-product-envelope.md) | Profile-based dataset/hardware envelope, required GPU, Linux/Vulkan, 1080p, no segmentation | D-004/D-005/D-006/D-015/D-016 |
-| [ADR-0008](ADR-0008-contribution-governance.md) | Maintainer-led MIT contributions with no CLA/DCO initially | D-003 |
-| [ADR-0009](ADR-0009-canonical-model-contract.md) | Pure canonical domain, identity, and project model before the product hard cutover | WP-07A |
-| [ADR-0010](ADR-0010-proportional-development-verification.md) | Proportional development verification with deep checks at affected boundaries | 2026 simplification |
+| ADR | Durable decision |
+| --- | --- |
+| [ADR-0002](ADR-0002-strict-m4d-format-lifecycle-and-identity.md) | Strict package profile, lifecycle, and identity |
+| [ADR-0003](ADR-0003-immutable-project-generations.md) | Immutable project objects and generations |
+| [ADR-0006](ADR-0006-publication-clean-root-source-first.md) | Source publication is separate from future full-data publication |
+| [ADR-0009](ADR-0009-canonical-model-contract.md) | One canonical domain, identity, and project model |
+| [ADR-0010](ADR-0010-proportional-development-verification.md) | Verification effort follows the changed boundary |
 
-D-003 contribution governance is operational in the public repository.
-ADR-0009's canonical model is the live authority. D-011 through D-014 and
-D-020 belong only to the deferred open-data follow-on. ADR-0010 supersedes the
-routine topology and time ceiling in ADR-0005 while retaining its public
-runner, `$0`, and workflow-safety decisions.
+Create an ADR only for a durable decision whose rationale remains useful.
+Temporary sequencing, test runs, rollout notes, and current status belong
+elsewhere.

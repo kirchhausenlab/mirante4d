@@ -83,8 +83,8 @@ def schema_command(command: list[str]) -> None:
 
 
 def schema_validate(repo: Path, manifest_path: Path, validator: Path) -> None:
-    schema_path = repo / "docs/plans/active/foundation-refactor/schemas/foundation-source-fixture-manifest-v1.schema.json"
-    common_path = repo / "docs/plans/active/foundation-refactor/schemas/foundation-common-v1.schema.json"
+    schema_path = repo / "verification/fixture-schemas/foundation-source-fixture-manifest-v1.schema.json"
+    common_path = repo / "verification/fixture-schemas/foundation-common-v1.schema.json"
     schema_command([str(validator), "metaschema", str(common_path), str(schema_path), "--format-assertion"])
     schema_command(
         [

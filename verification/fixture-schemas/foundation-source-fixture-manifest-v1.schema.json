@@ -25,7 +25,7 @@
   ],
   "properties": {
     "$schema": {
-      "const": "../../docs/plans/active/foundation-refactor/schemas/foundation-source-fixture-manifest-v1.schema.json"
+      "const": "../../verification/fixture-schemas/foundation-source-fixture-manifest-v1.schema.json"
     },
     "schema": {
       "const": "mirante4d-foundation-source-fixture-manifest"

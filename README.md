@@ -1,62 +1,60 @@
 # Mirante4D
 
 Mirante4D is a native desktop viewer for large 4D microscopy datasets. It is
-an early-stage academic project developed in the Kirchhausen Lab and written in
-Rust with `wgpu`, `winit`, and `egui`.
+an academic project from the Kirchhausen Lab. The application uses Rust,
+`wgpu`, `winit`, and `egui`.
 
-> **Status:** pre-alpha research software. The application is under active
-> foundational refactoring, has no stable file-format promise, and is not yet
-> distributed as a supported public release.
+> **Status:** Mirante4D is pre-alpha research software. Persisted formats can
+> change through explicit hard cuts. There is no supported public release.
 
 ## Current Capabilities
 
-- Import TIFF/OME-TIFF data into strict, sharded experimental Mirante4D
-  packages without modifying the source.
+- Import TIFF and OME-TIFF data into strict, sharded Mirante4D packages.
+- Keep source microscopy data unchanged during import and validation.
 - Stream datasets that are larger than RAM or VRAM.
-- Render intensity channels with MIP, DVR, and ISO modes.
-- Display multiple channels with per-channel rendering controls.
-- Run exact whole-layer time traces and numeric box intensity analysis, then
-  save and reopen their table and plot results.
-- Build and package the application for Linux x86_64.
+- Render intensity data with MIP, DVR, and ISO modes.
+- Display multiple channels with independent controls.
+- Navigate 3D and linked cross-sections through bounded multiscale data.
+- Play time series through a fixed-quality bounded temporal session.
+- Compute exact whole-layer time traces and numeric box statistics.
+- Save and reopen project state, tables, and plots.
+- Build local Linux x86_64 release candidates.
 
-Current implementation facts and limitations are recorded in
-[docs/CURRENT_STATE.md](docs/CURRENT_STATE.md).
+[Current state](docs/CURRENT_STATE.md) owns the exact implemented behavior and
+limitations.
 
 ## Build And Run
 
-Mirante4D currently targets Linux x86_64. TIFF import and create-only dataset
-publication require Linux kernel 5.8 or newer so filesystem-wide durability
-failures are reported reliably. Install the Rust toolchain selected by
-`rust-toolchain.toml`, clone the repository, and run:
+Mirante4D currently targets Linux x86_64. Import and create-only dataset
+publication require Linux kernel 5.8 or newer.
+
+Install the Rust toolchain selected by `rust-toolchain.toml`. Then run the
+generated development dataset:
 
 ```bash
 cargo xtask run-dev
 ```
 
-This builds the application and opens a generated development dataset. To
-start the ordinary dataset-independent application at its welcome launcher,
-run:
+Start the ordinary application without a dataset:
 
 ```bash
 cargo run --release -p mirante4d-app
 ```
 
-From there, choose an existing `.m4d` package or preprocess a new explicit
-per-channel TIFF source. For normal development and testing commands, see
-[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+The welcome window can open an existing `.m4d` package or configure an
+explicit per-channel TIFF source.
 
-There is no public microscopy dataset release yet. Local sample data must stay
-outside the repository.
-
-For a bounded local check before submitting a change, run:
+Run the public pull-request checks with:
 
 ```bash
 cargo xtask verify-pr
 ```
 
-This runs the public policy and Rust checks. GPU, packaged-product,
-performance, and real-data evidence remain separate trusted-local work; see
-[docs/TESTING.md](docs/TESTING.md).
+GPU, performance, package, and real-data checks are separate local work. See
+[development](docs/DEVELOPMENT.md) and [testing](docs/TESTING.md).
+
+There is no public microscopy dataset release. Keep local research data
+outside the repository.
 
 ## Documentation
 
@@ -64,26 +62,24 @@ performance, and real-data evidence remain separate trusted-local work; see
 - [Current state](docs/CURRENT_STATE.md)
 - [Current work](docs/planning/NOW.md)
 - [Architecture](docs/ARCHITECTURE.md)
-- [Data format](docs/DATA_FORMAT.md)
-- [Testing](docs/TESTING.md)
+- [Data format and safety](docs/DATA_FORMAT.md)
+- [Testing and validation](docs/TESTING.md)
 - [Documentation index](docs/README.md)
 
 ## Related Work
 
-Mirante4D is a native successor to the browser-based
-[llsm_viewer](https://github.com/kirchhausenlab/llsm_viewer). It does not
-preserve that viewer's architecture or data formats. Mirante4D is also related
-to the lab's [SpatialDINO](https://github.com/kirchhausenlab/spatialdino)
-research project and is briefly described in its
+Mirante4D is a native successor to
+[llsm_viewer](https://github.com/kirchhausenlab/llsm_viewer). It does not use
+that viewer's architecture or data formats. Mirante4D is also related to the
+lab's [SpatialDINO](https://github.com/kirchhausenlab/spatialdino) research
+project and its
 [bioRxiv preprint](https://doi.org/10.64898/2025.12.31.697247).
 
 ## Contributing And Citation
 
-The project is maintainer-led and welcomes focused issues and pull requests.
-See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and
+The project welcomes focused issues and pull requests. See
+[CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and
 [CITATION.cff](CITATION.cff).
 
-Mirante4D is licensed under the [MIT License](LICENSE). Retained source and
-visual assets, generated snapshots, dependency-provided fonts, and reviewed
-fixture/vendor additions are tracked in
+Mirante4D uses the [MIT License](LICENSE). Asset and vendor records are in
 [ASSET_PROVENANCE.md](ASSET_PROVENANCE.md).
