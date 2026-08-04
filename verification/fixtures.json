@@ -49,7 +49,7 @@
       "sha256": "6a02e027e15f149ea3c4d6da3b292ad427a7c2cda29c970592b421f29c62d975",
       "manifest": {
         "path": "fixtures/source/manifest.json",
-        "sha256": "3106f4a384c40ed70671aaea6f3aa41a5dc090711df4eb9c90bd646c02f55dde"
+        "sha256": "f79cecc4ef339a6afc52d1111ab6c2596bd694e68e5b1b3d48132a61a5e755eb"
       },
       "archive": {
         "path": "fixtures/source/mirante4d-source-tiff-fixtures-v2.tar",
@@ -120,7 +120,7 @@
       "publication": "public-safe-synthetic",
       "license": "MIT",
       "path": "fixtures/target/manifest.json",
-      "sha256": "b413c82e865d6ff6681dcaf8b5b2f11784d961ec59b60b6485cc6f05e5a50e25",
+      "sha256": "8bcf52aa3f401a6426f499b4ca0b3baf6b013b72cc489e768ab22f9ef9489dc7",
       "validation_command": "python3 tools/target-fixtures/t1/validate.py --manifest fixtures/target/manifest.json --self-test",
       "promotion": {
         "authority": "fixtures/target/manifest.json#/approvals",

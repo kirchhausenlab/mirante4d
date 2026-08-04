@@ -42,7 +42,7 @@ PRODUCER_LOCK = TOOL_ROOT / "producer/toolchain-lock.json"
 ORACLE_LOCK = TOOL_ROOT / "fact_oracle/toolchain-lock.json"
 OME_IMAGE_SCHEMA = ROOT / "verification/standards/ome-ngff-0.5.2/0.5/schemas/image.schema"
 OME_VERSION_SCHEMA = OME_IMAGE_SCHEMA.with_name("_version.schema")
-MANIFEST_SCHEMA = ROOT / "docs/plans/active/foundation-refactor/schemas/foundation-target-fixture-manifest-v1.schema.json"
+MANIFEST_SCHEMA = ROOT / "verification/fixture-schemas/foundation-target-fixture-manifest-v1.schema.json"
 SCHEMA_VALIDATOR_ID = "Mirante4D offline JSON Schema subset v1"
 EXPECTED_PYTHON_SHA256 = "1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118"
 EXPECTED_UV_SHA256 = "13b335cfb84d5ec0a649ce071d6eb7c1e81496412caf9646f75434049da9d85c"
@@ -1000,7 +1000,7 @@ def candidate_manifest(
         "reference": "WP10A-C-PREAUTH-2026-07-12",
     }
     return {
-        "$schema": "../../docs/plans/active/foundation-refactor/schemas/foundation-target-fixture-manifest-v1.schema.json",
+        "$schema": "../../verification/fixture-schemas/foundation-target-fixture-manifest-v1.schema.json",
         "schema": "mirante4d-foundation-target-fixture-manifest",
         "schema_version": 1,
         "status": "independently_validated",
@@ -1067,7 +1067,7 @@ def candidate_manifest(
             "path": "tools/target-fixtures/t1/validate.py",
             "sha256": sha256_file(VALIDATOR),
             "command": "python3 tools/target-fixtures/t1/validate.py --manifest fixtures/target/manifest.json --self-test",
-            "manifest_schema_path": "docs/plans/active/foundation-refactor/schemas/foundation-target-fixture-manifest-v1.schema.json",
+            "manifest_schema_path": "verification/fixture-schemas/foundation-target-fixture-manifest-v1.schema.json",
             "manifest_schema_sha256": sha256_file(MANIFEST_SCHEMA),
             "identity_vector_verifier_path": "tools/target-fixtures/t1/hand_vectors/verify_hand_vectors.py",
             "identity_vector_verifier_sha256": sha256_file(VECTOR_CHECK),

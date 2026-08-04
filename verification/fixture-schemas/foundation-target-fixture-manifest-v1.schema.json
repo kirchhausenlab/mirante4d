@@ -23,7 +23,7 @@
   ],
   "properties": {
     "$schema": {
-      "const": "../../docs/plans/active/foundation-refactor/schemas/foundation-target-fixture-manifest-v1.schema.json"
+      "const": "../../verification/fixture-schemas/foundation-target-fixture-manifest-v1.schema.json"
     },
     "schema": {
       "const": "mirante4d-foundation-target-fixture-manifest"
@@ -304,7 +304,7 @@
           "const": "python3 tools/target-fixtures/t1/validate.py --manifest fixtures/target/manifest.json --self-test"
         },
         "manifest_schema_path": {
-          "const": "docs/plans/active/foundation-refactor/schemas/foundation-target-fixture-manifest-v1.schema.json"
+          "const": "verification/fixture-schemas/foundation-target-fixture-manifest-v1.schema.json"
         },
         "manifest_schema_sha256": {
           "$ref": "#/$defs/sha256"

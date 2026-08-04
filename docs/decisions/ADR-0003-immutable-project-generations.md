@@ -1,125 +1,58 @@
-# ADR-0003 — Immutable Content-Addressed Project Generations
+# ADR-0003: Store Projects As Immutable Generations
 
-Status: ACCEPTED AND IMPLEMENTED
+Status: Accepted
+
 Accepted: 2026-07-09
-Last reviewed: 2026-07-14
-Decision ID: D-010
 
-WP-10B implemented this store as the sole product persistence route and
-deleted the project-v15 bridge. [Current State](../CURRENT_STATE.md) owns the
-current product facts.
+Last reviewed: 2026-08-04
 
 ## Context
 
-Mutable multi-file project saves cannot provide one clear committed revision
-when state and potentially large artifacts change concurrently. They make
-crash recovery, autosave, conflict detection, relocation, garbage collection,
-and exact dirty-state reporting difficult to prove. The replacement must keep
-filesystem behavior inspectable and incremental while never exposing a partial
-project generation or blocking the UI thread on persistence work.
+Mutable multi-file saves do not expose one clear committed revision when state
+and artifacts change concurrently. They make crash recovery, autosave,
+conflict detection, relocation, garbage collection, and dirty-state reporting
+difficult to prove.
 
-## Options
-
-- Continue mutable files or copy the whole project per save. This is simple but
-  leaves partial-state and scale problems.
-- Use SQLite/WAL for all data. This provides transactions but makes large
-  artifacts opaque and widens the persistence boundary.
-- Use SQLite plus external blobs. This creates a two-authority, two-phase
-  commit problem.
-- Use copy-on-write generation directories or an append-only event log. These
-  add duplication, portability, replay, snapshot, and compaction complexity.
-- Select a transparent directory-backed content-addressed object store with
-  complete immutable generations and tiny atomic refs. This is selected.
+A single database would hide large artifacts. A database plus external blobs
+would create a two-authority commit.
 
 ## Decision
 
-The target project is a directory-backed store containing a fixed envelope and
-project UUID, immutable content-addressed objects, immutable complete generation
-snapshots, bounded refs, staging, leases, pins, and quarantined trash. One
-atomic `head` ref identifies the current and previous manual generations; an
-independently synced recovery ref preserves the prior manual tip. Autosave uses
-equivalent independent head/recovery refs and records its base manual
-generation. A ref never points to staging or a partial closure.
-
-One background project-store actor owns serialization, hashing, file writes,
-flushes, directory sync, and ref replacement. Each save captures an exact
-domain revision and immutable snapshot. `saved_revision` advances only after
-that revision is durably committed, so an intervening edit leaves the project
-truthfully dirty. Persistence DTOs contain canonical durable state and typed
-object descriptors, never renderer, GPU, worker, cache, scheduler, arbitrary
-internal-path, or deleted-segmentation state.
-
-A commit validates the expected parent, stages and durably publishes changed
-objects, publishes and syncs one complete generation, durably updates recovery
-to the old tip, then flushes and atomically replaces the tiny head and syncs its
-directory. Publication is create-if-absent/no-replace. If final durability
-cannot be established, the store returns typed `CommitIndeterminate`, keeps the
-revision dirty, suspends further writes, and requires close/reopen recovery; a
-visible renamed file alone is not durability proof.
-
-Every opener holds a shared OS maintenance lease for its session. A writable
-opener also holds the writer lease, and commits compare the expected parent. A
-second process that cannot obtain the writer lease opens read-only; there is no
-automatic merge. Compaction requires the exclusive maintenance lease.
-
-Recovery and garbage collection fail closed. Open validates bounded control
-records and the referenced generation closure before use. Corrupt heads may
-offer only validated previous/recovery generations; bounded scans list
-candidates but never auto-repair. Unknown files, a corrupt graph, or an active
-lease block deletion. Unreachable data first moves into synced `trash`, and
-purge is separate. Non-regenerable annotations, ROIs, tracks, measurements,
-manual edits, imported material, and artifacts are never guessed or age-pruned
-away.
-
-The first writable tuple is exactly Linux ext4 magic `0xef53`, normalized VFS
-options `[rw,relatime]`, and super options `[rw]`, selected from the held root
-descriptor's mount ID and one unambiguous `/proc/self/mountinfo` record.
-Unknown, mismatched, unreadable, network, FUSE, and overlay stores are
-unqualified; probing cannot qualify them. Existing `PreferWritable` opens then
-report read-only, while any new destination fails `UnsupportedFilesystem`
-before source reads or mutation. Internal path operations remain descriptor-
-relative and no-follow, with no production qualification bypass.
-
-Dataset bindings use verified D-009 scientific identity; package/release IDs
-and locator hints remain distinct. The WP-10B replacement of transitional
-project v15 is a hard cut: no v13/v14/v15 reader, in-place migration,
-fallback, or converter is included afterward.
+- Use a directory-backed content-addressed object store.
+- Store complete project snapshots as immutable generations.
+- Publish only tiny atomic refs to complete, validated generation closures.
+- Keep manual and autosave heads and recovery refs distinct.
+- Let one background store actor own serialization, hashing, writes, flushes,
+  directory sync, and ref replacement.
+- Bind each save to an exact domain revision. Advance saved state only after
+  that revision commits durably.
+- Use leases and expected-parent checks to prevent conflicting writers.
+- Fail closed on ambiguous durability, corrupt control state, active leases,
+  unknown files, or an invalid object graph.
+- Move unreachable objects to synchronized trash before a separate purge.
+- Keep dataset scientific identity separate from package identity and locator
+  hints.
 
 ## Consequences
 
-- A committed head always names one complete immutable generation, and prior
-  accepted state remains available through explicit previous/recovery refs.
-- Saves are incremental, relocation-safe, revision-aware, and inspectable, but
-  require careful filesystem, locking, recovery, and growth controls.
-- Unqualified filesystems cannot be advertised writable merely because a basic
-  save appeared to work.
-- Content-addressed orphans are harmless before explicit compaction, so storage
-  may grow until retention and GC run.
-- Existing experimental v13/v14/v15 projects are regenerated unless a separately
-  requested and authorized external converter is later approved.
+A committed head names one complete immutable project generation. Saves are
+incremental and inspectable. Previous accepted state can remain reachable
+through explicit recovery refs.
 
-## Enforcement
+Orphaned content is safe but can consume space until maintenance runs.
+Unsupported filesystems cannot become writable because one simple save
+appeared to work. Experimental predecessor formats may require external
+regeneration after a hard cut.
 
-- WP-10B freezes canonical envelope/ref/generation/object schemas and independent
-  vectors, implements the sole project store, switches save/open atomically,
-  and deletes the temporary current-persistence bridge and old mutation paths.
-- Hosted acceptance injects failure before and after every frozen transition
-  and repeated occurrence. Fresh-process kills cover transitions that mutate
-  state or leave private residue; pure reads and comparisons instead prove
-  byte-identical no mutation.
-- VM power cuts cover only distinct post-sync, publish/replace, install,
-  remove/move, and required directory-sync authority boundaries, plus one
-  baseline. Equivalent adjacent before states are deduplicated. The harness
-  must discard unpersisted writes; mocks and `SIGKILL` alone remain
-  insufficient.
-- WP-10C verifies dataset/runtime integration but does not recut project
-  persistence; WP-10B remains the project save/open authority.
-- No mutable artifact authority, hybrid database/blob commit, UI-thread file
-  transaction, silent merge, auto-repair, or legacy project reader may be added
-  without a new owner-approved ADR and current-document update.
+## Guardrails
 
-## Owning Documents
+- No ref points to staging or an incomplete closure.
+- No UI-thread file transaction, silent merge, automatic repair, or guessed
+  deletion is allowed.
+- Non-regenerable user material is never age-pruned.
+- Writable support requires an explicit filesystem qualification.
+- A mutable artifact authority, hybrid commit, or legacy reader requires a new
+  decision.
 
-- [Current Architecture](../ARCHITECTURE.md)
-- [Data Format](../DATA_FORMAT.md)
-- [Current State](../CURRENT_STATE.md)
+[Architecture](../ARCHITECTURE.md) owns current persistence authority.
+[Data format](../DATA_FORMAT.md) owns the current project contract.
